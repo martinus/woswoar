@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Stray wheels: `pip download` writes into the current directory, which
+# once put a 3.7 MB shellcheck wheel in a commit. dist/ and build/ above do
+# not cover a wheel dropped in the repo root.
+*.whl

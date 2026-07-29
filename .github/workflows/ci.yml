@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONWARNINGS: error::DeprecationWarning
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # shellcheck comes from pip rather than apt so the version CI enforces is
+      # the same one `pip install -e .[dev]` gives you locally.
+      - run: pip install -e .[dev]
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy woswoar tests
+      - run: shellcheck --shell=bash woswoar/shell/woswoar.bash
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: bash version
+        # The hook needs bash 5 for $EPOCHSECONDS / $EPOCHREALTIME. ubuntu-latest
+        # ships it, but fail loudly rather than silently skipping the hook tests.
+        run: |
+          bash -c 'echo "bash ${BASH_VERSION}"'
+          bash -c '((BASH_VERSINFO[0] >= 5))' || { echo "bash 5.0+ required"; exit 1; }
+      - run: python -m unittest discover -s . -t . -p 'test_*.py' --verbose
+
+  hook:
+    # Called on every prompt, so the hook gets its own job: the fork-scaling
+    # check needs strace, and a regression here is felt on every command.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install strace and locales
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace locales
+          # The comma-decimal test needs a locale where $EPOCHREALTIME uses ","
+          sudo locale-gen de_AT.UTF-8
+      - run: python -m unittest tests.test_shell_hook --verbose
+
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: latency on a 52k-entry history
+        env:
+          WOSWOAR_BENCH: "1"
+        # Prints the measured numbers and fails only on a large regression, so a
+        # noisy shared runner cannot redden the build on its own.
+        run: python -m unittest tests.test_perf --verbose
+
+  install:
+    # Proves the packaging works and the documented first-run flow succeeds on a
+    # machine that has never seen woswoar before.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: first-run flow
+        run: |
+          set -euxo pipefail
+          export HOME="$(mktemp -d)"
+          printf '#1753000000\ngit status\n#1753000100\nninja -C build\n' > "$HOME/.bash_history"
+          touch "$HOME/.bashrc"
+
+          woswoar --version
+          woswoar install
+          woswoar import bash
+          woswoar stats
+
+          # The hook ships inside the wheel, so it must be present after a
+          # plain `pip install .` with no source tree in sight.
+          test -f "$HOME/.local/share/woswoar/woswoar.bash"
+          grep -q 'woswoar' "$HOME/.bashrc"
+
+          # Recording is end-to-end here: a real bash sources the installed hook
+          # and the command must come back out of `woswoar list`.
+          bash --norc -i <<'EOF'
+          source "$HOME/.local/share/woswoar/woswoar.bash"
+          echo ci-end-to-end-marker
+          EOF
+          woswoar list --scope global | grep -q 'ci-end-to-end-marker'
+
+          # doctor exits non-zero on a broken install; fzf is absent here, so
+          # only check that it runs and reports.
+          woswoar doctor || true

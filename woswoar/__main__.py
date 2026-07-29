@@ -1,0 +1,258 @@
+"""Command line entry point."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+from . import __version__, cache, importer, search, store
+
+HOOK_NAME = "woswoar.bash"
+_BEGIN = "# >>> woswoar >>>"
+_END = "# <<< woswoar <<<"
+_BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
+
+_MILESTONE_2 = (
+    "woswoar: '{name}' is not implemented yet.\n"
+    "Git sync with age encryption is milestone 2; milestone 1 records and\n"
+    "searches locally. See woswoar_design_summary.md for the sync design."
+)
+
+
+def _hook_source() -> Path:
+    # Imported here rather than at module scope: importlib.resources costs ~8 ms
+    # of startup and only `install` needs it, while every Ctrl-R pays for
+    # whatever this module imports eagerly.
+    from importlib import resources
+
+    with resources.as_file(resources.files("woswoar") / "shell" / HOOK_NAME) as path:
+        return Path(str(path))
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Set up machine identity, install the hook, and wire up .bashrc."""
+    import shutil
+
+    machine = store.machine()
+    target = store.data_dir() / HOOK_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(_hook_source(), target)
+
+    print(f"machine : {machine.name} ({machine.id})")
+    print(f"logs    : {store.logs_dir()}")
+    print(f"hook    : {target}")
+
+    rcfile = Path(args.rcfile).expanduser() if args.rcfile else Path.home() / ".bashrc"
+    block = f'{_BEGIN}\nsource "{target}"\n{_END}\n'
+
+    existing = rcfile.read_text(encoding="utf-8") if rcfile.is_file() else ""
+    if _BLOCK.search(existing):
+        updated = _BLOCK.sub(block, existing)
+        action = "updated"
+    else:
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        updated = f"{existing}{separator}\n{block}"
+        action = "added"
+
+    if updated == existing:
+        print(f"rcfile  : {rcfile} (already current)")
+    else:
+        rcfile.write_text(updated, encoding="utf-8")
+        print(f"rcfile  : {rcfile} ({action})")
+
+    print("\nOpen a new shell, or run:  source", target)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    lines = search.lines_for(args.scope, dedup=not args.no_dedup, limit=args.limit)
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    selection = search.interactive(args.scope, query=args.query, dedup=not args.no_dedup)
+    if selection is None:
+        return 1
+    print(selection)
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    try:
+        result = importer.run(
+            args.kind, Path(args.file).expanduser() if args.file else None, dry_run=args.dry_run
+        )
+    except FileNotFoundError as exc:
+        print(f"woswoar: {exc}", file=sys.stderr)
+        return 1
+
+    prefix = "would import" if args.dry_run else "imported"
+    print(f"{result.source}: {result.parsed} parsed, {prefix} {result.imported}", end="")
+    print(f", {result.skipped} already present" if result.skipped else "")
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    entries = cache.load_entries()
+    if not entries:
+        print("No history recorded yet. Try 'woswoar import bash'.")
+        return 0
+
+    names = store.host_names()
+    per_host = Counter(e.host for e in entries)
+    oldest = min(e.ts for e in entries)
+    newest = max(e.ts for e in entries)
+    unique = len({e.cmd for e in entries})
+
+    print(f"entries  : {len(entries)} ({unique} unique)")
+    print(f"range    : {store.day_for(oldest)} .. {store.day_for(newest)}")
+    print("hosts    :")
+    for host, count in per_host.most_common():
+        print(f"  {names.get(host, host):<24} {count}")
+
+    top = Counter(e.cmd for e in entries).most_common(args.top)
+    if top:
+        print(f"top {args.top}   :")
+        width = len(str(top[0][1]))
+        for cmd, count in top:
+            print(f"  {count:>{width}}  {cmd[:70]}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    import shutil
+    import subprocess
+
+    ok = True
+
+    def check(label: str, good: bool, detail: str) -> None:
+        """A pass/fail condition: failing means something needs fixing."""
+        nonlocal ok
+        ok = ok and good
+        print(f"[{'ok' if good else 'FAIL'}] {label:<12} {detail}")
+
+    def info(label: str, detail: str) -> None:
+        """Context that cannot fail, kept visually distinct from a real check."""
+        print(f"[--] {label:<12} {detail}")
+
+    bash = shutil.which("bash")
+    version = ""
+    if bash:
+        try:
+            out = subprocess.run(
+                [bash, "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            version = out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            version = ""
+    major = int(version.split(".")[0]) if version and version[0].isdigit() else 0
+    check("bash", major >= 5, f"{version or 'not found'} (5.0+ required)")
+
+    fzf = shutil.which("fzf")
+    check("fzf", fzf is not None, fzf or "not found - needed for 'woswoar search'")
+
+    machine_file = store.config_dir() / "machine"
+    check("identity", machine_file.is_file(), str(machine_file))
+
+    hook = store.data_dir() / HOOK_NAME
+    check("hook", hook.is_file(), str(hook))
+
+    rcfile = Path.home() / ".bashrc"
+    sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
+    detail = "sources the hook" if sourced else "has no woswoar block"
+    check("bashrc", sourced, f"{rcfile} {detail}")
+
+    logs = list(store.iter_log_files())
+    info("logs", f"{len(logs)} file(s) in {store.logs_dir()}")
+
+    started = time.perf_counter()
+    entries = cache.load_entries()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    info("cache", f"{len(entries)} entries loaded in {elapsed_ms:.0f} ms")
+
+    session = "set" if os.environ.get("WOSWOAR_SESSION") else "unset (hook not loaded here)"
+    info("session", session)
+
+    if not ok:
+        print("\nRun 'woswoar install' to fix identity/hook/bashrc problems.")
+    return 0 if ok else 1
+
+
+def cmd_milestone2(args: argparse.Namespace) -> int:
+    print(_MILESTONE_2.format(name=args.command), file=sys.stderr)
+    return 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="woswoar",
+        description="Distributed shell history over git, searched with fzf.",
+    )
+    parser.add_argument("--version", action="version", version=f"woswoar {__version__}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_scope(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--scope", choices=search.SCOPES, default="global")
+        sub.add_argument(
+            "--no-dedup", action="store_true", help="keep repeated commands instead of collapsing"
+        )
+
+    p_search = subparsers.add_parser("search", help="pick a command interactively with fzf")
+    add_scope(p_search)
+    p_search.add_argument("--query", default="", help="initial fzf query")
+    p_search.set_defaults(func=cmd_search)
+
+    p_list = subparsers.add_parser("list", help="print matching lines (used by fzf reload)")
+    add_scope(p_list)
+    p_list.add_argument("--limit", type=int, default=None)
+    p_list.set_defaults(func=cmd_list)
+
+    p_import = subparsers.add_parser("import", help="import an existing shell history")
+    p_import.add_argument("kind", choices=importer.KINDS)
+    p_import.add_argument("--file", help="source file (default: ~/.bash_history or ~/.zsh_history)")
+    p_import.add_argument("--dry-run", action="store_true")
+    p_import.set_defaults(func=cmd_import)
+
+    p_install = subparsers.add_parser("install", help="install the shell hook into .bashrc")
+    p_install.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
+    p_install.set_defaults(func=cmd_install)
+
+    p_stats = subparsers.add_parser("stats", help="summarise recorded history")
+    p_stats.add_argument("--top", type=int, default=10)
+    p_stats.set_defaults(func=cmd_stats)
+
+    p_doctor = subparsers.add_parser("doctor", help="check the installation")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    for name in ("sync", "reencrypt"):
+        stub = subparsers.add_parser(name, help=f"{name} (milestone 2, not implemented)")
+        stub.set_defaults(func=cmd_milestone2)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result: int = args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        # `woswoar list | head` is a normal thing to do.
+        return 0
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())

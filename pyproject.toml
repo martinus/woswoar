@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "woswoar"
+version = "0.1.0"
+description = "Distributed shell history over git, searched with fzf"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Martin Leitner-Ankerl", email = "martin.ankerl@gmail.com" }]
+keywords = ["shell", "history", "fzf", "git", "bash"]
+
+# Deliberately empty, and intended to stay that way: woswoar is standard library
+# only. fzf is required at runtime as the UI, age only for `woswoar sync`.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6", "mypy>=1.11", "shellcheck-py>=0.10"]
+
+[project.scripts]
+woswoar = "woswoar.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["woswoar"]
+
+[tool.hatch.build.targets.sdist]
+include = ["woswoar", "tests", "README.md", "LICENSE", "woswoar_design_summary.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Recent ruff formats fenced code blocks inside markdown; the design document
+# contains illustrative snippets that are not meant to be valid modules.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
