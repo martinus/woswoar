@@ -76,7 +76,12 @@ to woswoar too.
 Milestone 1 — recording, search, and import — works. Milestone 2 is git sync
 with `age` encryption, using append-only immutable chunks so a 5-minute sync
 interval doesn't inflate the repository. It is fully designed but not built;
-`woswoar sync` tells you so. See [woswoar_design_summary.md](woswoar_design_summary.md).
+`woswoar sync` tells you so.
+
+- [docs/woswoar_design_summary.md](docs/woswoar_design_summary.md) — architecture, record
+  format, and the milestone 2 sync/encryption design.
+- [docs/milestone-1-plan.md](docs/milestone-1-plan.md) — the implementation plan milestone 1
+  was built from.
 
 ## Development
 

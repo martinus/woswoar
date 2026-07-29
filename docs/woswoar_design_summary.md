@@ -87,6 +87,35 @@ to a regular file under the inode lock, so concurrent shells cannot interleave
 lines regardless of size; the cap is a sanity bound against pathological pastes
 and against filesystems (NFS) that make no such promise.
 
+### Two fields are stored compactly
+
+Metadata repeats on every line and milestone 2 commits every byte to git
+permanently, so line size directly drives repo growth.
+
+`session` is `<start second>-<pid>`, both in hex — `6a69f856-107de`. Unique per
+host: two shells cannot share a pid at one instant, and a reused pid necessarily
+starts in a later second. The earlier microsecond-clock form was 23 bytes for no
+extra guarantee.
+
+`cwd` is written home-relative as `~/src/woswoar` when the directory was under
+the recording user's home. The `~` means *that machine's* home, not the home of
+whoever later reads the file, so it is deliberately never expanded — two synced
+machines can have different usernames.
+
+> Matched anchored (`$cwd == "$HOME"/*`), not with `${PWD/#$HOME/~}`. The latter
+> rewrites `/home/martinuscopy` to `~copy` when `$HOME` is `/home/martinus`.
+
+Together these took a representative line from 117 to 95 bytes — **19% smaller,
+no functionality lost**, and the command itself went from 25% to 31% of the line.
+
+### Fields nothing reads yet
+
+`cwd`, `exit`, and `duration` are recorded but not currently surfaced by search.
+They are kept because metadata is write-once-or-never: a display feature can be
+added next month, but the exit code of a command already run can never be
+recovered. Directory-scoped search and failure filtering both become impossible
+for all history preceding the day they start being recorded.
+
 ---
 
 ## Recording: the hot path

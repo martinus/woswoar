@@ -133,6 +133,47 @@ class TestCapture(ShellHookTestCase):
         self.assertEqual(by_cmd["false"].host, MACHINE_ID)
         self.assertTrue(by_cmd["false"].session)
 
+    def test_session_id_is_compact_and_hex(self) -> None:
+        # Repeated on every line, so its size is not cosmetic. <second>-<pid>,
+        # both hex.
+        self.run_shell("echo hello\n")
+        session = self.recorded()[0].session
+        self.assertRegex(session, r"^[0-9a-f]+-[0-9a-f]+$")
+        self.assertLessEqual(len(session), 16)
+
+    def test_two_shells_get_different_sessions(self) -> None:
+        self.run_shell("echo one\n")
+        self.run_shell("echo two\n")
+        sessions = {e.session for e in self.recorded()}
+        self.assertEqual(len(sessions), 2, "session id must be unique per shell")
+
+    def test_home_is_stored_as_tilde(self) -> None:
+        # $HOME is self.root for these runs, so cd'ing there must record "~".
+        self.run_shell("cd ~\ntrue marker\n")
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertEqual(by_cmd["true marker"].cwd, "~")
+
+    def test_path_under_home_is_stored_relative(self) -> None:
+        (self.root / "src").mkdir(exist_ok=True)
+        self.run_shell("cd ~/src\ntrue marker\n")
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertEqual(by_cmd["true marker"].cwd, "~/src")
+
+    def test_path_outside_home_stays_absolute(self) -> None:
+        self.run_shell("cd /tmp\ntrue marker\n")
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertEqual(by_cmd["true marker"].cwd, "/tmp")
+
+    def test_sibling_of_home_is_not_mangled(self) -> None:
+        # The trap in ${PWD/#$HOME/~}: with $HOME=/home/martinus it rewrites
+        # /home/martinuscopy to ~copy. Anchored matching must leave it alone.
+        sibling = self.root.parent / f"{self.root.name}-sibling"
+        sibling.mkdir(exist_ok=True)
+        self.addCleanup(sibling.rmdir)
+        self.run_shell(f"cd {sibling}\ntrue marker\n")
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertEqual(by_cmd["true marker"].cwd, str(sibling))
+
     def test_duration_is_measured(self) -> None:
         self.run_shell("sleep 0.3\n")
         entry = self.recorded()[0]
