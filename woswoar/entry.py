@@ -17,7 +17,7 @@ The host is *not* a field. It is derived from the path the line was read from,
 which keeps every line shorter and makes a file trivially attributable.
 
 Two fields are stored compactly, because they repeat on every single line and
-milestone 2 commits every byte to git permanently:
+sync commits every byte to git permanently:
 
 ``cwd``
     Written home-relative as ``~/src/woswoar`` when the directory was under the

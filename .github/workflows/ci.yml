@@ -40,6 +40,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: install age
+        # Sync tests skip themselves without it, and a silently skipped suite
+        # looks exactly like a passing one.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
       - name: bash version
         # The hook needs bash 5 for $EPOCHSECONDS / $EPOCHREALTIME. ubuntu-latest
         # ships it, but fail loudly rather than silently skipping the hook tests.
@@ -64,6 +68,28 @@ jobs:
           # The comma-decimal test needs a locale where $EPOCHREALTIME uses ","
           sudo locale-gen de_AT.UTF-8
       - run: python -m unittest tests.test_shell_hook --verbose
+
+  sync:
+    # Two machines exchanging encrypted history through a bare repo, plus the
+    # invariant the storage design rests on: chunks are never rewritten.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - run: age --version && git --version
+      - name: sync suite
+        run: |
+          set -o pipefail
+          python -m unittest tests.test_sync --verbose 2>&1 | tee sync.log
+          # These tests skip themselves when age or git is absent. A skipped run
+          # is green, which is precisely the failure mode worth guarding.
+          if grep -q "skipped" sync.log; then
+            echo "::error::sync tests were skipped - age or git missing"
+            exit 1
+          fi
 
   perf:
     runs-on: ubuntu-latest
@@ -117,3 +143,37 @@ jobs:
           # doctor exits non-zero on a broken install; fzf is absent here, so
           # only check that it runs and reports.
           woswoar doctor || true
+
+      - name: two machines sync through a bare repo, from the installed wheel
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          BASE="$(mktemp -d)"
+          git init --quiet --bare "$BASE/origin.git"
+
+          run_as() {          # run_as <machine> <args...>
+            local m="$1"; shift
+            env HOME="$BASE/$m" \
+                WOSWOAR_DIR="$BASE/$m/data" \
+                XDG_CONFIG_HOME="$BASE/$m/conf" \
+                XDG_CACHE_HOME="$BASE/$m/cache" \
+                woswoar "$@"
+          }
+          mkdir -p "$BASE"/{alpha,beta}/{data,conf,cache}
+
+          run_as alpha init "$BASE/origin.git" --new-identity
+          ALPHA_ID=$(grep '^id=' "$BASE/alpha/conf/woswoar/machine" | cut -d= -f2)
+          mkdir -p "$BASE/alpha/data/logs/hosts/$ALPHA_ID"
+          printf '1700000001\ts1\t~/src\t0\t5\tsecret-marker-command\n' \
+            > "$BASE/alpha/data/logs/hosts/$ALPHA_ID/2023-11-14.tsv"
+          run_as alpha sync
+
+          # Nothing readable may reach the repo.
+          ! grep -rq 'secret-marker-command' "$BASE/origin.git"
+
+          run_as beta init "$BASE/origin.git" --new-identity
+          run_as alpha sync
+          run_as alpha reencrypt
+          run_as alpha sync
+          run_as beta sync
+          run_as beta list --scope global | grep -q 'secret-marker-command'

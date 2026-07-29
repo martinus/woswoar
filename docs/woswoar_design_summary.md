@@ -12,9 +12,8 @@ different goals:
 The name is Austrian dialect for *"Was war?"* — "what was it again?" — which is
 exactly the question this tool answers.
 
-**Status.** Milestone 1 (record, search, import) is implemented. Milestone 2
-(git sync with encryption) is designed below but not yet built; `woswoar sync`
-exits with a message saying so.
+**Status.** Both milestones are implemented: recording, search and import; and
+git sync with age encryption.
 
 ---
 
@@ -24,7 +23,7 @@ exits with a message saying so.
 bash hook  ──►  plaintext TSV logs  ──►  pickle cache  ──►  scope filter  ──►  fzf
    (record)          (truth)             (speed only)        (Python)         (UI)
                         │
-                        └──►  age-encrypted chunks  ──►  git  ──►  remote   [milestone 2]
+                        └──►  age-encrypted chunks  ──►  git  ──►  remote
 ```
 
 Two rules that everything else follows from:
@@ -44,8 +43,8 @@ Two rules that everything else follows from:
     hosts/<id>/2026-07-29.tsv
     hosts/<id>/.name          friendly label for display
   woswoar.bash                installed copy of the hook
-  history/                    git working tree, ciphertext only   [milestone 2]
-  state.json                                                      [milestone 2]
+  history/                    git working tree, ciphertext only
+  state.json                  sync watermarks (local, never synced)
 ~/.config/woswoar/machine     id + name
 ~/.config/woswoar/imported.json
 ~/.cache/woswoar/cache.pickle
@@ -89,8 +88,7 @@ and against filesystems (NFS) that make no such promise.
 
 ### Two fields are stored compactly
 
-Metadata repeats on every line and milestone 2 commits every byte to git
-permanently, so line size directly drives repo growth.
+Metadata repeats on every line and sync commits every byte to git permanently, so line size directly drives repo growth.
 
 `session` is `<start second>-<pid>`, both in hex — `6a69f856-107de`. Unique per
 host: two shells cannot share a pid at one instant, and a reused pid necessarily
@@ -189,7 +187,7 @@ history is loaded on every Ctrl-R.
 
 Entries are grouped **per file** rather than kept in one flat list. That costs a
 `chain.from_iterable` on read and buys O(1) invalidation of a single file —
-exactly what milestone 2 needs when a sync appends decrypted lines to one host's
+exactly what sync needs when it appends decrypted lines to one host's
 log.
 
 Update rules per file:
@@ -296,7 +294,7 @@ covers the count going stale when a history file is rotated or trimmed.
 
 ---
 
-## Synchronisation and encryption  [milestone 2]
+## Synchronisation and encryption
 
 ### Threat model
 
@@ -310,6 +308,20 @@ Encryption therefore requires an external tool. `age` was chosen: a single small
 binary that accepts **SSH public keys as recipients**, so every machine uses the
 keypair it already pushes to GitHub with and no secret is ever copied between
 machines.
+
+### Choosing an identity
+
+age does **not** use ssh-agent. A passphrase-protected SSH key prompts on a
+terminal and fails outright without one — verified: it exits 1 rather than
+hanging, which is the one saving grace for a systemd timer, but it still means
+sync would never succeed unattended.
+
+So `init` resolves the identity **once** and records it in
+`~/.config/woswoar/machine`, rather than re-detecting per sync. It prefers an
+existing SSH key, falling back to a dedicated age identity when none works. The
+check is a real encrypt/decrypt round trip, not an inspection of the key file,
+because the question is not what format the key claims to be — it is whether an
+unattended sync will actually work.
 
 ### Why the obvious approach fails
 
@@ -350,11 +362,21 @@ simpler than the alternatives:
   merged per (host, day).
 
 **Per-day key.** One X25519 identity per host per day, sealed to all recipients
-in `keys/<date>.age`; chunks are encrypted to that day's public key alone. This
-halves per-chunk header overhead (~200 B instead of ~450 B with three
-`ssh-ed25519` recipients), and more importantly makes onboarding cheap: adding a
-machine re-seals ~730 tiny key files rather than ~35,000 chunks, so `reencrypt`
-takes seconds instead of rewriting the archive.
+in `keys/<date>.age`; chunks are encrypted to that day's public key alone. The
+day's *public* key is stored beside it in the clear, so writing a chunk never
+has to open the sealed one.
+
+Measured with age 1.3.1, three `ssh-ed25519` recipients:
+
+| | overhead per chunk |
+|---|---|
+| sealed directly to 3 recipients | 432 B |
+| sealed to the day key | **200 B** |
+
+A sealed day key is 621 B, so re-sealing two years of them is ~450 KB — which is
+what makes onboarding cheap. Adding a machine re-seals ~730 tiny key files
+rather than ~35,000 chunks, so `reencrypt` takes seconds instead of rewriting
+the archive.
 
 **Cost: inodes.** At a 5-minute timer and ~40 content-bearing syncs a day, one
 machine produces ~35k chunk files over two years. Git copes, but a fresh clone
@@ -367,11 +389,32 @@ the core loop.
 ### Sync
 
 1. `flock` a lock file (concurrent shells, timer).
-2. For each own log file with unencrypted tail bytes: encrypt that tail into a
-   new chunk; `git add`; commit; `git pull --rebase`; push.
-3. For each other host: decrypt chunks newer than the merge watermark and append
+2. **Fetch and rebase first.**
+3. Seal each own log file's unsealed tail into a new chunk; commit.
+4. Push, retrying once after a fetch/rebase if someone else pushed meanwhile.
+5. For each other host, decrypt chunks newer than the merge watermark and append
    the plaintext to `logs/`.
-4. Update the cache incrementally.
+
+> Step 2 has to come before step 3, and this was learned the hard way. Creating
+> a day key seals it to whatever `recipients.txt` says *at that moment*. Export
+> first and you seal the day's key to a stale recipient list, so any machine
+> enrolled since the last sync can never open that day — silently, and
+> permanently, because the repo is append-only. The failure only shows up with
+> two machines and a new day, which is exactly the case a single-machine test
+> never reaches.
+
+Fetch-then-rebase, rather than `git pull --rebase`, because cloning an *empty*
+remote configures a tracking branch that points at nothing — the normal state
+for the first machine to enrol — and pulling from that fails.
+
+`init` publishes immediately for the same class of reason: until a new machine's
+public key is on the remote, `reencrypt` run elsewhere cannot include it, and
+onboarding would appear to succeed while silently granting no access to older
+history.
+
+Commits use a fixed `woswoar <woswoar@localhost>` identity set on the repo.
+Commit metadata is one of the few things that is not encrypted, so it should not
+carry a real name and address.
 
 Each chunk is decrypted **exactly once, ever** — the plaintext under `logs/` is
 the working copy. This is also why git clean/smudge filters were rejected: they
@@ -395,8 +438,7 @@ changed only at onboarding); `merge=union` in `.gitattributes` resolves it.
 Runtime: **Python standard library only** — `dataclasses`, `pathlib`, `pickle`,
 `subprocess`, `tempfile`, `time`, `secrets`, `hashlib`, `json`, `argparse`.
 
-External binaries: `fzf` (the UI), `age` (milestone 2 only), `git` (milestone 2
-only). Development only: `ruff`, `mypy`, `shellcheck`.
+External binaries: `fzf` (the UI), and `age` plus `git` (sync only). Development only: `ruff`, `mypy`, `shellcheck`.
 
 Supported: **bash 5.0+ on Linux.** bash 5 is required for `$EPOCHSECONDS` and
 `$EPOCHREALTIME`; without them the hot path would have to fork `date` on every

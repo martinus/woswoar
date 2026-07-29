@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync woswoar shell history periodically
+
+[Timer]
+# Wait a little after login rather than competing with everything else starting.
+OnStartupSec=2min
+OnUnitActiveSec=5min
+
+# Catch up after the machine was asleep or off, rather than silently skipping.
+Persistent=true
+
+# Every machine syncing on the same wall-clock tick is how you manufacture
+# push races. A minute of jitter costs nothing and avoids them.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

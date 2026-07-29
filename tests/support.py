@@ -18,7 +18,9 @@ def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -
     return Entry(ts=ts, host=host, session=session, cwd="/tmp", exit_code=0, duration_ms=1, cmd=cmd)
 
 
-_ENV_KEYS = (
+#: Every environment variable store.py consults. Shared with tests/test_sync.py
+#: so a new one cannot be isolated in one place and leak in the other.
+ENV_KEYS = (
     "WOSWOAR_DIR",
     "WOSWOAR_SESSION",
     "XDG_CONFIG_HOME",
@@ -40,10 +42,10 @@ class WoswoarTestCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
 
-        self._saved = {key: os.environ.get(key) for key in _ENV_KEYS}
+        self._saved = {key: os.environ.get(key) for key in ENV_KEYS}
         self.addCleanup(self._restore_env)
 
-        for key in _ENV_KEYS:
+        for key in ENV_KEYS:
             os.environ.pop(key, None)
         os.environ["WOSWOAR_DIR"] = str(self.root / "data")
         os.environ["XDG_CONFIG_HOME"] = str(self.root / "config")

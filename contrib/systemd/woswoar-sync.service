@@ -1,0 +1,21 @@
+[Unit]
+Description=woswoar shell history sync
+Documentation=https://github.com/martinus/woswoar
+# Pointless and noisy without a network; the timer will try again.
+After=network-online.target
+
+[Service]
+Type=oneshot
+# /usr/bin/env so this works wherever woswoar was installed (pipx, --user, venv)
+# without hardcoding a path into the unit.
+ExecStart=/usr/bin/env woswoar sync
+
+# Sync holds a lock and talks to a remote; if it hangs, fail rather than pile up.
+TimeoutStartSec=10min
+
+# It only ever needs its own data directory, an ssh key, and the network.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
