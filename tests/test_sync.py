@@ -356,7 +356,7 @@ class TestImmutability(SyncTestCase):
         )
         rewritten = {line for line in touched.splitlines() if line.endswith(".age")}
 
-        # Chunks live under hosts/<id>/YYYY/MM/DD/. Key files and name seals sit
+        # Chunks live under hosts/<id>/YYYY-MM-DD/. Key files and name seals sit
         # elsewhere in the tree and *are* rewritten, by design: that is exactly
         # what makes onboarding cheap. Separating the two here keeps the
         # exception explicit rather than quietly widening the invariant.
@@ -402,6 +402,77 @@ class TestImmutability(SyncTestCase):
             chunk_bytes * 4 + 64 * 1024,
             f"stored={stored} chunk_bytes={chunk_bytes} over {syncs} syncs",
         )
+
+
+class TestChunkPayload(unittest.TestCase):
+    """The chunk encoding, without needing age or git."""
+
+    def test_round_trip(self) -> None:
+        for data in (b"", b"x", b"a line\n", b"repeated line\n" * 500, bytes(range(256))):
+            self.assertEqual(store.unpack_payload(store.pack_payload(data)), data)
+
+    def test_repetitive_input_shrinks(self) -> None:
+        # Shell history is repetitive by nature, and this is the one moment it
+        # can be compressed: once sealed, ciphertext is incompressible forever.
+        data = b"1700000000\ts1\t~/src\t0\t5\tgit status\n" * 200
+        self.assertLess(len(store.pack_payload(data)), len(data) // 10)
+
+    def test_incompressible_input_is_stored_raw(self) -> None:
+        # Deflating a one-line chunk makes it bigger. Taking the smaller of the
+        # two is why the encoding needs a tag at all.
+        data = b"1700000000\ts1\t~\t0\t5\tls\n"
+        packed = store.pack_payload(data)
+        self.assertEqual(len(packed), len(data) + 1)
+        self.assertEqual(store.unpack_payload(packed), data)
+
+    def test_unknown_encoding_is_refused(self) -> None:
+        # Loudly, rather than decoding into garbage that then gets appended to
+        # a log file and cached.
+        with self.assertRaises(ValueError):
+            store.unpack_payload(b"\x7fanything")
+        with self.assertRaises(ValueError):
+            store.unpack_payload(b"")
+
+
+@requires_age
+@requires_git
+class TestLayout(SyncTestCase):
+    def test_a_chunk_lives_one_directory_below_its_host(self) -> None:
+        """`hosts/<id>/2023-11-14/<chunk>` -- the date is one path component.
+
+        Every commit rewrites a tree object per level it touches, so nesting
+        the date as `2023/11/14` costs two extra objects on every sync forever.
+        Pinned because it is invisible in behaviour and easy to reintroduce.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            chunk = next(iter(store.iter_chunks(alpha.id)))
+            relpath = chunk.path.relative_to(store.history_dir()).as_posix()
+
+        self.assertEqual(relpath.split("/")[:3], ["hosts", alpha.id, "2023-11-14"])
+        self.assertTrue(store.is_chunk_path(relpath), relpath)
+
+    def test_sealed_history_is_smaller_than_the_plaintext_it_carries(self) -> None:
+        """A day's worth of one machine's commands, compacted into one chunk.
+
+        Without compression the sealed form is strictly *larger* than the
+        plaintext -- age adds a header and encrypts. This asserts the whole
+        point of packing the payload first, on input shaped like real history.
+        """
+        alpha = self.machine("alpha")
+        plaintext = 0
+        with alpha.active():
+            for i in range(60):
+                cmd = f"git commit -m 'work on feature {i % 7}'"
+                alpha.record("2023-11-14", 1_700_000_000 + i, cmd)
+                plaintext = store.log_file(alpha.id, "2023-11-14").stat().st_size
+                sync.run()
+            sync.compact(before="2023-11-15")
+            sealed = sum(c.path.stat().st_size for c in store.iter_chunks(alpha.id))
+
+        self.assertLess(sealed, plaintext // 2, f"sealed={sealed} plaintext={plaintext}")
 
 
 class TestCompact(SyncTestCase):

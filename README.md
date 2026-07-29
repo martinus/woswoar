@@ -208,22 +208,25 @@ days it cannot read yet. Nothing is lost in the meantime.
 <details>
 <summary>How the repository stays small (and conflict-free)</summary>
 
-Each sync encrypts **only the lines added since last time** into a brand-new
-file that is never modified again:
+Each sync compresses **only the lines added since last time**, seals them, and
+writes a brand-new file that is never modified again:
 
 ```
-hosts/<id>/2026/07/29/<synctime>-<rand>.age    a plain age file
+hosts/<id>/2026-07-29/<synctime>-<rand>.age    a compressed, age-encrypted block
 hosts/<id>/keys/2026-07-29.age                 that day's key, sealed to all recipients
 ```
 
 Re-encrypting a whole day file on every sync would write a fresh random blob
-each time, and random data delta-compresses to nothing — measured at **~100 MB
-per year** versus **~8 MB** for write-once chunks. And because every machine only
-ever *adds* files under its own prefix, `git pull --rebase` has nothing to
-conflict over. Not "rarely" — structurally.
+each time, and random data delta-compresses to nothing. Compressing *before*
+sealing is the only chance there is — encrypted bytes are incompressible by
+definition, so once a chunk is written, nothing can ever shrink it again.
 
-`woswoar compact` can later merge a finished day's chunks to reduce the file
-count. It is opt-in, and the only operation that ever deletes anything.
+Because every machine only ever *adds* files under its own prefix,
+`git pull --rebase` has nothing to conflict over. Not "rarely" — structurally.
+
+`woswoar compact` can later merge a finished day's chunks into one. It reduces
+the *file count*, not the repository: git keeps the replaced chunks forever,
+reachable from the commits that added them.
 
 </details>
 
@@ -235,8 +238,31 @@ cp contrib/systemd/woswoar-sync.* ~/.config/systemd/user/
 systemctl --user enable --now woswoar-sync.timer
 ```
 
-Five-minute interval by default. Sync never runs on your prompt — a `git push`
-must not be able to block a shell.
+**One-minute interval by default**, because it turns out to be nearly free. Real
+typing is bursty, so a minute rather than five roughly doubles the number of
+syncs that actually carry something — not five times it. Sync never runs on your
+prompt: a `git push` must not be able to block a shell.
+
+<details>
+<summary>What that costs, measured</summary>
+
+Two years of one machine's real history — 25,997 commands, 3.61 MB of plaintext
+— replayed through `woswoar sync` itself at a 1-minute cadence:
+
+| | repo, packed | per year |
+|---|---|---|
+| before compression + flat paths | 16.22 MB | 7.9 MB |
+| **now** | **12.24 MB** | **5.9 MB** |
+
+About half of what remains is git's own bookkeeping rather than your commands:
+per sync, 359 B of blob (200 B of that the `age` header), 196 B of tree, 129 B
+of commit. That fixed part is why the interval matters at all — raise
+`OnUnitActiveSec` in the timer if you would rather have the bytes back.
+
+The per-year number tracks how much you type, not the timer; a busier stretch of
+the same history extrapolates to about 16 MB/year.
+
+</details>
 
 ---
 
@@ -287,7 +313,7 @@ were assigned independently.
 | `woswoar init [url]` | create or join an encrypted history repo |
 | `woswoar sync` | exchange history with the remote |
 | `woswoar reencrypt` | re-seal keys after enrolling a new machine |
-| `woswoar compact` | merge old chunks to reduce file count |
+| `woswoar compact` | merge old chunks to reduce the working-tree file count |
 
 ### Scopes
 

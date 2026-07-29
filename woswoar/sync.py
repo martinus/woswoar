@@ -243,7 +243,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             continue
 
         day = store.day_of_log(log.relpath)
-        sealed = crypto.encrypt_to(data, day_public_key(known, day))
+        sealed = crypto.encrypt_to(store.pack_payload(data), day_public_key(known, day))
         chunk = store.new_chunk(known.id, day, now)
         chunk.parent.mkdir(parents=True, exist_ok=True)
         store.write_atomic(chunk, sealed)
@@ -298,7 +298,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             report.unreadable.add(key)
             continue
 
-        plaintext = crypto.decrypt_with_secret(chunk.path.read_bytes(), secret)
+        sealed = chunk.path.read_bytes()
+        plaintext = store.unpack_payload(crypto.decrypt_with_secret(sealed, secret))
         pending.setdefault(chunk.day, []).append(plaintext)
         state.merged[key] = chunk.name
         report.chunks_merged += 1
@@ -430,9 +431,27 @@ def _ensure_repo_config() -> None:
         git("config", "user.email", COMMIT_EMAIL)
 
 
+def _staged_changes() -> bool:
+    """Whether the index differs from HEAD.
+
+    `git diff --cached --quiet` reports it in the exit code and reads the index
+    rather than stat-ing the working tree, which `status --porcelain` does. That
+    matters because the tree is tens of thousands of chunks after a couple of
+    years, and this runs on a timer.
+    """
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=store.history_dir(),
+        capture_output=True,
+        check=False,
+        timeout=GIT_TIMEOUT,
+    )
+    return result.returncode != 0
+
+
 def _commit() -> None:
     git("add", "-A")
-    if not git("status", "--porcelain"):
+    if not _staged_changes():
         return
     git("commit", "-q", "-m", COMMIT_MESSAGE)
 
@@ -643,9 +662,14 @@ def compact(before: str) -> tuple[int, int]:
         if len(chunks) < 2:
             continue
         secret = open_day_key(known, known.id, day)
-        plain = b"".join(crypto.decrypt_with_secret(c.path.read_bytes(), secret) for c in chunks)
+        plain = b"".join(
+            store.unpack_payload(crypto.decrypt_with_secret(c.path.read_bytes(), secret))
+            for c in chunks
+        )
         merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
-        store.write_atomic(merged, crypto.encrypt_to(plain, crypto.public_of(secret)))
+        store.write_atomic(
+            merged, crypto.encrypt_to(store.pack_payload(plain), crypto.public_of(secret))
+        )
         for chunk in chunks:
             chunk.path.unlink()
         days += 1

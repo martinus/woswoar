@@ -392,12 +392,19 @@ Each sync encrypts only the lines added since the last sync into a brand-new,
 never-modified file:
 
 ```
-history/hosts/<id>/2026/07/29/<synctime>-<rand>.age   one plain age file
+history/hosts/<id>/2026-07-29/<synctime>-<rand>.age   one plain age file
 history/hosts/<id>/keys/2026-07-29.age                that day's identity, sealed to all recipients
 ```
 
 A chunk covers exactly one plaintext day file, so a machine offline for five
-days emits five chunks. Date sharding keeps ~40 files per leaf directory.
+days emits five chunks. One directory per day keeps a directory to a day's
+worth of chunks.
+
+The date is deliberately **one path component and not three**. Every commit
+rewrites a tree object for each level it touches, so `2026/07/29` costs two
+extra objects on every sync, forever, for directories that hold exactly as many
+entries either way. Replaying two years of real history at a 1-minute timer,
+flattening cut tree bytes by a third and the whole repo by 10%.
 
 Nothing in the repo is ever modified or deleted, and that is what makes this
 simpler than the alternatives:
@@ -429,13 +436,92 @@ what makes onboarding cheap. Adding a machine re-seals ~730 tiny key files
 rather than ~35,000 chunks, so `reencrypt` takes seconds instead of rewriting
 the archive.
 
+**Compress before sealing.** A chunk's plaintext is `<tag><body>`, where the tag
+picks raw or `zlib`. This is the *only* moment compression is possible: age does
+not compress, and encrypted output is incompressible by definition, so once the
+bytes are sealed neither git's packfile nor anything else can ever shrink them
+again. Shell history is extremely repetitive, so the win is large. Small chunks
+deflate to *more* than they started as — a one-line chunk is 42 B and becomes
+47 — so the smaller form wins and the tag records which, at a cost of one byte
+on data that already carries a 200 B age header.
+
 **Cost: inodes.** At a 5-minute timer and ~40 content-bearing syncs a day, one
 machine produces ~35k chunk files over two years. Git copes, but a fresh clone
-writes a lot of small files. The sync interval is configurable — 15 minutes
-roughly halves both file count and header overhead — and an opt-in
-`woswoar compact` can merge a completed past day's own chunks into one. Compaction
-is the only operation that deletes files, which is exactly why it stays outside
-the core loop.
+writes a lot of small files. An opt-in `woswoar compact` merges a completed past
+day's own chunks into one; it is the only operation that deletes files, which is
+exactly why it stays outside the core loop.
+
+> `compact` reduces the **working tree**, not the repository. The chunks it
+> replaces stay reachable from the commits that added them, so git keeps them
+> forever — measured, compacting a 200-chunk day *added* 4.7 KB while taking the
+> directory from 200 files to 1. It is an inode and clone-time tool, and
+> describing it as a way to shrink the repo would be wrong.
+
+### What a sync actually costs
+
+The reference workload is this project author's real history: **25,997 commands
+over 754 days** on their busiest machine, 3.61 MB of plaintext, replayed at a
+1-minute cadence. Driving `sync.run()` itself against a local bare remote, then
+`gc`, then `git count-objects -v`:
+
+| | before | after |
+|---|---|---|
+| sealed chunk bytes | 6.11 MB (1.69x plaintext) | **4.35 MB (1.20x)** |
+| whole repo, packed | 16.22 MB | **12.24 MB** |
+| per year | 7.9 MB | **5.9 MB** |
+
+To attribute that, each change was also measured in isolation on the same
+history through a standalone harness — same `age`, same `git`, one commit per
+sync, `verify-pack` totals after `gc`. Absolute figures are lower than the table
+above because the harness writes chunks only, without day keys or
+`recipients.txt`; the point is the deltas:
+
+| timer | format | repo |
+|---|---|---|
+| 5-minute | nested date, no compression | 7.57 MB |
+| 5-minute | flat date | 6.94 MB |
+| 5-minute | **flat date + zlib** | **4.48 MB** |
+| 1-minute | nested date, no compression | 11.51 MB |
+| 1-minute | flat date | 10.31 MB |
+| 1-minute | **flat date + zlib** | **8.46 MB** |
+
+Compression pays far better at 5 minutes than at 1 — 35% against 18% — because
+larger chunks give deflate more to work with. A 1-minute chunk is a couple of
+lines.
+
+Two things fell out of this that the earlier estimates missed.
+
+**Git's own bookkeeping is about half the cost.** Per sync at a 1-minute timer:
+359 B of blob (200 B of that the age header), 196 B of tree, 129 B of commit. So
+684 B to carry ~160 B of compressed commands, and the fixed part cannot be
+reduced further without committing less often. It also means the earlier
+"~8 MB/year" figure — which counted chunk bytes only — was optimistic.
+
+**A 1-minute timer is far cheaper than the ratio suggests.** Not 5x the cost of
+a 5-minute one but roughly 2x, because real typing is bursty: going from 5
+minutes to 1 took content-bearing syncs from 8 a day to 16, not from 8 to 40.
+Most minutes have nothing to ship and cost one `git fetch`. That is why the
+shipped timer defaults to a minute.
+
+The corollary is that the per-year figure tracks how much you type, not the
+timer. The same machine's busiest recent 61 days ran at 45 content-bearing syncs
+a day and would extrapolate to 16 MB/year. Per-sync cost is the stable number;
+per-year is an illustration.
+
+Two alternatives were measured and rejected:
+
+- **Appending age blobs to one file per day** — the hope was that an unchanged
+  prefix would let git delta the append. It does, partly, but git stores enough
+  near-full copies that the result is *worse*: 5.50 MB against 3.36 MB for
+  chunks over the same synthetic 20 days. It wins only on inode count.
+- **A flat directory per host**, with the date in the filename, is cheaper on
+  trees at small scale but puts 35k entries in one tree object after two years,
+  which is the problem sharding exists to avoid.
+
+Wall-clock is not the constraint at any of these intervals: against a local
+remote a no-op sync is 21 ms and a sync carrying one command is 36 ms, of which
+`age` is 2.2 ms per call. Over a real network the round trip dominates, and it
+happens on a timer where nothing is waiting for it.
 
 ### Sync
 

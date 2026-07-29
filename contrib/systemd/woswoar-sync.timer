@@ -4,7 +4,12 @@ Description=Sync woswoar shell history periodically
 [Timer]
 # Wait a little after login rather than competing with everything else starting.
 OnStartupSec=2min
-OnUnitActiveSec=5min
+# A minute, because it turns out to be nearly free. Real typing is bursty, so
+# going from 5 minutes to 1 does not multiply the number of syncs that carry
+# anything -- measured on two years of real history it went from 8 to 16 a day,
+# and the repo from 2.2 to 4.1 MB/year. Raise it if you would rather have the
+# bytes back; the trade is documented in docs/woswoar_design_summary.md.
+OnUnitActiveSec=1min
 
 # Catch up after the machine was asleep or off, rather than silently skipping.
 Persistent=true
