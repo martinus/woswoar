@@ -292,6 +292,41 @@ the untimed case, where synthesised timestamps shift as the source grows and so
 cannot identify an entry. A `(ts, cmd)` check handles everything else, and
 covers the count going stale when a history file is rotated or trimmed.
 
+### atuin
+
+`woswoar import atuin` reads atuin's sqlite database directly — **read-only**,
+since it is very likely the live database of a running atuin, and read-only also
+means woswoar cannot trigger WAL recovery on someone else's file.
+
+Conversions, all of which are quirks of the real format rather than guesses:
+
+| atuin | woswoar |
+|---|---|
+| `timestamp` in nanoseconds | seconds |
+| `duration` in nanoseconds, **`-1` when the command never finished** | milliseconds, `-1` preserved |
+| `cwd` absolute, or the literal string **`"unknown"`** | home-relative for this machine, `""` for unknown |
+| `hostname` as `host:user` | one woswoar host per machine |
+| `session` UUID | hashed to 14 hex chars, matching the hook's width |
+| `deleted_at` non-null | skipped |
+
+**Host attribution is the interesting part.** atuin syncs every machine into one
+database, so an import can carry commands from many hosts — nine, in the case
+this was built against. Flattening them into the importing machine would make
+`--scope host` and `stats` lie, so each atuin machine gets its own woswoar host
+directory. Ids are derived from the hostname (`blake2b`, 16 hex chars) rather
+than random, so a second import lands in the same place instead of forking a
+duplicate machine. Commands from *this* machine merge into its real id, so they
+sit alongside what the hook records and sync normally.
+
+Idempotency is by `(timestamp, command)` per host, **not** by a position
+watermark: atuin backfills *older* rows whenever it syncs from another machine,
+so "everything after the last row I saw" would silently miss them.
+
+Since sync only publishes this machine's own commands, history imported for
+*other* machines stays local. That is deliberate — each machine runs the import
+against its own atuin database, which avoids two machines publishing overlapping
+copies of the same history.
+
 ---
 
 ## Synchronisation and encryption
