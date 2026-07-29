@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -50,6 +50,11 @@ class Result(NamedTuple):
     imported: int
     skipped: int
     source: Path
+    #: Rows dropped because an identical (second, command) was already taken
+    #: during *this* run -- distinct from `skipped`, which means it was already
+    #: on disk. Reporting them as one made a first-ever import into an empty
+    #: store claim entries were "already present".
+    collapsed: int = 0
     #: (display name, count) per machine, biggest first. Only atuin carries
     #: more than one host. A tuple rather than a dict because Result is a
     #: NamedTuple, and a mutable default would be shared across instances.
@@ -191,52 +196,102 @@ def _atuin_rows(path: Path) -> Iterator[AtuinRow]:
         raise FileNotFoundError(f"no atuin database at {path}")
 
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        db = sqlite3.connect(_readonly_uri(path), uri=True)
     except sqlite3.Error as exc:
         raise FileNotFoundError(f"cannot open {path} read-only: {exc}") from exc
 
+    # atuin has no encoding guarantee -- a mistyped paste or a filename in some
+    # other charset lands in the table verbatim, and sqlite3's default strict
+    # decode raises mid-iteration. Losing a character beats losing the import,
+    # which is the same trade the bash and zsh readers already make.
+    db.text_factory = lambda raw: raw.decode("utf-8", errors="replace")
+
     try:
         try:
-            cursor = db.execute(_ATUIN_QUERY)
+            for ts_ns, duration_ns, exit_code, cmd, cwd, session, hostname in db.execute(
+                _ATUIN_QUERY
+            ):
+                yield AtuinRow(
+                    ts=int(ts_ns) // _NS_PER_SECOND,
+                    # atuin writes -1 when it never saw the command finish,
+                    # which happens to be woswoar's own "unknown" value too.
+                    duration_ms=int(duration_ns) // _NS_PER_MS if duration_ns >= 0 else -1,
+                    exit_code=int(exit_code),
+                    cmd=cmd,
+                    cwd="" if cwd == _ATUIN_UNKNOWN_CWD else cwd,
+                    # Opaque either way, and repeated on every line; 14 hex
+                    # chars matches what the shell hook writes.
+                    session=hashlib.blake2b(session.encode(), digest_size=7).hexdigest(),
+                    hostname=hostname,
+                )
         except sqlite3.Error as exc:
-            raise FileNotFoundError(f"{path} does not look like an atuin database: {exc}") from exc
-
-        for ts_ns, duration_ns, exit_code, cmd, cwd, session, hostname in cursor:
-            yield AtuinRow(
-                ts=int(ts_ns) // _NS_PER_SECOND,
-                # atuin writes -1 when it never saw the command finish, which
-                # happens to be woswoar's own "unknown" value too.
-                duration_ms=int(duration_ns) // _NS_PER_MS if duration_ns >= 0 else -1,
-                exit_code=int(exit_code),
-                cmd=cmd,
-                cwd="" if cwd == _ATUIN_UNKNOWN_CWD else cwd,
-                # Opaque either way, and repeated on every line; 14 hex chars
-                # matches what the shell hook writes.
-                session=hashlib.blake2b(session.encode(), digest_size=7).hexdigest(),
-                hostname=hostname,
-            )
+            # Wraps the whole loop, not just execute(): sqlite reports a bad
+            # schema on execute but a bad *row* only once iteration reaches it.
+            raise FileNotFoundError(f"cannot read {path} as an atuin database: {exc}") from exc
     finally:
         db.close()
 
 
-def _host_for(hostname: str) -> tuple[str, str]:
-    """Map an atuin ``hostname:username`` to a woswoar (host id, display name).
+def _readonly_uri(path: Path) -> str:
+    """A sqlite URI that cannot be misread as carrying query parameters.
 
-    atuin syncs every machine's history into one database, so an import can
-    carry commands from many hosts. Flattening them into this machine would
-    make `--scope host` and `stats` lie, so each gets its own host directory.
+    Interpolating the path directly is unsafe: a ``#`` or ``?`` in it truncates
+    the filename, which drops ``mode=ro`` and makes sqlite happily *create* a
+    new writable database at the truncated name -- the exact opposite of the
+    guarantee this function exists to provide.
+    """
+    return f"{path.resolve().as_uri()}?mode=ro"
 
-    The id is derived from the name rather than random, so re-importing lands
-    in the same place. Commands from *this* machine merge into its real id, so
-    they sit alongside what the hook records and get synced normally.
+
+def display_name(hostname: str) -> str:
+    """atuin's ``host:user`` as a woswoar machine label.
+
+    The DNS domain is dropped to match :func:`store.default_machine_name`,
+    which uses only the first component of the nodename. Without that, the same
+    machine seen as ``mbp.local`` and as ``mbp`` would be two different hosts --
+    and one's *own* history would be filed as a foreign machine, invisible to
+    ``--scope host`` and never published by sync.
     """
     host, _, user = hostname.partition(":")
-    display = f"{user}@{host}" if user else host
+    host = host.split(".")[0]
+    return f"{user}@{host}" if user else host
 
-    if display == store.default_machine_name():
-        known = store.machine()
-        return known.id, known.name
-    return hashlib.blake2b(hostname.encode(), digest_size=8).hexdigest(), display
+
+def resolve_hosts(hostnames: Iterable[str]) -> dict[str, tuple[str, str]]:
+    """Map each atuin hostname to a woswoar (host id, display name).
+
+    Resolved once per distinct hostname rather than per row: there are a
+    handful of machines and tens of thousands of rows, and this reads config
+    and calls ``uname``.
+
+    Order matters:
+
+    1. This machine keeps its real id, so imported history sits alongside what
+       the hook records and syncs normally.
+    2. A machine already known locally -- because its history has synced in --
+       reuses *its* id. Otherwise the same peer would exist twice, under its
+       real random id and under a derived one, with the same label and no way
+       to reconcile them.
+    3. Anything else gets an id derived from the label, so a second import
+       lands in the same place instead of forking a duplicate machine.
+    """
+    known = store.machine()
+    own = {store.default_machine_name(), known.name}
+    existing = {name: host_id for host_id, name in store.host_names().items()}
+
+    resolved: dict[str, tuple[str, str]] = {}
+    for hostname in hostnames:
+        display = display_name(hostname)
+        if display in own:
+            resolved[hostname] = (known.id, known.name)
+        elif display in existing:
+            resolved[hostname] = (existing[display], display)
+        else:
+            resolved[hostname] = (
+                hashlib.blake2b(display.encode(), digest_size=8).hexdigest(),
+                display,
+            )
+    return resolved
 
 
 def _home_relative(cwd: str, home: str) -> str:
@@ -276,7 +331,9 @@ def _save_state(state: dict[str, int]) -> None:
     store.save_json(_state_path(), state)
 
 
-def run_atuin(path: Path | None = None, dry_run: bool = False) -> Result:
+def run_atuin(
+    path: Path | None = None, dry_run: bool = False, this_host_only: bool = False
+) -> Result:
     """Import atuin's sqlite history, preserving which machine ran what.
 
     Idempotency is by ``(timestamp, command)`` per host rather than by a
@@ -286,29 +343,46 @@ def run_atuin(path: Path | None = None, dry_run: bool = False) -> Result:
     """
     source = path or atuin_db()
     home = str(Path.home())
+    own_id = store.machine().id
+
+    by_hostname: dict[str, list[AtuinRow]] = {}
+    parsed = 0
+    for row in _atuin_rows(source):
+        parsed += 1
+        by_hostname.setdefault(row.hostname, []).append(row)
+
+    # Once per machine, not once per row.
+    resolved = resolve_hosts(by_hostname)
 
     by_host: dict[str, list[AtuinRow]] = {}
     names: dict[str, str] = {}
-    own_id = store.machine().id
-    parsed = 0
-
-    for row in _atuin_rows(source):
-        parsed += 1
-        host_id, display = _host_for(row.hostname)
+    for hostname, rows in by_hostname.items():
+        host_id, display = resolved[hostname]
+        if this_host_only and host_id != own_id:
+            continue
         names[host_id] = display
-        by_host.setdefault(host_id, []).append(row)
+        by_host.setdefault(host_id, []).extend(rows)
 
     entries_by_host: dict[str, list[Entry]] = {}
     skipped = 0
+    collapsed = 0
 
     for host_id, rows in by_host.items():
         days = {store.day_for(r.ts) for r in rows}
-        known = store.existing_keys(host_id, days)
+        on_disk = store.existing_keys(host_id, days)
+        known = set(on_disk)
         fresh: list[Entry] = []
         for row in rows:
             key = _dedup_key(row.ts, row.cmd)
             if key in known:
-                skipped += 1
+                # Two different things wearing the same skip. Already on disk
+                # means a previous import; otherwise it is a same-second,
+                # same-command row that woswoar's whole-second resolution
+                # cannot tell apart from the one already taken this run.
+                if key in on_disk:
+                    skipped += 1
+                else:
+                    collapsed += 1
                 continue
             known.add(key)
             fresh.append(
@@ -330,11 +404,11 @@ def run_atuin(path: Path | None = None, dry_run: bool = False) -> Result:
     imported = sum(len(v) for v in entries_by_host.values())
     if not dry_run:
         for host_id, entries in entries_by_host.items():
-            if not entries:
-                continue
-            store.append_entries(host_id, entries)
-            # So search labels these entries with a machine name rather than
-            # the opaque id. Never overwrite a name learned from a real sync.
+            if entries:
+                store.append_entries(host_id, entries)
+            # Written even when nothing was imported, so a run interrupted
+            # between the append and the label can be repaired by re-importing.
+            # Guarded only against overwriting a name learned from a real sync.
             label = store.name_file(host_id)
             if not label.is_file():
                 label.parent.mkdir(parents=True, exist_ok=True)
@@ -344,6 +418,7 @@ def run_atuin(path: Path | None = None, dry_run: bool = False) -> Result:
         parsed=parsed,
         imported=imported,
         skipped=skipped,
+        collapsed=collapsed,
         source=source,
         per_host=tuple(
             sorted(
@@ -354,7 +429,12 @@ def run_atuin(path: Path | None = None, dry_run: bool = False) -> Result:
     )
 
 
-def run(kind: Kind, path: Path | None = None, dry_run: bool = False) -> Result:
+def run(
+    kind: Kind,
+    path: Path | None = None,
+    dry_run: bool = False,
+    this_host_only: bool = False,
+) -> Result:
     """Import a history file, skipping anything already imported.
 
     Idempotency uses two independent guards. A per-source count handles the
@@ -363,7 +443,7 @@ def run(kind: Kind, path: Path | None = None, dry_run: bool = False) -> Result:
     else, and covers the count going stale if the source is rotated or trimmed.
     """
     if kind == "atuin":
-        return run_atuin(path, dry_run=dry_run)
+        return run_atuin(path, dry_run=dry_run, this_host_only=this_host_only)
 
     source = path or default_path(kind)
     if not source.is_file():
@@ -383,15 +463,20 @@ def run(kind: Kind, path: Path | None = None, dry_run: bool = False) -> Result:
     fresh = parsed[already:]
     machine_id = store.machine().id
     days = {store.day_for(p.ts) for p in fresh}
-    known = store.existing_keys(machine_id, days)
+    on_disk = store.existing_keys(machine_id, days)
+    known = set(on_disk)
 
     entries: list[Entry] = []
     skipped = 0
+    collapsed = 0
     for item in fresh:
         # Not `key`: that name already holds the per-source state key below.
         seen = _dedup_key(item.ts, item.cmd)
         if seen in known:
-            skipped += 1
+            if seen in on_disk:
+                skipped += 1
+            else:
+                collapsed += 1
             continue
         known.add(seen)
         entries.append(
@@ -411,4 +496,10 @@ def run(kind: Kind, path: Path | None = None, dry_run: bool = False) -> Result:
         state[key] = len(parsed)
         _save_state(state)
 
-    return Result(parsed=len(parsed), imported=len(entries), skipped=skipped, source=source)
+    return Result(
+        parsed=len(parsed),
+        imported=len(entries),
+        skipped=skipped,
+        collapsed=collapsed,
+        source=source,
+    )

@@ -312,11 +312,27 @@ Conversions, all of which are quirks of the real format rather than guesses:
 **Host attribution is the interesting part.** atuin syncs every machine into one
 database, so an import can carry commands from many hosts — nine, in the case
 this was built against. Flattening them into the importing machine would make
-`--scope host` and `stats` lie, so each atuin machine gets its own woswoar host
-directory. Ids are derived from the hostname (`blake2b`, 16 hex chars) rather
-than random, so a second import lands in the same place instead of forking a
-duplicate machine. Commands from *this* machine merge into its real id, so they
-sit alongside what the hook records and sync normally.
+`--scope host` and `stats` lie, so each atuin machine gets its own woswoar host.
+
+Ids resolve in this order, once per distinct hostname:
+
+1. **This machine** keeps its real id, so imported history sits alongside what
+   the hook records and syncs normally.
+2. **A machine already known locally** — because its history has synced in —
+   reuses *its* id. Without this the same peer would exist twice, under its real
+   random id and under a derived one, with the same label and no way to
+   reconcile them.
+3. **Anything else** gets an id derived from the label (`blake2b`, 16 hex
+   chars), so a second import lands in the same place instead of forking a
+   duplicate machine.
+
+The label drops the DNS domain, matching `store.default_machine_name()`. Without
+that, a host whose nodename is an FQDN would file *its own* history as a foreign
+machine — invisible to `--scope host`, never published by sync.
+
+Rule 2 only helps if the peers have already met. When several machines run
+woswoar, `--this-host-only` is the reliable answer: each imports its own rows
+and sync distributes them, so exactly one copy of everything exists.
 
 Idempotency is by `(timestamp, command)` per host, **not** by a position
 watermark: atuin backfills *older* rows whenever it syncs from another machine,

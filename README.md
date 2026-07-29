@@ -61,9 +61,18 @@ its existing history.
 The database is opened read-only — it is very likely a running atuin's live
 database, and woswoar has no business writing to it.
 
-One consequence worth knowing: `woswoar sync` only ever publishes *this*
-machine's own commands, so history imported for other machines stays local. Run
-`woswoar import atuin` on each machine to give them all the full set.
+**If you sync several woswoar machines, use `--this-host-only` on each.** Sync
+publishes only this machine's own commands, so importing every atuin host on
+every machine means each peer's history exists twice: once imported locally,
+once arriving over sync. Letting each machine import just its own keeps one
+copy of everything.
+
+Importing everything is the right choice when only one machine runs woswoar —
+you get all nine machines' history, it just stays local.
+
+woswoar reuses a peer's real host id when that peer is already known locally, so
+importing *after* your machines have synced also avoids duplicates. Importing
+before they have met cannot: the ids were assigned independently.
 
 `woswoar doctor` checks the installation if something looks wrong.
 

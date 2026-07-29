@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 from woswoar import cache, importer, search, store
@@ -40,7 +41,7 @@ BASE = 1_700_000_000 * SECOND
 
 
 class AtuinTestCase(WoswoarTestCase):
-    def atuin(self, rows: list[tuple[object, ...]], name: str = "history.db") -> Path:
+    def atuin(self, rows: Sequence[tuple[object, ...]], name: str = "history.db") -> Path:
         """Build an atuin database. Rows are (ts_ns, dur_ns, exit, cmd, cwd, session, host)."""
         path = self.root / name
         db = sqlite3.connect(path)
@@ -272,6 +273,138 @@ class TestIdempotency(AtuinTestCase):
         self.assertEqual(dict(result.per_host), {"martin@laptop": 2, "martin@desktop": 1})
         # Biggest first, so the summary reads usefully with nine machines.
         self.assertEqual([n for n, _ in result.per_host], ["martin@laptop", "martin@desktop"])
+
+
+class TestReviewRegressions(AtuinTestCase):
+    """Each of these was a real defect found by review, not a hypothetical."""
+
+    def test_fqdn_hostname_is_still_recognised_as_this_machine(self) -> None:
+        # default_machine_name() uses only the first nodename component, so
+        # comparing atuin's raw hostname filed one's *own* history under a
+        # foreign host: invisible to --scope host, never published by sync.
+        user, _, host = store.default_machine_name().partition("@")
+        db = self.atuin([(BASE, 0, 0, "mine", "/tmp", "s1", f"{host}.example.com:{user}")])
+        importer.run("atuin", db)
+        self.assertEqual(cache.load_entries()[0].host, store.machine().id)
+
+    def test_fqdn_and_short_hostname_are_the_same_machine(self) -> None:
+        db = self.atuin(
+            [
+                (BASE, 0, 0, "a", "/tmp", "s1", "laptop.lan:martin"),
+                (BASE + SECOND, 0, 0, "b", "/tmp", "s1", "laptop:martin"),
+            ]
+        )
+        importer.run("atuin", db)
+        self.assertEqual(
+            len(
+                {e.host for e in cache.load_entries()},
+            ),
+            1,
+        )
+
+    def test_a_peer_already_known_locally_is_not_duplicated(self) -> None:
+        # Once a peer's history syncs in it has a real, random host id. A
+        # derived id could never equal it, so the same machine would exist
+        # twice under two directories sharing one label.
+        peer_id = "aaaabbbbccccdddd"
+        store.name_file(peer_id).parent.mkdir(parents=True, exist_ok=True)
+        store.name_file(peer_id).write_text("martin@laptop\n", encoding="utf-8")
+
+        db = self.atuin([(BASE, 0, 0, "cmd", "/tmp", "s1", "laptop:martin")])
+        importer.run("atuin", db)
+        self.assertEqual(cache.load_entries()[0].host, peer_id)
+
+    def test_undecodable_command_does_not_abort_the_import(self) -> None:
+        db = self.atuin([(BASE + SECOND, 0, 0, "fine", "/tmp", "s1", "box:someone")])
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO history (id, timestamp, duration, exit, command, cwd, session,"
+            " hostname) VALUES ('bad', ?, 0, 0, CAST(x'6c73ff' AS TEXT), '/tmp', 's1',"
+            " 'box:someone')",
+            (BASE,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Previously raised sqlite3.OperationalError straight out of the
+        # generator, past the CLI's handler, killing the whole import.
+        result = importer.run("atuin", db)
+        self.assertEqual(result.imported, 2)
+        self.assertIn("fine", {e.cmd for e in cache.load_entries()})
+
+    def test_path_with_uri_metacharacters_is_read_not_created(self) -> None:
+        # A '#' truncated the spliced URI, dropping mode=ro -- so sqlite
+        # cheerfully created a new writable database at the truncated name,
+        # the exact opposite of the read-only guarantee.
+        db = self.atuin([(BASE, 0, 0, "cmd", "/tmp", "s1", "box:someone")], "od#d?b%1.db")
+        before = sorted(p.name for p in self.root.iterdir() if p.is_file())
+
+        result = importer.run("atuin", db)
+        self.assertEqual(result.imported, 1, "the real database was not read")
+        # A truncated URI made sqlite create a *new* writable database at the
+        # cut-off name; only woswoar's own directories may appear.
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.is_file()), before)
+
+    def test_first_import_into_an_empty_store_reports_no_false_skips(self) -> None:
+        # Same second, same command, different directory: one row survives
+        # woswoar's whole-second resolution. Counting that as "already
+        # present" made a first-ever import claim entries it had never seen.
+        db = self.atuin(
+            [
+                (BASE, 0, 0, "make", "/a", "s1", "box:someone"),
+                (BASE, 0, 0, "make", "/b", "s1", "box:someone"),
+            ]
+        )
+        result = importer.run("atuin", db)
+        self.assertEqual(result.skipped, 0)
+        self.assertEqual(result.collapsed, 1)
+        self.assertEqual(result.imported, 1)
+
+    def test_a_missing_name_is_repaired_by_reimporting(self) -> None:
+        db = self.atuin([(BASE, 0, 0, "cmd", "/tmp", "s1", "laptop:martin")])
+        importer.run("atuin", db)
+
+        host_id = next(h for h, n in store.host_names().items() if n == "martin@laptop")
+        store.name_file(host_id).unlink()
+
+        # The second run imports nothing, so a name write gated on fresh
+        # entries would leave this host labelled by its opaque id forever.
+        importer.run("atuin", db)
+        self.assertEqual(store.host_names().get(host_id), "martin@laptop")
+
+    def test_host_resolution_does_not_scale_with_row_count(self) -> None:
+        many = [
+            (BASE + i * SECOND, 0, 0, f"cmd {i}", "/tmp", "s1", f"host{i % 5}:user")
+            for i in range(400)
+        ]
+        db = self.atuin(many)
+        calls = 0
+        real = store.default_machine_name
+
+        def counted() -> str:
+            nonlocal calls
+            calls += 1
+            return real()
+
+        store.default_machine_name = counted
+        self.addCleanup(lambda: setattr(store, "default_machine_name", real))
+        importer.run("atuin", db)
+
+        # Once for the whole import, not once per row: this was ~60% of runtime.
+        self.assertLessEqual(calls, 2, f"resolved host identity {calls} times for 400 rows")
+
+
+class TestThisHostOnly(AtuinTestCase):
+    def test_only_this_machines_history_is_imported(self) -> None:
+        db = self.atuin(
+            [
+                (BASE, 0, 0, "mine", "/tmp", "s1", self.this_machine()),
+                (BASE + SECOND, 0, 0, "theirs", "/tmp", "s2", "elsewhere:someone"),
+            ]
+        )
+        result = importer.run("atuin", db, this_host_only=True)
+        self.assertEqual(result.imported, 1)
+        self.assertEqual({e.cmd for e in cache.load_entries()}, {"mine"})
 
 
 class TestFailures(AtuinTestCase):
