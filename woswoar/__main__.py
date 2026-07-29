@@ -20,7 +20,7 @@ _BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DO
 _MILESTONE_2 = (
     "woswoar: '{name}' is not implemented yet.\n"
     "Git sync with age encryption is milestone 2; milestone 1 records and\n"
-    "searches locally. See woswoar_design_summary.md for the sync design."
+    "searches locally. See docs/woswoar_design_summary.md for the sync design."
 )
 
 

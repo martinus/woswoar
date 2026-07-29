@@ -61,9 +61,12 @@ if [[ -z $(trap -p EXIT) ]]; then
     trap "rm -f -- '$__woswoar_scratch'" EXIT
 fi
 
-# Identifies this shell for `--scope session`. EPOCHREALTIME plus the pid is
-# unique per host without spawning uuidgen.
-printf -v WOSWOAR_SESSION '%s-%s' "${EPOCHREALTIME//[.,]/}" "$$"
+# Identifies this shell for `--scope session`. Start second plus pid, both in
+# hex: two shells cannot share a pid at the same instant, and a reused pid must
+# land in a later second, so the pair is unique on this host without spawning
+# uuidgen. Hex rather than the full microsecond clock because this string is
+# repeated on every recorded line -- 14 bytes instead of 23.
+printf -v WOSWOAR_SESSION '%x-%x' "$EPOCHSECONDS" "$$"
 export WOSWOAR_SESSION
 
 # Commands matching this extended regex are never recorded. Note that bash's own
@@ -165,8 +168,20 @@ __woswoar_precmd() {
 
     __woswoar_escape "$cmd"
     cmd=$__woswoar_escaped
-    __woswoar_escape "$PWD"
-    local cwd=$__woswoar_escaped
+
+    # Store paths under $HOME as ~/... -- the prefix would otherwise repeat on
+    # nearly every line. Matched anchored rather than with ${PWD/#$HOME/~},
+    # which would rewrite /home/martinuscopy into ~copy when $HOME is
+    # /home/martinus. The ~ means the *recording* user's home, so it is not
+    # expanded on read; see woswoar/entry.py.
+    local cwd=$PWD
+    if [[ $cwd == "$HOME" ]]; then
+        cwd='~'
+    elif [[ -n $HOME && $cwd == "$HOME"/* ]]; then
+        cwd='~'${cwd#"$HOME"}
+    fi
+    __woswoar_escape "$cwd"
+    cwd=$__woswoar_escaped
 
     local day
     printf -v day '%(%F)T' -1 # local time, matching store.day_for()

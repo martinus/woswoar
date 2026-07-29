@@ -26,7 +26,7 @@ woswoar = "woswoar.__main__:main"
 packages = ["woswoar"]
 
 [tool.hatch.build.targets.sdist]
-include = ["woswoar", "tests", "README.md", "LICENSE", "woswoar_design_summary.md"]
+include = ["woswoar", "tests", "docs", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

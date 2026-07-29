@@ -15,6 +15,19 @@ last means a parser only needs ``split("\\t", 5)``.
 
 The host is *not* a field. It is derived from the path the line was read from,
 which keeps every line shorter and makes a file trivially attributable.
+
+Two fields are stored compactly, because they repeat on every single line and
+milestone 2 commits every byte to git permanently:
+
+``cwd``
+    Written home-relative as ``~/src/woswoar`` when the directory was under the
+    recording user's home. The ``~`` therefore means *that machine's* home, not
+    the home of whoever later reads the file, so it is deliberately left
+    unexpanded -- two synced machines can have different usernames.
+
+``session``
+    ``<start second>-<pid>``, both hex. Unique per host: two shells cannot share
+    a pid at one instant, and a reused pid necessarily starts in a later second.
 """
 
 from __future__ import annotations
