@@ -21,15 +21,16 @@ The shape of this, and why:
 from __future__ import annotations
 
 import fcntl
-import json
 import subprocess
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from . import crypto, store
+from .errors import WoswoarError
 from .store import Machine
 
 GIT_TIMEOUT = 300
@@ -40,7 +41,7 @@ GIT_TIMEOUT = 300
 COMMIT_MESSAGE = "woswoar sync"
 
 
-class SyncError(RuntimeError):
+class SyncError(WoswoarError):
     pass
 
 
@@ -51,7 +52,6 @@ class Report:
     chunks_merged: int = 0
     lines_imported: int = 0
     pushed: bool = False
-    pulled: bool = False
     hosts_seen: set[str] = field(default_factory=set)
     #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
     #: error: it is what a freshly joined machine sees until someone runs
@@ -83,6 +83,29 @@ def has_remote() -> bool:
     return bool(git("remote", check=False))
 
 
+def remote_summary() -> str:
+    """One line describing where history is published, for humans."""
+    remotes = git("remote", "-v", check=False).splitlines()
+    return remotes[0] if remotes else "none (history is local only)"
+
+
+def list_recipients() -> list[tuple[str, str]]:
+    """``(kind, key)`` for every enrolled machine.
+
+    Parsed here rather than in the CLI because this module is the only writer of
+    recipients.txt, so the record shape is its to know.
+    """
+    path = store.recipients_file()
+    if not path.is_file():
+        return []
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            kind, _, rest = line.strip().partition(" ")
+            entries.append((kind, rest))
+    return entries
+
+
 def is_repo() -> bool:
     return (store.history_dir() / ".git").exists()
 
@@ -105,22 +128,18 @@ class State:
 
     @classmethod
     def load(cls) -> State:
-        try:
-            raw = json.loads(store.state_file().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return cls()
-        if not isinstance(raw, dict):
+        raw = store.load_json(store.state_file())
+        exported = raw.get("exported", {})
+        merged = raw.get("merged", {})
+        if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         return cls(
-            exported={str(k): int(v) for k, v in raw.get("exported", {}).items()},
-            merged={str(k): str(v) for k, v in raw.get("merged", {}).items()},
+            exported={str(k): int(v) for k, v in exported.items()},
+            merged={str(k): str(v) for k, v in merged.items()},
         )
 
     def save(self) -> None:
-        payload = json.dumps(
-            {"exported": self.exported, "merged": self.merged}, indent=2, sort_keys=True
-        )
-        store.write_atomic(store.state_file(), (payload + "\n").encode("utf-8"))
+        store.save_json(store.state_file(), {"exported": self.exported, "merged": self.merged})
 
 
 @contextmanager
@@ -151,6 +170,34 @@ def identity_path(known: Machine) -> Path:
     if not path.is_file():
         raise SyncError(f"identity {path} is missing; re-run 'woswoar init'")
     return path
+
+
+class IdentityStatus(NamedTuple):
+    ok: bool
+    detail: str
+
+
+def identity_status(known: Machine) -> IdentityStatus:
+    """Whether this machine could actually decrypt during an unattended sync.
+
+    Lives here rather than in `doctor` so the judgement is testable and stated
+    once. The passphrase case is the reason it exists: age does not use
+    ssh-agent, so such a key works perfectly by hand and fails forever from a
+    timer -- a failure mode nobody notices without being told.
+    """
+    if not known.identity:
+        return IdentityStatus(False, "no identity recorded - run 'woswoar init'")
+
+    path = Path(known.identity).expanduser()
+    if not path.is_file():
+        return IdentityStatus(False, f"identity {path} is missing - re-run 'woswoar init'")
+    if not crypto.available():
+        return IdentityStatus(True, f"identity {path} (age missing, cannot verify)")
+    if not crypto.usable(path):
+        return IdentityStatus(
+            False, f"{path} needs a passphrase - try 'woswoar init --new-identity'"
+        )
+    return IdentityStatus(True, f"identity {path}")
 
 
 def day_public_key(known: Machine, day: str) -> str:
@@ -186,31 +233,12 @@ def open_day_key(known: Machine, host_id: str, day: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _unsealed_tail(path: Path, offset: int) -> tuple[bytes, int]:
-    """Bytes after ``offset``, truncated to the last complete line.
-
-    A partial final line is left for the next sync, exactly as the cache does:
-    sealing half a record would put a permanently broken line in the repo, and
-    the repo is append-only so it could never be fixed.
-    """
-    try:
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            data = handle.read()
-    except OSError:
-        return b"", offset
-    cut = data.rfind(b"\n")
-    if cut < 0:
-        return b"", offset
-    return data[: cut + 1], offset + cut + 1
-
-
 def export(known: Machine, state: State, report: Report, now: int) -> None:
     """Seal each log file's new lines into a fresh chunk."""
     for log in store.iter_log_files():
         if log.host_id != known.id:
             continue  # other hosts' logs arrived decrypted; never re-export them
-        data, new_offset = _unsealed_tail(log.path, state.exported.get(log.relpath, 0))
+        data, new_offset = store.read_tail(log.path, state.exported.get(log.relpath, 0))
         if not data:
             continue
 
@@ -241,7 +269,12 @@ def merge(known: Machine, state: State, report: Report) -> None:
 
 
 def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> None:
-    day_keys: dict[str, str] = {}
+    #: None marks a day whose key we already failed to open. Caching the failure
+    #: matters as much as caching the success: without it, a machine that has
+    #: not been granted access yet retries the same doomed `age -d` once per
+    #: chunk rather than once per day -- tens of thousands of subprocess spawns
+    #: instead of hundreds, on precisely the first sync a new machine runs.
+    day_keys: dict[str, str | None] = {}
     pending: dict[str, list[bytes]] = {}
 
     for chunk in store.iter_chunks(host_id):
@@ -259,9 +292,13 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # `reencrypt` yet. Skip it without advancing the watermark so a
                 # later sync picks it up -- and above all without aborting, or
                 # one unreadable day would block this machine's own export too.
-                report.unreadable.add(f"{host_id}/{chunk.day}")
-                continue
-        plaintext = crypto.decrypt_with_secret(chunk.path.read_bytes(), day_keys[chunk.day])
+                day_keys[chunk.day] = None
+        secret = day_keys[chunk.day]
+        if secret is None:
+            report.unreadable.add(key)
+            continue
+
+        plaintext = crypto.decrypt_with_secret(chunk.path.read_bytes(), secret)
         pending.setdefault(chunk.day, []).append(plaintext)
         state.merged[key] = chunk.name
         report.chunks_merged += 1
@@ -335,7 +372,12 @@ def run(push: bool = True, now: int | None = None) -> Report:
 
 
 def _branch() -> str:
-    return git("rev-parse", "--abbrev-ref", "HEAD")
+    """The current branch, including before the first commit exists.
+
+    `rev-parse --abbrev-ref HEAD` cannot answer on an unborn HEAD, which is
+    exactly the state `init` is in when it enrols the first machine.
+    """
+    return git("branch", "--show-current")
 
 
 def _fetch_and_rebase(report: Report) -> None:
@@ -360,7 +402,6 @@ def _fetch_and_rebase(report: Report) -> None:
     except SyncError:
         git("rebase", "--abort", check=False)
         raise
-    report.pulled = True
 
 
 def _push(report: Report) -> None:
@@ -461,18 +502,21 @@ def initialise(
         git("remote", "add", "origin", remote)
 
     _ensure_repo_config()
-    _write_repo_metadata(known, chosen)
-    _commit()
+    report = Report()
+
+    # Adopt the remote's state before enrolling, so we append to the real
+    # recipients.txt rather than creating a competing one.
+    publishing = has_remote()
+    if publishing:
+        _fetch_and_rebase(report)
+
+    if _write_repo_metadata(known, chosen):
+        _commit()
 
     # Publish immediately. Until this machine's public key is on the remote,
     # `reencrypt` run elsewhere cannot include it, so onboarding would appear to
     # succeed and then silently fail to grant access to any older history.
-    if has_remote():
-        report = Report()
-        _fetch_and_rebase(report)
-        # The rebase may have brought in a recipients.txt that does not list us.
-        if _write_repo_metadata(known, chosen):
-            _commit()
+    if publishing:
         _push(report)
 
     return known, chosen
@@ -521,8 +565,7 @@ def reencrypt() -> int:
     resealed = 0
 
     for host_id in store.repo_hosts():
-        keys_dir = store.repo_host_dir(host_id) / "keys"
-        candidates = sorted(keys_dir.glob("*.age")) if keys_dir.is_dir() else []
+        candidates = list(store.iter_day_keys(host_id))
         seal = store.name_seal(host_id)
         if seal.is_file():
             candidates.append(seal)

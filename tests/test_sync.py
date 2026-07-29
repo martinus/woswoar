@@ -8,7 +8,6 @@ are enough, and that is only meaningful if it is actually demonstrated.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -20,14 +19,13 @@ from pathlib import Path
 from woswoar import cache, crypto, search, store, sync
 from woswoar.entry import Entry, format_line
 
-#: hosts/<id>/YYYY/MM/DD/<chunk>.age -- the write-once files. Key material
-#: lives outside this shape and is deliberately rewritable.
-CHUNK_PATH = re.compile(r"^hosts/[^/]+/\d{4}/\d{2}/\d{2}/[^/]+\.age$")
+from . import support
 
 requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 
-_ENV = ("WOSWOAR_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "WOSWOAR_SESSION", "HOME")
+#: One authoritative list, plus HOME which only these tests need to redirect.
+_ENV = (*support.ENV_KEYS, "HOME")
 
 
 class Fake:
@@ -322,7 +320,10 @@ class TestImmutability(SyncTestCase):
         # elsewhere in the tree and *are* rewritten, by design: that is exactly
         # what makes onboarding cheap. Separating the two here keeps the
         # exception explicit rather than quietly widening the invariant.
-        chunks = {p for p in rewritten if CHUNK_PATH.match(p)}
+        # Classified by store, not by a regex copied here: a hand-maintained
+        # pattern would silently stop matching if the layout ever changed,
+        # leaving this assertion vacuously true while real chunks were rewritten.
+        chunks = {p for p in rewritten if store.is_chunk_path(p)}
         self.assertEqual(sorted(chunks), [], f"chunks were rewritten: {sorted(chunks)}")
 
         # And the only things that were rewritten are the ones allowed to be.
@@ -390,6 +391,47 @@ class TestCompact(SyncTestCase):
         with beta.active():
             sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
+
+
+class TestIdentityStatus(SyncTestCase):
+    """The health check `doctor` reports. Testable because it lives in sync."""
+
+    def test_healthy_identity(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            status = sync.identity_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+
+    def test_missing_identity_file_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            known = store.machine()
+            Path(known.identity).unlink()
+            status = sync.identity_status(known)
+            self.assertFalse(status.ok)
+            self.assertIn("missing", status.detail)
+
+    def test_unconfigured_identity_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            status = sync.identity_status(store.machine()._replace(identity=""))
+            self.assertFalse(status.ok)
+            self.assertIn("woswoar init", status.detail)
+
+    def test_passphrase_protected_key_is_reported(self) -> None:
+        # The failure that only bites unattended: age cannot use ssh-agent, so
+        # this key would work by hand and never from a systemd timer.
+        alpha = self.machine("alpha")
+        with alpha.active():
+            locked = self.root / "locked"
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "hunter2", "-f", str(locked)],
+                check=True,
+                timeout=60,
+            )
+            status = sync.identity_status(store.machine()._replace(identity=str(locked)))
+            self.assertFalse(status.ok)
+            self.assertIn("passphrase", status.detail)
 
 
 class TestLocalOnly(SyncTestCase):

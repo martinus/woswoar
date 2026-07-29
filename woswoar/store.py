@@ -9,13 +9,14 @@ which is why the layout is defined here in one place.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import secrets
 import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from .entry import Entry, format_line, parse_line
 
@@ -123,6 +124,49 @@ def write_atomic(path: Path, data: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def read_tail(path: Path, offset: int) -> tuple[bytes, int]:
+    """Bytes from ``offset`` onwards, truncated to the last complete line.
+
+    Returns the data and the new consumed offset. A partially written final
+    line -- a shell killed mid-append -- is deliberately left unconsumed, so it
+    is picked up correctly once its writer finishes it.
+
+    Shared by the two pipelines that read these same physical files: the parse
+    cache, and sync's export. They must agree on where a file "ends", and for
+    sync the stakes are higher -- a half-sealed record would be committed to an
+    append-only repo where it could never be fixed.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return b"", offset
+
+    cut = data.rfind(b"\n")
+    if cut < 0:
+        return b"", offset
+    return data[: cut + 1], offset + cut + 1
+
+
+def load_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read a small JSON state file, tolerating absence and corruption.
+
+    These files are progress markers, never the source of truth: losing one
+    costs redundant work, so falling back beats raising.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return dict(default or {})
+    return raw if isinstance(raw, dict) else dict(default or {})
+
+
+def save_json(path: Path, payload: object) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    write_atomic(path, text.encode("utf-8"))
 
 
 def _read_kv(path: Path) -> dict[str, str]:
@@ -298,7 +342,6 @@ def new_chunk(machine_id: str, day: str, ts: int) -> Path:
 
 
 class Chunk(NamedTuple):
-    host_id: str
     day: str
     #: Filename only. Sorts chronologically, and is what the watermark stores.
     name: str
@@ -315,7 +358,36 @@ def iter_chunks(machine_id: str) -> Iterator[Chunk]:
             for mday in sorted(p for p in month.iterdir() if p.is_dir()):
                 day = f"{year.name}-{month.name}-{mday.name}"
                 for path in sorted(mday.glob(f"*{_CHUNK_SUFFIX}")):
-                    yield Chunk(host_id=machine_id, day=day, name=path.name, path=path)
+                    yield Chunk(day=day, name=path.name, path=path)
+
+
+def iter_day_keys(machine_id: str) -> Iterator[Path]:
+    """Every sealed day key belonging to one host.
+
+    Exists so callers never have to spell out the keys directory or the chunk
+    suffix themselves -- those are this module's to know, and a hand-typed copy
+    would silently stop matching rather than fail loudly if the layout changed.
+    """
+    keys = repo_host_dir(machine_id) / _KEYS
+    if not keys.is_dir():
+        return
+    yield from sorted(keys.glob(f"*{_CHUNK_SUFFIX}"))
+
+
+def is_chunk_path(relpath: str) -> bool:
+    """Whether a repo-relative path is a write-once chunk.
+
+    Key material and name seals live outside this shape and are deliberately
+    rewritable, so telling them apart is a property of the layout rather than
+    something a caller should pattern-match for itself.
+    """
+    parts = relpath.split("/")
+    return (
+        len(parts) == 6
+        and parts[0] == _HOSTS
+        and all(p.isdigit() for p in parts[2:5])
+        and parts[5].endswith(_CHUNK_SUFFIX)
+    )
 
 
 def repo_hosts() -> list[str]:

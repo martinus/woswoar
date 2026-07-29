@@ -88,23 +88,17 @@ def _fingerprint(path: Path) -> bytes:
 def _read_from(path: Path, host: str, offset: int) -> tuple[list[Entry], int]:
     """Parse whole lines starting at ``offset``.
 
-    Returns the entries and the new consumed offset. A trailing partial line is
-    left unconsumed so it gets parsed correctly once the writer finishes it.
+    The byte-level "read the tail, stop at the last complete line" step lives in
+    store, shared with sync's export -- both read these same files and must
+    agree on where one ends.
     """
-    try:
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            data = handle.read()
-    except OSError:
+    data, new_offset = store.read_tail(path, offset)
+    if not data:
         return [], offset
 
-    cut = data.rfind(b"\n")
-    if cut < 0:
-        return [], offset
-
-    text = data[: cut + 1].decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
     entries = [e for e in (parse_line(line, host) for line in text.splitlines()) if e is not None]
-    return entries, offset + cut + 1
+    return entries, new_offset
 
 
 def load() -> Cache:

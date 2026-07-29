@@ -10,7 +10,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, cache, crypto, importer, search, store, sync
+from . import __version__, cache, importer, search, store
+from .errors import WoswoarError
 
 HOOK_NAME = "woswoar.bash"
 _BEGIN = "# >>> woswoar >>>"
@@ -124,6 +125,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
+    from . import sync
+
     ok = True
 
     def check(label: str, good: bool, detail: str) -> None:
@@ -167,24 +170,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     detail = "sources the hook" if sourced else "has no woswoar block"
     check("bashrc", sourced, f"{rcfile} {detail}")
 
-    age = shutil.which("age")
-    info("age", age or "not found - needed for 'woswoar sync' only")
+    info("age", shutil.which("age") or "not found - needed for 'woswoar sync' only")
 
     if sync.is_repo():
-        known = store.machine()
-        identity = Path(known.identity).expanduser() if known.identity else None
-        if identity is None:
-            check("sync", False, "no identity recorded - run 'woswoar init'")
-        elif not identity.is_file():
-            check("sync", False, f"identity {identity} is missing - re-run 'woswoar init'")
-        elif age and not crypto.usable(identity):
-            # The failure that only bites unattended: age cannot use ssh-agent,
-            # so a passphrase-protected key works by hand and never from a timer.
-            check("sync", False, f"{identity} needs a passphrase; 'woswoar init --new-identity'")
-        else:
-            check("sync", True, f"identity {identity}")
-        remotes = sync.git("remote", "-v", check=False).splitlines()
-        info("remote", remotes[0] if remotes else "none (history is local only)")
+        status = sync.identity_status(store.machine())
+        check("sync", status.ok, status.detail)
+        info("remote", sync.remote_summary())
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 
@@ -205,6 +196,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    from . import sync
+
     known, identity = sync.initialise(
         remote=args.remote,
         new_identity=args.new_identity,
@@ -213,13 +206,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"machine  : {known.name} ({known.id})")
     print(f"identity : {identity}")
     print(f"repo     : {store.history_dir()}")
-    remotes = sync.git("remote", "-v", check=False).splitlines()
-    print(f"remote   : {remotes[0] if remotes else 'none (local only)'}")
+    print(f"remote   : {sync.remote_summary()}")
     print(f"\nRecipients now enrolled ({store.recipients_file()}):")
-    for line in store.recipients_file().read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            kind, _, rest = line.partition(" ")
-            print(f"  {kind} {rest[:24]}...")
+    for kind, key in sync.list_recipients():
+        print(f"  {kind} {key[:24]}...")
     if args.remote:
         print("\nNext: 'woswoar sync'.")
         print("On an already-enrolled machine, run 'woswoar reencrypt' so this")
@@ -228,6 +218,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    from . import sync
+
     report = sync.run(push=not args.no_push)
     print(
         f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
@@ -253,6 +245,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_reencrypt(args: argparse.Namespace) -> int:
+    from . import sync
+
     count = sync.reencrypt()
     print(f"re-sealed {count} key file(s) to the current recipients")
     print("Run 'woswoar sync' to publish them.")
@@ -260,6 +254,8 @@ def cmd_reencrypt(args: argparse.Namespace) -> int:
 
 
 def cmd_compact(args: argparse.Namespace) -> int:
+    from . import sync
+
     days, replaced = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
     if not days:
         print("nothing to compact")
@@ -345,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         # `woswoar list | head` is a normal thing to do.
         return 0
-    except (sync.SyncError, crypto.AgeUnavailable, crypto.AgeError) as exc:
+    except WoswoarError as exc:
         # These carry actionable messages -- a missing age, an unreadable
         # identity, a repo that was never initialised. A traceback would bury
         # them, and sync runs unattended from a timer where nobody reads one.

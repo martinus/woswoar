@@ -18,18 +18,20 @@ import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
+from .errors import WoswoarError
+
 AGE = "age"
 AGE_KEYGEN = "age-keygen"
 
 _TIMEOUT = 120
 
 
-class AgeUnavailable(RuntimeError):
-    """The age binary is not installed."""
+class AgeError(WoswoarError):
+    """age is missing, or ran and refused.
 
-
-class AgeError(RuntimeError):
-    """age ran and refused."""
+    One class rather than two: every call site caught both and handled them
+    identically, so the split was a distinction nothing branched on.
+    """
 
 
 class Identity(NamedTuple):
@@ -63,7 +65,7 @@ def available() -> bool:
 
 def require() -> None:
     if not available():
-        raise AgeUnavailable(_MISSING)
+        raise AgeError(_MISSING)
 
 
 def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:
@@ -129,7 +131,6 @@ def decrypt_with_secret(data: bytes, secret: str) -> bytes:
 
 def generate_identity() -> Identity:
     """Create a fresh X25519 identity, returned rather than written to disk."""
-    require()
     secret = _run([AGE_KEYGEN]).decode("utf-8")
     return Identity(secret=secret, public=public_of(secret))
 
@@ -168,5 +169,5 @@ def usable(identity: Path) -> bool:
         recipient = recipient_for(identity)
         sealed = encrypt_to(b"woswoar", recipient)
         return decrypt_with_file(sealed, identity) == b"woswoar"
-    except (AgeError, AgeUnavailable, OSError):
+    except (AgeError, OSError):
         return False

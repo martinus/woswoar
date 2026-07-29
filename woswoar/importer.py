@@ -7,7 +7,6 @@ what is new.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -146,18 +145,13 @@ def _state_path() -> Path:
 
 
 def _load_state() -> dict[str, int]:
-    try:
-        data = json.loads(_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    return {k: int(v) for k, v in store.load_json(_state_path()).items()}
 
 
 def _save_state(state: dict[str, int]) -> None:
     # Atomic: a half-written watermark file would make the next import either
     # duplicate everything or skip entries silently.
-    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
-    store.write_atomic(_state_path(), payload.encode("utf-8"))
+    store.save_json(_state_path(), state)
 
 
 def run(kind: Kind, path: Path | None = None, dry_run: bool = False) -> Result:
