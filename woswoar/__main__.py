@@ -82,15 +82,33 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_import(args: argparse.Namespace) -> int:
     try:
         result = importer.run(
-            args.kind, Path(args.file).expanduser() if args.file else None, dry_run=args.dry_run
+            args.kind,
+            Path(args.file).expanduser() if args.file else None,
+            dry_run=args.dry_run,
+            this_host_only=args.this_host_only,
         )
     except FileNotFoundError as exc:
         print(f"woswoar: {exc}", file=sys.stderr)
         return 1
 
     prefix = "would import" if args.dry_run else "imported"
+    notes = []
+    if result.skipped:
+        notes.append(f"{result.skipped} already present")
+    if result.collapsed:
+        notes.append(f"{result.collapsed} same-second duplicates collapsed")
     print(f"{result.source}: {result.parsed} parsed, {prefix} {result.imported}", end="")
-    print(f", {result.skipped} already present" if result.skipped else "")
+    print(f", {', '.join(notes)}" if notes else "")
+
+    if len(result.per_host) > 1:
+        print("\nper machine:")
+        width = max(len(name) for name, _ in result.per_host)
+        for name, count in result.per_host:
+            print(f"  {name:<{width}}  {count}")
+        print(
+            "\nOnly this machine's own commands are published by 'woswoar sync'.\n"
+            "Run 'woswoar import atuin' on each machine to give them all the full set."
+        )
     return 0
 
 
@@ -109,8 +127,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"entries  : {len(entries)} ({unique} unique)")
     print(f"range    : {store.day_for(oldest)} .. {store.day_for(newest)}")
     print("hosts    :")
+    labels = {host: names.get(host, host) for host, _ in per_host.most_common()}
+    width = max((len(label) for label in labels.values()), default=0)
     for host, count in per_host.most_common():
-        print(f"  {names.get(host, host):<24} {count}")
+        print(f"  {labels[host]:<{width}}  {count}")
 
     top = Counter(e.cmd for e in entries).most_common(args.top)
     if top:
@@ -291,8 +311,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_import = subparsers.add_parser("import", help="import an existing shell history")
     p_import.add_argument("kind", choices=importer.KINDS)
-    p_import.add_argument("--file", help="source file (default: ~/.bash_history or ~/.zsh_history)")
+    p_import.add_argument(
+        "--file",
+        help="source (default: ~/.bash_history, ~/.zsh_history, "
+        "or ~/.local/share/atuin/history.db)",
+    )
     p_import.add_argument("--dry-run", action="store_true")
+    p_import.add_argument(
+        "--this-host-only",
+        action="store_true",
+        help="atuin: skip history belonging to other machines",
+    )
     p_import.set_defaults(func=cmd_import)
 
     p_install = subparsers.add_parser("install", help="install the shell hook into .bashrc")

@@ -29,7 +29,7 @@ $ woswoar import bash
 - **Records exit code, duration, and working directory** alongside the command.
 - **Costs 28 µs per command and forks nothing.** The hook is pure bash; Python
   never runs on your prompt.
-- **Imports** your existing `~/.bash_history` or `~/.zsh_history`, idempotently.
+- **Imports** your existing bash, zsh, or **atuin** history, idempotently.
 
 ## Requirements
 
@@ -45,6 +45,35 @@ woswoar install         # writes the hook and sources it from ~/.bashrc
 woswoar import bash     # optional: bring your existing history along
 ```
 
+### Coming from atuin
+
+```bash
+woswoar import atuin --dry-run   # see what would happen, changes nothing
+woswoar import atuin
+```
+
+atuin keeps every machine it has synced with in one sqlite database, so an
+import can carry history from several hosts. woswoar keeps them apart rather
+than flattening them, so `--scope host` and `stats` stay truthful: each atuin
+machine gets its own host entry, and commands from *this* machine merge into
+its existing history.
+
+The database is opened read-only — it is very likely a running atuin's live
+database, and woswoar has no business writing to it.
+
+**If you sync several woswoar machines, use `--this-host-only` on each.** Sync
+publishes only this machine's own commands, so importing every atuin host on
+every machine means each peer's history exists twice: once imported locally,
+once arriving over sync. Letting each machine import just its own keeps one
+copy of everything.
+
+Importing everything is the right choice when only one machine runs woswoar —
+you get all nine machines' history, it just stays local.
+
+woswoar reuses a peer's real host id when that peer is already known locally, so
+importing *after* your machines have synced also avoids duplicates. Importing
+before they have met cannot: the ids were assigned independently.
+
 `woswoar doctor` checks the installation if something looks wrong.
 
 ## Commands
@@ -53,7 +82,7 @@ woswoar import bash     # optional: bring your existing history along
 |---|---|
 | `woswoar search` | interactive picker (what Ctrl-R runs) |
 | `woswoar list` | plain output, used by fzf's scope-switch reload |
-| `woswoar import bash\|zsh` | import an existing history |
+| `woswoar import bash\|zsh\|atuin` | import an existing history |
 | `woswoar stats` | entry counts, date range, most-used commands |
 | `woswoar doctor` | check bash version, fzf, hook, cache |
 | `woswoar init [url]` | create or join an encrypted history repo |
