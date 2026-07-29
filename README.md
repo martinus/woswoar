@@ -1,0 +1,2 @@
+# woswoar
+distributed shell history
