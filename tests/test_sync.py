@@ -174,14 +174,60 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             sync.run()
         # beta joined after alpha sealed those lines, so it cannot read them yet.
+        # One command on an already-enrolled machine is the whole fix, exactly
+        # as documented -- no surrounding sync to fetch beta's key or publish.
         with alpha.active():
-            sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             report = sync.run()
             self.assertEqual(report.chunks_merged, 1)
             self.assertEqual(beta.commands(), {"git status", "make -j8"})
+
+    def test_reencrypt_alone_grants_access_without_a_surrounding_sync(self) -> None:
+        """The recipient list is a file in the working tree.
+
+        Re-sealing against a checkout taken before the new machine enrolled
+        rewrites every key to the *old* recipients and reports full success,
+        while granting nothing. So `reencrypt` has to fetch first, and this
+        pins that it does -- alpha never syncs after beta joins.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        beta = self.machine("beta")  # init publishes beta's public key
+        with alpha.active():
+            report = sync.reencrypt()
+            self.assertTrue(report.pushed)
+            self.assertEqual(report.skipped, 0)
+            self.assertGreater(report.resealed, 0)
+
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status"})
+
+    def test_a_new_machine_cannot_reencrypt_for_itself(self) -> None:
+        """Re-sealing means opening the key first, which beta cannot do.
+
+        This is the property the encryption rests on, not a missing feature:
+        a machine nobody granted access to must not be able to grant itself
+        access. It must say so rather than report a successful no-op.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+            report = sync.reencrypt()
+            # It re-seals what it owns -- its own name seal -- and skips
+            # alpha's day key, so it still cannot read alpha's history.
+            self.assertGreater(report.skipped, 0)
+            self.assertEqual(sync.run().unreadable, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(beta.commands(), set())
 
     def test_new_machine_reports_rather_than_failing(self) -> None:
         alpha = self.machine("alpha")
@@ -204,7 +250,6 @@ class TestTwoMachines(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "from alpha")
             sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
@@ -222,7 +267,6 @@ class TestTwoMachines(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             sync.run()
             first = len(cache.load_entries())
@@ -236,7 +280,6 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             sync.run()
 
@@ -259,7 +302,6 @@ class TestTwoMachines(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             sync.run()
             # Without this, search would label alpha's entries with its opaque id.
@@ -272,7 +314,6 @@ class TestTwoMachines(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "from alpha")
             sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
@@ -293,7 +334,6 @@ class TestImmutability(SyncTestCase):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"alpha {i}")
                 sync.run()
             sync.reencrypt()
-            sync.run()
         with beta.active():
             for i in range(3):
                 beta.record("2023-11-15", 1_700_100_000 + i, f"beta {i}")
@@ -387,7 +427,6 @@ class TestCompact(SyncTestCase):
                 sync.run()
             sync.compact(before="2023-11-15")
             sync.reencrypt()
-            sync.run()
         with beta.active():
             sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
