@@ -46,7 +46,7 @@ that leaves your machine is encrypted with [age](https://github.com/FiloSottile/
 | 🔐 **Encrypted end to end** | commands, paths, hostnames — nothing readable reaches the remote |
 | 🧩 **No server, no database** | a git repo and plain text files you can `grep` |
 | 📦 **Zero Python dependencies** | standard library only — nothing to audit but this repo |
-| ⚡ **28 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
+| ⚡ **~150 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
 | 🔎 **fzf as the UI** | the fuzzy finder you already know, not a bespoke TUI |
 | 🚚 **Imports what you have** | bash, zsh and atuin histories, idempotently |
 | 🧱 **~2900 lines of implementation** | small enough to read in an afternoon |
@@ -336,17 +336,38 @@ Switch without leaving the picker:
 
 ### Performance
 
-Measured on **51,688 entries** across 730 daily files:
+Measured on a real **54,943-entry** history across ~750 daily files:
 
 | | |
 |---|---|
-| record a command | **28 µs**, 0 forks |
-| warm cache load | **28 ms** |
-| `list --scope global` | **62 ms** |
-| search right after a new command | **42 ms** |
+| record a command | **~150 µs**, 0 forks |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
 
 No index, no SQLite — a pickle cache that only re-reads what changed is enough,
 and CI re-measures it on every push.
+
+<details>
+<summary>Where those 105 ms go</summary>
+
+| | cumulative |
+|---|---|
+| Python interpreter start | 8.8 ms |
+| importing woswoar | 29 ms |
+| building the argparse parser | 36 ms |
+| loading the cache (unpickling 55k entries) | 67 ms |
+| filter, sort, dedup, render | 87 ms |
+| writing 1.5 MB to fzf | 105 ms |
+
+Roughly half is fixed Python startup and half is proportional to history size.
+Micro-optimising it was measured and did not help: the costs are structural, and
+cutting them further would mean either a resident daemon (which the whole
+no-server design exists to avoid) or an index the measurements do not justify.
+
+The recording hook is a different story — 150 µs is imperceptible, and about
+30 µs of it is the fork-free `history 1` capture that makes multi-line commands
+survive intact.
+
+</details>
 
 ---
 

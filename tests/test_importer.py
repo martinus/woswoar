@@ -13,6 +13,20 @@ from .support import WoswoarTestCase
 MTIME = 1_700_000_000
 
 
+class TestKindsStayInSync(unittest.TestCase):
+    def test_cli_choices_match_the_importer(self) -> None:
+        """`__main__` spells the kinds out so it need not import this module.
+
+        Building the parser happens on every Ctrl-R, and importing the importer
+        drags in sqlite3 for ~4.5 ms that a search never needs. The copy is the
+        price; this is what stops it drifting -- adding a fourth importer
+        without exposing it would otherwise fail silently at the CLI.
+        """
+        from woswoar.__main__ import IMPORT_KINDS
+
+        self.assertEqual(IMPORT_KINDS, importer.KINDS)
+
+
 class TestParseBash(unittest.TestCase):
     def test_with_histtimeformat(self) -> None:
         text = "#1753000000\ngit status\n#1753000100\nninja -C build\n"

@@ -28,6 +28,9 @@ DAYS = 730
 #: as slow will not slip through, but a noisy neighbour will not fail the build.
 CACHE_LOAD_TARGET_MS = 50.0
 LIST_TARGET_MS = 100.0
+#: The whole process, not just the functions. About double LIST_TARGET_MS,
+#: because a keypress also pays for an interpreter, the imports, and argparse.
+END_TO_END_TARGET_MS = 200.0
 TOLERANCE = 3.0
 
 COMMANDS = [
@@ -122,6 +125,41 @@ class TestPerformance(WoswoarTestCase):
             after_ms,
             LIST_TARGET_MS * TOLERANCE,
             f"list after a new command regressed: {after_ms:.1f} ms",
+        )
+
+    def test_end_to_end_latency(self) -> None:
+        """The whole process, which is what a keypress actually pays for.
+
+        Everything else here measures functions in a warm interpreter. That
+        misses a fresh interpreter start, the imports, and building the argparse
+        parser -- together about half the real cost, which is precisely the half
+        an in-process benchmark can never see.
+        """
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        cache.load_entries()  # warm the cache, as any real shell would have
+
+        argv = [sys.executable, "-m", "woswoar", "list", "--scope", "global"]
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+        subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
+
+        runs = []
+        for _ in range(5):
+            started = time.perf_counter()
+            done = subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
+            runs.append((time.perf_counter() - started) * 1000)
+        runs.sort()
+        median = runs[len(runs) // 2]
+        lines = done.stdout.count(b"\n")
+
+        print(f"\n  Ctrl-R end to end {median:8.1f} ms  ({lines} lines, whole process)")
+        self.assertGreater(lines, 0)
+        self.assertLess(
+            median,
+            END_TO_END_TARGET_MS * TOLERANCE,
+            f"end-to-end search regressed: {median:.1f} ms",
         )
 
     def test_a_single_new_command_does_not_rewrite_the_cache(self) -> None:

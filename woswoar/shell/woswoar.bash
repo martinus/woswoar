@@ -11,7 +11,8 @@
 # `history 1 > file` followed by `read < file` is how the full command line is
 # captured -- $BASH_COMMAND is free but lossy (it reports `for i in 1 2` for a
 # loop, and only the first element of `a && b`), while $(history 1) is faithful
-# but forks. The redirect-and-read pair is faithful, fork-free, and ~28us.
+# but forks. The redirect-and-read pair is faithful, fork-free, and ~30us --
+# the largest single item in a hook that costs ~150us per command end to end.
 
 # shellcheck shell=bash
 

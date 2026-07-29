@@ -130,7 +130,7 @@ Three options were measured (2000 iterations each, bash 5.3):
 |---|---|---|---|
 | `$BASH_COMMAND` | 2 µs | 0 | **lossy** |
 | `$(history 1)` | 380 µs | 1 clone | full |
-| `history 1 > f; read < f` | **28 µs** | **0** | **full** |
+| `history 1 > f; read < f` | **30 µs** | **0** | **full** |
 
 `$BASH_COMMAND` looks free but is unusable: it fires once per *simple* command,
 so `true a && true b` records as `true a`, and `for i in 1 2; do true $i; done`
@@ -138,6 +138,29 @@ records as `for i in 1 2` — a useless history entry. Command substitution is
 faithful but forks. Redirecting the `history` builtin to a scratch file and
 reading it back with `read` is faithful, fork-free, and 13× cheaper than the
 fork.
+
+### What the hook costs as a whole
+
+The 30 µs above is the capture step, not the hook. A/B-ing a real interactive
+bash — 4000 distinct commands per session, with the hook sourced and without —
+puts the whole thing at **~150 µs per recorded command**. The parts, measured
+inside a live shell:
+
+| | |
+|---|---|
+| capture (`history 1 > f; read -d '' < f`) | 30 µs |
+| `WOSWOAR_IGNORE` regex test | 12 µs |
+| escaping (command and cwd) | 12 µs |
+| strip the history number | 7 µs |
+| the appending `printf` | 9 µs |
+| `printf -v day '%(%F)T'` | 4 µs |
+| cwd anchoring, timing, dispatch | ~10 µs |
+
+Worth stating plainly because an earlier version of this document quoted the
+30 µs capture figure as the cost of recording, which understated it by 5x.
+150 µs is still imperceptible — a thousand commands cost 0.15 s in total — and
+the property that actually matters is the zero in the forks column, which CI
+asserts under `strace`. There is no case for optimising this further.
 
 Everything else uses builtins: `$EPOCHSECONDS` for the timestamp,
 `printf -v day '%(%F)T' -1` for the filename, `$EPOCHREALTIME` for millisecond
@@ -231,6 +254,41 @@ load **28 ms**, `list --scope global` **62 ms**, and — the case that matters �
 100 ms, so no index and no SQLite are needed. CI re-measures every run,
 including the after-a-new-command path, because measuring only the unchanged
 path is exactly what hid this.
+
+### What Ctrl-R costs in a process, not in a test
+
+Those figures are in-process, and that turns out to understate the real thing by
+about half: a keypress also pays for a fresh interpreter and for fzf. On a real
+54,943-entry history, `woswoar list --scope global` is **~105 ms**, cumulative:
+
+| | cumulative |
+|---|---|
+| interpreter start | 8.8 ms |
+| import `woswoar.__main__` | 29 ms |
+| build the argparse parser | 36 ms |
+| `cache.load_entries()` | 67 ms |
+| filter, sort, dedup, render | 87 ms |
+| write 1.5 MB to fzf | 105 ms |
+
+Roughly half is fixed startup and half scales with history size. A round of
+micro-optimisation was measured and **reverted**: `gc.disable()`, lazy `tempfile`
+and `hashlib` imports, `attrgetter` as a sort key and a fast path in `escape()`
+each looked worth 1–10 ms in a tight in-process loop, and together moved a
+60-sample interleaved A/B by **+0.1 ms** — a repeated call in a warm process is
+simply not the same machine as a cold one-shot process. Only the lazy `importer`
+import survived, on the grounds that it matches how `sync` is already handled.
+
+Going meaningfully below this needs a structural change, and both candidates are
+worse than the problem:
+
+- **Stop materialising 55k `Entry` objects.** Unpickling plain tuples is 16 ms
+  against 34, but reconstructing the NamedTuples costs the 13 ms back, so the
+  gain only exists if search indexes tuples positionally. Worth ~20 ms of 105,
+  paid for in readability across the whole search path.
+- **A resident daemon**, which is what the no-server design exists to avoid.
+
+So 105 ms stands. fzf renders as it reads, so what a user perceives is closer to
+the 87 ms mark.
 
 ### Why not SQLite
 
