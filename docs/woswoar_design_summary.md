@@ -463,6 +463,29 @@ public key is on the remote, `reencrypt` run elsewhere cannot include it, and
 onboarding would appear to succeed while silently granting no access to older
 history.
 
+### `reencrypt`
+
+Re-sealing every day key to the current recipient list is what lets a newly
+enrolled machine read *old* history. It is deliberately a separate command — it
+is one of only two operations that rewrite an existing file — but it is a
+*complete* one: it fetches, re-seals, commits and pushes under the same lock
+`sync` takes.
+
+> The fetch is the part that is easy to get wrong, and it is the same trap as
+> exporting before fetching. The recipient list is a **file in the working
+> tree**, and the entire purpose of the operation is that a machine enrolled
+> since the last sync appears in it. Re-sealing against a stale checkout
+> rewrites every key back to the *old* recipients, prints `re-sealed 730 key
+> file(s)`, and grants exactly nothing. It looks like success from both
+> machines: the old one reports a full re-seal, the new one keeps reporting
+> unreadable days.
+
+**Only a machine that is already a recipient can do it**, because re-sealing a
+key means opening it first. That is the property the design rests on, not a
+missing feature — a machine nobody granted access to must not be able to grant
+itself access. Running it on the new machine re-seals only what that machine
+owns and reports the rest as skipped, rather than reporting a successful no-op.
+
 Commits use a fixed `woswoar <woswoar@localhost>` identity set on the repo.
 Commit metadata is one of the few things that is not encrypted, so it should not
 carry a real name and address.

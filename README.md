@@ -183,18 +183,25 @@ woswoar sync
 
 ```bash
 # then once, on a machine that was already enrolled
-woswoar reencrypt && woswoar sync
+woswoar reencrypt
 ```
 
 <details>
-<summary>Why that last step exists</summary>
+<summary>Why that last step exists — and why the new machine can't do it itself</summary>
 
 History sealed *before* the new machine joined was encrypted to a recipient list
 that did not include it. `reencrypt` re-seals the small per-day keys — not the
-history itself — so it takes seconds even with years of commands.
+history itself — so it takes seconds even with years of commands. It fetches and
+publishes on its own, so it is one command, not a sync sandwich.
 
-Until you run it, the new machine syncs fine and simply reports how many days it
-cannot read yet. Nothing is lost in the meantime.
+**Only a machine that is already a recipient can do this**, and that is the
+point rather than a limitation: re-sealing a key means *opening* it first. If a
+machine nobody had granted access to could re-seal old keys for itself, the
+encryption would not be worth anything. Run it on the new machine and it will
+tell you it could not open those keys.
+
+Until someone runs it, the new machine syncs fine and simply reports how many
+days it cannot read yet. Nothing is lost in the meantime.
 
 </details>
 

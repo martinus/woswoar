@@ -257,7 +257,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             f"\n{days} day(s) of history are sealed to recipients that do not include\n"
             "this machine - it joined after they were written. On a machine that was\n"
             "already enrolled run:\n"
-            "    woswoar reencrypt && woswoar sync\n"
+            "    woswoar reencrypt\n"
             "then sync here again. Nothing is lost in the meantime.",
             file=sys.stderr,
         )
@@ -267,9 +267,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
 def cmd_reencrypt(args: argparse.Namespace) -> int:
     from . import sync
 
-    count = sync.reencrypt()
-    print(f"re-sealed {count} key file(s) to the current recipients")
-    print("Run 'woswoar sync' to publish them.")
+    report = sync.reencrypt()
+    print(f"re-sealed {report.resealed} key file(s) to the current recipients")
+    if report.pushed:
+        print("pushed to remote")
+    else:
+        print("no remote configured; nothing published")
+    if report.skipped:
+        # Almost always means this machine is the new one. Saying so beats
+        # letting "re-sealed 0 key files" read as success.
+        print(
+            f"\n{report.skipped} key file(s) could not be opened by this machine, so\n"
+            "they were left alone. Re-sealing a key means opening it first, which\n"
+            "only a machine that was already a recipient can do. Run this on one of\n"
+            "those instead.",
+            file=sys.stderr,
+        )
     return 0
 
 

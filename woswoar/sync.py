@@ -546,8 +546,15 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     return changed
 
 
-def reencrypt() -> int:
-    """Re-seal every key file to the current recipient list.
+class ReencryptReport(NamedTuple):
+    resealed: int
+    #: Keys this machine cannot open, so cannot re-seal for anyone else.
+    skipped: int
+    pushed: bool
+
+
+def reencrypt() -> ReencryptReport:
+    """Re-seal every key file to the current recipient list, and publish it.
 
     This is what makes a newly onboarded machine able to read *old* history.
     Chunks are encrypted to per-day keys, so only those small key files -- and
@@ -555,33 +562,61 @@ def reencrypt() -> int:
     untouched. Any machine already enrolled can do it for every host, because
     all hosts seal their keys to the same recipient list.
 
+    Only a machine that is *already* a recipient can do this: re-sealing means
+    opening the existing key first. That is the point rather than a limitation
+    -- if a machine nobody had granted access to could re-seal old keys, the
+    encryption would not be worth anything. So the new machine cannot onboard
+    itself, and one that cannot open a key skips it silently.
+
+    Fetching first is not optional, for the same reason `run` exports after
+    fetching: the recipient list this re-seals to is a *file in the working
+    tree*, and the whole purpose of the operation is that a machine enrolled
+    since the last sync appears in it. Re-sealing against a stale checkout
+    reports full success and grants exactly nothing.
+
     This is one of only two operations that rewrite an existing file. It is
     deliberately explicit rather than part of sync.
     """
     crypto.require()
+    if not is_repo():
+        raise SyncError("no history repo yet; run 'woswoar init' first")
+
     known = store.machine()
     identity = identity_path(known)
     recipients = store.recipients_file()
-    resealed = 0
+    _ensure_repo_config()
+    git_report = Report()
+    remote = has_remote()
+    resealed = skipped = 0
 
-    for host_id in store.repo_hosts():
-        candidates = list(store.iter_day_keys(host_id))
-        seal = store.name_seal(host_id)
-        if seal.is_file():
-            candidates.append(seal)
+    # The same lock sync takes: this rewrites files in the working tree, and a
+    # timer-driven sync must not be reading them halfway through.
+    with lock():
+        if remote:
+            _fetch_and_rebase(git_report)
 
-        for path in candidates:
-            try:
-                plain = crypto.decrypt_with_file(path.read_bytes(), identity)
-            except (crypto.AgeError, OSError):
-                # Not ours to re-seal: a machine that was removed from the
-                # recipient list leaves keys nobody here can open.
-                continue
-            store.write_atomic(path, crypto.encrypt_to_recipients(plain, recipients))
-            resealed += 1
+        for host_id in store.repo_hosts():
+            candidates = list(store.iter_day_keys(host_id))
+            seal = store.name_seal(host_id)
+            if seal.is_file():
+                candidates.append(seal)
 
-    _commit()
-    return resealed
+            for path in candidates:
+                try:
+                    plain = crypto.decrypt_with_file(path.read_bytes(), identity)
+                except (crypto.AgeError, OSError):
+                    # Not ours to re-seal: keys sealed before this machine
+                    # joined, or left behind by one since removed.
+                    skipped += 1
+                    continue
+                store.write_atomic(path, crypto.encrypt_to_recipients(plain, recipients))
+                resealed += 1
+
+        _commit()
+        if remote:
+            _push(git_report)
+
+    return ReencryptReport(resealed, skipped, git_report.pushed)
 
 
 def compact(before: str) -> tuple[int, int]:
