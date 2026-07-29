@@ -119,7 +119,10 @@ __woswoar_precmd() {
     fi
     __woswoar_armed=1
 
-    HISTTIMEFORMAT= history 1 >"$__woswoar_scratch" 2>/dev/null || return 0
+    # Empty HISTTIMEFORMAT for this one call so the output format is "  N  cmd"
+    # regardless of the user's setting. Written as '' rather than a bare = so
+    # that SC1007 can tell it is a deliberate override and not a typo.
+    HISTTIMEFORMAT='' history 1 >"$__woswoar_scratch" 2>/dev/null || return 0
 
     # -d '' reads the whole file, newlines included, so multi-line commands
     # survive intact. It reports failure at EOF because it never finds the NUL

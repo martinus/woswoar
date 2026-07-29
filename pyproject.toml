@@ -17,7 +17,7 @@ keywords = ["shell", "history", "fzf", "git", "bash"]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["ruff>=0.6", "mypy>=1.11"]
+dev = ["ruff>=0.6", "mypy>=1.11", "shellcheck-py>=0.10"]
 
 [project.scripts]
 woswoar = "woswoar.__main__:main"

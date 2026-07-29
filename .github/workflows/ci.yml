@@ -21,14 +21,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff mypy
+      # shellcheck comes from pip rather than apt so the version CI enforces is
+      # the same one `pip install -e .[dev]` gives you locally.
+      - run: pip install -e .[dev]
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy woswoar tests
-      - name: shellcheck
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck --shell=bash woswoar/shell/woswoar.bash
+      - run: shellcheck --shell=bash woswoar/shell/woswoar.bash
 
   test:
     runs-on: ubuntu-latest
