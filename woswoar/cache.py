@@ -5,7 +5,7 @@ pickled and only the *appended* tail of each file is re-read on the next run.
 
 Entries are grouped per file rather than kept in one flat list. That costs a
 ``chain.from_iterable`` at read time and buys O(1) invalidation of a single
-file, which is exactly what milestone 2 needs when a sync appends decrypted
+file, which is exactly what sync needs when it appends decrypted
 lines to one host's log.
 
 The cache is disposable by design: any corruption, version mismatch, or

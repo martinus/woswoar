@@ -10,18 +10,12 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, cache, importer, search, store
+from . import __version__, cache, crypto, importer, search, store, sync
 
 HOOK_NAME = "woswoar.bash"
 _BEGIN = "# >>> woswoar >>>"
 _END = "# <<< woswoar <<<"
 _BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
-
-_MILESTONE_2 = (
-    "woswoar: '{name}' is not implemented yet.\n"
-    "Git sync with age encryption is milestone 2; milestone 1 records and\n"
-    "searches locally. See docs/woswoar_design_summary.md for the sync design."
-)
 
 
 def _hook_source() -> Path:
@@ -173,6 +167,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     detail = "sources the hook" if sourced else "has no woswoar block"
     check("bashrc", sourced, f"{rcfile} {detail}")
 
+    age = shutil.which("age")
+    info("age", age or "not found - needed for 'woswoar sync' only")
+
+    if sync.is_repo():
+        known = store.machine()
+        identity = Path(known.identity).expanduser() if known.identity else None
+        if identity is None:
+            check("sync", False, "no identity recorded - run 'woswoar init'")
+        elif not identity.is_file():
+            check("sync", False, f"identity {identity} is missing - re-run 'woswoar init'")
+        elif age and not crypto.usable(identity):
+            # The failure that only bites unattended: age cannot use ssh-agent,
+            # so a passphrase-protected key works by hand and never from a timer.
+            check("sync", False, f"{identity} needs a passphrase; 'woswoar init --new-identity'")
+        else:
+            check("sync", True, f"identity {identity}")
+        remotes = sync.git("remote", "-v", check=False).splitlines()
+        info("remote", remotes[0] if remotes else "none (history is local only)")
+    else:
+        info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
+
     logs = list(store.iter_log_files())
     info("logs", f"{len(logs)} file(s) in {store.logs_dir()}")
 
@@ -189,9 +204,69 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def cmd_milestone2(args: argparse.Namespace) -> int:
-    print(_MILESTONE_2.format(name=args.command), file=sys.stderr)
-    return 2
+def cmd_init(args: argparse.Namespace) -> int:
+    known, identity = sync.initialise(
+        remote=args.remote,
+        new_identity=args.new_identity,
+        identity=Path(args.identity).expanduser() if args.identity else None,
+    )
+    print(f"machine  : {known.name} ({known.id})")
+    print(f"identity : {identity}")
+    print(f"repo     : {store.history_dir()}")
+    remotes = sync.git("remote", "-v", check=False).splitlines()
+    print(f"remote   : {remotes[0] if remotes else 'none (local only)'}")
+    print(f"\nRecipients now enrolled ({store.recipients_file()}):")
+    for line in store.recipients_file().read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            kind, _, rest = line.partition(" ")
+            print(f"  {kind} {rest[:24]}...")
+    if args.remote:
+        print("\nNext: 'woswoar sync'.")
+        print("On an already-enrolled machine, run 'woswoar reencrypt' so this")
+        print("one can read history sealed before it joined.")
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    report = sync.run(push=not args.no_push)
+    print(
+        f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
+        f"merged {report.lines_imported} line(s) from {report.chunks_merged} chunk(s) "
+        f"across {len(report.hosts_seen)} other host(s)"
+    )
+    if report.pushed:
+        print("pushed to remote")
+    elif not sync.has_remote():
+        print("no remote configured - history is local only")
+
+    if report.unreadable:
+        days = len(report.unreadable)
+        print(
+            f"\n{days} day(s) of history are sealed to recipients that do not include\n"
+            "this machine - it joined after they were written. On a machine that was\n"
+            "already enrolled run:\n"
+            "    woswoar reencrypt && woswoar sync\n"
+            "then sync here again. Nothing is lost in the meantime.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_reencrypt(args: argparse.Namespace) -> int:
+    count = sync.reencrypt()
+    print(f"re-sealed {count} key file(s) to the current recipients")
+    print("Run 'woswoar sync' to publish them.")
+    return 0
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    days, replaced = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
+    if not days:
+        print("nothing to compact")
+    else:
+        print(f"compacted {replaced} chunk(s) into {days} (one per day)")
+        print("Run 'woswoar sync' to publish. Note this rewrites history.")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -235,9 +310,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = subparsers.add_parser("doctor", help="check the installation")
     p_doctor.set_defaults(func=cmd_doctor)
 
-    for name in ("sync", "reencrypt"):
-        stub = subparsers.add_parser(name, help=f"{name} (milestone 2, not implemented)")
-        stub.set_defaults(func=cmd_milestone2)
+    p_init = subparsers.add_parser("init", help="create or join a history repo")
+    p_init.add_argument("remote", nargs="?", help="git URL of the history repo")
+    p_init.add_argument(
+        "--new-identity",
+        action="store_true",
+        help="generate a dedicated age key instead of reusing an SSH key",
+    )
+    p_init.add_argument("--identity", help="use this private key")
+    p_init.set_defaults(func=cmd_init)
+
+    p_sync = subparsers.add_parser("sync", help="exchange history with the remote")
+    p_sync.add_argument("--no-push", action="store_true", help="stay local; do not contact remote")
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_reencrypt = subparsers.add_parser(
+        "reencrypt", help="re-seal keys after enrolling a new machine"
+    )
+    p_reencrypt.set_defaults(func=cmd_reencrypt)
+
+    p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
+    p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
+    p_compact.set_defaults(func=cmd_compact)
 
     return parser
 
@@ -251,6 +345,12 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         # `woswoar list | head` is a normal thing to do.
         return 0
+    except (sync.SyncError, crypto.AgeUnavailable, crypto.AgeError) as exc:
+        # These carry actionable messages -- a missing age, an unreadable
+        # identity, a repo that was never initialised. A traceback would bury
+        # them, and sync runs unattended from a timer where nobody reads one.
+        print(f"woswoar: {exc}", file=sys.stderr)
+        return 1
     return result
 
 

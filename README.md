@@ -56,7 +56,10 @@ woswoar import bash     # optional: bring your existing history along
 | `woswoar import bash\|zsh` | import an existing history |
 | `woswoar stats` | entry counts, date range, most-used commands |
 | `woswoar doctor` | check bash version, fzf, hook, cache |
-| `woswoar sync` | git sync — **not implemented yet**, see below |
+| `woswoar init [url]` | create or join an encrypted history repo |
+| `woswoar sync` | exchange history with the remote |
+| `woswoar reencrypt` | re-seal keys after enrolling a new machine |
+| `woswoar compact` | merge old chunks to reduce file count |
 
 ## Configuration
 
@@ -71,15 +74,65 @@ Your existing `HISTCONTROL`, `HISTIGNORE`, and `ignorespace` settings are
 honoured automatically — anything bash declines to put in history is invisible
 to woswoar too.
 
+## Multi-machine sync
+
+History is synced through an ordinary git repo, encrypted with
+[age](https://github.com/FiloSottile/age). There is no server. **Nothing
+readable ever reaches the remote** — not commands, not paths, not usernames or
+hostnames — so the repo can live anywhere you can push to.
+
+Create an empty repo somewhere (`woswoar-history` on GitHub, a bare repo on a
+NAS, anything), then on your first machine:
+
+```bash
+woswoar init git@github.com:you/woswoar-history.git
+woswoar sync
+```
+
+On each additional machine:
+
+```bash
+woswoar init git@github.com:you/woswoar-history.git   # enrols this machine
+woswoar sync
+```
+
+Then, **once**, on a machine that was already enrolled:
+
+```bash
+woswoar reencrypt && woswoar sync
+```
+
+That step exists because history sealed before the new machine joined was
+encrypted to a recipient list that didn't include it. `reencrypt` re-seals the
+small per-day keys — not the history itself — so it takes seconds even with
+years of commands. Until you run it the new machine syncs fine, and simply
+reports how many days it cannot read yet. Nothing is lost in the meantime.
+
+### Keys
+
+Each machine keeps its own key and **no secret is ever copied between
+machines**. `init` reuses your existing SSH key when it can, and falls back to a
+dedicated age key when it can't — notably when your SSH key has a passphrase,
+since age cannot use ssh-agent and would fail from an unattended timer. Force
+either with `--new-identity` or `--identity <path>`.
+
+### Automatic syncing
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/woswoar-sync.* ~/.config/systemd/user/
+systemctl --user enable --now woswoar-sync.timer
+```
+
+Five-minute interval by default. Sync never runs on your prompt — a git push
+must not be able to block a shell.
+
 ## Status
 
-Milestone 1 — recording, search, and import — works. Milestone 2 is git sync
-with `age` encryption, using append-only immutable chunks so a 5-minute sync
-interval doesn't inflate the repository. It is fully designed but not built;
-`woswoar sync` tells you so.
+Both milestones are done: recording and search, and encrypted git sync.
 
 - [docs/woswoar_design_summary.md](docs/woswoar_design_summary.md) — architecture, record
-  format, and the milestone 2 sync/encryption design.
+  format, and the sync/encryption design with measured numbers.
 - [docs/milestone-1-plan.md](docs/milestone-1-plan.md) — the implementation plan milestone 1
   was built from.
 
