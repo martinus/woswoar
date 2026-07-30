@@ -61,15 +61,19 @@ that leaves your machine is encrypted with [age](https://github.com/FiloSottile/
 ## Install
 
 ```bash
-pipx install --force git+https://github.com/martinus/woswoar.git
+pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
 woswoar install         # writes the hook, sources it from ~/.bashrc
 woswoar import bash     # optional: bring your existing history along
 ```
 
-No clone needed, and **the same line upgrades an existing install** — that is
-what `--force` is for. Without it pipx refuses to touch a version that is
-already there, and since woswoar installs straight from the branch rather than
-from a version number, `pipx upgrade` has nothing to compare against.
+No clone needed, and **the same line upgrades an existing install** — run it
+again whenever you want the latest release. `stable` always points at the most
+recent tagged release, so the command never changes and you never edit a version
+number on five machines.
+
+`--force` is what makes the upgrade work: without it pipx refuses to touch an
+install that is already there. Swap `@stable` for `@main` to track the tip
+instead, or for `@v0.2.0` to pin a release exactly.
 
 **Requirements:** bash 5.0+ (Linux) · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) for the picker ·
@@ -220,7 +224,7 @@ ever.
 The same four lines everywhere — first machine or fifth, it makes no difference:
 
 ```bash
-pipx install --force git+https://github.com/martinus/woswoar.git
+pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
 woswoar install                                       # hook it into bash
 woswoar import atuin --this-host-only                 # optional: this machine's past
 woswoar init git@github.com:you/woswoar-history.git   # join the repo
@@ -463,7 +467,7 @@ caching, encrypting, git — happens when you search or when the timer fires.
 ## Development
 
 ```bash
-python -m unittest discover -s . -t . -p 'test_*.py'    # 142 tests
+python -m unittest discover -s . -t . -p 'test_*.py'    # 194 tests
 WOSWOAR_BENCH=1 python -m unittest tests.test_perf      # latency on 52k entries
 ruff check . && ruff format --check . && mypy woswoar tests
 ```
@@ -471,6 +475,24 @@ ruff check . && ruff format --check . && mypy woswoar tests
 CI runs lint, tests on Python 3.10/3.12/3.14, the shell-hook and fork-free
 checks, a two-machine end-to-end sync against real `age` and real `git`,
 immutability and repo-growth assertions, and an install smoke test.
+
+### Cutting a release
+
+The version lives in `woswoar/__init__.py` and nowhere else — `pyproject.toml`
+reads it from there, so the two cannot disagree.
+
+```bash
+# 1. bump __version__, open a PR, merge it (main is protected)
+# 2. tag the merged commit:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Everything after that is automatic. `.github/workflows/release.yml` refuses the
+tag unless it matches `__version__` and sits on `main`, re-runs the whole suite
+at that exact commit, builds the sdist and wheel, publishes a GitHub release
+with generated notes, and fast-forwards `stable` — which is what the install
+command above tracks. The `stable` push is not forced, so tagging an older
+commit fails loudly rather than moving everyone backwards.
 
 ## License
 

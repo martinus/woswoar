@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "woswoar"
-version = "0.1.0"
+# Read from woswoar/__init__.py rather than repeated here. Two declarations can
+# disagree, and when they do `woswoar --version` lies about what is installed --
+# which matters most during a release, when it is the only thing anyone checks.
+dynamic = ["version"]
 description = "Distributed shell history over git, searched with fzf"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +24,9 @@ dev = ["ruff>=0.6", "mypy>=1.11", "shellcheck-py>=0.10"]
 
 [project.scripts]
 woswoar = "woswoar.__main__:main"
+
+[tool.hatch.version]
+path = "woswoar/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["woswoar"]
