@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hmac
 import os
-import secrets
 import shutil
 import subprocess
 from collections.abc import Iterable
@@ -41,6 +40,11 @@ AGE_KEYGEN = "age-keygen"
 
 #: HMAC-SHA256 output, and so the fixed-width prefix every chunk carries.
 TAG_BYTES = 32
+
+#: Key length. The same 32 as :data:`TAG_BYTES` by coincidence, not by
+#: derivation -- widening the tag is a format change, and re-sizing the key
+#: is not, so reading one from the other would couple two unrelated decisions.
+_KEY_BYTES = 32
 
 _TIMEOUT = 120
 
@@ -208,8 +212,13 @@ def recipient_for(identity: Path) -> str:
 
 
 def new_mac_key() -> bytes:
-    """A fresh key for :func:`tag`, from the OS random source."""
-    return secrets.token_bytes(TAG_BYTES)
+    """A fresh key for :func:`tag`, from the OS random source.
+
+    ``os.urandom`` rather than ``secrets.token_bytes``, which is a thin wrapper
+    over it: importing ``secrets`` drags in ``random`` and ``bisect`` for ~1.4 ms
+    of interpreter start, and this module is loaded by every `sync`.
+    """
+    return os.urandom(_KEY_BYTES)
 
 
 def tag(key: bytes, data: bytes) -> bytes:

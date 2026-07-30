@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import unittest
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -654,10 +654,6 @@ class TestLocalOnly(SyncTestCase):
             sync.run()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestChunkAuthenticity(SyncTestCase):
     """Whether one of *this user's* machines wrote a chunk, which age cannot say.
 
@@ -667,16 +663,13 @@ class TestChunkAuthenticity(SyncTestCase):
     able to open it is not the same as being willing to believe it.
     """
 
-    def push_as_attacker(self, write: object) -> None:
+    def push_as_attacker(self, write: Callable[[Path], None]) -> None:
         """Do what push access alone allows: no identity, no keys, just the repo."""
         work = self.root / "attacker"
-        if not work.exists():
-            subprocess.run(
-                ["git", "clone", "--quiet", str(self.origin), str(work)], check=True, timeout=60
-            )
-        else:
-            subprocess.run(["git", "-C", str(work), "pull", "--quiet"], check=True, timeout=60)
-        write(work)  # type: ignore[operator]
+        subprocess.run(
+            ["git", "clone", "--quiet", str(self.origin), str(work)], check=True, timeout=60
+        )
+        write(work)
         for args in (
             ["add", "-A"],
             ["-c", "user.name=x", "-c", "user.email=x@y", "commit", "-q", "-m", COMMIT],
@@ -685,16 +678,29 @@ class TestChunkAuthenticity(SyncTestCase):
             subprocess.run(["git", "-C", str(work), *args], check=True, timeout=60)
 
     @staticmethod
-    def forged_chunk(work: Path, host_id: str, day: str, cmd: str) -> None:
-        """A chunk sealed to a host's *published* day key, tagged by nobody."""
+    def forged_chunk(
+        work: Path,
+        host_id: str,
+        day: str,
+        cmd: str,
+        tag: bytes = b"",
+        name: str = "9999999999-ffffff",
+    ) -> None:
+        """A chunk sealed to a host's *published* day key, but not authentic.
+
+        ``tag`` empty writes it untagged, which is what an attacker holding no
+        enrolled identity can actually produce; passing bytes writes a wrong
+        tag. Both must be refused, so both are exercised.
+        """
         pub = (work / "hosts" / host_id / "keys" / f"{day}.pub").read_text(encoding="utf-8").strip()
         entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
         payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
         # Named far in the future so it sorts above whatever the real machine
         # has published; a forgery the watermark skips proves nothing.
-        target = work / "hosts" / host_id / day / "9999999999-ffffff.age"
+        sealed = crypto.encrypt_to(payload, pub)
+        target = work / "hosts" / host_id / day / f"{name}.age"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(crypto.encrypt_to(payload, pub))
+        target.write_bytes(store.frame_chunk(sealed, tag) if tag else sealed)
 
     def enrolled_pair(self) -> tuple[Fake, Fake]:
         """alpha publishing history, beta granted and up to date."""
@@ -807,28 +813,45 @@ class TestChunkAuthenticity(SyncTestCase):
         with beta.active():
             self.assertEqual(sync.run().unauthenticated, {f"{alpha.id}/2023-11-14"})
 
-    def test_an_untagged_chunk_is_refused_like_a_wrongly_tagged_one(self) -> None:
+    def test_a_wrongly_tagged_chunk_is_refused_like_an_untagged_one(self) -> None:
         """ "No tag" and "wrong tag" must reach the same answer.
 
-        Anything else is the downgrade: an attacker would simply omit the tag.
+        Anything else is the downgrade: an attacker would simply pick whichever
+        shape was treated more leniently.
         """
         alpha, beta = self.enrolled_pair()
-
-        def legacy(work: Path) -> None:
-            pub = (
-                (work / "hosts" / alpha.id / "keys" / "2023-11-14.pub")
-                .read_text(encoding="utf-8")
-                .strip()
+        self.push_as_attacker(
+            lambda work: self.forged_chunk(
+                work, alpha.id, "2023-11-14", "wrongly-tagged", tag=b"\x00" * 32
             )
-            entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "old-but-mine")
-            payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
-            target = work / "hosts" / alpha.id / "2023-11-14" / "9999999999-eeeeee.age"
-            # No frame_chunk: exactly what an older woswoar wrote.
-            target.write_bytes(crypto.encrypt_to(payload, pub))
-
-        self.push_as_attacker(legacy)
+        )
 
         with beta.active():
             report = sync.run()
             self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
-            self.assertNotIn("old-but-mine", beta.commands(), "unverified history was merged")
+            self.assertNotIn("wrongly-tagged", beta.commands())
+
+    def test_compact_refuses_to_launder_a_chunk_this_machine_did_not_write(self) -> None:
+        """`merge` skips our own host id, so compaction is where this is caught.
+
+        Compaction re-seals and re-tags whatever it merges, then deletes the
+        originals -- so a chunk planted under our *own* id would come out
+        carrying a tag every other machine believes, with the evidence gone.
+        It has to refuse rather than launder.
+        """
+        alpha, _ = self.enrolled_pair()
+        self.push_as_attacker(
+            lambda work: self.forged_chunk(work, alpha.id, "2023-11-14", "planted-under-my-own-id")
+        )
+
+        with alpha.active():
+            sync.run()  # pulls the planted chunk into alpha's own working tree
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.compact(before="2023-11-15")
+            self.assertIn("refusing to compact", str(caught.exception))
+            # And it is still there, not silently dropped.
+            self.assertTrue(list(store.iter_chunks(alpha.id)))
+
+
+if __name__ == "__main__":
+    unittest.main()

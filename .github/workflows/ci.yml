@@ -189,7 +189,7 @@ jobs:
           git clone --quiet "$BASE/origin.git" "$ATTACK"
           DAY_PUB=$(cat "$ATTACK/hosts/$ALPHA_ID/keys/2023-11-14.pub")
           printf '1700000009\ts1\t~\t0\t5\tforged-marker-command\n' \
-            | python3 -c 'import sys,zlib; sys.stdout.buffer.write(zlib.compress(sys.stdin.buffer.read(),9))' \
+            | python3 -c 'import sys; from woswoar import sync; sys.stdout.buffer.write(sync.pack(sys.stdin.buffer.read()))' \
             | age -r "$DAY_PUB" \
             > "$ATTACK/hosts/$ALPHA_ID/2023-11-14/9999999999-ffffff.age"
           git -C "$ATTACK" add -A

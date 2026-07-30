@@ -629,6 +629,13 @@ deflate to *more* than they started as — a one-line chunk is 42 B and becomes
 47 — so the smaller form wins and the tag records which, at a cost of one byte
 on data that already carries a 200 B age header.
 
+**Cost: a tag per chunk.** Each chunk carries a 32-byte HMAC-SHA256 prefix
+proving one of your own machines wrote it — measured, about +12% on a real
+chunk file (255 B for one line, 265 B for three) and roughly +3% on the yearly
+repo growth below. It buys the property that a chunk nothing holding the repo
+key wrote is never opened; a header rather than a sibling file keeps the file
+count, the `*.age` gitattributes glob and the never-rewritten invariant intact.
+
 **Cost: inodes.** At a 5-minute timer and ~40 content-bearing syncs a day, one
 machine produces ~35k chunk files over two years. Git copes, but a fresh clone
 writes a lot of small files. An opt-in `woswoar compact` merges a completed past

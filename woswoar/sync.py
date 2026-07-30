@@ -255,6 +255,26 @@ def identity_status(known: Machine) -> IdentityStatus:
     return IdentityStatus(True, f"identity {path}")
 
 
+def repo_key_status(known: Machine) -> IdentityStatus:
+    """Whether this machine can authenticate history, for `doctor` to report.
+
+    Lives here rather than in `doctor` for the same reason `identity_status`
+    does: the judgement is testable and stated once. It is worth surfacing
+    because a machine that cannot open this key publishes *nothing* -- it keeps
+    recording, looks healthy, and says so only on a timer's stderr.
+    """
+    path = store.mac_key_file()
+    if not is_repo():
+        return IdentityStatus(True, "no history repo yet")
+    if not path.is_file():
+        return IdentityStatus(False, f"{path} is missing - re-run 'woswoar init'")
+    try:
+        mac_key(known)
+    except (crypto.AgeError, SyncError) as exc:
+        return IdentityStatus(False, f"cannot be opened ({exc}) - run 'woswoar grant' elsewhere")
+    return IdentityStatus(True, str(path))
+
+
 def day_public_key(known: Machine, day: str) -> str:
     """The public half of this host's key for ``day``, creating it if needed.
 
@@ -274,19 +294,30 @@ def day_public_key(known: Machine, day: str) -> str:
 
 
 def mac_key(known: Machine) -> bytes:
-    """The repo's authentication key, creating it if this is a fresh repo.
+    """The repo's authentication key. Raises if this machine cannot open it.
 
     Sealed to every recipient, so holding it is exactly "being one of the
     enrolled machines" -- which is the property every chunk is checked against.
     Someone who can push to the repo but holds no enrolled identity cannot open
     it, and so cannot produce a tag any machine will accept.
+
+    Opens, never creates. `day_public_key` mints on demand safely because a day
+    key lives under this host's own id, a path nobody else writes; this file is
+    one shared path at the repo root, so two machines minting it on the same
+    timer tick would each tag chunks with a key the other will never hold, and
+    `.gitattributes` marks ``*.age -merge`` -- so the rebase conflicts and the
+    timer replays that conflict forever. Creation happens once, in `initialise`.
     """
     path = store.mac_key_file()
-    if path.is_file():
-        return crypto.decrypt_with_file(path.read_bytes(), identity_path(known))
+    if not path.is_file():
+        raise crypto.AgeError(f"no authentication key at {path}")
+    return crypto.decrypt_with_file(path.read_bytes(), identity_path(known))
 
+
+def create_mac_key(known: Machine) -> bytes:
+    """Mint the repo's authentication key. Only `initialise` may call this."""
     key = crypto.new_mac_key()
-    store.write_atomic(path, crypto.encrypt_to_recipients(key, recipients()))
+    store.write_atomic(store.mac_key_file(), crypto.encrypt_to_recipients(key, recipients()))
     return key
 
 
@@ -374,6 +405,23 @@ def merge(known: Machine, state: State, report: Report, mac: bytes) -> None:
         _merge_name(known, host_id)
 
 
+def open_chunk(path: Path, mac: bytes) -> bytes:
+    """A chunk's sealed bytes, or :class:`ValueError` if it is not authentic.
+
+    The *only* way to read a chunk. `store.split_chunk` merely slices the frame
+    apart and leaves "and now check the tag" to the caller, which is a choice no
+    caller should get: `compact` took the other branch and became a laundering
+    path -- it re-sealed and re-tagged whatever it found under this host's own
+    id, which `merge` never inspects, turning a planted chunk into one every
+    peer would believe, and then deleted the evidence. Verification lives here
+    so that "read a chunk without checking it" is not expressible.
+    """
+    sealed, tag = store.split_chunk(path.read_bytes())
+    if not crypto.tag_matches(mac, sealed, tag):
+        raise ValueError(f"{path.name} failed authentication")
+    return sealed
+
+
 def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac: bytes) -> None:
     #: None marks a day whose key we already failed to open. Caching the failure
     #: matters as much as caching the success: without it, a machine that has
@@ -412,11 +460,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac:
         # timer. Opening a day key touches no chunk bytes, so nothing is
         # decrypted any earlier for being ordered this way.
         try:
-            blob, expected = store.split_chunk(chunk.path.read_bytes())
+            blob = open_chunk(chunk.path, mac)
         except (OSError, ValueError):
-            report.unauthenticated.add(key)
-            continue
-        if not crypto.tag_matches(mac, blob, expected):
             report.unauthenticated.add(key)
             continue
 
@@ -672,8 +717,8 @@ def initialise(
     # After the recipient list exists, so the key is sealed to a list that
     # includes this machine. On a repo that already has one this does nothing;
     # opening it is `grant`'s job, not enrolment's.
-    if not store.mac_key_file().is_file() and recipients():
-        mac_key(known)
+    if not store.mac_key_file().is_file():
+        create_mac_key(known)
         _commit()
 
     # Publish immediately. Until this machine's public key is on the remote,
@@ -794,16 +839,14 @@ def grant(confirmed: list[str] | None = None) -> ReencryptReport:
         # The repo key first: it is what a newly enrolled machine needs before
         # it can authenticate anything at all, and unlike the per-host keys
         # there is exactly one of it.
-        everything: list[Path] = []
-        if store.mac_key_file().is_file():
-            everything.append(store.mac_key_file())
+        sealed = [store.mac_key_file()]
         for host_id in store.repo_hosts():
-            everything.extend(store.iter_day_keys(host_id))
-            seal = store.name_seal(host_id)
-            if seal.is_file():
-                everything.append(seal)
+            sealed.extend(store.iter_day_keys(host_id))
+            sealed.append(store.name_seal(host_id))
 
-        for path in everything:
+        for path in sealed:
+            if not path.is_file():
+                continue
             try:
                 plain = crypto.decrypt_with_file(path.read_bytes(), identity)
             except (crypto.AgeError, OSError):
@@ -853,12 +896,22 @@ def compact(before: str) -> tuple[int, int]:
             if len(chunks) < 2:
                 continue
             secret = open_day_key(known, known.id, day)
-            plain = b"".join(
-                unpack(
-                    crypto.decrypt_with_secret(store.split_chunk(c.path.read_bytes())[0], secret)
+            # Authenticated before it is re-sealed, and fatally so. Compaction
+            # rewrites chunks under a fresh tag, so anything it accepts here it
+            # launders into something every other machine will believe -- and it
+            # then deletes the original. `merge` skips this host's own id, so
+            # this is the *only* time these chunks are ever checked.
+            try:
+                plain = b"".join(
+                    unpack(crypto.decrypt_with_secret(open_chunk(c.path, mac), secret))
+                    for c in chunks
                 )
-                for c in chunks
-            )
+            except ValueError as exc:
+                raise SyncError(
+                    f"refusing to compact {day}: {exc}.\n"
+                    "Compaction re-tags what it merges, so it must not be used to "
+                    "launder a chunk this machine did not write."
+                ) from exc
             merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
             sealed = crypto.encrypt_to(pack(plain), crypto.public_of(secret))
             store.write_atomic(merged, store.frame_chunk(sealed, crypto.tag(mac, sealed)))
