@@ -135,14 +135,18 @@ class TestPrivateByDefault(WoswoarTestCase):
             if p.stat().st_mode & 0o077 and store.history_dir() not in [p, *p.parents]
         )
 
-    def first_run(self) -> None:
-        """What a real first run writes, through the real entry points.
+    def as_if_never_installed(self) -> None:
+        """Drop the config directory the shared harness pre-creates.
 
-        The shared harness pre-creates the config directory with a plain
-        mkdir; removing it first means the assertions are about directories
-        woswoar actually created rather than ones it inherited.
+        It is made with a plain mkdir at the ambient umask, so leaving it would
+        make every assertion here about a directory woswoar inherited rather
+        than one it created.
         """
         shutil.rmtree(store.config_dir())
+
+    def first_run(self) -> None:
+        """What a real first run writes, through the real entry points."""
+        self.as_if_never_installed()
         store.save_machine(store.machine())
         store.append_entries(MACHINE_ID, [make_entry(1_700_000_000, "git status")])
 

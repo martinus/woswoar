@@ -18,6 +18,7 @@ from pathlib import Path
 
 from woswoar import cache, crypto, search, store, sync
 from woswoar.entry import Entry, format_line
+from woswoar.errors import WoswoarError
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support
@@ -676,6 +677,75 @@ class TestSyncIsPrivate(SyncTestCase):
             sync.run()
             exposed = store.readable_by_others()
             self.assertEqual(exposed, [], f"sync left {exposed} readable by others")
+
+
+class TestRepoKeyIsNeverMintedTwice(SyncTestCase):
+    """Creation belongs to `initialise`, opening to everything else.
+
+    `mac.age` is one shared path at the repo root, unlike a day key, which
+    lives under a host id nobody else writes. If a routine sync minted it when
+    absent, two machines on the one-minute timer would each tag chunks with a
+    key the other will never hold -- and `.gitattributes` marks ``*.age
+    -merge``, so the rebase conflicts and the timer replays that conflict
+    forever.
+    """
+
+    def test_sync_reports_rather_than_minting_a_replacement(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            before = store.mac_key_file().read_bytes()
+            store.mac_key_file().unlink()
+
+            report = sync.run()
+            self.assertTrue(report.needs_grant, "a missing repo key was papered over")
+            self.assertFalse(store.mac_key_file().is_file(), "sync minted a competing repo key")
+            self.assertEqual(report.chunks_written, 0)
+
+            # And the real one still works once it is back.
+            store.write_atomic(store.mac_key_file(), before)
+            self.assertFalse(sync.run().needs_grant)
+
+    def test_compacting_without_the_repo_key_refuses(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(2):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
+                sync.run()
+            store.mac_key_file().unlink()
+            with self.assertRaises(WoswoarError):
+                sync.compact(before="2023-11-15")
+
+
+class TestMergedHistoryIsStoredFaithfully(SyncTestCase):
+    def test_a_peers_history_lands_verbatim_and_owner_only(self) -> None:
+        """Merging must not decode-and-re-encode another machine's log.
+
+        A command can hold bytes that are not valid UTF-8 -- a mistyped paste,
+        a filename in another charset -- and the recording machine stored them
+        verbatim. Passing them through a lossy decode to fit a text-mode helper
+        would silently rewrite history that machine got right.
+        """
+        alpha = self.machine("alpha")
+        raw = b"1700000001\ts1\t~\t0\t5\tgrep \xff\xfe binary\n"
+        with alpha.active():
+            path = store.log_file(alpha.id, "2023-11-14")
+            with store.private_append(path, binary=True) as handle:
+                handle.write(raw)
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            landed = store.log_file(alpha.id, "2023-11-14")
+            merged = landed.read_bytes()
+            mode = landed.stat().st_mode & 0o777
+        self.assertEqual(merged, raw, "the peer's bytes were rewritten in transit")
+        # Another machine's history is no less private than this machine's, and
+        # it lands in the same tree -- so it is created with the same mode.
+        self.assertEqual(mode & 0o077, 0, f"merged history landed {oct(mode)}")
 
 
 class TestChunkAuthenticity(SyncTestCase):
