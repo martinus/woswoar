@@ -79,18 +79,30 @@ class ShellHookTestCase(WoswoarTestCase):
         env.update(extra or {})
         return env
 
-    def run_shell(self, script: str, env_extra: dict[str, str] | None = None) -> None:
-        """Run ``script`` line by line in an interactive bash with the hook loaded."""
-        subprocess.run(
+    def run_shell(
+        self,
+        script: str,
+        env_extra: dict[str, str] | None = None,
+        before: str = "",
+    ) -> str:
+        """Run ``script`` line by line in an interactive bash with the hook loaded.
+
+        ``before`` runs *ahead of* the hook, which is how a real ~/.bashrc looks:
+        the interesting bugs are all about what else already owns PROMPT_COMMAND
+        and the DEBUG trap by the time woswoar loads. Returns the shell's output
+        so a test can assert the other tool still ran.
+        """
+        result = subprocess.run(
             ["bash", "--norc", "-i"],
-            input=f"source {HOOK}\n{textwrap.dedent(script)}",
+            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{textwrap.dedent(script)}",
             text=True,
             env=self.shell_env(env_extra),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             check=False,
             timeout=60,
         )
+        return result.stdout
 
     def recorded(self) -> list[Entry]:
         """Every entry the hook wrote, oldest first, minus the `source` line."""
@@ -189,6 +201,74 @@ class TestCapture(ShellHookTestCase):
         entry = self.recorded()[0]
         self.assertGreaterEqual(entry.duration_ms, 250)
         self.assertLess(entry.duration_ms, 30_000)
+
+
+@requires_bash5
+class TestCoexistence(ShellHookTestCase):
+    """woswoar is never the only thing hooked into a real .bashrc.
+
+    A terminal-title hook, a prompt framework, bash-preexec, atuin and ble.sh
+    all want the DEBUG trap or PROMPT_COMMAND. Every case here is something that
+    was actually broken.
+    """
+
+    #: The shape of a common .bashrc: a title hook owning both.
+    PRIOR = """
+        _title_preexec() { printf 'PREEXEC[%s]\\n' "$BASH_COMMAND"; }
+        _title_prompt() { :; }
+        trap '_title_preexec' DEBUG
+        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_title_prompt"
+    """
+
+    def test_an_existing_debug_trap_still_fires(self) -> None:
+        # A bare `trap ... DEBUG` in the hook silently replaced it, so the other
+        # tool simply stopped working with nothing to show for it.
+        out = self.run_shell("echo hello\n", before=self.PRIOR)
+        self.assertIn("PREEXEC[echo hello]", out)
+        self.assertEqual(self.commands(), ["echo hello"])
+
+    def test_durations_survive_chaining(self) -> None:
+        self.run_shell("sleep 0.2\n", before=self.PRIOR)
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertGreaterEqual(by_cmd["sleep 0.2"].duration_ms, 100)
+
+    def test_exit_codes_survive_a_prior_prompt_command(self) -> None:
+        """`$?` is only the user's status for the *first* PROMPT_COMMAND entry.
+
+        With anything already in PROMPT_COMMAND, reading `$?` inside our own
+        entry yielded the previous entry's status instead -- so every command
+        was recorded as having succeeded. The fix is a bare assignment
+        prepended ahead of everything else.
+        """
+        self.run_shell("false\ntrue\n", before=self.PRIOR)
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        self.assertEqual(by_cmd["false"].exit_code, 1)
+        self.assertEqual(by_cmd["true"].exit_code, 0)
+
+    def test_recording_survives_losing_the_debug_trap(self) -> None:
+        """Something claiming DEBUG *after* us must cost timing, not history.
+
+        Recording used to be gated on a flag the trap set, so one later
+        `trap ... DEBUG` anywhere in .bashrc turned woswoar off silently.
+        """
+        self.run_shell("_o() { :; }\ntrap '_o' DEBUG\necho after-one\necho after-two\n")
+        commands = self.commands()
+        self.assertIn("echo after-one", commands)
+        self.assertIn("echo after-two", commands)
+        by_cmd = {e.cmd: e for e in self.recorded()}
+        # Duration is the one thing that legitimately degrades.
+        self.assertEqual(by_cmd["echo after-one"].duration_ms, -1)
+
+    def test_a_prior_handler_containing_quotes_is_not_mangled(self) -> None:
+        # The handler is recovered by re-running what `trap -p` prints, rather
+        # than by unquoting it by hand, precisely so this works.
+        before = """
+            _q() { printf "QUOTED[%s]\\n" "it's fine"; }
+            trap '_q' DEBUG
+        """
+        out = self.run_shell("echo hello\n", before=before)
+        self.assertIn("QUOTED[it's fine]", out)
+        self.assertEqual(self.commands(), ["echo hello"])
 
 
 @requires_bash5

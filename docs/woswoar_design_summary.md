@@ -173,6 +173,42 @@ The result is verified rather than asserted: CI runs the hook under `strace` wit
 — startup legitimately forks for `mkdir` and one `trap -p` subshell — but flat,
 which is the property that actually matters.
 
+### Sharing the shell with everything else
+
+woswoar is never the only thing hooked into a real `.bashrc`. A terminal-title
+hook, a prompt framework, bash-preexec, atuin and ble.sh all want the DEBUG trap
+and `PROMPT_COMMAND`. Two bugs came out of getting this wrong, both found by
+driving a real interactive bash rather than by reading the code.
+
+**The DEBUG trap has to be chained, and cannot be chained at load time.** A bare
+`trap … DEBUG` silently replaced whatever was there, so the other tool simply
+stopped working. The obvious fix — read the existing trap and call it too —
+does not work from the hook, because **a sourced file cannot see the DEBUG
+trap at all**: bash gives sourced files their own trap scope, so `trap -p DEBUG`
+reports nothing from inside one. It is visible from a `PROMPT_COMMAND` *string*,
+which is evaluated at top level, so the wiring is deferred to the first prompt.
+That delay turns out to be the better design anyway: by then the whole of
+`.bashrc` has run, so woswoar chains onto whoever actually ended up owning the
+trap, and the order of lines in `.bashrc` stops mattering.
+
+The handler is recovered by re-running what `trap -p` prints with `trap` shadowed
+by a function, rather than by unquoting its output by hand — handlers containing
+quotes are the common case, not the exotic one.
+
+**Recording must not depend on that trap.** It used to be gated on a flag the
+DEBUG handler set, so anything claiming the trap *after* woswoar turned
+recording off entirely and silently. The history number already distinguishes
+"a command ran" from "nothing happened", so that is what gates recording now,
+and a lost trap costs the **duration** of a command rather than the command.
+
+**`$?` is only the user's exit status for the *first* `PROMPT_COMMAND` entry.**
+After that it is the status of the previous entry. woswoar appends itself, so
+any pre-existing entry — a title hook is enough — meant every command was
+recorded as having succeeded. The fix is a bare assignment *prepended* ahead of
+everything else, which is the only part that has to run first; a bare assignment
+cannot be mistaken for a command the user typed. Reading `$?` directly looked
+obviously correct and was wrong in every configuration but the empty one.
+
 > **`$EPOCHREALTIME` honours `LC_NUMERIC`.** Under a `de_AT` locale it reads
 > `1785321992,048777`, with a comma. Stripping only `.` silently yields garbage
 > durations. The hook strips `[.,]`, and a test pins it under `de_AT.UTF-8`.
