@@ -173,7 +173,9 @@ jobs:
 
           run_as beta init "$BASE/origin.git" --new-identity
           run_as alpha sync
-          run_as alpha reencrypt
+          # --yes because there is no terminal here; grant refuses to widen
+          # who can read the history on an assumed answer.
+          run_as alpha grant --yes
           run_as alpha sync
           run_as beta sync
           run_as beta list --scope global | grep -q 'secret-marker-command'
