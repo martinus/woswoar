@@ -57,10 +57,6 @@ __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 # days recorded, and this runs on every interactive shell.
 (umask 077 && mkdir -p "$__woswoar_logdir") 2>/dev/null || return 0
 
-# Captured once, so the hot path can drop to 077 for the one write a day that
-# creates a file and put it straight back without forking to read it.
-__woswoar_umask=$(umask)
-
 # Scratch file for capturing `history 1`. Prefer XDG_RUNTIME_DIR: it is a
 # per-user tmpfs that systemd clears at logout, so a shell killed with -9 cannot
 # leave the last command lying around in /tmp.
@@ -230,12 +226,18 @@ __woswoar_precmd() {
     # the answer changes once a day.
     if [[ $day != "$__woswoar_today" ]]; then
         __woswoar_today=$day
-        # `>>` rather than `>`: it creates when absent and does nothing when
-        # present, so no separate existence test is needed and a day already
-        # underway cannot be truncated.
-        umask 077
-        : >>"$__woswoar_logdir/$day.tsv" 2>/dev/null
-        umask "$__woswoar_umask"
+        # A file's mode is fixed when it is created, so this is the only moment
+        # it can be got right -- `>>` alone would create it 0644 under the usual
+        # umask. `>>` rather than `>` so a day already underway is never
+        # truncated, which also removes the need to test for existence first.
+        #
+        # In a subshell, so the caller's umask is untouched no matter what: the
+        # fork happens once per day, not once per command, and the guard above
+        # keeps it off the hot path entirely. Saving and restoring the umask
+        # inline instead would be fork-free, but reading it costs a fork at
+        # startup anyway and a failed read would leave this *setting* the user's
+        # umask to a guess -- loosening it, in the one case it must not.
+        (umask 077 && : >>"$__woswoar_logdir/$day.tsv") 2>/dev/null
     fi
 
     # One O_APPEND write. Linux serialises these under the inode lock, so

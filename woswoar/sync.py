@@ -482,6 +482,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac:
         state.merged[key] = chunk.name
         report.chunks_merged += 1
 
+    if pending:
+        store.private_dir(store.host_dir(host_id))
     for day, blocks in pending.items():
         payload = b"".join(blocks)
         # Another machine's history is no less private than this one's, and it
