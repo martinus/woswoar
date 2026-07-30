@@ -21,6 +21,23 @@ from .support import requires_age, requires_ssh_keygen
 #: pipe, not a file in $HOME, which is what the rule is actually about.
 _ALLOWED_PATH_PREFIX = "/dev/fd/"
 
+#: A real ed25519 public key, and the same key with its last character changed.
+#: Spelled this way so "these differ in one character of key material" is
+#: visible rather than something a reader has to diff by eye.
+_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB7Ep0mZ0mCwvvzMLbaXn8g4mBIhnCEE1zLLuqA6IGGz"
+_SSH_KEY_ALMOST = _SSH_KEY[:-1] + "y"
+
+
+def make_ssh_identity(directory: Path, comment: str = "woswoar-test") -> Path:
+    """A throwaway ed25519 keypair, returning the private half's path."""
+    key = directory / "id_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q", "-C", comment],
+        check=True,
+        timeout=60,
+    )
+    return key
+
 
 @requires_age
 class TestNoAgeCallNamesAFile(unittest.TestCase):
@@ -43,13 +60,7 @@ class TestNoAgeCallNamesAFile(unittest.TestCase):
         return path
 
     def ssh_identity(self) -> Path:
-        key = self.tmp / "id_ed25519"
-        subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q", "-C", "woswoar-test"],
-            check=True,
-            timeout=60,
-        )
-        return key
+        return make_ssh_identity(self.tmp)
 
     def assert_named_no_file(self, spy: mock.Mock) -> None:
         for call in spy.call_args_list:
@@ -116,6 +127,64 @@ class TestWhyUnusable(unittest.TestCase):
         reason = crypto.why_unusable(Path("/nonexistent/woswoar/identity"))
         self.assertIn("cannot be read", reason)
         self.assertNotIn("passphrase", reason)
+
+
+class TestFingerprint(unittest.TestCase):
+    """What `grant` shows instead of a name anyone with push access can write."""
+
+    @requires_ssh_keygen
+    def test_an_ssh_key_gets_the_fingerprint_ssh_keygen_prints(self) -> None:
+        """Not a detail: the value of the fingerprint is that it can be checked
+        against the machine itself, with the tool already installed there."""
+        with tempfile.TemporaryDirectory(prefix="woswoar-fp-") as tmp:
+            key = make_ssh_identity(Path(tmp), comment="box")
+            # Through `recipient_for`, so this exercises the rule the product
+            # uses to find the .pub sibling rather than a second guess at it.
+            pub = crypto.recipient_for(key)
+            listed = subprocess.run(
+                ["ssh-keygen", "-lf", str(key) + ".pub"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout.split()[1]
+
+        self.assertTrue(listed.startswith("SHA256:"))
+        self.assertEqual(crypto.fingerprint(pub), listed)
+
+    def test_the_comment_field_cannot_change_an_ssh_fingerprint(self) -> None:
+        # The comment is the part a label is usually taken from, and the part
+        # anyone editing recipients.txt can rewrite.
+        self.assertEqual(
+            crypto.fingerprint(f"{_SSH_KEY} martin@laptop"),
+            crypto.fingerprint(f"{_SSH_KEY} martin@laptop-but-not-really"),
+        )
+
+    def test_two_keys_never_share_a_fingerprint(self) -> None:
+        self.assertNotEqual(crypto.fingerprint(_SSH_KEY), crypto.fingerprint(_SSH_KEY_ALMOST))
+
+    def test_an_age_recipient_is_its_own_fingerprint(self) -> None:
+        # Short, canonical, and reproducible with `age-keygen -y`, so hashing it
+        # would only make it harder to check.
+        key = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwwwwww"
+        self.assertEqual(crypto.fingerprint(f"{key}  "), key)
+
+    def test_a_line_that_parses_as_neither_is_still_derived_from_itself(self) -> None:
+        """A hand-edited recipients.txt must not take the confirmation down with
+        a traceback -- that is the one moment it has to still work -- and must
+        not render two different lines as the same machine either.
+        """
+        first = crypto.fingerprint("ssh-rsa not-base64!! martin@laptop")
+        second = crypto.fingerprint("ssh-rsa also-not-base64!! martin@laptop")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("SHA256:"))
+        self.assertEqual(crypto.fingerprint(""), "")
+
+    def test_the_check_command_matches_the_kind_of_fingerprint(self) -> None:
+        # Telling someone to run ssh-keygen against an age identity is advice
+        # that cannot work, on the one screen where advice has to.
+        self.assertIn("ssh-keygen", crypto.how_to_check(crypto.fingerprint(_SSH_KEY)))
+        self.assertIn("age-keygen", crypto.how_to_check(crypto.fingerprint("age1qqqqwwwwww")))
 
 
 class TestChunkFraming(unittest.TestCase):

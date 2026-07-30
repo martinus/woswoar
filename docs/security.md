@@ -76,7 +76,29 @@ Enrolling a new laptop means publishing a public key — nothing sensitive trave
 and nothing sensitive is stored in the repo.
 
 Widening who can read the archive is therefore a deliberate act: `woswoar grant`
-lists the machines by name and asks before it re-seals anything.
+lists the machines and asks before it re-seals anything.
+
+<details>
+<summary>What that prompt shows, and why not just the names</summary>
+
+`recipients.txt` is plain text and `merge=union`, so anyone who can push can
+append a key labelled `martin@laptop` alongside your real one. A confirmation
+that shows only names is therefore a confirmation of attacker-supplied text, and
+approving it hands over the whole archive without breaking any encryption.
+
+So the prompt leads with a **fingerprint**, which is derived from the key and
+cannot be chosen: for an SSH key it is exactly what `ssh-keygen -lf` prints on
+the machine itself, and an age recipient is already its own. Names are printed
+inert and quoted — a label cannot carry an escape sequence that erases the line
+above it — and two keys sharing one name are marked as such.
+
+Only **additions** are put to you. Re-sealing to a set you already approved
+widens nothing, so it does not ask; a prompt that fires when there is nothing to
+decide is one people learn to answer without reading. What you last approved is
+remembered locally, on purpose: a record kept in the repo could be edited by the
+attacker the prompt exists to catch.
+
+</details>
 
 <details>
 <summary>What if my SSH key has a passphrase?</summary>

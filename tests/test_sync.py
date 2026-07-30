@@ -7,16 +7,18 @@ are enough, and that is only meaningful if it is actually demonstrated.
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import tempfile
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 from woswoar import cache, crypto, search, store, sync
+from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
 from woswoar.errors import WoswoarError
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
@@ -90,6 +92,18 @@ class Fake:
 
     def commands(self) -> set[str]:
         return {e.cmd for e in cache.load_entries()}
+
+    def append_recipient(self, label: str) -> str:
+        """Add a key to recipients.txt behind woswoar's back, and return it.
+
+        Written straight to the file rather than through `sync.add_recipient`,
+        because that is what the other end of a shared repo looks like: a line
+        that arrived by `git pull`, with a label nothing here sanitised.
+        """
+        key = crypto.generate_identity().public
+        with store.recipients_file().open("a", encoding="utf-8") as handle:
+            handle.write(f"{key}{sync._LABEL_SEP}{label}\n")
+        return key
 
 
 @requires_age
@@ -466,18 +480,30 @@ class TestGrantConfirmation(SyncTestCase):
         # `age1ejf3l4f0nhnp9...` is not something anyone can consent to.
         alpha = self.machine("alpha", display="martinus@box")
         with alpha.active():
-            labels = dict((label, key) for key, label in sync.reader_labels())
+            labels = {reader.label for reader in sync.readers()}
         self.assertIn("martinus@box", labels)
 
-    def test_an_unlabelled_key_still_gets_a_readable_handle(self) -> None:
-        # recipients.txt written by an older woswoar, or hand-edited.
+    def test_an_unlabelled_key_gets_a_handle_that_is_not_the_key(self) -> None:
+        """recipients.txt written by an older woswoar, or hand-edited.
+
+        The fallback label used to be an abbreviation of the key, which let a
+        *chosen* label impersonate one -- and that is the whole weakness: a name
+        in this file is written by whoever added the key.
+        """
         alpha = self.machine("alpha")
         with alpha.active():
-            path = store.recipients_file()
-            path.write_text("age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwwwwww\n", encoding="utf-8")
-            ((key, label),) = sync.reader_labels()
-            self.assertTrue(label)
-            self.assertNotIn(sync._LABEL_SEP, key)
+            key = crypto.generate_identity().public
+            store.recipients_file().write_text(f"{key}\n", encoding="utf-8")
+            (reader,) = sync.readers()
+
+        self.assertTrue(reader.label)
+        self.assertNotIn(sync._LABEL_SEP, reader.key)
+        # Split on the abbreviation's own ellipsis, so a label built out of both
+        # ends of the key is caught rather than only one made of a single run.
+        self.assertFalse(
+            any(part and part in key for part in reader.label.split("...")),
+            f"the label {reader.label!r} is made out of the key it names",
+        )
 
     def test_a_key_listed_twice_is_offered_to_age_once(self) -> None:
         """`recipients.txt` is `merge=union`.
@@ -499,18 +525,178 @@ class TestGrantConfirmation(SyncTestCase):
         than none, so the approved list is checked against the fetched one."""
         alpha = self.machine("alpha")
         with alpha.active():
-            approved = sync.readers()
+            approved = [reader.key for reader in sync.readers()]
         self.machine("beta")  # enrols behind alpha's back
 
         with alpha.active(), self.assertRaises(sync.SyncError) as caught:
-            sync.grant(confirmed=approved)
+            sync.grant(approved=approved)
         self.assertIn("changed while you were deciding", str(caught.exception))
 
     def test_granting_with_the_approved_list_goes_ahead(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            report = sync.grant(confirmed=sync.readers())
+            report = sync.grant(approved=[reader.key for reader in sync.readers()])
             self.assertGreater(report.resealed, 0)
+
+    def test_a_label_cannot_drive_the_terminal(self) -> None:
+        """`\\x1b[1A\\x1b[2K` moves the cursor up a line and erases it.
+
+        A label is free text appended by whoever added the key, so on a shared
+        repo it is attacker input, and the one place it is printed is the prompt
+        where a human decides who may read everything.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.append_recipient(label="martin@laptop\x1b[2K\x1b[1A")
+            for reader in sync.readers():
+                self.assertNotIn("\x1b", reader.label)
+                self.assertNotIn("\n", reader.label)
+
+    def test_a_label_written_here_cannot_forge_a_second_entry(self) -> None:
+        """The label comes from this machine's config file, so it is not
+        guaranteed to be one line just because a name usually is."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            before = len(sync.recipients())
+            intruder = crypto.generate_identity().public
+            sync.add_recipient(
+                crypto.generate_identity().public,
+                label=f"laptop\n{intruder}{sync._LABEL_SEP}desktop",
+            )
+            self.assertEqual(len(sync.recipients()), before + 1)
+            self.assertNotIn(intruder, sync.recipients())
+
+    def test_a_key_that_is_not_one_line_is_refused_rather_than_written(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+            sync.add_recipient(f"{crypto.generate_identity().public}\nage1intruder", label="laptop")
+        self.assertIn("not one line", str(caught.exception))
+
+    def test_two_keys_with_one_name_are_told_apart(self) -> None:
+        """The defence is not that duplicate names are impossible -- two
+        machines really can share one -- it is that the identity shown is
+        derived from the key, and that the collision is said out loud.
+        """
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            alpha.append_recipient(label="martin@laptop")
+            readers = sync.readers()
+
+        self.assertEqual({reader.label for reader in readers}, {"martin@laptop"})
+        self.assertEqual(len({reader.fingerprint for reader in readers}), 2)
+        self.assertTrue(all(reader.shares_name for reader in readers))
+
+    def test_a_name_nobody_else_uses_is_not_flagged(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            alpha.append_recipient(label="martin@desktop")
+            self.assertFalse(any(reader.shares_name for reader in sync.readers()))
+
+    def test_the_machine_the_human_is_sitting_at_is_marked(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            mine = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+            alpha.append_recipient(label="martin@desktop")
+            marked = [reader.key for reader in sync.readers() if reader.is_mine]
+        self.assertEqual(marked, [mine])
+
+
+class TestGrantConfirmsAdditions(SyncTestCase):
+    """A confirmation listing everything makes the one new line easy to miss."""
+
+    def grant(self, fake: Fake, *args: str) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with fake.active(), redirect_stdout(buffer):
+            code = main(["grant", *args])
+        return code, buffer.getvalue()
+
+    def test_the_first_grant_reports_every_machine_as_new(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            self.assertTrue(all(reader.is_new for reader in sync.readers()))
+
+    def test_granting_remembers_who_was_approved(self) -> None:
+        alpha = self.machine("alpha")
+        code, _ = self.grant(alpha, "--yes")
+        self.assertEqual(code, 0)
+        with alpha.active():
+            self.assertFalse(any(reader.is_new for reader in sync.readers()))
+
+    def test_a_grant_nobody_approved_does_not_silence_the_next_prompt(self) -> None:
+        """Omitting `approved` means no human saw a list, so there was no
+        decision to remember."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.grant()
+            self.assertTrue(all(reader.is_new for reader in sync.readers()))
+
+    def test_a_key_appended_afterwards_is_the_only_one_reported_as_new(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        self.grant(alpha, "--yes")
+
+        # Exactly what push access alone buys: append a key labelled like one of
+        # the machines that is already there.
+        with alpha.active():
+            forged = alpha.append_recipient(label="martin@laptop")
+            new = [reader for reader in sync.readers() if reader.is_new]
+
+        self.assertEqual([reader.key for reader in new], [forged])
+
+    def test_a_new_key_is_put_to_the_human_even_with_a_familiar_name(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        self.grant(alpha, "--yes")
+        with alpha.active():
+            alpha.append_recipient(label="martin@laptop")
+
+        code, out = self.grant(alpha, "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("1 machine(s) NOT yet granted", out)
+        self.assertIn("SAME NAME AS ANOTHER KEY", out)
+
+    def test_no_label_can_put_an_escape_sequence_on_the_prompt(self) -> None:
+        """The second half of the defence, and independent of the first.
+
+        `make_inert` handles C0; printing with `repr` covers what is left --
+        anything Python calls unprintable, a bidi override among them -- and
+        quotes the label so leading whitespace is visible rather than shifting
+        the line it is on.
+        """
+        # U+202E flips the direction of everything after it, and is neither a
+        # control character nor anything `make_inert` touches.
+        hostile = "  martin@desktop\u202e"
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            alpha.append_recipient(label=hostile)
+
+        _, out = self.grant(alpha, "--yes")
+        self.assertIn("martin@desktop", out)
+        self.assertNotIn(hostile, out)
+        self.assertNotIn("\u202e", out)
+
+    def test_re_sealing_to_an_unchanged_set_does_not_ask(self) -> None:
+        """Nothing is widened, so there is nothing to consent to -- and a prompt
+        that fires when there is nothing to decide is one people stop reading.
+
+        Driven without `--yes` and without a terminal, which is exactly what the
+        old code refused.
+        """
+        alpha = self.machine("alpha")
+        self.grant(alpha, "--yes")
+
+        code, out = self.grant(alpha)
+        self.assertEqual(code, 0)
+        self.assertIn("No machine is new", out)
+
+    def test_a_new_machine_without_yes_and_without_a_terminal_is_refused(self) -> None:
+        alpha = self.machine("alpha")
+        self.grant(alpha, "--yes")
+        with alpha.active():
+            alpha.append_recipient(label="martin@desktop")
+
+        code, _ = self.grant(alpha)
+        self.assertEqual(code, 1)
+        with alpha.active():
+            self.assertTrue(any(reader.is_new for reader in sync.readers()))
 
 
 class TestChunkNaming(support.WoswoarTestCase):
