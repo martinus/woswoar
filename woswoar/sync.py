@@ -673,33 +673,41 @@ def compact(before: str) -> tuple[int, int]:
     property the rest of the design leans on. Only this host's own chunks are
     touched, so it still cannot conflict.
 
+    Holds the same lock `run` does, and must: this is the one operation that
+    unlinks chunks, and the timer fires every minute. It is also what makes
+    `store.new_chunk`'s uniqueness check sound, since that check assumes no
+    other process is creating chunks for this host concurrently.
+
     Returns (days compacted, chunks replaced).
     """
     crypto.require()
     known = store.machine()
-    by_day: dict[str, list[store.Chunk]] = {}
-    for chunk in store.iter_chunks(known.id):
-        if chunk.day < before:
-            by_day.setdefault(chunk.day, []).append(chunk)
 
-    days = 0
-    replaced = 0
-    for day, chunks in sorted(by_day.items()):
-        if len(chunks) < 2:
-            continue
-        secret = open_day_key(known, known.id, day)
-        plain = b"".join(
-            unpack(crypto.decrypt_with_secret(c.path.read_bytes(), secret)) for c in chunks
-        )
-        merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
-        store.write_atomic(merged, crypto.encrypt_to(pack(plain), crypto.public_of(secret)))
-        for chunk in chunks:
-            chunk.path.unlink()
-        days += 1
-        replaced += len(chunks)
+    with lock():
+        by_day: dict[str, list[store.Chunk]] = {}
+        for chunk in store.iter_chunks(known.id):
+            if chunk.day < before:
+                by_day.setdefault(chunk.day, []).append(chunk)
 
-    if days:
-        _commit()
+        days = 0
+        replaced = 0
+        for day, chunks in sorted(by_day.items()):
+            if len(chunks) < 2:
+                continue
+            secret = open_day_key(known, known.id, day)
+            plain = b"".join(
+                unpack(crypto.decrypt_with_secret(c.path.read_bytes(), secret)) for c in chunks
+            )
+            merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
+            store.write_atomic(merged, crypto.encrypt_to(pack(plain), crypto.public_of(secret)))
+            for chunk in chunks:
+                chunk.path.unlink()
+            days += 1
+            replaced += len(chunks)
+
+        if days:
+            _commit()
+
     return days, replaced
 
 

@@ -79,8 +79,12 @@ export WOSWOAR_SESSION
 #: Mirrors MAX_CMD_CHARS in woswoar/entry.py.
 __woswoar_max=8000
 
-__woswoar_armed=1
+#: Set by preexec, consumed by precmd. Empty also means "no command has been
+#: timed since the last prompt", which is what makes a separate armed flag
+#: unnecessary: preexec only stamps when it is empty, so the first simple
+#: command of a compound line wins and the rest are ignored.
 __woswoar_start=
+__woswoar_status=
 __woswoar_lastnum=
 
 # ---------------------------------------------------------------------------
@@ -107,21 +111,31 @@ __woswoar_escape() {
 # used for the command text (see the header), only as a timing signal.
 __woswoar_preexec() {
     [[ -n ${COMP_LINE:-} ]] && return 0 # tab completion, not a real command
-    ((__woswoar_armed)) || return 0
-    __woswoar_armed=0
-    local now=${EPOCHREALTIME//[.,]/} # locale may use a comma, not a period
+    [[ -z $__woswoar_start ]] || return 0 # DEBUG refires per simple command
+    local now=${EPOCHREALTIME//[.,]/}    # locale may use a comma, not a period
     __woswoar_start=${now%???}
 }
 
 __woswoar_precmd() {
-    local exit_code=$?
+    # Not `$?`. PROMPT_COMMAND entries run in order, and `$?` only holds the
+    # user's exit status for the *first* of them -- after that it is the status
+    # of the previous entry. Anything already in PROMPT_COMMAND (a title hook,
+    # a prompt framework) therefore made every recorded command look successful.
+    # __woswoar_stamp is prepended so it captures the real one before any of
+    # that runs. Consumed rather than cached: leaving it set would make a shell
+    # whose PROMPT_COMMAND was replaced wholesale record a *stale* code, which
+    # is worse than falling back to whatever $? holds here.
+    local exit_code=${__woswoar_status:-$?}
+    __woswoar_status=
 
-    if ((__woswoar_armed)); then
-        # No command ran since the last prompt (empty line, or Ctrl-C at an
-        # empty prompt). Nothing to record.
-        return 0
-    fi
-    __woswoar_armed=1
+    # Taken and cleared in one place, so every path out of this function is
+    # covered by construction. Recording deliberately does not depend on the
+    # DEBUG trap having fired: if some other tool claims that trap after we do,
+    # we lose the *duration* of a command, not the command. Gating the whole
+    # function on a flag the trap set meant a single `trap ... DEBUG` later in
+    # .bashrc silently turned recording off with nothing to show for it.
+    local start=$__woswoar_start
+    __woswoar_start=
 
     # Empty HISTTIMEFORMAT for this one call so the output format is "  N  cmd"
     # regardless of the user's setting. Written as '' rather than a bare = so
@@ -143,9 +157,17 @@ __woswoar_precmd() {
     # If the number did not advance, bash never stored this command --
     # HISTCONTROL=ignorespace/ignoredups or HISTIGNORE rejected it, or the user
     # just pressed Enter. Respecting bash's own decision here means we never
-    # need a second set of rules for the same thing.
+    # need a second set of rules for the same thing. This check is also what
+    # makes recording independent of the DEBUG trap: it, not a flag the trap
+    # sets, is what distinguishes "a command ran" from "nothing happened".
     [[ $num == "$__woswoar_lastnum" ]] && return 0
+
+    # Empty only at the very first prompt of a shell, where `history 1` is
+    # whatever the previous session left in the history file rather than
+    # anything typed here.
+    local previous=$__woswoar_lastnum
     __woswoar_lastnum=$num
+    [[ -n $previous ]] || return 0
 
     local cmd=${raw#"$num"}
     cmd=${cmd#"${cmd%%[![:space:]]*}"} # drop the separator spaces
@@ -156,11 +178,11 @@ __woswoar_precmd() {
         return 0
     fi
 
+    # -1 means "unknown", which is what a lost DEBUG trap leaves behind.
     local duration=-1
-    if [[ -n $__woswoar_start ]]; then
+    if [[ -n $start ]]; then
         local now=${EPOCHREALTIME//[.,]/}
-        duration=$((${now%???} - __woswoar_start))
-        __woswoar_start=
+        duration=$((${now%???} - start))
     fi
 
     if ((${#cmd} > __woswoar_max)); then
@@ -211,20 +233,101 @@ __woswoar_widget() {
 # Wiring
 # ---------------------------------------------------------------------------
 
-trap '__woswoar_preexec' DEBUG
+# Chain onto whatever already owns the DEBUG trap rather than replacing it.
+# Terminal-title hooks, bash-preexec, atuin and ble.sh all live there, and a
+# bare `trap ... DEBUG` silently breaks whichever of them loaded first -- the
+# same reasoning that already guards the EXIT trap above.
+#
+# The wiring is deferred to the first prompt, which is not fussiness: a sourced
+# file cannot see the DEBUG trap at all. `trap -p DEBUG` reports nothing from
+# inside one (bash gives sourced files their own trap scope), so from here we
+# could neither chain onto an existing handler nor even notice we were about to
+# replace one. A PROMPT_COMMAND *string* runs at top level, where it can. The
+# delay is a feature: by the first prompt the whole of .bashrc has run, so we
+# chain onto whoever actually ended up owning the trap rather than whoever
+# happened to load before us -- which makes the order of the lines in .bashrc
+# stop mattering.
+__woswoar_wire_debug() {
+    local spec=
+    [[ -s $__woswoar_scratch ]] && IFS= read -r -d '' spec <"$__woswoar_scratch"
 
-# Append rather than prepend: anything else in PROMPT_COMMAND runs before us, so
+    # `trap -p` prints a command that would restore the trap, with the handler
+    # requoted -- `trap -- 'handler' DEBUG`. Re-splitting that as an array
+    # unquotes it exactly, which hand-written unquoting does not: handlers
+    # containing quotes are the common case, not the exotic one. Deliberately
+    # *not* done by shadowing the `trap` builtin with a function and re-running
+    # the spec: a shell function is process-global, and ble.sh ships its own
+    # `trap` wrapper, so defining and unsetting one would silently disable
+    # ble.sh's trap manager for the rest of the session.
+    local -a parts=()
+    [[ -n $spec ]] && eval "parts=($spec)"
+    local prior=${parts[1]-}
+    [[ $prior == -- ]] && prior=${parts[2]-}
+
+    # Never chain onto ourselves: otherwise re-wiring would nest a handler
+    # inside itself.
+    if [[ -z $prior || $prior == *__woswoar* ]]; then
+        trap '__woswoar_preexec' DEBUG
+    else
+        # Composed once, here, rather than by a wrapper function that evals the
+        # prior handler on every command: same behaviour for ~10us less per
+        # command, and $BASH_COMMAND is identical either way. The prior owner
+        # goes first so it still sees the exit status of the command before this
+        # one, and the separator is a newline rather than `;` so a handler that
+        # ends in a comment still works.
+        trap "$prior"$'\n''__woswoar_preexec' DEBUG
+    fi
+}
+
+#: Removes itself from PROMPT_COMMAND once the trap is wired, so the steady
+#: state costs nothing. Leaving it in place measured ~12us on every command for
+#: the life of the shell -- 8% of the hook's budget to re-test a flag.
+__woswoar_unboot() {
+    local entry
+    if [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+        local -a kept=()
+        for entry in "${PROMPT_COMMAND[@]}"; do
+            [[ $entry == "$__woswoar_boot" ]] || kept+=("$entry")
+        done
+        PROMPT_COMMAND=("${kept[@]}")
+    else
+        # shellcheck disable=SC2178  # PROMPT_COMMAND is a string on this branch
+        PROMPT_COMMAND=${PROMPT_COMMAND/"$__woswoar_boot"$'\n'/}
+    fi
+}
+
+#: Runs at the first prompt and then deletes itself. A string, not a function,
+#: because only a string element is evaluated at top level, and `trap -p DEBUG`
+#: reports nothing from inside a function or a sourced file. Ordered before
+#: __woswoar_precmd so both can use the scratch file.
+# shellcheck disable=SC2016  # single quotes are the point: this expands later
+__woswoar_boot='{
+    builtin trap -p DEBUG >"$__woswoar_scratch" 2>/dev/null
+    __woswoar_wire_debug
+    __woswoar_unboot
+}'
+
+#: Prepended, so it runs before every other PROMPT_COMMAND entry -- including
+#: ones that were already there. It has to restore the status it just read:
+#: an assignment succeeds, so leaving it at 0 would hand every *other* entry the
+#: same wrong `$?` this hook exists to stop getting itself. `return` is a
+#: builtin, so this stays fork-free. Same approach as bash-preexec.
+__woswoar_ret() { return "$1"; }
+# shellcheck disable=SC2016  # single quotes are the point: this expands later
+__woswoar_stamp='__woswoar_status=$?; __woswoar_ret "$__woswoar_status"'
+
+# The rest is appended: anything else in PROMPT_COMMAND then runs before us, so
 # its own commands cannot be mistaken for something the user typed.
 __woswoar_attrs=
 if ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))); then
     __woswoar_attrs=${PROMPT_COMMAND@a}
 fi
 if [[ $__woswoar_attrs == *a* ]]; then
-    PROMPT_COMMAND+=(__woswoar_precmd)
+    PROMPT_COMMAND=("$__woswoar_stamp" "${PROMPT_COMMAND[@]}" "$__woswoar_boot" __woswoar_precmd)
 elif [[ -z ${PROMPT_COMMAND:-} ]]; then
-    PROMPT_COMMAND=__woswoar_precmd
+    PROMPT_COMMAND=$__woswoar_stamp$'\n'$__woswoar_boot$'\n'__woswoar_precmd
 else
-    PROMPT_COMMAND=${PROMPT_COMMAND%$'\n'}$'\n'__woswoar_precmd
+    PROMPT_COMMAND=$__woswoar_stamp$'\n'${PROMPT_COMMAND%$'\n'}$'\n'$__woswoar_boot$'\n'__woswoar_precmd
 fi
 unset -v __woswoar_attrs
 

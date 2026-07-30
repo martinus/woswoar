@@ -342,10 +342,21 @@ def new_chunk(machine_id: str, day: str, ts: int) -> Path:
     """A chunk path that has never existed before.
 
     Zero-padded seconds sort chronologically as strings, which is what lets the
-    merge watermark be a plain string comparison. The random suffix keeps two
-    syncs in the same second from colliding.
+    merge watermark be a plain string comparison.
+
+    Uniqueness is a guarantee, not a probability. A collision would silently
+    overwrite an already-sealed chunk, destroying committed history in a design
+    whose whole premise is that chunks are written once and never modified --
+    entropy alone left that to chance, which
+    tests/test_sync.py::TestChunkNaming now pins. Checking the filesystem is
+    sound because both writers of a host's chunks, `sync.run` and
+    `sync.compact`, hold the same lock.
     """
-    return chunk_dir(machine_id, day) / f"{ts:010d}-{secrets.token_hex(2)}{_CHUNK_SUFFIX}"
+    directory = chunk_dir(machine_id, day)
+    while True:
+        path = directory / f"{ts:010d}-{secrets.token_hex(3)}{_CHUNK_SUFFIX}"
+        if not path.exists():
+            return path
 
 
 class Chunk(NamedTuple):

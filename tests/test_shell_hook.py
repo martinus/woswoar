@@ -79,26 +79,49 @@ class ShellHookTestCase(WoswoarTestCase):
         env.update(extra or {})
         return env
 
-    def run_shell(self, script: str, env_extra: dict[str, str] | None = None) -> None:
-        """Run ``script`` line by line in an interactive bash with the hook loaded."""
-        subprocess.run(
+    def run_shell(
+        self,
+        script: str,
+        env_extra: dict[str, str] | None = None,
+        before: str = "",
+    ) -> str:
+        """Run ``script`` line by line in an interactive bash with the hook loaded.
+
+        ``before`` runs *ahead of* the hook, which is how a real ~/.bashrc looks:
+        the interesting bugs are all about what else already owns PROMPT_COMMAND
+        and the DEBUG trap by the time woswoar loads. Returns the shell's output
+        so a test can assert the other tool still ran.
+        """
+        result = subprocess.run(
             ["bash", "--norc", "-i"],
-            input=f"source {HOOK}\n{textwrap.dedent(script)}",
+            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{textwrap.dedent(script)}",
             text=True,
             env=self.shell_env(env_extra),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             check=False,
             timeout=60,
         )
+        return result.stdout
 
     def recorded(self) -> list[Entry]:
-        """Every entry the hook wrote, oldest first, minus the `source` line."""
-        entries = sorted(cache.load_entries(), key=lambda e: (e.ts, e.duration_ms))
-        return [e for e in entries if not e.cmd.startswith("source ")]
+        """Every entry the hook wrote, oldest first.
+
+        Deliberately unfiltered. This used to drop anything starting with
+        ``source``, because the ``source .../woswoar.bash`` line the harness
+        itself types got recorded. The hook now skips the prompt at which it
+        loads, so the subtraction is not only unnecessary but would hide that
+        guard regressing -- and would also swallow a real
+        ``source .venv/bin/activate``.
+        """
+        return sorted(cache.load_entries(), key=lambda e: (e.ts, e.duration_ms))
 
     def commands(self) -> list[str]:
         return [e.cmd for e in self.recorded()]
+
+    def by_cmd(self) -> dict[str, Entry]:
+        """Recorded entries indexed by command, for asserting on metadata."""
+        return {e.cmd: e for e in self.recorded()}
 
 
 @requires_bash5
@@ -127,7 +150,7 @@ class TestCapture(ShellHookTestCase):
 
     def test_metadata_is_captured(self) -> None:
         self.run_shell("cd /tmp\nfalse\n")
-        by_cmd = {e.cmd: e for e in self.recorded()}
+        by_cmd = self.by_cmd()
         self.assertEqual(by_cmd["false"].exit_code, 1)
         self.assertEqual(by_cmd["false"].cwd, "/tmp")
         self.assertEqual(by_cmd["false"].host, MACHINE_ID)
@@ -150,18 +173,18 @@ class TestCapture(ShellHookTestCase):
     def test_home_is_stored_as_tilde(self) -> None:
         # $HOME is self.root for these runs, so cd'ing there must record "~".
         self.run_shell("cd ~\ntrue marker\n")
-        by_cmd = {e.cmd: e for e in self.recorded()}
+        by_cmd = self.by_cmd()
         self.assertEqual(by_cmd["true marker"].cwd, "~")
 
     def test_path_under_home_is_stored_relative(self) -> None:
         (self.root / "src").mkdir(exist_ok=True)
         self.run_shell("cd ~/src\ntrue marker\n")
-        by_cmd = {e.cmd: e for e in self.recorded()}
+        by_cmd = self.by_cmd()
         self.assertEqual(by_cmd["true marker"].cwd, "~/src")
 
     def test_path_outside_home_stays_absolute(self) -> None:
         self.run_shell("cd /tmp\ntrue marker\n")
-        by_cmd = {e.cmd: e for e in self.recorded()}
+        by_cmd = self.by_cmd()
         self.assertEqual(by_cmd["true marker"].cwd, "/tmp")
 
     def test_sibling_of_home_is_not_mangled(self) -> None:
@@ -171,7 +194,7 @@ class TestCapture(ShellHookTestCase):
         sibling.mkdir(exist_ok=True)
         self.addCleanup(sibling.rmdir)
         self.run_shell(f"cd {sibling}\ntrue marker\n")
-        by_cmd = {e.cmd: e for e in self.recorded()}
+        by_cmd = self.by_cmd()
         self.assertEqual(by_cmd["true marker"].cwd, str(sibling))
 
     def test_duration_is_measured(self) -> None:
@@ -189,6 +212,99 @@ class TestCapture(ShellHookTestCase):
         entry = self.recorded()[0]
         self.assertGreaterEqual(entry.duration_ms, 250)
         self.assertLess(entry.duration_ms, 30_000)
+
+
+@requires_bash5
+class TestCoexistence(ShellHookTestCase):
+    """woswoar is never the only thing hooked into a real .bashrc.
+
+    A terminal-title hook, a prompt framework, bash-preexec, atuin and ble.sh
+    all want the DEBUG trap or PROMPT_COMMAND. Every case here is something that
+    was actually broken.
+    """
+
+    #: The shape of a common .bashrc: a title hook owning both. `_title_prompt`
+    #: prints `$?` because that is what a real prompt does with it, and it is
+    #: the only way to notice woswoar handing everyone downstream a 0.
+    PRIOR = """
+        _title_preexec() { printf 'PREEXEC[%s]\\n' "$BASH_COMMAND"; }
+        _title_prompt() { printf 'PROMPT[%s]\\n' "$?"; }
+        trap '_title_preexec' DEBUG
+        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_title_prompt"
+    """
+
+    def test_an_existing_debug_trap_still_fires(self) -> None:
+        # A bare `trap ... DEBUG` in the hook silently replaced it, so the other
+        # tool simply stopped working with nothing to show for it.
+        out = self.run_shell("echo hello\n", before=self.PRIOR)
+        self.assertIn("PREEXEC[echo hello]", out)
+        self.assertEqual(self.commands(), ["echo hello"])
+
+    def test_durations_survive_chaining(self) -> None:
+        self.run_shell("sleep 0.2\n", before=self.PRIOR)
+        by_cmd = self.by_cmd()
+        self.assertGreaterEqual(by_cmd["sleep 0.2"].duration_ms, 100)
+
+    def test_exit_codes_survive_a_prior_prompt_command(self) -> None:
+        """`$?` is only the user's status for the *first* PROMPT_COMMAND entry.
+
+        With anything already in PROMPT_COMMAND, reading `$?` inside our own
+        entry yielded the previous entry's status instead -- so every command
+        was recorded as having succeeded. The fix is a bare assignment
+        prepended ahead of everything else.
+        """
+        self.run_shell("false\ntrue\n", before=self.PRIOR)
+        by_cmd = self.by_cmd()
+        self.assertEqual(by_cmd["false"].exit_code, 1)
+        self.assertEqual(by_cmd["true"].exit_code, 0)
+
+    def test_recording_survives_losing_the_debug_trap(self) -> None:
+        """Something claiming DEBUG *after* us must cost timing, not history.
+
+        Recording used to be gated on a flag the trap set, so one later
+        `trap ... DEBUG` anywhere in .bashrc turned woswoar off silently.
+        """
+        self.run_shell("_o() { :; }\ntrap '_o' DEBUG\necho after-one\necho after-two\n")
+        commands = self.commands()
+        self.assertIn("echo after-one", commands)
+        self.assertIn("echo after-two", commands)
+        by_cmd = self.by_cmd()
+        # Duration is the one thing that legitimately degrades.
+        self.assertEqual(by_cmd["echo after-one"].duration_ms, -1)
+
+    def test_downstream_prompt_entries_still_see_the_real_status(self) -> None:
+        """Capturing `$?` must not consume it.
+
+        woswoar prepends its capture, which puts it in the one slot only one
+        participant can have. An assignment succeeds, so without restoring the
+        status afterwards every *other* PROMPT_COMMAND entry -- an exit-code
+        colouring prompt, `__git_ps1` -- would see 0 for every command. That is
+        the bug woswoar prepends the capture to avoid, handed outward.
+        """
+        out = self.run_shell("false\n", before=self.PRIOR)
+        self.assertIn("PROMPT[1]", out)
+        self.assertEqual(self.by_cmd()["false"].exit_code, 1)
+
+    def test_a_prior_handler_containing_quotes_is_not_mangled(self) -> None:
+        """The quotes must be in the *handler*, not merely in a function it calls.
+
+        `trap -p` requotes whatever it prints, so a handler that is just a
+        function name survives even a naive unquoter. This is the case that
+        actually distinguishes them.
+        """
+        before = """
+            trap 'printf "QUOTED[%s]\\n" "it'\\''s fine"' DEBUG
+        """
+        out = self.run_shell("echo hello\n", before=before)
+        self.assertIn("QUOTED[it's fine]", out)
+        self.assertEqual(self.commands(), ["echo hello"])
+
+    def test_the_prompt_at_which_the_hook_loads_records_nothing(self) -> None:
+        # `history 1` at that point is whatever the previous session left
+        # behind. The harness types `source .../woswoar.bash`, which used to be
+        # subtracted in recorded() rather than not recorded in the first place.
+        self.run_shell("echo only-this\n")
+        self.assertEqual(self.commands(), ["echo only-this"])
 
 
 @requires_bash5

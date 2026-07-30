@@ -75,6 +75,37 @@ below is optional.
 If something looks wrong, `woswoar doctor` checks the bash version, fzf, the
 hook and the cache, and tells you what to fix.
 
+<details>
+<summary>Does this disturb my normal bash, or my other prompt tools?</summary>
+
+**Up-arrow and `~/.bash_history` are untouched.** woswoar never modifies
+`HISTFILE`, `HISTSIZE`, `HISTCONTROL` or the history list — it only *reads*
+`history 1`. It is purely additive: a second, richer log next to the one bash
+already keeps. Your `HISTTIMEFORMAT` is not disturbed either; the hook's
+override is scoped to its own call.
+
+**It shares the DEBUG trap and `PROMPT_COMMAND` rather than taking them.** A
+terminal-title hook, a prompt framework, bash-preexec, atuin and ble.sh all want
+the same two places. woswoar chains onto whatever owns the DEBUG trap *at the
+first prompt* — not at the moment it is sourced — so it picks up whoever ended
+up owning it once your whole `.bashrc` has run. It also restores `$?` after
+reading it, so an exit-code-colouring prompt downstream still sees the real
+status.
+
+If something else claims the trap *after* that, you lose the recorded
+**duration** of those commands and nothing else; the commands themselves are
+still recorded. This is all pinned by tests that drive a real interactive bash.
+
+**A half-typed line becomes the search query.** Type `docker comp`, press
+<kbd>Ctrl</kbd>+<kbd>R</kbd>, and fzf opens already filtered to that. Escape
+leaves your line byte-for-byte as it was; picking something replaces the line
+and puts the cursor at the end, never executing it.
+
+`WOSWOAR_NO_BIND=1` skips the <kbd>Ctrl</kbd>+<kbd>R</kbd> binding entirely if
+you would rather keep another tool's.
+
+</details>
+
 ---
 
 ## Security
