@@ -155,6 +155,12 @@ inside a live shell:
 | the appending `printf` | 9 µs |
 | `printf -v day '%(%F)T'` | 4 µs |
 | cwd anchoring, timing, dispatch | ~10 µs |
+| each extra `PROMPT_COMMAND` entry | ~8 µs |
+
+That last row is why the wiring below keeps its `PROMPT_COMMAND` footprint to
+two entries: the status capture, which has to be there, and `__woswoar_precmd`.
+A third entry that only re-tested an "already wired" flag measured ~12 µs on
+every command for the life of the shell, so it deletes itself once it has run.
 
 Worth stating plainly because an earlier version of this document quoted the
 30 µs capture figure as the cost of recording, which understated it by 5x.
@@ -191,9 +197,18 @@ That delay turns out to be the better design anyway: by then the whole of
 `.bashrc` has run, so woswoar chains onto whoever actually ended up owning the
 trap, and the order of lines in `.bashrc` stops mattering.
 
-The handler is recovered by re-running what `trap -p` prints with `trap` shadowed
-by a function, rather than by unquoting its output by hand — handlers containing
-quotes are the common case, not the exotic one.
+The handler is recovered by re-splitting what `trap -p` prints as an array —
+`trap -- 'handler' DEBUG` is already shell-quoted, so `eval "parts=($spec)"`
+unquotes it exactly, which hand-written unquoting does not. Handlers containing
+quotes are the common case, not the exotic one. Shadowing the `trap` builtin
+with a function and re-running the spec also works and reads more directly, but
+a shell function is process-global and ble.sh ships its own `trap` wrapper:
+defining one and unsetting it afterwards would disable ble.sh's trap manager for
+the rest of the session.
+
+The two handlers are composed into a single trap string once, at wiring time,
+rather than by a wrapper that `eval`s the prior handler on every command —
+measured at ~10 µs per command, with `$BASH_COMMAND` identical either way.
 
 **Recording must not depend on that trap.** It used to be gated on a flag the
 DEBUG handler set, so anything claiming the trap *after* woswoar turned
@@ -204,10 +219,17 @@ and a lost trap costs the **duration** of a command rather than the command.
 **`$?` is only the user's exit status for the *first* `PROMPT_COMMAND` entry.**
 After that it is the status of the previous entry. woswoar appends itself, so
 any pre-existing entry — a title hook is enough — meant every command was
-recorded as having succeeded. The fix is a bare assignment *prepended* ahead of
-everything else, which is the only part that has to run first; a bare assignment
-cannot be mistaken for a command the user typed. Reading `$?` directly looked
-obviously correct and was wrong in every configuration but the empty one.
+recorded as having succeeded. The fix is prepended ahead of everything else,
+since that is the only slot from which the real status is visible. Reading `$?`
+directly looked obviously correct and was wrong in every configuration but the
+empty one.
+
+That slot can only have one occupant, so taking it comes with an obligation:
+an assignment *succeeds*, which would hand every entry downstream the same
+wrong `$?` — an exit-code-colouring prompt, `__git_ps1` — that this fix exists
+to stop woswoar getting. So the capture restores the status immediately, via a
+one-line `return "$1"` helper. bash-preexec solves it the same way, and
+`return` is a builtin, so it stays fork-free.
 
 > **`$EPOCHREALTIME` honours `LC_NUMERIC`.** Under a `de_AT` locale it reads
 > `1785321992,048777`, with a comma. Stripping only `.` silently yields garbage

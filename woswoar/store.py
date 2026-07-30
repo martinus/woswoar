@@ -344,16 +344,13 @@ def new_chunk(machine_id: str, day: str, ts: int) -> Path:
     Zero-padded seconds sort chronologically as strings, which is what lets the
     merge watermark be a plain string comparison.
 
-    The random suffix alone did not make the docstring true, which is what the
-    loop is for. Four hex characters is 65,536 values, so twenty chunks written
-    inside one second collided about 0.3% of the time -- rare enough to read as
-    a flaky test, common enough to happen. A collision silently *overwrites* an
-    already-sealed chunk, destroying committed history in a design whose whole
-    premise is that chunks are written once and never modified. Six characters
-    makes a first-try collision negligible; the check makes it impossible.
-
-    Checking the filesystem is sufficient because `flock` serialises syncs on a
-    machine and every machine writes only under its own host id.
+    Uniqueness is a guarantee, not a probability. A collision would silently
+    overwrite an already-sealed chunk, destroying committed history in a design
+    whose whole premise is that chunks are written once and never modified --
+    entropy alone left that to chance, which
+    tests/test_sync.py::TestChunkNaming now pins. Checking the filesystem is
+    sound because both writers of a host's chunks, `sync.run` and
+    `sync.compact`, hold the same lock.
     """
     directory = chunk_dir(machine_id, day)
     while True:

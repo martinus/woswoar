@@ -449,16 +449,14 @@ class TestChunkNaming(support.WoswoarTestCase):
         exactly once in CI, as one missing chunk.
         """
         made: set[Path] = set()
+        store.chunk_dir("host", "2023-11-14").mkdir(parents=True, exist_ok=True)
         for _ in range(2000):
             path = store.new_chunk("host", "2023-11-14", 1_700_000_000)
             self.assertNotIn(path, made)
             made.add(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"x")  # only an existing file can be collided with
 
 
-@requires_age
-@requires_git
 class TestLayout(SyncTestCase):
     def test_a_chunk_lives_one_directory_below_its_host(self) -> None:
         """`hosts/<id>/2023-11-14/<chunk>` -- the date is one path component.

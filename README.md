@@ -86,12 +86,13 @@ override is scoped to its own call.
 
 **It shares the DEBUG trap and `PROMPT_COMMAND` rather than taking them.** A
 terminal-title hook, a prompt framework, bash-preexec, atuin and ble.sh all want
-the same two places. woswoar chains onto whatever already owns the DEBUG trap,
-and it does that wiring at the first prompt rather than while loading — so the
-order of lines in your `.bashrc` does not matter, and it will chain onto
-whoever ended up owning it.
+the same two places. woswoar chains onto whatever owns the DEBUG trap *at the
+first prompt* — not at the moment it is sourced — so it picks up whoever ended
+up owning it once your whole `.bashrc` has run. It also restores `$?` after
+reading it, so an exit-code-colouring prompt downstream still sees the real
+status.
 
-If something else claims the trap *after* woswoar, you lose the recorded
+If something else claims the trap *after* that, you lose the recorded
 **duration** of those commands and nothing else; the commands themselves are
 still recorded. This is all pinned by tests that drive a real interactive bash.
 
