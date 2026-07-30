@@ -86,12 +86,17 @@ already keeps. Your `HISTTIMEFORMAT` is not disturbed either; the hook's
 override is scoped to its own call.
 
 **It shares the DEBUG trap and `PROMPT_COMMAND` rather than taking them.** A
-terminal-title hook, a prompt framework, bash-preexec, atuin and ble.sh all want
-the same two places. woswoar chains onto whatever owns the DEBUG trap *at the
-first prompt* — not at the moment it is sourced — so it picks up whoever ended
-up owning it once your whole `.bashrc` has run. It also restores `$?` after
-reading it, so an exit-code-colouring prompt downstream still sees the real
-status.
+terminal-title hook, a prompt framework, bash-preexec and atuin all want the same
+two places. woswoar chains onto whatever owns the DEBUG trap *at the first
+prompt* — not at the moment it is sourced — so it picks up whoever ended up
+owning it once your whole `.bashrc` has run. It also restores `$?` after reading
+it, so an exit-code-colouring prompt downstream still sees the real status.
+
+**[ble.sh](https://github.com/akinomyoga/ble.sh) is handled separately**, because
+it replaces bash's prompt machinery rather than hooking into it — neither
+`PROMPT_COMMAND` nor the DEBUG trap sees your commands there. woswoar registers
+with `blehook PREEXEC`/`PRECMD` when it finds ble.sh loaded. Nothing to
+configure; it works in either load order, and alongside atuin.
 
 If something else claims the trap *after* that, you lose the recorded
 **duration** of those commands and nothing else; the commands themselves are
