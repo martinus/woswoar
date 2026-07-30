@@ -93,18 +93,17 @@ class Fake:
     def commands(self) -> set[str]:
         return {e.cmd for e in cache.load_entries()}
 
+    def append_recipient(self, label: str) -> str:
+        """Add a key to recipients.txt behind woswoar's back, and return it.
 
-def append_recipient(label: str) -> str:
-    """Add a key to recipients.txt behind woswoar's back, and return it.
-
-    Written straight to the file rather than through `sync.add_recipient`,
-    because that is what the other end of a shared repo looks like: a line that
-    arrived by `git pull`, with a label nothing on this machine sanitised.
-    """
-    key = crypto.generate_identity().public
-    with store.recipients_file().open("a", encoding="utf-8") as handle:
-        handle.write(f"{key}{sync._LABEL_SEP}{label}\n")
-    return key
+        Written straight to the file rather than through `sync.add_recipient`,
+        because that is what the other end of a shared repo looks like: a line
+        that arrived by `git pull`, with a label nothing here sanitised.
+        """
+        key = crypto.generate_identity().public
+        with store.recipients_file().open("a", encoding="utf-8") as handle:
+            handle.write(f"{key}{sync._LABEL_SEP}{label}\n")
+        return key
 
 
 @requires_age
@@ -484,21 +483,12 @@ class TestGrantConfirmation(SyncTestCase):
             labels = {reader.label for reader in sync.readers()}
         self.assertIn("martinus@box", labels)
 
-    def test_an_unlabelled_key_still_gets_a_readable_handle(self) -> None:
-        # recipients.txt written by an older woswoar, or hand-edited.
-        alpha = self.machine("alpha")
-        with alpha.active():
-            path = store.recipients_file()
-            path.write_text(f"{crypto.generate_identity().public}\n", encoding="utf-8")
-            (reader,) = sync.readers()
-            self.assertTrue(reader.label)
-            self.assertNotIn(sync._LABEL_SEP, reader.key)
+    def test_an_unlabelled_key_gets_a_handle_that_is_not_the_key(self) -> None:
+        """recipients.txt written by an older woswoar, or hand-edited.
 
-    def test_an_unlabelled_key_is_never_named_after_itself(self) -> None:
-        """The fallback label used to be an abbreviation of the key.
-
-        That let a *chosen* label impersonate one, which is the whole weakness:
-        a name in this file is written by whoever added the key.
+        The fallback label used to be an abbreviation of the key, which let a
+        *chosen* label impersonate one -- and that is the whole weakness: a name
+        in this file is written by whoever added the key.
         """
         alpha = self.machine("alpha")
         with alpha.active():
@@ -506,6 +496,8 @@ class TestGrantConfirmation(SyncTestCase):
             store.recipients_file().write_text(f"{key}\n", encoding="utf-8")
             (reader,) = sync.readers()
 
+        self.assertTrue(reader.label)
+        self.assertNotIn(sync._LABEL_SEP, reader.key)
         # Split on the abbreviation's own ellipsis, so a label built out of both
         # ends of the key is caught rather than only one made of a single run.
         self.assertFalse(
@@ -537,13 +529,13 @@ class TestGrantConfirmation(SyncTestCase):
         self.machine("beta")  # enrols behind alpha's back
 
         with alpha.active(), self.assertRaises(sync.SyncError) as caught:
-            sync.grant(confirmed=approved)
+            sync.grant(approved=approved)
         self.assertIn("changed while you were deciding", str(caught.exception))
 
     def test_granting_with_the_approved_list_goes_ahead(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            report = sync.grant(confirmed=[reader.key for reader in sync.readers()])
+            report = sync.grant(approved=[reader.key for reader in sync.readers()])
             self.assertGreater(report.resealed, 0)
 
     def test_a_label_cannot_drive_the_terminal(self) -> None:
@@ -555,7 +547,7 @@ class TestGrantConfirmation(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            append_recipient(label="martin@laptop\x1b[2K\x1b[1A")
+            alpha.append_recipient(label="martin@laptop\x1b[2K\x1b[1A")
             for reader in sync.readers():
                 self.assertNotIn("\x1b", reader.label)
                 self.assertNotIn("\n", reader.label)
@@ -574,17 +566,39 @@ class TestGrantConfirmation(SyncTestCase):
             self.assertEqual(len(sync.recipients()), before + 1)
             self.assertNotIn(intruder, sync.recipients())
 
+    def test_a_key_that_is_not_one_line_is_refused_rather_than_written(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+            sync.add_recipient(f"{crypto.generate_identity().public}\nage1intruder", label="laptop")
+        self.assertIn("not one line", str(caught.exception))
+
     def test_two_keys_with_one_name_are_told_apart(self) -> None:
         """The defence is not that duplicate names are impossible -- two
         machines really can share one -- it is that the identity shown is
-        derived from the key."""
+        derived from the key, and that the collision is said out loud.
+        """
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
-            append_recipient(label="martin@laptop")
+            alpha.append_recipient(label="martin@laptop")
             readers = sync.readers()
 
         self.assertEqual({reader.label for reader in readers}, {"martin@laptop"})
         self.assertEqual(len({reader.fingerprint for reader in readers}), 2)
+        self.assertTrue(all(reader.shares_name for reader in readers))
+
+    def test_a_name_nobody_else_uses_is_not_flagged(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            alpha.append_recipient(label="martin@desktop")
+            self.assertFalse(any(reader.shares_name for reader in sync.readers()))
+
+    def test_the_machine_the_human_is_sitting_at_is_marked(self) -> None:
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            mine = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+            alpha.append_recipient(label="martin@desktop")
+            marked = [reader.key for reader in sync.readers() if reader.is_mine]
+        self.assertEqual(marked, [mine])
 
 
 class TestGrantConfirmsAdditions(SyncTestCase):
@@ -609,8 +623,8 @@ class TestGrantConfirmsAdditions(SyncTestCase):
             self.assertFalse(any(reader.is_new for reader in sync.readers()))
 
     def test_a_grant_nobody_approved_does_not_silence_the_next_prompt(self) -> None:
-        """`confirmed=None` means no human saw a list, so no decision was made
-        to remember."""
+        """Omitting `approved` means no human saw a list, so there was no
+        decision to remember."""
         alpha = self.machine("alpha")
         with alpha.active():
             sync.grant()
@@ -623,7 +637,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         # Exactly what push access alone buys: append a key labelled like one of
         # the machines that is already there.
         with alpha.active():
-            forged = append_recipient(label="martin@laptop")
+            forged = alpha.append_recipient(label="martin@laptop")
             new = [reader for reader in sync.readers() if reader.is_new]
 
         self.assertEqual([reader.key for reader in new], [forged])
@@ -632,7 +646,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         alpha = self.machine("alpha", display="martin@laptop")
         self.grant(alpha, "--yes")
         with alpha.active():
-            append_recipient(label="martin@laptop")
+            alpha.append_recipient(label="martin@laptop")
 
         code, out = self.grant(alpha, "--yes")
         self.assertEqual(code, 0)
@@ -652,7 +666,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         hostile = "  martin@desktop\u202e"
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
-            append_recipient(label=hostile)
+            alpha.append_recipient(label=hostile)
 
         _, out = self.grant(alpha, "--yes")
         self.assertIn("martin@desktop", out)
@@ -677,7 +691,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         alpha = self.machine("alpha")
         self.grant(alpha, "--yes")
         with alpha.active():
-            append_recipient(label="martin@desktop")
+            alpha.append_recipient(label="martin@desktop")
 
         code, _ = self.grant(alpha)
         self.assertEqual(code, 1)

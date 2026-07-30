@@ -24,6 +24,7 @@ import fcntl
 import subprocess
 import time
 import zlib
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -129,20 +130,22 @@ def _labelled_recipients() -> list[tuple[str, str]]:
     this is only a name.
 
     Made inert on the way in. Every byte of it was written by whoever added the
-    key, and on a shared repo that is not necessarily one of your machines.
+    key, and on a shared repo that is not necessarily one of your machines. That
+    covers C0 only, which is what a *record* needs; making it safe to put on a
+    terminal is `Reader.display_name`.
     """
-    out: list[tuple[str, str]] = []
+    out: dict[str, str] = {}
     for line in _recipient_lines():
         key, _, label = line.partition(_LABEL_SEP)
         key = key.strip()
-        if not key or any(key == existing for existing, _ in out):
+        if not key or key in out:
             continue
         label = label.strip()
         if not label:
             fields = key.split(None, 2)
             label = fields[2] if len(fields) > 2 else "(unnamed)"
-        out.append((key, make_inert(label)))
-    return out
+        out[key] = make_inert(label)
+    return list(out.items())
 
 
 def recipients() -> list[str]:
@@ -152,15 +155,6 @@ def recipients() -> list[str]:
     in $HOME, because a sandboxed age cannot open one.
     """
     return [key for key, _ in _labelled_recipients()]
-
-
-def list_recipients() -> list[tuple[str, str]]:
-    """``(kind, key)`` for every enrolled machine.
-
-    Parsed here rather than in the CLI because this module is the only writer of
-    recipients.txt, so the record shape is its to know.
-    """
-    return [(kind, rest) for kind, _, rest in (line.partition(" ") for line in recipients())]
 
 
 def is_repo() -> bool:
@@ -779,7 +773,13 @@ class ReencryptReport(NamedTuple):
 
 
 class Reader(NamedTuple):
-    """One enrolled machine, as a human has to see it before granting."""
+    """One enrolled machine, as a human has to see it before granting.
+
+    Everything a confirmation needs to say about a machine is decided here
+    rather than at the print, including the two facts that depend on the rest of
+    the list. They were computed in the CLI first, which put security-relevant
+    conclusions somewhere only a test that greps stdout could reach them.
+    """
 
     key: str
     #: Free text written by whoever added the key. A name, not an identity.
@@ -791,6 +791,26 @@ class Reader(NamedTuple):
     #: read everything already, so re-listing it only makes the one extra line
     #: that matters easier to miss.
     is_new: bool
+    #: The machine the human is sitting at.
+    is_mine: bool
+    #: Another key in the list carries the same name. Legitimate -- two machines
+    #: really can both be `martin@laptop` -- and also exactly what a key added by
+    #: someone else looks like, which is why it is said out loud.
+    shares_name: bool
+
+    def display_name(self) -> str:
+        """The label, in a form that cannot rearrange the line it is printed on.
+
+        `make_inert` has already removed C0, so this is about the rest: `repr`
+        escapes everything Python calls unprintable -- a bidi override among
+        them -- and quotes the result, so leading and trailing whitespace is
+        visible rather than shifting the columns around it.
+
+        A method rather than a rule the caller has to remember: printing
+        `label` directly is the bug this whole change exists to fix, and it
+        should not be reachable by forgetting a `!r`.
+        """
+        return repr(self.label)
 
 
 def readers() -> list[Reader]:
@@ -809,13 +829,31 @@ def readers() -> list[Reader]:
         if has_remote():
             _fetch_and_rebase()
         granted = set(State.load().granted)
+        labelled = _labelled_recipients()
+
+        # Not fatal if this machine's own key cannot be worked out: the list is
+        # still true, it just loses the "(this machine)" note. `grant` is the
+        # command someone runs *because* something is wrong with enrolment.
+        try:
+            mine = crypto.recipient_for(identity_path(store.machine())).strip()
+        except (WoswoarError, OSError):
+            mine = ""
+
+        names = Counter(label for _, label in labelled)
         return [
-            Reader(key, label, crypto.fingerprint(key), key not in granted)
-            for key, label in _labelled_recipients()
+            Reader(
+                key=key,
+                label=label,
+                fingerprint=crypto.fingerprint(key),
+                is_new=key not in granted,
+                is_mine=key == mine,
+                shares_name=names[label] > 1,
+            )
+            for key, label in labelled
         ]
 
 
-def grant(confirmed: list[str] | None = None) -> ReencryptReport:
+def grant(approved: list[str] | None = None) -> ReencryptReport:
     """Re-seal every key file to the current recipient list, and publish it.
 
     Named for what it does to the user's history rather than to the files:
@@ -823,9 +861,13 @@ def grant(confirmed: list[str] | None = None) -> ReencryptReport:
     including days recorded before it existed. `reencrypt` described the
     mechanism and hid that.
 
-    ``confirmed`` is the list a human agreed to. If the fetch below turns up a
-    different one -- someone enrolled a machine in the meantime -- this refuses
-    rather than granting access to a machine nobody approved.
+    ``approved`` is the list a human at this machine agreed to, and passing it
+    asserts exactly that. It does two jobs, both following from that one
+    meaning: if the fetch below turns up a different list -- someone enrolled a
+    machine in the meantime -- this refuses rather than granting access to a
+    machine nobody approved; and the list is remembered, so the next
+    confirmation can show what has appeared since. Omit it and neither happens,
+    which is what an unattended caller wants.
 
     This is what makes a newly onboarded machine able to read *old* history.
     Chunks are encrypted to per-day keys, so only those small key files -- and
@@ -870,7 +912,7 @@ def grant(confirmed: list[str] | None = None) -> ReencryptReport:
         # recipients and report full success. Reading it once here also saves
         # re-parsing the file for every one of a few thousand key files.
         keys = recipients()
-        if confirmed is not None and sorted(keys) != sorted(confirmed):
+        if approved is not None and sorted(keys) != sorted(approved):
             raise SyncError(
                 "the set of machines changed while you were deciding; "
                 "run 'woswoar grant' again to see the current list"
@@ -897,12 +939,12 @@ def grant(confirmed: list[str] | None = None) -> ReencryptReport:
             store.write_atomic(path, crypto.encrypt_to_recipients(plain, keys))
             resealed += 1
 
-        if confirmed is not None:
-            # What is recorded is a *human's* decision, which is why this hangs
-            # off `confirmed` rather than off how many files were re-sealed: it
-            # is what the next confirmation subtracts to find the machines
-            # nobody here has agreed to yet. A grant with no approved list
-            # behind it -- an unattended one -- must not silence that.
+        if approved is not None:
+            # Recorded rather than counted: what the next confirmation subtracts
+            # is the set a human agreed to, not the set that happened to be
+            # re-sealable from here. A machine that could open nothing still
+            # approved these, and a grant with no approved list behind it -- an
+            # unattended one -- must not silence the next prompt.
             state = State.load()
             state.granted = keys
             state.save()
@@ -983,11 +1025,16 @@ def add_recipient(recipient: str, label: str = "") -> bool:
     without it the prompt lists opaque age keys and cannot be consented to in
     any real sense.
 
-    One line per key, guaranteed rather than assumed: the label comes from this
-    machine's config, and a newline in it would append a second entry that
-    nobody added.
+    One line per key, guaranteed rather than assumed: both halves come from this
+    machine's own files, and a newline in either would append a second entry
+    that nobody added. The label is made inert, which is enough because it is
+    free text; a key with a newline in it is malformed rather than merely ugly,
+    so it is refused instead of rewritten into something age would reject later
+    and less clearly.
     """
     key = recipient.strip()
+    if "\n" in key:
+        raise SyncError(f"the public key for this machine is not one line: {key!r}")
     if key in recipients():
         return False
     path = store.recipients_file()

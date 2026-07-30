@@ -219,26 +219,46 @@ def fingerprint(recipient: str) -> str:
     rather than against the repo making the claim. An age recipient is already
     short, canonical, and derived from its own secret -- ``age-keygen -y``
     reproduces it -- so it is its own fingerprint and is returned unchanged.
+
+    Anything else -- a hand-edited line, a key type this does not parse -- is
+    hashed whole. It matches no external tool, but it is still derived from the
+    line rather than chosen, which is the property the caller is promised: two
+    malformed entries must not come out looking like the same machine.
     """
-    # Imported here rather than at module scope: this runs once per machine on
-    # the `grant` path, while the module is loaded by every sync, and base64
-    # pulls in `re`.
+    # `hashlib` is imported here rather than at module scope because it costs a
+    # measured 1.3 ms (mostly `_hashlib`) and nothing else pulls it in -- `hmac`
+    # does not, since `tag` passes the digest name as a string. This module is
+    # loaded by every sync, and this function runs once per machine on `grant`.
+    # `base64` is already loaded by then; it is deferred only to sit with it.
     import base64
     import hashlib
+
+    def digest(data: bytes) -> str:
+        # ssh-keygen prints the digest unpadded.
+        return "SHA256:" + base64.b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
 
     fields = recipient.split()
     if not fields:
         return ""
-    if len(fields) >= 2:
-        try:
-            blob = base64.b64decode(fields[1], validate=True)
-        except ValueError:  # binascii.Error is a subclass
-            blob = b""
-        if blob:
-            digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii")
-            # ssh-keygen prints the digest unpadded.
-            return "SHA256:" + digest.rstrip("=")
-    return fields[0]
+    if len(fields) == 1:
+        return fields[0]
+    try:
+        return digest(base64.b64decode(fields[1], validate=True))
+    except ValueError:  # binascii.Error is a subclass
+        return digest(recipient.encode())
+
+
+#: How to reproduce a fingerprint, keyed by whether it is one we computed.
+#: Beside `fingerprint` on purpose: the format and the command that reproduces
+#: it are one decision, and splitting them is how a prompt ends up telling
+#: someone to run ssh-keygen against an age identity.
+_CHECK_SSH = "ssh-keygen -lf ~/.ssh/id_ed25519.pub"
+_CHECK_AGE = "age-keygen -y ~/.config/woswoar/identity"
+
+
+def how_to_check(fingerprint: str) -> str:
+    """The command that reproduces ``fingerprint`` on the machine it names."""
+    return _CHECK_SSH if fingerprint.startswith("SHA256:") else _CHECK_AGE
 
 
 # ---------------------------------------------------------------------------

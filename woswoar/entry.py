@@ -112,9 +112,12 @@ def unescape(value: str) -> str:
     return "".join(out)
 
 
-#: Control characters that carry meaning worth preserving are rendered back
-#: into visible escapes; everything else is dropped.
-_INERT = {"\n": "\\n", "\r": "\\r"}
+#: The two control characters worth keeping as something readable rather than
+#: dropping. Taken from `_ESCAPES` rather than restated: `search` recovers a
+#: command as ``make_inert(unescape(line))``, so if `escape` ever rendered a
+#: newline differently, a second literal here would send the picker's round trip
+#: silently out of step.
+_INERT = {char: _ESCAPES[char] for char in ("\n", "\r")}
 
 #: C0 plus DEL, minus tab. Everything left either ends a command, forges a line
 #: in a record file, or moves a terminal cursor around. Tab is excluded
@@ -124,20 +127,24 @@ _CONTROL = frozenset(chr(code) for code in [*range(0x20), 0x7F]) - {"\t"}
 
 
 def make_inert(text: str) -> str:
-    """``text`` with no raw control characters, so it cannot act on its own.
+    """``text`` with no raw C0 control character left in it.
 
-    Two callers, one property. Leaving the fzf picker, this is what keeps a
-    recalled command one command: `escape` maps newlines for *display*, and
-    without this `unescape` would undo that exactly as the text lands in the
-    shell's edit buffer, where bash runs a multi-line buffer as several commands
-    on a single Enter. fzf clips a long line, so the picker can genuinely show
-    one command while handing over two.
+    Leaving the fzf picker, this is what keeps a recalled command one command:
+    `escape` maps newlines for *display*, and without this `unescape` would undo
+    that exactly as the text lands in the shell's edit buffer, where bash runs a
+    multi-line buffer as several commands on a single Enter. fzf clips a long
+    line, so the picker can genuinely show one command while handing over two.
 
-    Around a recipient label, it keeps free text that anyone with push access
-    can write from forging a line in ``recipients.txt`` or from driving the
-    terminal during the `grant` confirmation -- ``\\x1b[1A\\x1b[2K`` erases the
-    line above it, which is one way to hide a machine from the list approving
-    it.
+    Around a recipient label it does the same job for a different reader: it
+    stops free text that anyone with push access can write from forging a line
+    in ``recipients.txt``, or from driving the terminal during the `grant`
+    confirmation -- ``\\x1b[1A\\x1b[2K`` erases the line above it, which is one
+    way to hide a machine from the list approving it.
+
+    C0 and no further, deliberately: widening it would mangle the UTF-8 in a
+    recalled command, which is the caller with the stronger claim. What that
+    leaves -- a bidi override, say -- is not dangerous in an edit buffer, and is
+    handled where it is dangerous, by `sync.Reader.display_name`.
 
     Never applied to what is stored in a log: the history keeps the command as
     it was typed. A recalled multi-line command therefore comes back with a
