@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from operator import attrgetter
 from typing import Literal
 
 from . import cache, store
@@ -77,7 +78,9 @@ def rank(entries: list[Entry], dedup: bool = True) -> list[Entry]:
     default because a real history is mostly repetition -- it is the difference
     between scrolling past twenty ``git status`` lines and seeing one.
     """
-    ordered = sorted(entries, key=lambda e: e.ts, reverse=True)
+    # attrgetter rather than a lambda: it is the same key, resolved in C, and
+    # this sorts the whole history on every Ctrl-R.
+    ordered = sorted(entries, key=attrgetter("ts"), reverse=True)
     if not dedup:
         return ordered
 

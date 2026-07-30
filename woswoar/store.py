@@ -325,10 +325,17 @@ def day_key_public(machine_id: str, day: str) -> Path:
 
 
 def chunk_dir(machine_id: str, day: str) -> Path:
-    """``hosts/<id>/2026/07/29`` -- sharded so no directory holds tens of
-    thousands of entries after a couple of years."""
-    year, month, mday = day.split("-")
-    return repo_host_dir(machine_id) / year / month / mday
+    """``hosts/<id>/2026-07-29`` -- one directory per day.
+
+    Sharding by day keeps any directory to a day's worth of chunks, but the
+    date is *one* path component rather than three. Every commit rewrites the
+    tree object for each level it touches, so nesting ``2026/07/29`` costs two
+    extra tree objects on every single sync forever, for a directory that holds
+    exactly as many entries either way. Magnitudes are in
+    docs/woswoar_design_summary.md, which is re-measured as a whole; repeating
+    them here is how they go stale.
+    """
+    return repo_host_dir(machine_id) / day
 
 
 def new_chunk(machine_id: str, day: str, ts: int) -> Path:
@@ -353,12 +360,15 @@ def iter_chunks(machine_id: str) -> Iterator[Chunk]:
     root = repo_host_dir(machine_id)
     if not root.is_dir():
         return
-    for year in sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()):
-        for month in sorted(p for p in year.iterdir() if p.is_dir()):
-            for mday in sorted(p for p in month.iterdir() if p.is_dir()):
-                day = f"{year.name}-{month.name}-{mday.name}"
-                for path in sorted(mday.glob(f"*{_CHUNK_SUFFIX}")):
-                    yield Chunk(day=day, name=path.name, path=path)
+    for day_dir in sorted(p for p in root.iterdir() if p.is_dir() and _is_day(p.name)):
+        for path in sorted(day_dir.glob(f"*{_CHUNK_SUFFIX}")):
+            yield Chunk(day=day_dir.name, name=path.name, path=path)
+
+
+def _is_day(name: str) -> bool:
+    """``2026-07-29``. Distinguishes day directories from ``keys``."""
+    parts = name.split("-")
+    return len(parts) == 3 and all(p.isdigit() for p in parts)
 
 
 def iter_day_keys(machine_id: str) -> Iterator[Path]:
@@ -383,10 +393,10 @@ def is_chunk_path(relpath: str) -> bool:
     """
     parts = relpath.split("/")
     return (
-        len(parts) == 6
+        len(parts) == 4
         and parts[0] == _HOSTS
-        and all(p.isdigit() for p in parts[2:5])
-        and parts[5].endswith(_CHUNK_SUFFIX)
+        and _is_day(parts[2])
+        and parts[3].endswith(_CHUNK_SUFFIX)
     )
 
 

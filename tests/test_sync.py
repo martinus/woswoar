@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -356,7 +357,7 @@ class TestImmutability(SyncTestCase):
         )
         rewritten = {line for line in touched.splitlines() if line.endswith(".age")}
 
-        # Chunks live under hosts/<id>/YYYY/MM/DD/. Key files and name seals sit
+        # Chunks live under hosts/<id>/YYYY-MM-DD/. Key files and name seals sit
         # elsewhere in the tree and *are* rewritten, by design: that is exactly
         # what makes onboarding cheap. Separating the two here keeps the
         # exception explicit rather than quietly widening the invariant.
@@ -402,6 +403,82 @@ class TestImmutability(SyncTestCase):
             chunk_bytes * 4 + 64 * 1024,
             f"stored={stored} chunk_bytes={chunk_bytes} over {syncs} syncs",
         )
+
+
+class TestChunkPayload(unittest.TestCase):
+    """The chunk encoding, without needing age or git."""
+
+    def test_round_trip(self) -> None:
+        for data in (b"", b"x", b"a line\n", b"repeated line\n" * 500, bytes(range(256))):
+            self.assertEqual(sync.unpack(sync.pack(data)), data)
+
+    def test_repetitive_input_shrinks(self) -> None:
+        # Shell history is repetitive by nature, and this is the one moment it
+        # can be compressed: once sealed, ciphertext is incompressible forever.
+        data = b"1700000000\ts1\t~/src\t0\t5\tgit status\n" * 200
+        self.assertLess(len(sync.pack(data)), len(data) // 10)
+
+    def test_a_tiny_chunk_costs_only_a_few_bytes(self) -> None:
+        """Deflate has a floor, and one very short line can land above it.
+
+        This is what `pack` used to avoid by tagging each payload raw-or-
+        deflated and keeping the smaller. It was not worth it: the tag cost a
+        byte on every chunk that *did* compress, which is all but the shortest,
+        and the worst case it bought back is the handful of bytes below --
+        against a sealed chunk that already carries a 200-byte age header.
+        """
+        data = b"1700000000\ts1\t~\t0\t5\tls\n"
+        self.assertLess(len(sync.pack(data)) - len(data), 8)
+
+    def test_a_payload_we_cannot_read_is_refused(self) -> None:
+        # Loudly, rather than decoding into garbage that then gets appended to
+        # a log file and cached. `_merge_host` turns this into an unreadable
+        # chunk rather than letting it abort the sync.
+        for blob in (b"\x7fanything", b"", b"1700000000\ts1\t~\t0\t5\tls\n"):
+            with self.assertRaises(zlib.error):
+                sync.unpack(blob)
+
+
+class TestLayout(SyncTestCase):
+    def test_a_chunk_lives_one_directory_below_its_host(self) -> None:
+        """`hosts/<id>/2023-11-14/<chunk>` -- the date is one path component.
+
+        Every commit rewrites a tree object per level it touches, so nesting
+        the date as `2023/11/14` costs two extra objects on every sync forever.
+        Pinned because it is invisible in behaviour and easy to reintroduce.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            chunk = next(iter(store.iter_chunks(alpha.id)))
+            relpath = chunk.path.relative_to(store.history_dir()).as_posix()
+
+        self.assertEqual(relpath.split("/")[:3], ["hosts", alpha.id, "2023-11-14"])
+        self.assertTrue(store.is_chunk_path(relpath), relpath)
+
+    def test_sealed_history_is_smaller_than_the_plaintext_it_carries(self) -> None:
+        """A day's worth of one machine's commands, compacted into one chunk.
+
+        Without compression the sealed form is strictly *larger* than the
+        plaintext -- age adds a header and encrypts. This asserts the whole
+        point of packing the payload first, on input shaped like real history.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            # Two syncs, not sixty: `compact` only needs more than one chunk to
+            # merge, and each extra sync is a fetch, a rebase, a push and an
+            # `age` spawn for no additional coverage.
+            for i in range(60):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"git commit -m 'feature {i % 7}'")
+                if i == 29:
+                    sync.run()
+            sync.run()
+            plaintext = store.log_file(alpha.id, "2023-11-14").stat().st_size
+            sync.compact(before="2023-11-15")
+            sealed = sum(c.path.stat().st_size for c in store.iter_chunks(alpha.id))
+
+        self.assertLess(sealed, plaintext // 2, f"sealed={sealed} plaintext={plaintext}")
 
 
 class TestCompact(SyncTestCase):

@@ -23,6 +23,7 @@ from __future__ import annotations
 import fcntl
 import subprocess
 import time
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -233,6 +234,36 @@ def open_day_key(known: Machine, host_id: str, day: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def pack(data: bytes) -> bytes:
+    """Compress a chunk's lines before they are sealed.
+
+    This is the only moment compression is possible. age does not compress, and
+    ciphertext is incompressible by definition, so once the bytes are sealed
+    neither git's packfile nor anything else can ever shrink them again -- and
+    the repo is append-only, so there is no second chance. Shell history is
+    extremely repetitive, and the measured effect on repo size is in
+    docs/woswoar_design_summary.md.
+
+    Deliberately unconditional. An earlier version tagged each payload raw-or-
+    deflated and stored whichever was smaller, on the theory that a very short
+    chunk would inflate. On real line shapes it does not: a single-line chunk
+    is 42 bytes raw and 35 deflated, so the tag saved a byte exactly once and
+    cost one on every chunk after that.
+    """
+    return zlib.compress(data, 9)
+
+
+def unpack(blob: bytes) -> bytes:
+    """Inverse of :func:`pack`.
+
+    Not defensive on purpose: zlib rejects anything that is not a deflate
+    stream, so a payload written by some future format fails here rather than
+    being appended to a log as garbage. Callers treat that like any other
+    unreadable chunk.
+    """
+    return zlib.decompress(blob)
+
+
 def export(known: Machine, state: State, report: Report, now: int) -> None:
     """Seal each log file's new lines into a fresh chunk."""
     for log in store.iter_log_files():
@@ -243,7 +274,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             continue
 
         day = store.day_of_log(log.relpath)
-        sealed = crypto.encrypt_to(data, day_public_key(known, day))
+        sealed = crypto.encrypt_to(pack(data), day_public_key(known, day))
         chunk = store.new_chunk(known.id, day, now)
         chunk.parent.mkdir(parents=True, exist_ok=True)
         store.write_atomic(chunk, sealed)
@@ -298,7 +329,18 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             report.unreadable.add(key)
             continue
 
-        plaintext = crypto.decrypt_with_secret(chunk.path.read_bytes(), secret)
+        try:
+            sealed = crypto.decrypt_with_secret(chunk.path.read_bytes(), secret)
+            plaintext = unpack(sealed)
+        except (crypto.AgeError, zlib.error, OSError):
+            # Same judgement as an unopenable day key above: a chunk we cannot
+            # consume -- damaged, or written by a woswoar that packs it some
+            # other way -- must not abort the sync. Aborting would block this
+            # machine's own export and every other host's readable chunks, on
+            # this run and every run after it.
+            report.unreadable.add(key)
+            continue
+
         pending.setdefault(chunk.day, []).append(plaintext)
         state.merged[key] = chunk.name
         report.chunks_merged += 1
@@ -357,13 +399,14 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # sync can never open -- silently, and permanently, because the repo is
         # append-only.
         if remote:
-            _fetch_and_rebase(report)
+            _fetch_and_rebase()
 
         export(known, state, report, int(time.time()) if now is None else now)
         _commit()
 
         if remote:
-            _push(report)
+            _push()
+            report.pushed = True
 
         merge(known, state, report)
         state.save()
@@ -380,7 +423,7 @@ def _branch() -> str:
     return git("branch", "--show-current")
 
 
-def _fetch_and_rebase(report: Report) -> None:
+def _fetch_and_rebase() -> None:
     """Adopt the remote's history under ours.
 
     Fetch-then-rebase rather than ``git pull --rebase`` because the tracking ref
@@ -404,15 +447,14 @@ def _fetch_and_rebase(report: Report) -> None:
         raise
 
 
-def _push(report: Report) -> None:
+def _push() -> None:
     """Publish, retrying once if someone else pushed while we worked."""
     branch = _branch()
     try:
         git("push", "--quiet", "-u", "origin", branch)
     except SyncError:
-        _fetch_and_rebase(report)
+        _fetch_and_rebase()
         git("push", "--quiet", "-u", "origin", branch)
-    report.pushed = True
 
 
 #: Commit metadata is one of the few things in the repo that is *not* encrypted,
@@ -431,8 +473,13 @@ def _ensure_repo_config() -> None:
 
 
 def _commit() -> None:
-    git("add", "-A")
-    if not git("status", "--porcelain"):
+    # `--verbose` prints one "add '<path>'"/"remove '<path>'" line per staged
+    # path and nothing at all when the index already matches, so the same
+    # command that stages also answers "is there anything to commit". The
+    # obvious `status --porcelain` afterwards costs a second full stat of a
+    # working tree that is tens of thousands of chunks after a couple of years,
+    # on a timer that now fires every minute.
+    if not git("add", "-A", "--verbose"):
         return
     git("commit", "-q", "-m", COMMIT_MESSAGE)
 
@@ -502,13 +549,12 @@ def initialise(
         git("remote", "add", "origin", remote)
 
     _ensure_repo_config()
-    report = Report()
 
     # Adopt the remote's state before enrolling, so we append to the real
     # recipients.txt rather than creating a competing one.
     publishing = has_remote()
     if publishing:
-        _fetch_and_rebase(report)
+        _fetch_and_rebase()
 
     if _write_repo_metadata(known, chosen):
         _commit()
@@ -517,7 +563,7 @@ def initialise(
     # `reencrypt` run elsewhere cannot include it, so onboarding would appear to
     # succeed and then silently fail to grant access to any older history.
     if publishing:
-        _push(report)
+        _push()
 
     return known, chosen
 
@@ -585,7 +631,6 @@ def reencrypt() -> ReencryptReport:
     identity = identity_path(known)
     recipients = store.recipients_file()
     _ensure_repo_config()
-    git_report = Report()
     remote = has_remote()
     resealed = skipped = 0
 
@@ -593,7 +638,7 @@ def reencrypt() -> ReencryptReport:
     # timer-driven sync must not be reading them halfway through.
     with lock():
         if remote:
-            _fetch_and_rebase(git_report)
+            _fetch_and_rebase()
 
         for host_id in store.repo_hosts():
             candidates = list(store.iter_day_keys(host_id))
@@ -614,9 +659,9 @@ def reencrypt() -> ReencryptReport:
 
         _commit()
         if remote:
-            _push(git_report)
+            _push()
 
-    return ReencryptReport(resealed, skipped, git_report.pushed)
+    return ReencryptReport(resealed, skipped, pushed=remote)
 
 
 def compact(before: str) -> tuple[int, int]:
@@ -643,9 +688,11 @@ def compact(before: str) -> tuple[int, int]:
         if len(chunks) < 2:
             continue
         secret = open_day_key(known, known.id, day)
-        plain = b"".join(crypto.decrypt_with_secret(c.path.read_bytes(), secret) for c in chunks)
+        plain = b"".join(
+            unpack(crypto.decrypt_with_secret(c.path.read_bytes(), secret)) for c in chunks
+        )
         merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
-        store.write_atomic(merged, crypto.encrypt_to(plain, crypto.public_of(secret)))
+        store.write_atomic(merged, crypto.encrypt_to(pack(plain), crypto.public_of(secret)))
         for chunk in chunks:
             chunk.path.unlink()
         days += 1

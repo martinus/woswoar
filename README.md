@@ -46,7 +46,7 @@ that leaves your machine is encrypted with [age](https://github.com/FiloSottile/
 | 🔐 **Encrypted end to end** | commands, paths, hostnames — nothing readable reaches the remote |
 | 🧩 **No server, no database** | a git repo and plain text files you can `grep` |
 | 📦 **Zero Python dependencies** | standard library only — nothing to audit but this repo |
-| ⚡ **28 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
+| ⚡ **~150 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
 | 🔎 **fzf as the UI** | the fuzzy finder you already know, not a bespoke TUI |
 | 🚚 **Imports what you have** | bash, zsh and atuin histories, idempotently |
 | 🧱 **~2900 lines of implementation** | small enough to read in an afternoon |
@@ -208,22 +208,25 @@ days it cannot read yet. Nothing is lost in the meantime.
 <details>
 <summary>How the repository stays small (and conflict-free)</summary>
 
-Each sync encrypts **only the lines added since last time** into a brand-new
-file that is never modified again:
+Each sync compresses **only the lines added since last time**, seals them, and
+writes a brand-new file that is never modified again:
 
 ```
-hosts/<id>/2026/07/29/<synctime>-<rand>.age    a plain age file
+hosts/<id>/2026-07-29/<synctime>-<rand>.age    a compressed, age-encrypted block
 hosts/<id>/keys/2026-07-29.age                 that day's key, sealed to all recipients
 ```
 
 Re-encrypting a whole day file on every sync would write a fresh random blob
-each time, and random data delta-compresses to nothing — measured at **~100 MB
-per year** versus **~8 MB** for write-once chunks. And because every machine only
-ever *adds* files under its own prefix, `git pull --rebase` has nothing to
-conflict over. Not "rarely" — structurally.
+each time, and random data delta-compresses to nothing. Compressing *before*
+sealing is the only chance there is — encrypted bytes are incompressible by
+definition, so once a chunk is written, nothing can ever shrink it again.
 
-`woswoar compact` can later merge a finished day's chunks to reduce the file
-count. It is opt-in, and the only operation that ever deletes anything.
+Because every machine only ever *adds* files under its own prefix,
+`git pull --rebase` has nothing to conflict over. Not "rarely" — structurally.
+
+`woswoar compact` can later merge a finished day's chunks into one. It reduces
+the *file count*, not the repository: git keeps the replaced chunks forever,
+reachable from the commits that added them.
 
 </details>
 
@@ -235,8 +238,31 @@ cp contrib/systemd/woswoar-sync.* ~/.config/systemd/user/
 systemctl --user enable --now woswoar-sync.timer
 ```
 
-Five-minute interval by default. Sync never runs on your prompt — a `git push`
-must not be able to block a shell.
+**One-minute interval by default**, because it turns out to be nearly free. Real
+typing is bursty, so a minute rather than five roughly doubles the number of
+syncs that actually carry something — not five times it. Sync never runs on your
+prompt: a `git push` must not be able to block a shell.
+
+<details>
+<summary>What that costs, measured</summary>
+
+Two years of one machine's real history — 25,997 commands, 3.61 MB of plaintext
+— replayed through `woswoar sync` itself at a 1-minute cadence:
+
+| | repo, packed | per year |
+|---|---|---|
+| before compression + flat paths | 16.22 MB | 7.9 MB |
+| **now** | **12.24 MB** | **5.9 MB** |
+
+About half of what remains is git's own bookkeeping rather than your commands:
+per sync, 359 B of blob (200 B of that the `age` header), 196 B of tree, 129 B
+of commit. That fixed part is why the interval matters at all — raise
+`OnUnitActiveSec` in the timer if you would rather have the bytes back.
+
+The per-year number tracks how much you type, not the timer; a busier stretch of
+the same history extrapolates to about 16 MB/year.
+
+</details>
 
 ---
 
@@ -287,7 +313,7 @@ were assigned independently.
 | `woswoar init [url]` | create or join an encrypted history repo |
 | `woswoar sync` | exchange history with the remote |
 | `woswoar reencrypt` | re-seal keys after enrolling a new machine |
-| `woswoar compact` | merge old chunks to reduce file count |
+| `woswoar compact` | merge old chunks to reduce the working-tree file count |
 
 ### Scopes
 
@@ -310,17 +336,38 @@ Switch without leaving the picker:
 
 ### Performance
 
-Measured on **51,688 entries** across 730 daily files:
+Measured on a real **54,943-entry** history across ~750 daily files:
 
 | | |
 |---|---|
-| record a command | **28 µs**, 0 forks |
-| warm cache load | **28 ms** |
-| `list --scope global` | **62 ms** |
-| search right after a new command | **42 ms** |
+| record a command | **~150 µs**, 0 forks |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
 
 No index, no SQLite — a pickle cache that only re-reads what changed is enough,
 and CI re-measures it on every push.
+
+<details>
+<summary>Where those 105 ms go</summary>
+
+| | cumulative |
+|---|---|
+| Python interpreter start | 8.8 ms |
+| importing woswoar | 29 ms |
+| building the argparse parser | 36 ms |
+| loading the cache (unpickling 55k entries) | 67 ms |
+| filter, sort, dedup, render | 87 ms |
+| writing 1.5 MB to fzf | 105 ms |
+
+Roughly half is fixed Python startup and half is proportional to history size.
+Micro-optimising it was measured and did not help: the costs are structural, and
+cutting them further would mean either a resident daemon (which the whole
+no-server design exists to avoid) or an index the measurements do not justify.
+
+The recording hook is a different story — 150 µs is imperceptible, and about
+30 µs of it is the fork-free `history 1` capture that makes multi-line commands
+survive intact.
+
+</details>
 
 ---
 
