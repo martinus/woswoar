@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from woswoar import cache, search, store, sync
+from woswoar import cache, crypto, search, store, sync
 from woswoar.entry import Entry, format_line
 
 from . import support
@@ -175,7 +175,7 @@ class TestTwoMachines(SyncTestCase):
         # One command on an already-enrolled machine is the whole fix, exactly
         # as documented -- no surrounding sync to fetch beta's key or publish.
         with alpha.active():
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             report = sync.run()
             self.assertEqual(report.chunks_merged, 1)
@@ -196,7 +196,7 @@ class TestTwoMachines(SyncTestCase):
 
         beta = self.machine("beta")  # init publishes beta's public key
         with alpha.active():
-            report = sync.reencrypt()
+            report = sync.grant()
             self.assertTrue(report.pushed)
             self.assertEqual(report.skipped, 0)
             self.assertGreater(report.resealed, 0)
@@ -220,7 +220,7 @@ class TestTwoMachines(SyncTestCase):
         beta = self.machine("beta")
         with beta.active():
             sync.run()
-            report = sync.reencrypt()
+            report = sync.grant()
             # It re-seals what it owns -- its own name seal -- and skips
             # alpha's day key, so it still cannot read alpha's history.
             self.assertGreater(report.skipped, 0)
@@ -247,7 +247,7 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "from alpha")
             sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
@@ -264,7 +264,7 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             sync.run()
             first = len(cache.load_entries())
@@ -277,7 +277,7 @@ class TestTwoMachines(SyncTestCase):
         beta = self.machine("beta")
         with alpha.active():
             sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             sync.run()
 
@@ -299,7 +299,7 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             sync.run()
             # Without this, search would label alpha's entries with its opaque id.
@@ -311,7 +311,7 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "from alpha")
             sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
@@ -331,7 +331,7 @@ class TestImmutability(SyncTestCase):
             for i in range(4):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"alpha {i}")
                 sync.run()
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             for i in range(3):
                 beta.record("2023-11-15", 1_700_100_000 + i, f"beta {i}")
@@ -436,6 +436,60 @@ class TestChunkPayload(unittest.TestCase):
                 sync.unpack(blob)
 
 
+class TestGrantConfirmation(SyncTestCase):
+    """`grant` widens who can read everything, so it says so and asks first."""
+
+    def test_readers_are_labelled_for_a_human(self) -> None:
+        # `age1ejf3l4f0nhnp9...` is not something anyone can consent to.
+        alpha = self.machine("alpha", display="martinus@box")
+        with alpha.active():
+            labels = dict((label, key) for key, label in sync.reader_labels())
+        self.assertIn("martinus@box", labels)
+
+    def test_an_unlabelled_key_still_gets_a_readable_handle(self) -> None:
+        # recipients.txt written by an older woswoar, or hand-edited.
+        alpha = self.machine("alpha")
+        with alpha.active():
+            path = store.recipients_file()
+            path.write_text("age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwwwwww\n", encoding="utf-8")
+            ((key, label),) = sync.reader_labels()
+            self.assertTrue(label)
+            self.assertNotIn(sync._LABEL_SEP, key)
+
+    def test_a_key_listed_twice_is_offered_to_age_once(self) -> None:
+        """`recipients.txt` is `merge=union`.
+
+        Two machines appending the same key, one labelled and one not, leaves
+        both lines -- and age rejects a repeated recipient.
+        """
+        alpha = self.machine("alpha", display="box")
+        with alpha.active():
+            key = sync.recipients()[0]
+            path = store.recipients_file()
+            path.write_text(f"{key}\n{key}{sync._LABEL_SEP}box\n", encoding="utf-8")
+            self.assertEqual(sync.recipients(), [key])
+            # And it is still usable, which is the point of deduplicating.
+            crypto.encrypt_to_recipients(b"x", sync.recipients())
+
+    def test_granting_refuses_if_the_machines_changed_while_deciding(self) -> None:
+        """A confirmation that can under-report what it authorises is worse
+        than none, so the approved list is checked against the fetched one."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            approved = sync.readers()
+        self.machine("beta")  # enrols behind alpha's back
+
+        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+            sync.grant(confirmed=approved)
+        self.assertIn("changed while you were deciding", str(caught.exception))
+
+    def test_granting_with_the_approved_list_goes_ahead(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            report = sync.grant(confirmed=sync.readers())
+            self.assertGreater(report.resealed, 0)
+
+
 class TestChunkNaming(support.WoswoarTestCase):
     def test_many_chunks_in_one_second_all_get_distinct_paths(self) -> None:
         """Overwriting a sealed chunk would destroy committed history.
@@ -518,7 +572,7 @@ class TestCompact(SyncTestCase):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
                 sync.run()
             sync.compact(before="2023-11-15")
-            sync.reencrypt()
+            sync.grant()
         with beta.active():
             sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})

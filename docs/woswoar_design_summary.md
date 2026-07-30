@@ -617,7 +617,7 @@ Measured with age 1.3.1, three `ssh-ed25519` recipients:
 
 A sealed day key is 621 B, so re-sealing two years of them is ~450 KB — which is
 what makes onboarding cheap. Adding a machine re-seals ~730 tiny key files
-rather than ~35,000 chunks, so `reencrypt` takes seconds instead of rewriting
+rather than ~35,000 chunks, so `grant` takes seconds instead of rewriting
 the archive.
 
 **Compress before sealing.** A chunk's plaintext is `<tag><body>`, where the tag
@@ -729,14 +729,25 @@ remote configures a tracking branch that points at nothing — the normal state
 for the first machine to enrol — and pulling from that fails.
 
 `init` publishes immediately for the same class of reason: until a new machine's
-public key is on the remote, `reencrypt` run elsewhere cannot include it, and
+public key is on the remote, `grant` run elsewhere cannot include it, and
 onboarding would appear to succeed while silently granting no access to older
 history.
 
-### `reencrypt`
+### `grant`
 
 Re-sealing every day key to the current recipient list is what lets a newly
-enrolled machine read *old* history. It is deliberately a separate command — it
+enrolled machine read *old* history. It was called `reencrypt`, which named the
+mechanism and hid the consequence: what the command actually does is widen who
+can read the whole archive. It now says so, lists the machines by name, and asks
+before proceeding -- and because woswoar parses `recipients.txt` itself rather
+than handing age the path, it can carry a human label next to each key, without
+which the prompt would list opaque `age1...` strings nobody could consent to.
+`--yes` skips the prompt; a non-interactive run without it refuses rather than
+hanging or assuming.
+
+The list is shown *after* fetching, and the fetched list is passed back into the
+operation, which refuses if it changed in the meantime. A confirmation that can
+under-report what it is about to authorise is worse than none. It is deliberately a separate command — it
 is one of only two operations that rewrite an existing file — but it is a
 *complete* one: it fetches, re-seals, commits and pushes under the same lock
 `sync` takes.

@@ -197,7 +197,7 @@ Being straight about the limits is part of the security story:
 >   pattern catches everything.
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run
->   `woswoar reencrypt` from another machine.
+>   `woswoar grant` from another machine.
 
 ---
 
@@ -225,12 +225,24 @@ Open a new shell. That machine is now recording and syncing.
 On a machine you set up **earlier**, run:
 
 ```bash
-woswoar reencrypt
+woswoar grant
 ```
 
-That is what lets the newcomer read history from before it existed. There is no
-rush: until you run it, the new machine syncs its own commands normally and just
-reports how many older days it cannot read yet.
+That is what lets the newcomer read history from before it existed. It lists the
+machines by name and asks first, because it widens who can read *everything*:
+
+```
+This will let each of these machines read your ENTIRE history,
+including days recorded before it ever existed:
+
+  martinus@box   (this machine)
+  martin@work-laptop
+
+Grant all 2 machines full access? [y/N]
+```
+
+There is no rush: until you run it, the new machine syncs its own commands
+normally and just reports how many older days it cannot read yet.
 
 > [!TIP]
 > `.bashrc` is written with `$HOME`, not your username, so the same one works on
@@ -240,7 +252,7 @@ reports how many older days it cannot read yet.
 <summary>Why that extra step exists — and why the new machine can't do it itself</summary>
 
 History sealed *before* the new machine joined was encrypted to a recipient list
-that did not include it. `reencrypt` re-seals the small per-day keys — not the
+that did not include it. `grant` re-seals the small per-day keys — not the
 history itself — so it takes seconds even with years of commands. It fetches and
 publishes on its own, so it is one command, not a sync sandwich.
 
@@ -362,7 +374,7 @@ were assigned independently.
 | `woswoar doctor` | check bash version, fzf, hook, cache |
 | `woswoar init [url]` | create or join an encrypted history repo |
 | `woswoar sync` | exchange history with the remote |
-| `woswoar reencrypt` | re-seal keys after enrolling a new machine |
+| `woswoar grant` | let newly enrolled machines read the older history |
 | `woswoar compact` | merge old chunks to reduce the working-tree file count |
 
 ### Scopes

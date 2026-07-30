@@ -251,7 +251,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"  {kind} {key[:24]}...")
     if args.remote:
         print("\nNext: 'woswoar sync'.")
-        print("On an already-enrolled machine, run 'woswoar reencrypt' so this")
+        print("On a machine that already has access, run 'woswoar grant' so this")
         print("one can read history sealed before it joined.")
     return 0
 
@@ -276,29 +276,66 @@ def cmd_sync(args: argparse.Namespace) -> int:
             f"\n{days} day(s) of history are sealed to recipients that do not include\n"
             "this machine - it joined after they were written. On a machine that was\n"
             "already enrolled run:\n"
-            "    woswoar reencrypt\n"
+            "    woswoar grant\n"
             "then sync here again. Nothing is lost in the meantime.",
             file=sys.stderr,
         )
     return 0
 
 
-def cmd_reencrypt(args: argparse.Namespace) -> int:
-    from . import sync
+def cmd_grant(args: argparse.Namespace) -> int:
+    """Let every enrolled machine read the whole history."""
+    from . import crypto, sync
 
-    report = sync.reencrypt()
-    print(f"re-sealed {report.resealed} key file(s) to the current recipients")
+    keys = sync.readers()
+    if not keys:
+        print("no machines enrolled yet; run 'woswoar init <url>' first", file=sys.stderr)
+        return 1
+
+    try:
+        mine = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+    except (WoswoarError, OSError):
+        mine = ""
+
+    print("This will let each of these machines read your ENTIRE history,")
+    print("including days recorded before it ever existed:\n")
+    for key, label in sync.reader_labels():
+        print(f"  {label}{'   (this machine)' if key == mine else ''}")
+    print(
+        "\nIt re-seals the small per-day keys -- not the history itself -- and"
+        "\npublishes them. Nothing is decrypted, and nothing else is re-uploaded."
+    )
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print(
+                "\nRefusing to grant access without confirmation. "
+                "Re-run with --yes if you mean it.",
+                file=sys.stderr,
+            )
+            return 1
+        if input(f"\nGrant all {len(keys)} machines full access? [y/N] ").strip().lower() not in (
+            "y",
+            "yes",
+        ):
+            print("Nothing changed.")
+            return 1
+
+    report = sync.grant(confirmed=keys)
+    print(f"\nre-sealed {report.resealed} key file(s)")
     if report.pushed:
-        print("pushed to remote")
+        print("published to the remote")
+        print("\nOn each machine that was waiting, run:  woswoar sync")
     else:
-        print("no remote configured; nothing published")
+        print("no remote configured, so nothing was published")
+
     if report.skipped:
         # Almost always means this machine is the new one. Saying so beats
         # letting "re-sealed 0 key files" read as success.
         print(
             f"\n{report.skipped} key file(s) could not be opened by this machine, so\n"
             "they were left alone. Re-sealing a key means opening it first, which\n"
-            "only a machine that was already a recipient can do. Run this on one of\n"
+            "only a machine that already had access can do. Run this on one of\n"
             "those instead.",
             file=sys.stderr,
         )
@@ -381,10 +418,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--no-push", action="store_true", help="stay local; do not contact remote")
     p_sync.set_defaults(func=cmd_sync)
 
-    p_reencrypt = subparsers.add_parser(
-        "reencrypt", help="re-seal keys after enrolling a new machine"
+    p_grant = subparsers.add_parser(
+        "grant",
+        # `reencrypt` named the mechanism, which hid what it does to the user's
+        # history. Kept working so older notes and error messages do not rot.
+        aliases=["reencrypt"],
+        help="let newly enrolled machines read the older history",
     )
-    p_reencrypt.set_defaults(func=cmd_reencrypt)
+    p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_grant.set_defaults(func=cmd_grant)
 
     p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
