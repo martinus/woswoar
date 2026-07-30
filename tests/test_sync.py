@@ -439,6 +439,26 @@ class TestChunkPayload(unittest.TestCase):
                 sync.unpack(blob)
 
 
+class TestChunkNaming(support.WoswoarTestCase):
+    def test_many_chunks_in_one_second_all_get_distinct_paths(self) -> None:
+        """Overwriting a sealed chunk would destroy committed history.
+
+        The name is `<epoch seconds>-<random>`, so everything written inside one
+        second is competing for the same random suffix. With four hex characters
+        and no check, twenty chunks collided in ~0.3% of runs -- which showed up
+        exactly once in CI, as one missing chunk.
+        """
+        made: set[Path] = set()
+        for _ in range(2000):
+            path = store.new_chunk("host", "2023-11-14", 1_700_000_000)
+            self.assertNotIn(path, made)
+            made.add(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")  # only an existing file can be collided with
+
+
+@requires_age
+@requires_git
 class TestLayout(SyncTestCase):
     def test_a_chunk_lives_one_directory_below_its_host(self) -> None:
         """`hosts/<id>/2023-11-14/<chunk>` -- the date is one path component.

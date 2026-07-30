@@ -342,10 +342,24 @@ def new_chunk(machine_id: str, day: str, ts: int) -> Path:
     """A chunk path that has never existed before.
 
     Zero-padded seconds sort chronologically as strings, which is what lets the
-    merge watermark be a plain string comparison. The random suffix keeps two
-    syncs in the same second from colliding.
+    merge watermark be a plain string comparison.
+
+    The random suffix alone did not make the docstring true, which is what the
+    loop is for. Four hex characters is 65,536 values, so twenty chunks written
+    inside one second collided about 0.3% of the time -- rare enough to read as
+    a flaky test, common enough to happen. A collision silently *overwrites* an
+    already-sealed chunk, destroying committed history in a design whose whole
+    premise is that chunks are written once and never modified. Six characters
+    makes a first-try collision negligible; the check makes it impossible.
+
+    Checking the filesystem is sufficient because `flock` serialises syncs on a
+    machine and every machine writes only under its own host id.
     """
-    return chunk_dir(machine_id, day) / f"{ts:010d}-{secrets.token_hex(2)}{_CHUNK_SUFFIX}"
+    directory = chunk_dir(machine_id, day)
+    while True:
+        path = directory / f"{ts:010d}-{secrets.token_hex(3)}{_CHUNK_SUFFIX}"
+        if not path.exists():
+            return path
 
 
 class Chunk(NamedTuple):
