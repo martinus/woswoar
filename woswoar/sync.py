@@ -56,7 +56,7 @@ class Report:
     hosts_seen: set[str] = field(default_factory=set)
     #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
     #: error: it is what a freshly joined machine sees until someone runs
-    #: `reencrypt` on a machine that was already a recipient.
+    #: `grant` on a machine that was already a recipient.
     unreadable: set[str] = field(default_factory=set)
 
 
@@ -90,16 +90,53 @@ def remote_summary() -> str:
     return remotes[0] if remotes else "none (history is local only)"
 
 
+#: Separates a recipient from the human label woswoar appends after it. age
+#: never sees the label, because woswoar parses this file itself rather than
+#: handing age the path -- which is what makes labelling possible at all.
+_LABEL_SEP = " # "
+
+
+def _recipient_lines() -> list[str]:
+    path = store.recipients_file()
+    if not path.is_file():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def recipients() -> list[str]:
     """Every enrolled machine's public key, in the form age wants on `-r`.
 
     Read here rather than handed to age as a path: `crypto` never names a file
     in $HOME, because a sandboxed age cannot open one.
+
+    Deduplicated by key. `.gitattributes` marks this file ``merge=union``, so a
+    machine that appends a labelled line where another has the same key unlabelled
+    leaves both, and age rejects a repeated recipient.
     """
-    path = store.recipients_file()
-    if not path.is_file():
-        return []
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    seen: dict[str, None] = {}
+    for line in _recipient_lines():
+        seen.setdefault(line.split(_LABEL_SEP, 1)[0].strip(), None)
+    return list(seen)
+
+
+def reader_labels() -> list[tuple[str, str]]:
+    """``(key, label)`` for every enrolled machine, for showing to a human.
+
+    Nobody can meaningfully consent to granting `age1ejf3l4f0nhnp9...` access to
+    their history. The label is woswoar's own trailing comment when present, the
+    SSH key's comment field otherwise, and an abbreviated key as a last resort.
+    """
+    out: list[tuple[str, str]] = []
+    for line in _recipient_lines():
+        key, _, label = line.partition(_LABEL_SEP)
+        key = key.strip()
+        if any(key == existing for existing, _ in out):
+            continue
+        if not label:
+            fields = key.split(None, 2)
+            label = fields[2] if len(fields) > 2 else f"{key[:12]}...{key[-6:]}"
+        out.append((key, label.strip()))
+    return out
 
 
 def list_recipients() -> list[tuple[str, str]]:
@@ -326,7 +363,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 day_keys[chunk.day] = open_day_key(known, host_id, chunk.day)
             except (crypto.AgeError, SyncError):
                 # Sealed before this machine was enrolled, and no one has run
-                # `reencrypt` yet. Skip it without advancing the watermark so a
+                # `grant` yet. Skip it without advancing the watermark so a
                 # later sync picks it up -- and above all without aborting, or
                 # one unreadable day would block this machine's own export too.
                 day_keys[chunk.day] = None
@@ -570,7 +607,7 @@ def initialise(
         _commit()
 
     # Publish immediately. Until this machine's public key is on the remote,
-    # `reencrypt` run elsewhere cannot include it, so onboarding would appear to
+    # `grant` run elsewhere cannot include it, so onboarding would appear to
     # succeed and then silently fail to grant access to any older history.
     if publishing:
         _push()
@@ -588,7 +625,7 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
         store.write_atomic(attrs, store.GITATTRIBUTES_CONTENT.encode("utf-8"))
         changed = True
 
-    if add_recipient(crypto.recipient_for(identity)):
+    if add_recipient(crypto.recipient_for(identity), label=known.name):
         changed = True
 
     seal = store.name_seal(known.id)
@@ -609,8 +646,31 @@ class ReencryptReport(NamedTuple):
     pushed: bool
 
 
-def reencrypt() -> ReencryptReport:
+def readers() -> list[str]:
+    """Who would be able to read the whole history if `grant` ran now.
+
+    Fetches first, because the point of granting is to include a machine that
+    enrolled since this one last looked -- reporting the pre-fetch list would
+    show fewer machines than the operation is about to authorise, which is the
+    one direction a security confirmation must never be wrong in.
+    """
+    with lock():
+        if has_remote():
+            _fetch_and_rebase()
+        return recipients()
+
+
+def grant(confirmed: list[str] | None = None) -> ReencryptReport:
     """Re-seal every key file to the current recipient list, and publish it.
+
+    Named for what it does to the user's history rather than to the files:
+    afterwards, every machine in `recipients.txt` can read *everything*,
+    including days recorded before it existed. `reencrypt` described the
+    mechanism and hid that.
+
+    ``confirmed`` is the list a human agreed to. If the fetch below turns up a
+    different one -- someone enrolled a machine in the meantime -- this refuses
+    rather than granting access to a machine nobody approved.
 
     This is what makes a newly onboarded machine able to read *old* history.
     Chunks are encrypted to per-day keys, so only those small key files -- and
@@ -655,6 +715,11 @@ def reencrypt() -> ReencryptReport:
         # recipients and report full success. Reading it once here also saves
         # re-parsing the file for every one of a few thousand key files.
         keys = recipients()
+        if confirmed is not None and sorted(keys) != sorted(confirmed):
+            raise SyncError(
+                "the set of machines changed while you were deciding; "
+                "run 'woswoar grant' again to see the current list"
+            )
 
         for host_id in store.repo_hosts():
             candidates = list(store.iter_day_keys(host_id))
@@ -727,13 +792,20 @@ def compact(before: str) -> tuple[int, int]:
     return days, replaced
 
 
-def add_recipient(recipient: str) -> bool:
-    """Append a public key to recipients.txt if it is not already listed."""
+def add_recipient(recipient: str, label: str = "") -> bool:
+    """Append a public key to recipients.txt if its key is not already listed.
+
+    The label is what `grant` shows a human before widening who can read the
+    history; without it the prompt lists opaque age keys and cannot be consented
+    to in any real sense.
+    """
+    key = recipient.strip()
+    if key in recipients():
+        return False
     path = store.recipients_file()
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    if recipient.strip() in {line.strip() for line in existing.splitlines()}:
-        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     separator = "" if not existing or existing.endswith("\n") else "\n"
-    store.write_atomic(path, f"{existing}{separator}{recipient.strip()}\n".encode())
+    line = f"{key}{_LABEL_SEP}{label}" if label else key
+    store.write_atomic(path, f"{existing}{separator}{line}\n".encode())
     return True
