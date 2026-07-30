@@ -90,21 +90,25 @@ def remote_summary() -> str:
     return remotes[0] if remotes else "none (history is local only)"
 
 
+def recipients() -> list[str]:
+    """Every enrolled machine's public key, in the form age wants on `-r`.
+
+    Read here rather than handed to age as a path: `crypto` never names a file
+    in $HOME, because a sandboxed age cannot open one.
+    """
+    path = store.recipients_file()
+    if not path.is_file():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def list_recipients() -> list[tuple[str, str]]:
     """``(kind, key)`` for every enrolled machine.
 
     Parsed here rather than in the CLI because this module is the only writer of
     recipients.txt, so the record shape is its to know.
     """
-    path = store.recipients_file()
-    if not path.is_file():
-        return []
-    entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            kind, _, rest = line.strip().partition(" ")
-            entries.append((kind, rest))
-    return entries
+    return [(kind, rest) for kind, _, rest in (line.partition(" ") for line in recipients())]
 
 
 def is_repo() -> bool:
@@ -196,8 +200,10 @@ def identity_status(known: Machine) -> IdentityStatus:
         return IdentityStatus(True, f"identity {path} (age missing, cannot verify)")
     reason = crypto.why_unusable(path)
     if reason:
-        hint = " - try 'woswoar init --new-identity'" if "passphrase" in reason else ""
-        return IdentityStatus(False, f"{path} {reason}{hint}")
+        # No hint appended here: crypto already puts the right advice in the
+        # reason, and picking it by grepping this string for "passphrase" made
+        # sync depend on crypto's exact wording.
+        return IdentityStatus(False, f"identity {path} {reason}")
     return IdentityStatus(True, f"identity {path}")
 
 
@@ -212,7 +218,7 @@ def day_public_key(known: Machine, day: str) -> str:
         return pub_path.read_text(encoding="utf-8").strip()
 
     identity = crypto.generate_identity()
-    sealed = crypto.encrypt_to_recipients(identity.secret.encode("utf-8"), store.recipients_file())
+    sealed = crypto.encrypt_to_recipients(identity.secret.encode("utf-8"), recipients())
     pub_path.parent.mkdir(parents=True, exist_ok=True)
     store.write_atomic(store.day_key(known.id, day), sealed)
     store.write_atomic(pub_path, (identity.public + "\n").encode("utf-8"))
@@ -504,8 +510,12 @@ def choose_identity(new_identity: bool = False, explicit: Path | None = None) ->
     """
     if explicit is not None:
         path = explicit.expanduser()
-        if not crypto.usable(path):
-            raise SyncError(f"{path} cannot decrypt without a terminal; see 'woswoar doctor'")
+        reason = crypto.why_unusable(path)
+        if reason:
+            # The reason, not a guess at it. Reporting every failure as
+            # "cannot decrypt without a terminal" is what sent someone with a
+            # perfectly good unencrypted key looking for a passphrase problem.
+            raise SyncError(f"{path} {reason}")
         return path
 
     if not new_identity:
@@ -586,7 +596,7 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
         seal.parent.mkdir(parents=True, exist_ok=True)
         store.write_atomic(
             seal,
-            crypto.encrypt_to_recipients(f"{known.name}\n".encode(), store.recipients_file()),
+            crypto.encrypt_to_recipients(f"{known.name}\n".encode(), recipients()),
         )
         changed = True
     return changed
@@ -629,7 +639,6 @@ def reencrypt() -> ReencryptReport:
 
     known = store.machine()
     identity = identity_path(known)
-    recipients = store.recipients_file()
     _ensure_repo_config()
     remote = has_remote()
     resealed = skipped = 0
@@ -639,6 +648,13 @@ def reencrypt() -> ReencryptReport:
     with lock():
         if remote:
             _fetch_and_rebase()
+
+        # Read *after* the fetch, never before. The whole point of this command
+        # is to seal to a machine that enrolled since the last sync, so taking
+        # the list from a pre-fetch checkout would re-seal everything to the old
+        # recipients and report full success. Reading it once here also saves
+        # re-parsing the file for every one of a few thousand key files.
+        keys = recipients()
 
         for host_id in store.repo_hosts():
             candidates = list(store.iter_day_keys(host_id))
@@ -654,7 +670,7 @@ def reencrypt() -> ReencryptReport:
                     # joined, or left behind by one since removed.
                     skipped += 1
                     continue
-                store.write_atomic(path, crypto.encrypt_to_recipients(plain, recipients))
+                store.write_atomic(path, crypto.encrypt_to_recipients(plain, keys))
                 resealed += 1
 
         _commit()

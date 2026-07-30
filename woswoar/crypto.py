@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -90,13 +91,24 @@ def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] =
     return result.stdout
 
 
-def encrypt_to_recipients(data: bytes, recipients_file: Path) -> bytes:
-    """Seal ``data`` so that every recipient listed in the file can open it.
+def encrypt_to_recipients(data: bytes, recipients: Iterable[str]) -> bytes:
+    """Seal ``data`` so that every one of ``recipients`` can open it.
 
     age wraps one random file key separately per recipient, so the payload is
     stored once no matter how many machines are listed.
+
+    Takes the keys, not the path to the file holding them, for the same reason
+    the identity functions do: no age invocation may name a file in ``$HOME``.
+    Passing ``-R recipients.txt`` reintroduced exactly the failure this module
+    exists to avoid, one step later in `init`.
     """
-    return _run([AGE, "-R", str(recipients_file)], data)
+    keys = list(recipients)
+    if not keys:
+        raise AgeError("no recipients to seal to; run 'woswoar init' first")
+    argv = [AGE]
+    for key in keys:
+        argv += ["-r", key]
+    return _run(argv, data)
 
 
 def encrypt_to(data: bytes, recipient: str) -> bytes:
@@ -163,8 +175,10 @@ def recipient_for(identity: Path) -> str:
     pub = identity.with_suffix(identity.suffix + ".pub")
     if pub.is_file():
         return pub.read_text(encoding="utf-8").strip()
-    # On stdin, not as a path argument -- see decrypt_with_file.
-    return _run([AGE_KEYGEN, "-y"], identity.read_bytes()).decode("utf-8").strip()
+    # Reading the file ourselves, then reusing public_of, which already knows
+    # both how to skip the subprocess when the identity carries its own
+    # `# public key:` comment and how to feed age on stdin when it does not.
+    return public_of(identity.read_text(encoding="utf-8"))
 
 
 def why_unusable(identity: Path) -> str:
@@ -174,11 +188,14 @@ def why_unusable(identity: Path) -> str:
     key file, because the thing that matters is whether an unattended sync will
     work, not what format the key claims to be.
 
-    The reason is returned rather than a bare bool because the two failures
-    need different advice and used to be reported as the same one: a key that
-    needs a passphrase wants ``--new-identity``, whereas a key this process
-    cannot even read wants the *file* looked at, and telling someone their
-    unencrypted key needs a passphrase sends them the wrong way entirely.
+    The reason is returned rather than a bare bool because the failures need
+    different advice and used to be reported as the same one: a key that needs
+    a passphrase wants ``--new-identity``, whereas a key this process cannot
+    even read wants the *file* looked at, and telling someone their unencrypted
+    key needs a passphrase sends them the wrong way entirely. The wording comes
+    from `_run`, which already classifies the passphrase case from age's own
+    stderr -- inferring it from which step failed is how the misdiagnosis
+    happened in the first place.
     """
     try:
         identity.read_bytes()
@@ -194,8 +211,8 @@ def why_unusable(identity: Path) -> str:
     try:
         if decrypt_with_file(sealed, identity) != b"woswoar":
             return "age round trip did not return the original"
-    except (AgeError, OSError):
-        return "needs a passphrase, so an unattended sync could never use it"
+    except (AgeError, OSError) as exc:
+        return f"cannot decrypt: {exc}"
     return ""
 
 

@@ -8,7 +8,6 @@ are enough, and that is only meaningful if it is actually demonstrated.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,13 +16,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from woswoar import cache, crypto, search, store, sync
+from woswoar import cache, search, store, sync
 from woswoar.entry import Entry, format_line
 
 from . import support
-
-requires_age = unittest.skipUnless(crypto.available(), "age required")
-requires_git = unittest.skipUnless(shutil.which("git"), "git required")
+from .support import requires_age, requires_git
 
 #: One authoritative list, plus HOME which only these tests need to redirect.
 _ENV = (*support.ENV_KEYS, "HOME")

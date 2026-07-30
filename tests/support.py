@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from woswoar import store
+from woswoar import crypto, store
 from woswoar.entry import Entry
 
 MACHINE_ID = "0123456789abcdef"
+
+#: External tools some suites need. Defined once so that a check which has to
+#: grow later -- an age version floor, say -- cannot be updated in one file and
+#: forgotten in the other.
+requires_age = unittest.skipUnless(crypto.available(), "age required")
+requires_git = unittest.skipUnless(shutil.which("git"), "git required")
+requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
 
 
 def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -> Entry:
