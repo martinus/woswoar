@@ -198,9 +198,12 @@ class State:
 @contextmanager
 def lock() -> Iterator[None]:
     """Serialise syncs. A prompt-triggered sync and the timer can collide."""
-    path = store.data_dir() / "sync.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("w")
+    path = store.private_dir(store.data_dir()) / "sync.lock"
+    # Through the same helper as everything else. The file is empty and holds
+    # nothing secret, but `doctor` walks the data directory and a stray 0644
+    # here would report an exposure that is not one -- an alarm that is wrong
+    # in the harmless direction still teaches people to ignore it.
+    handle = store.private_append(path)
     try:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -287,7 +290,6 @@ def day_public_key(known: Machine, day: str) -> str:
 
     identity = crypto.generate_identity()
     sealed = crypto.encrypt_to_recipients(identity.secret.encode("utf-8"), recipients())
-    pub_path.parent.mkdir(parents=True, exist_ok=True)
     store.write_atomic(store.day_key(known.id, day), sealed)
     store.write_atomic(pub_path, (identity.public + "\n").encode("utf-8"))
     return identity.public
@@ -382,7 +384,6 @@ def export(known: Machine, state: State, report: Report, now: int, mac: bytes) -
         day = store.day_of_log(log.relpath)
         sealed = crypto.encrypt_to(pack(data), day_public_key(known, day))
         chunk = store.new_chunk(known.id, day, now)
-        chunk.parent.mkdir(parents=True, exist_ok=True)
         store.write_atomic(chunk, store.frame_chunk(sealed, crypto.tag(mac, sealed)))
 
         state.exported[log.relpath] = new_offset
@@ -483,10 +484,10 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac:
 
     for day, blocks in pending.items():
         payload = b"".join(blocks)
-        target = store.log_file(host_id, day)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("ab") as handle:
-            handle.write(payload)
+        # Another machine's history is no less private than this one's, and it
+        # lands in the same tree, so it is created with the same mode.
+        with store.private_append(store.log_file(host_id, day)) as handle:
+            handle.write(payload.decode("utf-8", errors="replace"))
         report.lines_imported += payload.count(b"\n")
 
 
@@ -503,8 +504,7 @@ def _merge_name(known: Machine, host_id: str) -> None:
     except (crypto.AgeError, SyncError, OSError):
         # A name we cannot open is cosmetic; the opaque id still works.
         return
-    local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_bytes(name)
+    store.write_atomic(local, name)
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +674,6 @@ def choose_identity(new_identity: bool = False, explicit: Path | None = None) ->
         return dedicated
 
     identity = crypto.generate_identity()
-    dedicated.parent.mkdir(parents=True, exist_ok=True)
     store.write_atomic(dedicated, identity.secret.encode("utf-8"))
     dedicated.chmod(0o600)
     return dedicated
@@ -694,7 +693,7 @@ def initialise(
 
     history = store.history_dir()
     if not is_repo():
-        history.parent.mkdir(parents=True, exist_ok=True)
+        store.private_dir(history.parent)
         if remote and not any(history.glob("*")):
             git("clone", "--quiet", remote, str(history), cwd=history.parent)
         else:
@@ -745,7 +744,6 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
 
     seal = store.name_seal(known.id)
     if not seal.is_file():
-        seal.parent.mkdir(parents=True, exist_ok=True)
         store.write_atomic(
             seal,
             crypto.encrypt_to_recipients(f"{known.name}\n".encode(), recipients()),
@@ -938,7 +936,6 @@ def add_recipient(recipient: str, label: str = "") -> bool:
         return False
     path = store.recipients_file()
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    path.parent.mkdir(parents=True, exist_ok=True)
     separator = "" if not existing or existing.endswith("\n") else "\n"
     line = f"{key}{_LABEL_SEP}{label}" if label else key
     store.write_atomic(path, f"{existing}{separator}{line}\n".encode())

@@ -113,6 +113,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | The repo key never leaks | the key's bytes appear nowhere in the committed tree |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
+| History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
 | Search stays fast | latency measured on 52,000 entries |
 
 ## ⚠️ What is *not* protected
@@ -120,10 +121,14 @@ Claims rot. The ones that matter are asserted in CI on every push:
 Being straight about the limits is part of the security story:
 
 > [!IMPORTANT]
-> - **Local history is plaintext.** `~/.local/share/woswoar/logs/` is readable by
->   anyone who can read your home directory — same as `~/.bash_history`.
->   Encryption protects the *synced copy*, not your disk. Use full-disk
->   encryption for that.
+> - **Local history is plaintext.** `~/.local/share/woswoar/logs/` holds your
+>   commands unencrypted. woswoar's own directories are created `0700` and its
+>   files `0600` — the same as `~/.bash_history` — and `woswoar doctor` fails if
+>   anything under them is readable by another user. The encrypted `history/`
+>   checkout is excluded from that walk: it is ciphertext, and the directory
+>   above it is owner-only. All of which only keeps out other accounts on the
+>   same machine. Encryption protects the *synced copy*,
+>   not your disk. Use full-disk encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
 >   when they synced, and roughly how many commands you ran per day.
 > - **One key across your machines.** Authentication proves a chunk came from

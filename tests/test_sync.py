@@ -77,11 +77,14 @@ class Fake:
         return self._id
 
     def record(self, day: str, ts: int, cmd: str, session: str = "s1") -> None:
-        """Append a line the way the shell hook would."""
-        path = store.log_file(self.id, day)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """Append a line the way the shell hook would.
+
+        Through `store.private_append`, because the hook creates its day file
+        owner-only; a raw ``open("a")`` here would leave 0644 files that no
+        real recording path produces.
+        """
         entry = Entry(ts, self.id, session, "~/src", 0, 5, cmd)
-        with path.open("a", encoding="utf-8") as handle:
+        with store.private_append(store.log_file(self.id, day)) as handle:
             handle.write(format_line(entry) + "\n")
 
     def commands(self) -> set[str]:
@@ -652,6 +655,27 @@ class TestLocalOnly(SyncTestCase):
         alpha = self.machine("alpha")
         with alpha.active(), sync.lock(), self.assertRaises(sync.SyncError):
             sync.run()
+
+
+class TestSyncIsPrivate(SyncTestCase):
+    def test_a_sync_that_runs_before_install_leaves_nothing_readable(self) -> None:
+        """The timer can fire on a machine where `install` never ran.
+
+        Everything sync creates on its own -- the data directory, the lock, the
+        state file, a peer's learned name -- has to be owner-only by itself,
+        because `install` is the only thing that re-tightens and it may never
+        have run here.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            # The harness pre-creates WOSWOAR_DIR, which stands in for a user
+            # pointing it at a directory that already existed -- woswoar leaves
+            # those alone by design, so start from the state `install` leaves.
+            store.harden()
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            exposed = store.readable_by_others()
+            self.assertEqual(exposed, [], f"sync left {exposed} readable by others")
 
 
 class TestChunkAuthenticity(SyncTestCase):

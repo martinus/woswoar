@@ -18,7 +18,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from woswoar import cache
+from woswoar import cache, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
 from .support import MACHINE_ID, WoswoarTestCase
@@ -519,6 +519,43 @@ class TestForkFree(ShellHookTestCase):
             many,
             f"record path forks: {few} clones for 3 commands, {many} for 30",
         )
+
+
+@requires_bash5
+class TestRecordingIsPrivate(ShellHookTestCase):
+    """The hook creates the log file, so the hook is where its mode is decided.
+
+    Python never touches that file on the recording path, so a fix in `store`
+    alone would not have covered the case this exists for.
+    """
+
+    def test_the_day_file_is_owner_only_under_a_stock_umask(self) -> None:
+        self.run_shell("echo hello\n")
+        files = list((Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts").rglob("*.tsv"))
+        self.assertTrue(files, "nothing was recorded")
+        for path in files:
+            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
+
+    def test_the_hook_agrees_with_store_about_what_private_means(self) -> None:
+        """The hook is copied verbatim, so it cannot import the constants.
+
+        Nothing else would notice `store.DIR_MODE` being relaxed and the hook
+        being left behind, which is the direction that silently reopens the
+        hole this class exists for.
+        """
+        source = HOOK.read_text(encoding="utf-8")
+        self.assertIn("umask 077", source)
+        self.assertEqual(store.DIR_MODE, 0o700)
+        self.assertEqual(store.FILE_MODE, 0o600)
+
+    def test_the_hook_leaves_the_shell_umask_alone(self) -> None:
+        """It drops to 077 to create the file; it must put it back.
+
+        Otherwise every file the user creates afterwards would silently become
+        0600 -- a surprising thing for a history tool to do to a shell.
+        """
+        out = self.run_shell("echo start\numask\n")
+        self.assertIn("0022", out)
 
 
 if __name__ == "__main__":

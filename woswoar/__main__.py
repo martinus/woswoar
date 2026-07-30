@@ -61,9 +61,15 @@ def cmd_install(args: argparse.Namespace) -> int:
     import shutil
 
     machine = store.machine()
+    store.private_dir(store.data_dir())
     target = store.data_dir() / HOOK_NAME
-    target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(_hook_source(), target)
+    # After the copy, not before: `copyfile` creates at the ambient umask, so
+    # hardening first would leave the one file install itself writes as the one
+    # file its own migration missed. This is also what re-tightens a tree from
+    # a woswoar that predated owner-only directories -- `install` is the
+    # command people re-run to upgrade.
+    store.harden()
 
     print(f"machine : {machine.name} ({machine.id})")
     print(f"logs    : {store.logs_dir()}")
@@ -264,6 +270,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     logs = list(store.iter_log_files())
     info("logs", f"{len(logs)} file(s) in {store.logs_dir()}")
+
+    # Recorded history is more than ~/.bash_history holds -- the command, the
+    # directory, the exit status, and every other machine's history once sync
+    # has run -- so anything another user can read is a finding, not a note.
+    exposed = store.readable_by_others()
+    if exposed:
+        detail = f"{len(exposed)} path(s) other users can read, e.g. {exposed[0]}"
+        detail += " - run 'woswoar install' to fix"
+    else:
+        detail = f"{store.data_dir()} is owner-only"
+    check("private", not exposed, detail)
 
     started = time.perf_counter()
     entries = cache.load_entries()
