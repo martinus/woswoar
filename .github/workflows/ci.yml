@@ -88,7 +88,9 @@ jobs:
           python -m unittest tests.test_sync --verbose 2>&1 | tee sync.log
           # These tests skip themselves when age or git is absent. A skipped run
           # is green, which is precisely the failure mode worth guarding.
-          if grep -q "skipped" sync.log; then
+          # The summary line, not the bare word: a test *docstring* containing
+          # "skipped" used to redden this build.
+          if grep -qE "^(OK|FAILED) \(.*skipped=" sync.log; then
             echo "::error::sync tests were skipped - age or git missing"
             exit 1
           fi
@@ -179,5 +181,27 @@ jobs:
           # who can read the history on an assumed answer.
           run_as alpha grant --yes
           run_as alpha sync
+          # beta fetches alpha's signing key with this sync, then pins it.
+          # --yes for the same reason grant needs it: no terminal here.
+          run_as beta sync
+          run_as beta trust --yes
           run_as beta sync
           run_as beta list --scope global | grep -q 'secret-marker-command'
+
+          # And the point of the pin: a chunk alpha did not sign is refused.
+          # Sealed to alpha's published day key, which is in the clear on
+          # purpose, so this is exactly what a push-capable attacker can build
+          # with nothing but push access and the repo's own contents.
+          ATTACK="$BASE/attacker"
+          git clone --quiet "$BASE/origin.git" "$ATTACK"
+          DAY_PUB=$(cat "$ATTACK/hosts/$ALPHA_ID/keys/2023-11-14.pub")
+          printf '1700000009\ts1\t~\t0\t5\tforged-marker-command\n' \
+            | python3 -c 'import sys,zlib; sys.stdout.buffer.write(zlib.compress(sys.stdin.buffer.read(),9))' \
+            | age -r "$DAY_PUB" \
+            > "$ATTACK/hosts/$ALPHA_ID/2023-11-14/9999999999-ffffff.age"
+          git -C "$ATTACK" add -A
+          git -C "$ATTACK" -c user.name=x -c user.email=x@y commit -q -m 'woswoar sync'
+          git -C "$ATTACK" push --quiet origin HEAD
+
+          run_as beta sync
+          ! run_as beta list --scope global | grep -q 'forged-marker-command'
