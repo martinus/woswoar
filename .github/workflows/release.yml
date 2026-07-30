@@ -1,0 +1,91 @@
+name: Release
+
+# Everything after `git push origin vX.Y.Z` is automated. The tag is the
+# trigger because it is the one step that has to be a deliberate human act:
+# `main` is protected, so the version bump arrives as a PR like anything else,
+# and tagging is how you say "that one".
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release, and move `stable`
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the ancestry check below needs to see main.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: the tag must match the version in the code
+        # Otherwise `woswoar --version` reports something other than the
+        # release it came from, and the tag is the only thing anyone checks.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          code="$(python -c 'import woswoar; print(woswoar.__version__)')"
+          if [ "$tag" != "$code" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $tag, woswoar/__init__.py says $code"
+            exit 1
+          fi
+          echo "releasing $code"
+
+      - name: the tag must be on main
+        # `stable` is only meaningful if it can only ever point at something
+        # that went through the protected branch, with its checks.
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not on main; releases are cut from main only"
+            exit 1
+          fi
+
+      - name: install age
+        # The sync suite skips itself without age, and a skipped suite is green
+        # -- so prove age is here rather than assume the install worked.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          age --version
+
+      - name: tests
+        # A tag can be pushed to any commit by anyone. Re-running the suite here
+        # costs half a minute and means a release is never cut from something
+        # that was not tested at this exact commit.
+        run: python -m unittest discover -s . -t . -p 'test_*.py'
+
+      - name: build
+        run: |
+          python -m pip install --quiet build
+          python -m build
+          # A second copy under a fixed name, so this URL is stable across
+          # releases and can be pasted once:
+          #   pipx install "woswoar @ https://github.com/martinus/woswoar/releases/latest/download/woswoar.tar.gz"
+          # A wheel or sdist filename has to encode the version, so the normal
+          # artefacts cannot serve that; a PEP 508 direct reference supplies the
+          # project name instead, which is what makes the arbitrary name legal.
+          cp dist/woswoar-*.tar.gz dist/woswoar.tar.gz
+
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
+
+      - name: move stable to this release
+        # The install line in the README is `@stable`, so this is what makes it
+        # mean "the latest release" without anyone editing a version number on
+        # five machines. Deliberately not forced: if this is not a
+        # fast-forward -- tagging an older commit, say -- the push fails and the
+        # release stays where it is rather than silently going backwards.
+        run: git push origin "$GITHUB_SHA:refs/heads/stable"

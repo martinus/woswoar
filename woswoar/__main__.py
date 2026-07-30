@@ -80,6 +80,15 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"rcfile  : {rcfile} ({action})")
 
     print("\nOpen a new shell, or run:  source", target)
+
+    # The moment someone finds out, so the moment to say it. Recording works
+    # without any of these, which is why this warns rather than fails -- but
+    # without fzf there is no Ctrl-R, and Ctrl-R is what woswoar is for.
+    from . import deps
+
+    absent = deps.missing()
+    if absent:
+        print(f"\n{deps.report(absent)}", file=sys.stderr)
     return 0
 
 
@@ -164,7 +173,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
-    from . import crypto, sync
+    from . import crypto, deps, sync
 
     ok = True
 
@@ -196,7 +205,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("bash", major >= 5, f"{version or 'not found'} (5.0+ required)")
 
     fzf = shutil.which("fzf")
-    check("fzf", fzf is not None, fzf or "not found - needed for 'woswoar search'")
+    check("fzf", fzf is not None, fzf or f"not found - {deps.advice([deps.FZF])}")
 
     machine_file = store.machine_file()
     # Read before anything calls store.machine(), which would create it.
@@ -217,7 +226,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # "permission denied" from `init` with doctor reporting nothing at all.
     age_path = shutil.which("age")
     if age_path is None:
-        info("age", "not found - needed for 'woswoar sync' only")
+        info("age", f"not found, needed for 'woswoar sync' - {deps.advice([deps.AGE])}")
     else:
         failure = crypto.selftest()
         check("age", not failure, age_path)
@@ -233,6 +242,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         check("identity", status.ok, status.detail)
     else:
         info("identity", "none yet - chosen by 'woswoar init'")
+
+    git_path = shutil.which("git")
+    if git_path is None:
+        info("git", f"not found, needed for 'woswoar sync' - {deps.advice([deps.GIT])}")
 
     if sync.is_repo():
         info("remote", sync.remote_summary())
