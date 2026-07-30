@@ -25,12 +25,6 @@ SCOPES: tuple[Scope, ...] = ("global", "host", "session")
 _TIME_WIDTH = 4
 _PREFIX = _TIME_WIDTH + 2
 
-_FZF_MISSING = (
-    "woswoar: fzf not found on PATH.\n"
-    "It is the only runtime dependency; install it with your package manager\n"
-    "(e.g. 'dnf install fzf') or use 'woswoar list' for plain output."
-)
-
 
 def relative_time(ts: int, now: int | None = None) -> str:
     """Render a timestamp as an age, at most :data:`_TIME_WIDTH` characters.
@@ -164,7 +158,10 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
     import subprocess
 
     if shutil.which("fzf") is None:
-        print(_FZF_MISSING, file=sys.stderr)
+        from . import deps
+
+        print(deps.report([deps.FZF]), file=sys.stderr)
+        print("\nMeanwhile 'woswoar list' prints the same history as plain text.", file=sys.stderr)
         return None
 
     lines = lines_for(scope, dedup=dedup)

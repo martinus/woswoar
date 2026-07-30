@@ -40,13 +40,16 @@ class Identity(NamedTuple):
     public: str
 
 
-_MISSING = (
-    "woswoar: 'age' not found on PATH.\n"
-    "Sync encrypts every line before it reaches git, so age is required.\n"
-    "  Fedora:  sudo dnf install age\n"
-    "  Debian:  sudo apt install age\n"
-    "  macOS:   brew install age"
-)
+def _missing_message() -> str:
+    """Built when needed, so the install command matches *this* machine.
+
+    The previous version listed Fedora, Debian and macOS unconditionally and
+    left the reader to pick; `deps` detects the distro instead.
+    """
+    from . import deps
+
+    return "Sync encrypts every line before it reaches git.\n" + deps.report([deps.AGE])
+
 
 #: age emits this when it wants a passphrase it cannot ask for. Worth
 #: recognising: an unattended sync from a systemd timer has no terminal, so a
@@ -66,7 +69,7 @@ def available() -> bool:
 
 def require() -> None:
     if not available():
-        raise AgeError(_MISSING)
+        raise AgeError(_missing_message())
 
 
 def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:

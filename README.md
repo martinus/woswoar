@@ -60,14 +60,22 @@ that leaves your machine is encrypted with [age](https://github.com/FiloSottile/
 
 ## Install
 
-**Requirements:** bash 5.0+ (Linux) · [fzf](https://github.com/junegunn/fzf) ·
-Python 3.10+ · [age](https://github.com/FiloSottile/age) and git *(only for sync)*
-
 ```bash
-pipx install .          # or: pip install --user .
+pipx install --force git+https://github.com/martinus/woswoar.git
 woswoar install         # writes the hook, sources it from ~/.bashrc
 woswoar import bash     # optional: bring your existing history along
 ```
+
+No clone needed, and **the same line upgrades an existing install** — that is
+what `--force` is for. Without it pipx refuses to touch a version that is
+already there, and since woswoar installs straight from the branch rather than
+from a version number, `pipx upgrade` has nothing to compare against.
+
+**Requirements:** bash 5.0+ (Linux) · Python 3.10+ ·
+[fzf](https://github.com/junegunn/fzf) for the picker ·
+[age](https://github.com/FiloSottile/age) and git *(only for sync)*.
+`woswoar install` checks for these and prints the exact command for your
+distribution if any are missing.
 
 Open a new shell and press <kbd>Ctrl</kbd>+<kbd>R</kbd>. That's it — everything
 below is optional. To add more machines, see
@@ -212,7 +220,7 @@ ever.
 The same four lines everywhere — first machine or fifth, it makes no difference:
 
 ```bash
-pipx install .
+pipx install --force git+https://github.com/martinus/woswoar.git
 woswoar install                                       # hook it into bash
 woswoar import atuin --this-host-only                 # optional: this machine's past
 woswoar init git@github.com:you/woswoar-history.git   # join the repo
