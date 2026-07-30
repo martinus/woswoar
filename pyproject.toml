@@ -20,7 +20,11 @@ keywords = ["shell", "history", "fzf", "git", "bash"]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["ruff>=0.6", "mypy>=1.11", "shellcheck-py>=0.10"]
+# Floors, not pins -- but recent ones. `ruff format --check` is a *formatter*
+# gate, and its output changes between versions, so a floor three years behind
+# lets a contributor pass locally and fail in CI for no reason they can see.
+# These are the versions the suite is actually run against.
+dev = ["ruff>=0.16", "mypy>=2.3", "shellcheck-py>=0.11"]
 
 [project.scripts]
 woswoar = "woswoar.__main__:main"
