@@ -13,6 +13,14 @@ from pathlib import Path
 from . import __version__, cache, importer, search, store
 from .errors import WoswoarError
 
+#: Both "no repo key yet" and "some days unreadable" have the same fix, and
+#: used to say so in two independently worded paragraphs.
+_GRANT_REMEDY = (
+    "On a machine that is already enrolled run:\n"
+    "    woswoar grant\n"
+    "then sync here again. Nothing is lost in the meantime."
+)
+
 HOOK_NAME = "woswoar.bash"
 _BEGIN = "# >>> woswoar >>>"
 _END = "# <<< woswoar <<<"
@@ -249,6 +257,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if sync.is_repo():
         info("remote", sync.remote_summary())
+        status = sync.repo_key_status(store.machine())
+        check("repo key", status.ok, status.detail)
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 
@@ -294,6 +304,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
     report = sync.run(push=not args.no_push)
+    if report.needs_grant:
+        print(
+            "This machine cannot publish or read history yet: the repo's\n"
+            f"authentication key was sealed before it enrolled.\n{_GRANT_REMEDY}\n"
+            "Commands are still being recorded locally and will be published in\n"
+            "full once this is done.",
+            file=sys.stderr,
+        )
+        return 0
     print(
         f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
         f"merged {report.lines_imported} line(s) from {report.chunks_merged} chunk(s) "
@@ -308,10 +327,16 @@ def cmd_sync(args: argparse.Namespace) -> int:
         days = len(report.unreadable)
         print(
             f"\n{days} day(s) of history are sealed to recipients that do not include\n"
-            "this machine - it joined after they were written. On a machine that was\n"
-            "already enrolled run:\n"
-            "    woswoar grant\n"
-            "then sync here again. Nothing is lost in the meantime.",
+            f"this machine - it joined after they were written.\n{_GRANT_REMEDY}",
+            file=sys.stderr,
+        )
+
+    if report.unauthenticated:
+        print(
+            f"\nWARNING: {len(report.unauthenticated)} day(s) of history could not be\n"
+            "authenticated and were refused. Every chunk carries a tag computed with\n"
+            "a key only your enrolled machines can open, so this means the repo\n"
+            "contains history none of them wrote - someone else can write to it.",
             file=sys.stderr,
         )
     return 0

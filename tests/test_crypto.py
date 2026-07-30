@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from woswoar import crypto
+from woswoar import crypto, store
 
 from .support import requires_age, requires_ssh_keygen
 
@@ -116,6 +116,31 @@ class TestWhyUnusable(unittest.TestCase):
         reason = crypto.why_unusable(Path("/nonexistent/woswoar/identity"))
         self.assertIn("cannot be read", reason)
         self.assertNotIn("passphrase", reason)
+
+
+class TestChunkFraming(unittest.TestCase):
+    def test_the_tag_width_store_uses_matches_the_one_crypto_produces(self) -> None:
+        """`store` deliberately does not import `crypto`.
+
+        `crypto` pulls in subprocess and shutil at module scope, and `store` is
+        imported on every Ctrl-R -- so the width is spelled out in both, and the
+        only thing keeping them equal is this. If they drift, every chunk in an
+        append-only repo is framed at one width and read at another.
+        """
+        self.assertEqual(store._TAG_BYTES, crypto.TAG_BYTES)
+        self.assertEqual(len(crypto.tag(crypto.new_mac_key(), b"x")), store._TAG_BYTES)
+
+    def test_a_chunk_round_trips_through_its_frame(self) -> None:
+        key = crypto.new_mac_key()
+        sealed = b"pretend-this-is-age-output"
+        blob = store.frame_chunk(sealed, crypto.tag(key, sealed))
+        back, tag = store.split_chunk(blob)
+        self.assertEqual(back, sealed)
+        self.assertTrue(crypto.tag_matches(key, back, tag))
+
+    def test_a_blob_too_short_to_be_framed_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            store.split_chunk(b"x" * store._TAG_BYTES)
 
 
 if __name__ == "__main__":

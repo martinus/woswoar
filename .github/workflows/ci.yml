@@ -86,7 +86,9 @@ jobs:
           python -m unittest tests.test_sync --verbose 2>&1 | tee sync.log
           # These tests skip themselves when age or git is absent. A skipped run
           # is green, which is precisely the failure mode worth guarding.
-          if grep -q "skipped" sync.log; then
+          # The summary line, not the bare word: a test *docstring* containing
+          # "skipped" would otherwise redden this build.
+          if grep -qE "^(OK|FAILED) \(.*skipped=" sync.log; then
             echo "::error::sync tests were skipped - age or git missing"
             exit 1
           fi
@@ -179,3 +181,20 @@ jobs:
           run_as alpha sync
           run_as beta sync
           run_as beta list --scope global | grep -q 'secret-marker-command'
+
+          # The point of the tag: a chunk none of these machines wrote is
+          # refused. Sealed to alpha's published day key, which is in the clear
+          # on purpose, so this is exactly what push access alone can build.
+          ATTACK="$BASE/attacker"
+          git clone --quiet "$BASE/origin.git" "$ATTACK"
+          DAY_PUB=$(cat "$ATTACK/hosts/$ALPHA_ID/keys/2023-11-14.pub")
+          printf '1700000009\ts1\t~\t0\t5\tforged-marker-command\n' \
+            | python3 -c 'import sys; from woswoar import sync; sys.stdout.buffer.write(sync.pack(sys.stdin.buffer.read()))' \
+            | age -r "$DAY_PUB" \
+            > "$ATTACK/hosts/$ALPHA_ID/2023-11-14/9999999999-ffffff.age"
+          git -C "$ATTACK" add -A
+          git -C "$ATTACK" -c user.name=x -c user.email=x@y commit -q -m 'woswoar sync'
+          git -C "$ATTACK" push --quiet origin HEAD
+
+          run_as beta sync
+          ! run_as beta list --scope global | grep -q 'forged-marker-command'

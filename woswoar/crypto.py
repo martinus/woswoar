@@ -1,4 +1,4 @@
-"""Encryption, delegated entirely to the ``age`` binary.
+"""Encryption, delegated entirely to the ``age`` binary, plus one MAC.
 
 Python's standard library has no cipher -- only hashing and randomness -- so
 sealing the synced history needs an external tool. ``age`` was chosen because it
@@ -6,12 +6,26 @@ is one small static binary and it accepts **SSH public keys as recipients**,
 which means each machine can use the keypair it already pushes to git with and
 no secret ever has to be copied between machines.
 
+``age`` answers "who may read this?" and nothing else. It has no notion of a
+sender, and the recipient list is published in the repo, so on its own anyone
+who can push could seal a chunk every machine would open and offer in Ctrl-R.
+Answering "did one of *my* machines write this?" needs a second primitive, and
+that one *is* in the standard library: :func:`tag` is ``hmac`` over the sealed
+bytes with a key that lives encrypted in the repo, readable only by machines
+that are already recipients.
+
+That is the only cryptographic primitive woswoar composes itself, and it is the
+one with nothing to get wrong: no nonce, no mode, no padding, no IV, and a
+constant-time comparison the standard library provides. Everything else is
+still someone else's audited binary.
+
 Nothing here knows about history, chunks, or git; it is a thin, testable seam so
 that swapping the backend later touches one file.
 """
 
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 import subprocess
@@ -23,6 +37,14 @@ from .errors import WoswoarError
 
 AGE = "age"
 AGE_KEYGEN = "age-keygen"
+
+#: HMAC-SHA256 output, and so the fixed-width prefix every chunk carries.
+TAG_BYTES = 32
+
+#: Key length. The same 32 as :data:`TAG_BYTES` by coincidence, not by
+#: derivation -- widening the tag is a format change, and re-sizing the key
+#: is not, so reading one from the other would couple two unrelated decisions.
+_KEY_BYTES = 32
 
 _TIMEOUT = 120
 
@@ -182,6 +204,41 @@ def recipient_for(identity: Path) -> str:
     # both how to skip the subprocess when the identity carries its own
     # `# public key:` comment and how to feed age on stdin when it does not.
     return public_of(identity.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Authenticity. Answers "did one of my machines write this?", which age cannot.
+# ---------------------------------------------------------------------------
+
+
+def new_mac_key() -> bytes:
+    """A fresh key for :func:`tag`, from the OS random source.
+
+    ``os.urandom`` rather than ``secrets.token_bytes``, which is a thin wrapper
+    over it: importing ``secrets`` drags in ``random`` and ``bisect`` for ~1.4 ms
+    of interpreter start, and this module is loaded by every `sync`.
+    """
+    return os.urandom(_KEY_BYTES)
+
+
+def tag(key: bytes, data: bytes) -> bytes:
+    """The authentication tag for ``data``.
+
+    Computed over the *sealed* bytes rather than the plaintext, so a reader can
+    establish that a chunk came from one of its own machines before decrypting
+    or decompressing it -- encrypt-then-MAC, the ordering that does not need
+    the recipient to parse hostile input first.
+    """
+    return hmac.new(key, data, "sha256").digest()
+
+
+def tag_matches(key: bytes, data: bytes, expected: bytes) -> bool:
+    """Whether ``expected`` is the right tag for ``data``.
+
+    ``compare_digest`` rather than ``==``: the standard library's constant-time
+    comparison, so the check cannot be turned into an oracle by timing it.
+    """
+    return hmac.compare_digest(tag(key, data), expected)
 
 
 def selftest() -> str:
