@@ -118,6 +118,59 @@ class TestWhyUnusable(unittest.TestCase):
         self.assertNotIn("passphrase", reason)
 
 
+class TestFingerprint(unittest.TestCase):
+    """What `grant` shows instead of a name anyone with push access can write."""
+
+    @requires_ssh_keygen
+    def test_an_ssh_key_gets_the_fingerprint_ssh_keygen_prints(self) -> None:
+        """Not a detail: the value of the fingerprint is that it can be checked
+        against the machine itself, with the tool already installed there."""
+        with tempfile.TemporaryDirectory(prefix="woswoar-fp-") as tmp:
+            key = Path(tmp) / "id_ed25519"
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q", "-C", "box"],
+                check=True,
+                timeout=60,
+            )
+            listed = subprocess.run(
+                ["ssh-keygen", "-lf", str(key.with_suffix(".pub"))],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout.split()[1]
+            pub = key.with_suffix(".pub").read_text(encoding="utf-8").strip()
+
+        self.assertTrue(listed.startswith("SHA256:"))
+        self.assertEqual(crypto.fingerprint(pub), listed)
+
+    def test_the_comment_field_cannot_change_an_ssh_fingerprint(self) -> None:
+        # The comment is the part a label is usually taken from, and the part
+        # anyone editing recipients.txt can rewrite.
+        blob = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB7Ep0mZ0mCwvvzMLbaXn8g4mBIhnCEE1zLLuqA6IGGz"
+        self.assertEqual(
+            crypto.fingerprint(f"{blob} martin@laptop"),
+            crypto.fingerprint(f"{blob} martin@laptop-but-not-really"),
+        )
+
+    def test_two_keys_never_share_a_fingerprint(self) -> None:
+        first = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB7Ep0mZ0mCwvvzMLbaXn8g4mBIhnCEE1zLLuqA6IGGz"
+        second = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB7Ep0mZ0mCwvvzMLbaXn8g4mBIhnCEE1zLLuqA6IGGy"
+        self.assertNotEqual(crypto.fingerprint(first), crypto.fingerprint(second))
+
+    def test_an_age_recipient_is_its_own_fingerprint(self) -> None:
+        # Short, canonical, and reproducible with `age-keygen -y`, so hashing it
+        # would only make it harder to check.
+        key = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwwwwww"
+        self.assertEqual(crypto.fingerprint(f"{key}  "), key)
+
+    def test_a_key_that_parses_as_neither_still_yields_something_printable(self) -> None:
+        # A hand-edited recipients.txt must not take the confirmation down with
+        # a traceback -- that is the one moment it has to still work.
+        self.assertEqual(crypto.fingerprint(""), "")
+        self.assertEqual(crypto.fingerprint("ssh-rsa not-base64!! box"), "ssh-rsa")
+
+
 class TestChunkFraming(unittest.TestCase):
     def test_the_tag_width_store_uses_matches_the_one_crypto_produces(self) -> None:
         """`store` deliberately does not import `crypto`.

@@ -206,6 +206,41 @@ def recipient_for(identity: Path) -> str:
     return public_of(identity.read_text(encoding="utf-8"))
 
 
+def fingerprint(recipient: str) -> str:
+    """A short name for a recipient that is derived from the key, not chosen.
+
+    The label beside a key in ``recipients.txt`` is free text, appended by
+    whoever added the key, and `merge=union` keeps both sides of any conflict.
+    So a human asked to approve *a label* is approving a string an attacker with
+    push access wrote -- ``martin@laptop`` twice, and one of them is not.
+
+    For an SSH key this is byte-for-byte what ``ssh-keygen -lf id_ed25519.pub``
+    prints, which is the point: it can be checked against the machine itself
+    rather than against the repo making the claim. An age recipient is already
+    short, canonical, and derived from its own secret -- ``age-keygen -y``
+    reproduces it -- so it is its own fingerprint and is returned unchanged.
+    """
+    # Imported here rather than at module scope: this runs once per machine on
+    # the `grant` path, while the module is loaded by every sync, and base64
+    # pulls in `re`.
+    import base64
+    import hashlib
+
+    fields = recipient.split()
+    if not fields:
+        return ""
+    if len(fields) >= 2:
+        try:
+            blob = base64.b64decode(fields[1], validate=True)
+        except ValueError:  # binascii.Error is a subclass
+            blob = b""
+        if blob:
+            digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii")
+            # ssh-keygen prints the digest unpadded.
+            return "SHA256:" + digest.rstrip("=")
+    return fields[0]
+
+
 # ---------------------------------------------------------------------------
 # Authenticity. Answers "did one of my machines write this?", which age cannot.
 # ---------------------------------------------------------------------------

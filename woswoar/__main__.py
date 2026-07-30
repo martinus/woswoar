@@ -9,9 +9,13 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import __version__, cache, importer, search, store
 from .errors import WoswoarError
+
+if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
+    from .sync import Reader
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
 #: used to say so in two independently worded paragraphs.
@@ -359,12 +363,30 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_readers(readers: list[Reader], mine: str, duplicated: set[str]) -> None:
+    """One line per machine: fingerprint first, then the name.
+
+    The fingerprint leads because it is the only part of the line the repo
+    cannot choose. A label is printed with `repr`, so leading spaces, a tab, or
+    anything Python considers unprintable -- a bidi override, say -- shows up as
+    an escape instead of rearranging the line it is on.
+    """
+    for reader in readers:
+        notes = []
+        if reader.key == mine:
+            notes.append("this machine")
+        if reader.label in duplicated:
+            notes.append("SAME NAME AS ANOTHER KEY")
+        suffix = f"   ({', '.join(notes)})" if notes else ""
+        print(f"  {reader.fingerprint}  {reader.label!r}{suffix}")
+
+
 def cmd_grant(args: argparse.Namespace) -> int:
     """Let every enrolled machine read the whole history."""
     from . import crypto, sync
 
-    keys = sync.readers()
-    if not keys:
+    readers = sync.readers()
+    if not readers:
         print("no machines enrolled yet; run 'woswoar init <url>' first", file=sys.stderr)
         return 1
 
@@ -373,16 +395,49 @@ def cmd_grant(args: argparse.Namespace) -> int:
     except (WoswoarError, OSError):
         mine = ""
 
-    print("This will let each of these machines read your ENTIRE history,")
-    print("including days recorded before it ever existed:\n")
-    for key, label in sync.reader_labels():
-        print(f"  {label}{'   (this machine)' if key == mine else ''}")
+    # Two keys may legitimately share a name -- two machines really can both be
+    # called `martin@laptop`. Saying so is the point: it is also what a key
+    # added by someone else looks like, and the fingerprints then differ.
+    counts = Counter(reader.label for reader in readers)
+    duplicated = {label for label, count in counts.items() if count > 1}
+
+    new = [reader for reader in readers if reader.is_new]
+    known = [reader for reader in readers if not reader.is_new]
+
+    if new:
+        print(f"{len(new)} machine(s) NOT yet granted. Granting lets each of them read")
+        print("your ENTIRE history, including days recorded before it ever existed:\n")
+        _show_readers(new, mine, duplicated)
+        if known:
+            print(f"\nAlready granted, and unchanged ({len(known)}):\n")
+            _show_readers(known, mine, duplicated)
+    else:
+        print(f"No machine is new since you last granted. Re-sealing to the same {len(readers)}:\n")
+        _show_readers(readers, mine, duplicated)
+
+    # Named for the kinds actually listed. A blanket ssh-keygen line is wrong
+    # advice on a fleet that uses `--new-identity` everywhere, and advice that
+    # does not fit what is on screen is advice nobody follows.
+    kinds = {reader.fingerprint.startswith("SHA256:") for reader in readers}
+    checks = [
+        command
+        for is_ssh, command in (
+            (True, "ssh-keygen -lf ~/.ssh/id_ed25519.pub"),
+            (False, "age-keygen -y ~/.config/woswoar/identity"),
+        )
+        if is_ssh in kinds
+    ]
     print(
-        "\nIt re-seals the small per-day keys -- not the history itself -- and"
+        "\nThe name beside a key is free text written by whoever added it, so check"
+        f"\nthe key itself on the machine it belongs to:  {'  or  '.join(checks)}"
+        "\n\nGranting re-seals the small per-day keys -- not the history itself -- and"
         "\npublishes them. Nothing is decrypted, and nothing else is re-uploaded."
     )
 
-    if not args.yes:
+    # Only additions are put to a human. Re-sealing to a set that was already
+    # approved widens nothing, and a prompt that fires when there is nothing to
+    # decide is a prompt people learn to answer without reading.
+    if new and not args.yes:
         if not sys.stdin.isatty():
             print(
                 "\nRefusing to grant access without confirmation. "
@@ -390,14 +445,14 @@ def cmd_grant(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        if input(f"\nGrant all {len(keys)} machines full access? [y/N] ").strip().lower() not in (
+        if input(f"\nGrant {len(new)} new machine(s) full access? [y/N] ").strip().lower() not in (
             "y",
             "yes",
         ):
             print("Nothing changed.")
             return 1
 
-    report = sync.grant(confirmed=keys)
+    report = sync.grant(confirmed=[reader.key for reader in readers])
     print(f"\nre-sealed {report.resealed} key file(s)")
     if report.pushed:
         print("published to the remote")

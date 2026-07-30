@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import crypto, store
+from .entry import make_inert
 from .errors import WoswoarError
 from .store import Machine
 
@@ -114,40 +115,43 @@ def _recipient_lines() -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def recipients() -> list[str]:
-    """Every enrolled machine's public key, in the form age wants on `-r`.
+def _labelled_recipients() -> list[tuple[str, str]]:
+    """``(key, label)`` for every enrolled machine, deduplicated by key.
 
-    Read here rather than handed to age as a path: `crypto` never names a file
-    in $HOME, because a sandboxed age cannot open one.
+    Deduplicated because `.gitattributes` marks this file ``merge=union``, so a
+    machine that appends a labelled line where another has the same key
+    unlabelled leaves both, and age rejects a repeated recipient.
 
-    Deduplicated by key. `.gitattributes` marks this file ``merge=union``, so a
-    machine that appends a labelled line where another has the same key unlabelled
-    leaves both, and age rejects a repeated recipient.
-    """
-    seen: dict[str, None] = {}
-    for line in _recipient_lines():
-        seen.setdefault(line.split(_LABEL_SEP, 1)[0].strip(), None)
-    return list(seen)
+    The label is woswoar's own trailing comment when present and the SSH key's
+    comment field otherwise. It is never derived from the key -- an abbreviated
+    key used to be the last-resort label, which let a *chosen* label impersonate
+    one. `crypto.fingerprint` is the thing to show when the identity matters;
+    this is only a name.
 
-
-def reader_labels() -> list[tuple[str, str]]:
-    """``(key, label)`` for every enrolled machine, for showing to a human.
-
-    Nobody can meaningfully consent to granting `age1ejf3l4f0nhnp9...` access to
-    their history. The label is woswoar's own trailing comment when present, the
-    SSH key's comment field otherwise, and an abbreviated key as a last resort.
+    Made inert on the way in. Every byte of it was written by whoever added the
+    key, and on a shared repo that is not necessarily one of your machines.
     """
     out: list[tuple[str, str]] = []
     for line in _recipient_lines():
         key, _, label = line.partition(_LABEL_SEP)
         key = key.strip()
-        if any(key == existing for existing, _ in out):
+        if not key or any(key == existing for existing, _ in out):
             continue
+        label = label.strip()
         if not label:
             fields = key.split(None, 2)
-            label = fields[2] if len(fields) > 2 else f"{key[:12]}...{key[-6:]}"
-        out.append((key, label.strip()))
+            label = fields[2] if len(fields) > 2 else "(unnamed)"
+        out.append((key, make_inert(label)))
     return out
+
+
+def recipients() -> list[str]:
+    """Every enrolled machine's public key, in the form age wants on `-r`.
+
+    Read here rather than handed to age as a path: `crypto` never names a file
+    in $HOME, because a sandboxed age cannot open one.
+    """
+    return [key for key, _ in _labelled_recipients()]
 
 
 def list_recipients() -> list[tuple[str, str]]:
@@ -178,21 +182,34 @@ class State:
     exported: dict[str, int] = field(default_factory=dict)
     #: "<host>/<day>" -> newest chunk filename already merged into logs/.
     merged: dict[str, str] = field(default_factory=dict)
+    #: Keys a human at this machine last approved in `grant`. Local like the
+    #: rest of State, and here that is the whole point: "which machines are new
+    #: since *you* last agreed to this?" is a question only this machine can
+    #: answer, and a record kept in the repo could be edited by exactly the
+    #: attacker the confirmation exists to catch.
+    granted: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> State:
         raw = store.load_json(store.state_file())
         exported = raw.get("exported", {})
         merged = raw.get("merged", {})
+        granted = raw.get("granted", [])
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         return cls(
             exported={str(k): int(v) for k, v in exported.items()},
             merged={str(k): str(v) for k, v in merged.items()},
+            # A malformed list costs the prompt its memory, which shows every
+            # machine as new -- the safe direction to be wrong in.
+            granted=[str(k) for k in granted] if isinstance(granted, list) else [],
         )
 
     def save(self) -> None:
-        store.save_json(store.state_file(), {"exported": self.exported, "merged": self.merged})
+        store.save_json(
+            store.state_file(),
+            {"exported": self.exported, "merged": self.merged, "granted": self.granted},
+        )
 
 
 @contextmanager
@@ -761,18 +778,41 @@ class ReencryptReport(NamedTuple):
     pushed: bool
 
 
-def readers() -> list[str]:
+class Reader(NamedTuple):
+    """One enrolled machine, as a human has to see it before granting."""
+
+    key: str
+    #: Free text written by whoever added the key. A name, not an identity.
+    label: str
+    #: Derived from the key and so not chooseable. This is the identity.
+    fingerprint: str
+    #: Not among the keys this machine last granted. These are what a
+    #: confirmation is actually about: a machine that was already granted can
+    #: read everything already, so re-listing it only makes the one extra line
+    #: that matters easier to miss.
+    is_new: bool
+
+
+def readers() -> list[Reader]:
     """Who would be able to read the whole history if `grant` ran now.
 
     Fetches first, because the point of granting is to include a machine that
     enrolled since this one last looked -- reporting the pre-fetch list would
     show fewer machines than the operation is about to authorise, which is the
     one direction a security confirmation must never be wrong in.
+
+    One read of recipients.txt, not two. The list shown to the human and the
+    list handed back to `grant` as their answer used to come from separate
+    parses either side of the prompt, so they could describe different sets.
     """
     with lock():
         if has_remote():
             _fetch_and_rebase()
-        return recipients()
+        granted = set(State.load().granted)
+        return [
+            Reader(key, label, crypto.fingerprint(key), key not in granted)
+            for key, label in _labelled_recipients()
+        ]
 
 
 def grant(confirmed: list[str] | None = None) -> ReencryptReport:
@@ -857,6 +897,16 @@ def grant(confirmed: list[str] | None = None) -> ReencryptReport:
             store.write_atomic(path, crypto.encrypt_to_recipients(plain, keys))
             resealed += 1
 
+        if confirmed is not None:
+            # What is recorded is a *human's* decision, which is why this hangs
+            # off `confirmed` rather than off how many files were re-sealed: it
+            # is what the next confirmation subtracts to find the machines
+            # nobody here has agreed to yet. A grant with no approved list
+            # behind it -- an unattended one -- must not silence that.
+            state = State.load()
+            state.granted = keys
+            state.save()
+
         _commit()
         if remote:
             _push()
@@ -929,9 +979,13 @@ def compact(before: str) -> tuple[int, int]:
 def add_recipient(recipient: str, label: str = "") -> bool:
     """Append a public key to recipients.txt if its key is not already listed.
 
-    The label is what `grant` shows a human before widening who can read the
-    history; without it the prompt lists opaque age keys and cannot be consented
-    to in any real sense.
+    The label is the name `grant` shows a human beside the key's fingerprint;
+    without it the prompt lists opaque age keys and cannot be consented to in
+    any real sense.
+
+    One line per key, guaranteed rather than assumed: the label comes from this
+    machine's config, and a newline in it would append a second entry that
+    nobody added.
     """
     key = recipient.strip()
     if key in recipients():
@@ -939,6 +993,6 @@ def add_recipient(recipient: str, label: str = "") -> bool:
     path = store.recipients_file()
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     separator = "" if not existing or existing.endswith("\n") else "\n"
-    line = f"{key}{_LABEL_SEP}{label}" if label else key
+    line = f"{key}{_LABEL_SEP}{make_inert(label)}" if label else key
     store.write_atomic(path, f"{existing}{separator}{line}\n".encode())
     return True
