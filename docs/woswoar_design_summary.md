@@ -500,6 +500,44 @@ check is a real encrypt/decrypt round trip, not an inspection of the key file,
 because the question is not what format the key claims to be — it is whether an
 unattended sync will actually work.
 
+### age never gets a path
+
+**woswoar reads key material itself and hands `age` the bytes. No age
+invocation names a file in `$HOME`.**
+
+The rule came from a machine where `woswoar init` failed with
+
+```
+age-keygen: error: failed to open input file ".../woswoar/identity":
+  open .../woswoar/identity: permission denied
+```
+
+on a file that was mode 600 and owned by the user running the command. age was
+sandboxed and denied the hidden directories under `$HOME`; whether *the user*
+can read a file is simply a different question from whether *age* can, and
+passing a path asks the second one.
+
+Two things made it worse than a confusing error. The round-trip check above
+runs through the same decrypt, so the machine's perfectly good unencrypted
+`~/.ssh/id_ed25519` failed it and was silently rejected — and the only failure
+the code modelled was a passphrase, so it told the user their unencrypted key
+needed one and pointed at `--new-identity`, which cannot help. The passphrase
+case is now classified where the evidence is, in `_run`, from age's own stderr,
+rather than inferred from which step happened to fail.
+
+One path remains: `decrypt_with_secret` passes `/dev/fd/N`. That is a kernel
+object holding an inherited pipe rather than a file in `$HOME`, and it is the
+assumption the whole arrangement rests on — worth knowing if a sandbox is ever
+found that blocks it too.
+
+The rule is asserted at the seam every age call passes through, not per
+function, because per-function tests only cover what someone remembered to
+write one for. That is not hypothetical: the first version of this fix
+converted the two identity calls and left `encrypt_to_recipients` passing
+`-R recipients.txt`, so the reported machine would still have failed one step
+later, at sealing the name file during `init`. The seam test catches it; a
+third per-function test would not have existed.
+
 ### Why the obvious approach fails
 
 Re-encrypting a whole day file on every sync writes a fresh random blob each

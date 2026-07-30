@@ -131,7 +131,7 @@ at all — only hashing — so instead of reaching for a third-party library and
 composing primitives by hand, woswoar shells out to
 [age](https://github.com/FiloSottile/age): a small, audited, widely deployed
 tool with one job. woswoar's crypto module is a
-[173-line subprocess wrapper](woswoar/crypto.py). There is no key derivation, no
+[small subprocess wrapper](woswoar/crypto.py). There is no key derivation, no
 nonce management and no mode selection to get wrong, because none of it lives
 here.
 

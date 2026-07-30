@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -90,13 +91,24 @@ def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] =
     return result.stdout
 
 
-def encrypt_to_recipients(data: bytes, recipients_file: Path) -> bytes:
-    """Seal ``data`` so that every recipient listed in the file can open it.
+def encrypt_to_recipients(data: bytes, recipients: Iterable[str]) -> bytes:
+    """Seal ``data`` so that every one of ``recipients`` can open it.
 
     age wraps one random file key separately per recipient, so the payload is
     stored once no matter how many machines are listed.
+
+    Takes the keys, not the path to the file holding them, for the same reason
+    the identity functions do: no age invocation may name a file in ``$HOME``.
+    Passing ``-R recipients.txt`` reintroduced exactly the failure this module
+    exists to avoid, one step later in `init`.
     """
-    return _run([AGE, "-R", str(recipients_file)], data)
+    keys = list(recipients)
+    if not keys:
+        raise AgeError("no recipients to seal to; run 'woswoar init' first")
+    argv = [AGE]
+    for key in keys:
+        argv += ["-r", key]
+    return _run(argv, data)
 
 
 def encrypt_to(data: bytes, recipient: str) -> bytes:
@@ -105,8 +117,16 @@ def encrypt_to(data: bytes, recipient: str) -> bytes:
 
 
 def decrypt_with_file(data: bytes, identity: Path) -> bytes:
-    """Open ``data`` using an identity stored on disk (an SSH or age key)."""
-    return _run([AGE, "-d", "-i", str(identity)], data)
+    """Open ``data`` using an identity stored on disk (an SSH or age key).
+
+    Python reads the file and hands age the *bytes*, never the path. Passing
+    a path makes the operation depend on age being able to open it, which is
+    not the same question as whether the user can: a sandboxed age -- snap,
+    flatpak, or anything else confined -- is refused access to ``~/.config``
+    and ``~/.ssh`` and fails with a bare "permission denied" on a file the
+    owner can plainly read.
+    """
+    return decrypt_with_secret(data, identity.read_text(encoding="utf-8"))
 
 
 def decrypt_with_secret(data: bytes, secret: str) -> bytes:
@@ -155,19 +175,46 @@ def recipient_for(identity: Path) -> str:
     pub = identity.with_suffix(identity.suffix + ".pub")
     if pub.is_file():
         return pub.read_text(encoding="utf-8").strip()
-    return _run([AGE_KEYGEN, "-y", str(identity)]).decode("utf-8").strip()
+    # Reading the file ourselves, then reusing public_of, which already knows
+    # both how to skip the subprocess when the identity carries its own
+    # `# public key:` comment and how to feed age on stdin when it does not.
+    return public_of(identity.read_text(encoding="utf-8"))
 
 
-def usable(identity: Path) -> bool:
-    """Whether this identity can decrypt without a terminal.
+def why_unusable(identity: Path) -> str:
+    """``""`` if this identity can decrypt unattended, else why not.
 
     Checked by actually performing a round trip rather than by inspecting the
     key file, because the thing that matters is whether an unattended sync will
     work, not what format the key claims to be.
+
+    The reason is returned rather than a bare bool because the failures need
+    different advice and used to be reported as the same one: a key that needs
+    a passphrase wants ``--new-identity``, whereas a key this process cannot
+    even read wants the *file* looked at, and telling someone their unencrypted
+    key needs a passphrase sends them the wrong way entirely. The wording comes
+    from `_run`, which already classifies the passphrase case from age's own
+    stderr -- inferring it from which step failed is how the misdiagnosis
+    happened in the first place.
     """
+    try:
+        identity.read_bytes()
+    except OSError as exc:
+        return f"cannot be read: {exc.strerror}"
+
     try:
         recipient = recipient_for(identity)
         sealed = encrypt_to(b"woswoar", recipient)
-        return decrypt_with_file(sealed, identity) == b"woswoar"
-    except (AgeError, OSError):
-        return False
+    except (AgeError, OSError) as exc:
+        return f"no usable public key: {exc}"
+
+    try:
+        if decrypt_with_file(sealed, identity) != b"woswoar":
+            return "age round trip did not return the original"
+    except (AgeError, OSError) as exc:
+        return f"cannot decrypt: {exc}"
+    return ""
+
+
+def usable(identity: Path) -> bool:
+    return not why_unusable(identity)
