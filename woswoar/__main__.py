@@ -328,6 +328,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
     report = sync.run(push=not args.no_push)
+    if report.revoked:
+        print(
+            "This machine's access to the shared history was revoked, so it can\n"
+            "no longer publish or read it. This is not something 'woswoar grant'\n"
+            "can undo -- a revocation is permanent, deliberately.\n\n"
+            "Commands are still being recorded locally, and 'woswoar list' still\n"
+            "shows everything this machine had before. To take part again, enrol\n"
+            "with a fresh identity:  woswoar init <url> --new-identity",
+            file=sys.stderr,
+        )
+        return 0
     if report.needs_grant:
         print(
             "This machine cannot publish or read history yet: the repo's\n"
@@ -364,6 +375,30 @@ def cmd_sync(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def _confirm(question: str, yes: bool) -> bool:
+    """Whether a human here agreed to change who can read the history.
+
+    One gate for every command that does, because the ``isatty`` branch is a
+    security control and not formatting: nothing may widen or narrow access on
+    an assumed answer, and an unattended caller has to say ``--yes`` and mean
+    it. Copied per command, the third copy is the one that quietly drops it and
+    still reads exactly like the other two.
+    """
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "\nRefusing to change who can read your history without confirmation. "
+            "Re-run with --yes if you mean it.",
+            file=sys.stderr,
+        )
+        return False
+    if input(f"\n{question} [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Nothing changed.")
+        return False
+    return True
 
 
 def _show_readers(readers: list[Reader]) -> None:
@@ -420,20 +455,8 @@ def cmd_grant(args: argparse.Namespace) -> int:
     # Only additions are put to a human. Re-sealing to a set that was already
     # approved widens nothing, and a prompt that fires when there is nothing to
     # decide is a prompt people learn to answer without reading.
-    if new and not args.yes:
-        if not sys.stdin.isatty():
-            print(
-                "\nRefusing to grant access without confirmation. "
-                "Re-run with --yes if you mean it.",
-                file=sys.stderr,
-            )
-            return 1
-        if input(f"\nGrant {len(new)} new machine(s) full access? [y/N] ").strip().lower() not in (
-            "y",
-            "yes",
-        ):
-            print("Nothing changed.")
-            return 1
+    if new and not _confirm(f"Grant {len(new)} new machine(s) full access?", args.yes):
+        return 1
 
     report = sync.grant(approved=[reader.key for reader in readers])
     print(f"\nre-sealed {report.resealed} key file(s)")
@@ -451,6 +474,67 @@ def cmd_grant(args: argparse.Namespace) -> int:
             "they were left alone. Re-sealing a key means opening it first, which\n"
             "only a machine that already had access can do. Run this on one of\n"
             "those instead.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_revoke(args: argparse.Namespace) -> int:
+    """Withdraw one machine's access to history recorded from now on."""
+    from . import sync
+
+    reader = sync.find_reader(args.fingerprint)
+
+    print("This withdraws access for:\n")
+    _show_readers([reader])
+    print(
+        "\nFrom now on it cannot read newly minted day keys, and a copy of the"
+        "\nrepository taken after this cannot be opened with that key at all."
+    )
+    # Said before the prompt, not after it. These are the reasons someone might
+    # answer no and go do something else first, so printing them alongside the
+    # result would be printing them too late to act on.
+    print(
+        "\nWhat this does NOT do:"
+        "\n  - It does not un-publish anything. Everything already in the repo"
+        "\n    stays readable by that key if it kept a copy."
+        "\n  - It does not revoke git access. If the key got in through a stolen"
+        "\n    token or deploy key, rotate that too, or it can simply fetch again."
+        "\n  - It does not stop that machine WRITING history yours will accept."
+        "\n    The authentication key is shared and cannot be rotated without"
+        "\n    rebuilding the repo."
+    )
+
+    if not _confirm("Revoke this machine's access?", args.yes):
+        return 1
+
+    report = sync.revoke(reader)
+    print(f"\nrevoked; re-sealed {report.resealed} key file(s)")
+    if report.pushed:
+        print("published to the remote")
+        print("\nOn each machine that is still enrolled, run:  woswoar sync")
+    else:
+        print("no remote configured, so nothing was published")
+
+    if report.still_readable:
+        days = ", ".join(report.still_readable)
+        print(
+            f"\nCommands this machine records on {days} still go to a day key that\n"
+            "was minted before the revocation, so they remain readable by the\n"
+            "revoked key. Rotating it now would strand the chunks already sealed\n"
+            "to it on every machine that has not merged them yet. From the next\n"
+            "day onward, nothing new is readable by it.\n"
+            "Your other machines have the same gap for the days they are recording\n"
+            "into; this one cannot see which those are.",
+            file=sys.stderr,
+        )
+
+    if report.skipped:
+        print(
+            f"\n{report.skipped} key file(s) could not be opened by this machine, so\n"
+            "they are still sealed to the revoked key. Re-sealing means opening\n"
+            "first, which only a machine that already had access can do. Run this\n"
+            "on one of those as well.",
             file=sys.stderr,
         )
     return 0
@@ -541,6 +625,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_grant.set_defaults(func=cmd_grant)
+
+    p_revoke = subparsers.add_parser(
+        "revoke", help="withdraw a machine's access to history recorded from now on"
+    )
+    p_revoke.add_argument(
+        "fingerprint",
+        help="the fingerprint 'woswoar grant' shows, or an unambiguous prefix of it",
+    )
+    p_revoke.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_revoke.set_defaults(func=cmd_revoke)
 
     p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")

@@ -14,11 +14,11 @@ import tempfile
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from woswoar import cache, crypto, search, store, sync
-from woswoar.__main__ import main
+from woswoar.__main__ import _GRANT_REMEDY, main
 from woswoar.entry import Entry, format_line
 from woswoar.errors import WoswoarError
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
@@ -134,6 +134,18 @@ class SyncTestCase(unittest.TestCase):
     def git_in_repo(self, fake: Fake, *args: str) -> str:
         with fake.active():
             return sync.git(*args)
+
+    def run_cli(self, fake: Fake, *argv: str) -> tuple[int, str]:
+        """Drive the real CLI as ``fake``, returning ``(exit code, stdout)``.
+
+        Only stdout: several commands put their warnings on stderr, and a test
+        that means "it warned" has to say which stream it is asserting on. The
+        two that need stderr capture it themselves.
+        """
+        buffer = io.StringIO()
+        with fake.active(), redirect_stdout(buffer):
+            code = main(list(argv))
+        return code, buffer.getvalue()
 
 
 class TestSingleMachine(SyncTestCase):
@@ -601,14 +613,247 @@ class TestGrantConfirmation(SyncTestCase):
         self.assertEqual(marked, [mine])
 
 
+class TestRevokeSubtraction(SyncTestCase):
+    """A withdrawal has to survive `merge=union`, which never deletes a line."""
+
+    def test_a_revoked_key_stops_being_a_recipient(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(label="old-laptop")
+            self.assertIn(gone, sync.recipients())
+
+            sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
+            self.assertNotIn(gone, sync.recipients())
+
+    def test_a_tombstone_above_its_key_still_subtracts(self) -> None:
+        """Union merges interleave two machines' appends in whatever order the
+        rebase produces, so the withdrawal can land above the enrolment.
+
+        Skipping tombstones as they are met, rather than collecting them in a
+        pass of their own, would make this depend on line order.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            mine = sync.recipients()
+            gone = crypto.generate_identity().public
+            store.recipients_file().write_text(
+                f"-{gone}{sync._LABEL_SEP}revoked\n{gone}{sync._LABEL_SEP}old-laptop\n"
+                + "".join(f"{key}\n" for key in mine),
+                encoding="utf-8",
+            )
+            self.assertNotIn(gone, sync.recipients())
+
+    def test_a_revoked_key_cannot_be_re_added(self) -> None:
+        """Otherwise whoever the revocation was aimed at un-revokes themselves
+        by appending the line again -- they have push access, that is the whole
+        premise. Re-enrolling a real machine means a new identity."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(label="old-laptop")
+            sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
+
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.add_recipient(gone, label="back-again")
+            self.assertIn("revocation is permanent", str(caught.exception))
+
+            # And appending the line by hand, which is all push access buys,
+            # does not bring it back either.
+            with store.recipients_file().open("a", encoding="utf-8") as handle:
+                handle.write(f"{gone}{sync._LABEL_SEP}back-again\n")
+            self.assertNotIn(gone, sync.recipients())
+
+    def test_revoking_re_seals_so_the_key_can_no_longer_open_the_repo(self) -> None:
+        """The list is what future keys are minted from; this is what makes a
+        copy of the repo taken *after* the revocation useless to that key."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+            beta_identity = sync.identity_path(store.machine())
+            beta_key = crypto.recipient_for(beta_identity).strip()
+
+        with alpha.active():
+            sync.grant(approved=[reader.key for reader in sync.readers()])
+            # Opens for beta here, which is what makes the failure below a
+            # consequence of the revocation rather than of never having access.
+            crypto.decrypt_with_file(store.mac_key_file().read_bytes(), beta_identity)
+
+            report = sync.revoke(sync.find_reader(crypto.fingerprint(beta_key)))
+            self.assertGreater(report.resealed, 0)
+            resealed = store.mac_key_file().read_bytes()
+
+        with self.assertRaises(crypto.AgeError):
+            crypto.decrypt_with_file(resealed, beta_identity)
+
+    def test_a_revoked_machine_cannot_read_history_recorded_afterwards(self) -> None:
+        """The end-to-end claim, driven through real age and real git."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant(approved=[reader.key for reader in sync.readers()])
+            alpha.record("2023-11-14", 1_700_000_001, "before-revocation")
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertIn("before-revocation", beta.commands())
+            beta_key = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+
+        with alpha.active():
+            sync.revoke(sync.find_reader(crypto.fingerprint(beta_key)))
+            # A fresh day, so the key is minted from the reduced list. Same-day
+            # keys already exist and are reported as still readable instead.
+            alpha.record("2023-11-15", 1_700_100_002, "after-revocation")
+            sync.run()
+
+        with beta.active():
+            sync.run()
+            self.assertNotIn("after-revocation", beta.commands())
+        with alpha.active():
+            self.assertIn("after-revocation", alpha.commands())
+
+    def test_days_already_keyed_are_reported_rather_than_left_to_be_guessed(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "recorded today")
+            sync.run()
+            gone = alpha.append_recipient(label="old-laptop")
+            report = sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
+        self.assertEqual(report.still_readable, ["2023-11-14"])
+
+    def test_revoking_this_machine_is_refused(self) -> None:
+        # It would seal the history away from the machine doing the sealing.
+        alpha = self.machine("alpha")
+        with alpha.active():
+            (mine,) = [reader for reader in sync.readers() if reader.is_mine]
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.revoke(mine)
+        self.assertIn("lock this machine out", str(caught.exception))
+
+    def test_revoking_the_only_other_machine_leaves_the_history_readable(self) -> None:
+        """Sealing to an empty recipient list is how you lose an archive."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            # Only one recipient, and it is not this machine -- so `is_mine`
+            # does not catch it and the emptiness guard is what has to.
+            store.recipients_file().write_text("", encoding="utf-8")
+            only = alpha.append_recipient(label="only-one")
+            (other,) = sync.readers()
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.revoke(other)
+            self.assertIn(only, sync.recipients())
+        self.assertIn("only machine left", str(caught.exception))
+
+    def test_the_revoked_machine_is_told_that_rather_than_to_ask_for_a_grant(self) -> None:
+        """It is the machine that can no longer decrypt anything, so it is also
+        the one that would otherwise see "ask someone to run grant" forever."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+            beta_key = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+        with alpha.active():
+            sync.grant(approved=[reader.key for reader in sync.readers()])
+            sync.revoke(sync.find_reader(crypto.fingerprint(beta_key)))
+
+        with beta.active():
+            report = sync.run()
+        self.assertTrue(report.needs_grant)
+        self.assertTrue(report.revoked)
+
+        buffer = io.StringIO()
+        with beta.active(), redirect_stderr(buffer):
+            self.assertEqual(main(["sync"]), 0)
+        message = buffer.getvalue()
+        self.assertIn("was revoked", message)
+        self.assertNotIn(_GRANT_REMEDY, message)
+
+    def test_a_machine_merely_waiting_for_a_grant_is_not_told_it_was_revoked(self) -> None:
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            report = sync.run()
+        self.assertTrue(report.needs_grant)
+        self.assertFalse(report.revoked)
+
+    def test_a_key_shaped_like_a_tombstone_is_refused(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+            sync.add_recipient(f"-{crypto.generate_identity().public}", label="sneaky")
+        self.assertIn("may not start with", str(caught.exception))
+
+
+class TestFindReader(SyncTestCase):
+    """Revocation is by fingerprint: the name is the part an attacker writes."""
+
+    def test_a_full_fingerprint_selects_one_machine(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            other = alpha.append_recipient(label="old-laptop")
+            self.assertEqual(sync.find_reader(crypto.fingerprint(other)).key, other)
+
+    def test_an_unambiguous_prefix_is_enough(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            other = alpha.append_recipient(label="old-laptop")
+            found = sync.find_reader(crypto.fingerprint(other)[:20])
+        self.assertEqual(found.key, other)
+
+    def test_an_ambiguous_prefix_is_refused_rather_than_resolved(self) -> None:
+        # Guessing here removes somebody's access.
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.append_recipient(label="old-laptop")
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.find_reader("age1")
+        self.assertIn("matches 2 machines", str(caught.exception))
+
+    def test_a_fingerprint_nobody_has_is_refused(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+            sync.find_reader("SHA256:nothing-like-this")
+        self.assertIn("no enrolled machine", str(caught.exception))
+
+
+class TestRevokeConfirmation(SyncTestCase):
+    def test_without_yes_and_without_a_terminal_nothing_changes(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(label="old-laptop")
+
+        code, _ = self.run_cli(alpha, "revoke", crypto.fingerprint(gone))
+        self.assertEqual(code, 1)
+        with alpha.active():
+            self.assertIn(gone, sync.recipients())
+
+    def test_the_limits_are_stated_before_the_decision(self) -> None:
+        """They are the reasons someone would answer no and go do something
+        else first, so printing them after the fact is printing them too late.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(label="old-laptop")
+
+        code, out = self.run_cli(alpha, "revoke", crypto.fingerprint(gone), "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("does not un-publish", out)
+        self.assertIn("does not revoke git access", out)
+        self.assertIn("WRITING", out)
+        with alpha.active():
+            self.assertNotIn(gone, sync.recipients())
+
+
 class TestGrantConfirmsAdditions(SyncTestCase):
     """A confirmation listing everything makes the one new line easy to miss."""
-
-    def grant(self, fake: Fake, *args: str) -> tuple[int, str]:
-        buffer = io.StringIO()
-        with fake.active(), redirect_stdout(buffer):
-            code = main(["grant", *args])
-        return code, buffer.getvalue()
 
     def test_the_first_grant_reports_every_machine_as_new(self) -> None:
         alpha = self.machine("alpha", display="martin@laptop")
@@ -617,7 +862,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
 
     def test_granting_remembers_who_was_approved(self) -> None:
         alpha = self.machine("alpha")
-        code, _ = self.grant(alpha, "--yes")
+        code, _ = self.run_cli(alpha, "grant", "--yes")
         self.assertEqual(code, 0)
         with alpha.active():
             self.assertFalse(any(reader.is_new for reader in sync.readers()))
@@ -632,7 +877,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
 
     def test_a_key_appended_afterwards_is_the_only_one_reported_as_new(self) -> None:
         alpha = self.machine("alpha", display="martin@laptop")
-        self.grant(alpha, "--yes")
+        self.run_cli(alpha, "grant", "--yes")
 
         # Exactly what push access alone buys: append a key labelled like one of
         # the machines that is already there.
@@ -644,11 +889,11 @@ class TestGrantConfirmsAdditions(SyncTestCase):
 
     def test_a_new_key_is_put_to_the_human_even_with_a_familiar_name(self) -> None:
         alpha = self.machine("alpha", display="martin@laptop")
-        self.grant(alpha, "--yes")
+        self.run_cli(alpha, "grant", "--yes")
         with alpha.active():
             alpha.append_recipient(label="martin@laptop")
 
-        code, out = self.grant(alpha, "--yes")
+        code, out = self.run_cli(alpha, "grant", "--yes")
         self.assertEqual(code, 0)
         self.assertIn("1 machine(s) NOT yet granted", out)
         self.assertIn("SAME NAME AS ANOTHER KEY", out)
@@ -668,7 +913,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         with alpha.active():
             alpha.append_recipient(label=hostile)
 
-        _, out = self.grant(alpha, "--yes")
+        _, out = self.run_cli(alpha, "grant", "--yes")
         self.assertIn("martin@desktop", out)
         self.assertNotIn(hostile, out)
         self.assertNotIn("\u202e", out)
@@ -681,19 +926,19 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         old code refused.
         """
         alpha = self.machine("alpha")
-        self.grant(alpha, "--yes")
+        self.run_cli(alpha, "grant", "--yes")
 
-        code, out = self.grant(alpha)
+        code, out = self.run_cli(alpha, "grant")
         self.assertEqual(code, 0)
         self.assertIn("No machine is new", out)
 
     def test_a_new_machine_without_yes_and_without_a_terminal_is_refused(self) -> None:
         alpha = self.machine("alpha")
-        self.grant(alpha, "--yes")
+        self.run_cli(alpha, "grant", "--yes")
         with alpha.active():
             alpha.append_recipient(label="martin@desktop")
 
-        code, _ = self.grant(alpha)
+        code, _ = self.run_cli(alpha, "grant")
         self.assertEqual(code, 1)
         with alpha.active():
             self.assertTrue(any(reader.is_new for reader in sync.readers()))
