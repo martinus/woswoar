@@ -104,6 +104,25 @@ class TestCache(WoswoarTestCase):
         store.cache_file().write_bytes(b"this is not a pickle")
         self.assertEqual([e.cmd for e in cache.load_entries()], ["git status"])
 
+    def test_a_cache_missing_a_newer_attribute_falls_back_to_a_rebuild(self) -> None:
+        """Right class and right version is not the same as right shape.
+
+        Pickle restores ``__dict__`` and never runs ``__init__``, so a file
+        written by a build with one attribute fewer unpickles cleanly and then
+        raises deep inside refresh() -- on the Ctrl-R path. Found in the wild:
+        a cache predating ``unsaved`` crashed `woswoar doctor` outright.
+        """
+        import pickle
+
+        self.write_log(MACHINE_ID, "2026-07-29", [line(100, "git status")])
+        cache.load_entries()
+
+        older = cache.load()
+        del older.__dict__["unsaved"]
+        store.cache_file().write_bytes(pickle.dumps(older, protocol=pickle.HIGHEST_PROTOCOL))
+
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["git status"])
+
     def test_stale_version_falls_back_to_a_rebuild(self) -> None:
         self.write_log(MACHINE_ID, "2026-07-29", [line(100, "git status")])
         cache.load_entries()

@@ -164,7 +164,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
-    from . import sync
+    from . import crypto, sync
 
     ok = True
 
@@ -198,8 +198,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     fzf = shutil.which("fzf")
     check("fzf", fzf is not None, fzf or "not found - needed for 'woswoar search'")
 
-    machine_file = store.config_dir() / "machine"
-    check("identity", machine_file.is_file(), str(machine_file))
+    machine_file = store.machine_file()
+    # Read before anything calls store.machine(), which would create it.
+    has_machine = machine_file.is_file()
+    check("machine", has_machine, str(machine_file))
 
     hook = store.data_dir() / HOOK_NAME
     check("hook", hook.is_file(), str(hook))
@@ -209,11 +211,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     detail = "sources the hook" if sourced else "has no woswoar block"
     check("bashrc", sourced, f"{rcfile} {detail}")
 
-    info("age", shutil.which("age") or "not found - needed for 'woswoar sync' only")
+    # Not just "is age on PATH". A sandboxed age -- snap, flatpak, anything
+    # confined -- answers `--version` perfectly and then cannot open a key,
+    # which is a real failure that used to reach the user as an unexplained
+    # "permission denied" from `init` with doctor reporting nothing at all.
+    age_path = shutil.which("age")
+    if age_path is None:
+        info("age", "not found - needed for 'woswoar sync' only")
+    else:
+        failure = crypto.selftest()
+        check("age", not failure, age_path)
+        for line in failure.splitlines():
+            print(f"     {line}")
+
+    # Checked whether or not a repo exists: `init` is exactly when this breaks,
+    # and gating it behind is_repo() meant doctor was silent in the one state
+    # where someone would think to run it.
+    identity = store.machine().identity if has_machine else ""
+    if identity:
+        status = sync.identity_status(store.machine())
+        check("identity", status.ok, status.detail)
+    else:
+        info("identity", "none yet - chosen by 'woswoar init'")
 
     if sync.is_repo():
-        status = sync.identity_status(store.machine())
-        check("sync", status.ok, status.detail)
         info("remote", sync.remote_summary())
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
