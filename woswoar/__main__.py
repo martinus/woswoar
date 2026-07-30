@@ -294,6 +294,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
     report = sync.run(push=not args.no_push)
+    if report.needs_grant:
+        print(
+            "This machine cannot publish or read history yet: the repo's\n"
+            "authentication key was sealed before it enrolled. On a machine that\n"
+            "is already enrolled run:\n"
+            "    woswoar grant\n"
+            "then sync here again. Commands are still being recorded locally and\n"
+            "will be published in full once this is done.",
+            file=sys.stderr,
+        )
+        return 0
     print(
         f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
         f"merged {report.lines_imported} line(s) from {report.chunks_merged} chunk(s) "
@@ -312,6 +323,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
             "already enrolled run:\n"
             "    woswoar grant\n"
             "then sync here again. Nothing is lost in the meantime.",
+            file=sys.stderr,
+        )
+
+    if report.forged:
+        print(
+            f"\nWARNING: {len(report.forged)} day(s) of history failed authentication\n"
+            "and were refused. Every chunk is tagged with a key only your enrolled\n"
+            "machines can open, so this means the repo contains history none of them\n"
+            "wrote - someone else can write to it.",
             file=sys.stderr,
         )
     return 0

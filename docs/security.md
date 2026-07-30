@@ -16,20 +16,57 @@ opaque random hex, because paths are not encrypted by anything and
 
 ## 🧊 No self-rolled cryptography
 
-Not one line of crypto in this codebase. Python's standard library has no cipher
-at all — only hashing — so instead of reaching for a third-party library and
-composing primitives by hand, woswoar shells out to
+Almost no crypto in this codebase, and none of the parts that are easy to get
+wrong. Python's standard library has no cipher at all — only hashing — so instead
+of reaching for a third-party library and composing primitives by hand, woswoar
+shells out to
 [age](https://github.com/FiloSottile/age): a small, audited, widely deployed
 tool with one job. woswoar's crypto module is a
 [small subprocess wrapper](../woswoar/crypto.py). There is no key derivation, no
 nonce management and no mode selection to get wrong, because none of it lives
-here.
+here. The one primitive woswoar does call directly is `hmac` from the standard
+library, for the chunk tags above — the one with no nonce, no mode, no padding
+and a constant-time comparison provided for you.
 
 woswoar also never hands age a *path* — it reads key files itself and pipes the
 bytes. That sounds like a detail until you meet a sandboxed age that can run
 perfectly and still not open `~/.ssh`; see
 [the design summary](woswoar_design_summary.md#age-never-gets-a-path) for the
 incident that established the rule.
+
+## ✅ Only your own machines can put history in your Ctrl-R
+
+Encryption answers *"who may read this?"*. It does not answer *"who wrote
+this?"* — age has no notion of a sender, `recipients.txt` publishes every
+machine's public key, and each day's *public* key sits in the clear so that
+writing a chunk never has to open the sealed one. On its own that means
+**anyone who can push to the repo could seal a chunk every machine would open
+and offer you in Ctrl-R**, one keypress from running.
+
+So the repo also holds a random authentication key, sealed to the recipients
+exactly like a day key, and every chunk carries an HMAC-SHA256 tag over its
+ciphertext. Chunks are authenticated *before* they are decrypted, so a chunk
+your machines did not write is never opened at all.
+
+Holding that key is the same thing as being one of your enrolled machines, so
+this needs no new command and no new key to manage: `woswoar grant`, which
+already re-seals the per-day keys to a newly enrolled machine, re-seals this one
+too.
+
+<details>
+<summary>What this does and does not stop</summary>
+
+Stopped: anyone with push access to the repo — a stolen token, a mis-scoped
+deploy key, the git host itself — fabricating history or tampering with what a
+machine already published.
+
+Not stopped: one of your *own* enrolled machines. The key is shared across them,
+so a compromised machine could publish history attributed to another of your
+machines. It could already publish anything under its own name and read
+everything, so the marginal loss is attribution between machines you own — the
+deliberate trade for having no per-machine keys to accept, compare or revoke.
+
+</details>
 
 ## 🔑 No secret is ever copied between machines
 
@@ -71,6 +108,10 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
 | History is never rewritten | `git log --diff-filter=MD` over chunk files must be **empty** |
 | age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
+| Forged history is refused | a chunk sealed to a host's published day key, but untagged, is rejected and reported |
+| Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
+| The repo key never leaks | the key's bytes appear nowhere in the committed tree |
+| A recalled command is one command | control characters never survive from the picker into the shell buffer |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 | Search stays fast | latency measured on 52,000 entries |
 
@@ -85,6 +126,8 @@ Being straight about the limits is part of the security story:
 >   encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
 >   when they synced, and roughly how many commands you ran per day.
+> - **One key across your machines.** Authentication proves a chunk came from
+>   your fleet, not which machine in it. See the note above.
 > - **Secrets you type are still secrets.** `WOSWOAR_IGNORE` skips
 >   credential-shaped commands by default (`*TOKEN=`, `*SECRET=`, `--password`,
 >   …), and bash's own `HISTCONTROL`/`HISTIGNORE` are honoured for free — but no

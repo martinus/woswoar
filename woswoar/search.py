@@ -99,9 +99,34 @@ def render(entries: list[Entry], now: int | None = None) -> list[str]:
     return [f"{relative_time(e.ts, now):>{_TIME_WIDTH}}  {escape(e.cmd)}" for e in entries]
 
 
+#: Control characters are rendered back into visible escapes on the way out of
+#: the picker. `escape` maps them for *display*, so one entry is one line;
+#: without this, `unescape` would undo that exactly as the text lands in the
+#: shell's edit buffer, and bash runs a multi-line buffer as several commands on
+#: a single Enter. fzf clips a long line, so the picker can genuinely show one
+#: command while handing over two.
+_INERT = {"\n": "\\n", "\r": "\\r"}
+
+#: C0 plus DEL, minus tab. Everything left either ends a command or moves a
+#: terminal cursor around. Tab is excluded deliberately: it is ordinary inside a
+#: command -- `awk -F'\t'` is written with a real one -- and does neither.
+_CONTROL = frozenset(chr(code) for code in [*range(0x20), 0x7F]) - {"\t"}
+
+
+def make_inert(cmd: str) -> str:
+    """A command with no raw control characters, so it is exactly one command.
+
+    Applied to what leaves the picker, never to what is stored: the log keeps
+    the command as it was typed. A recalled multi-line command therefore comes
+    back with a visible ``\\n`` in it -- wrong to run as-is, but obviously
+    wrong, which beats silently running a command the picker never showed.
+    """
+    return "".join(_INERT.get(char, "") if char in _CONTROL else char for char in cmd)
+
+
 def command_from_line(line: str) -> str:
     """Recover the original command from a rendered line."""
-    return unescape(line[_PREFIX:])
+    return make_inert(unescape(line[_PREFIX:]))
 
 
 def lines_for(scope: Scope, dedup: bool = True, limit: int | None = None) -> list[str]:

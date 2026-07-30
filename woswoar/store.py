@@ -28,6 +28,10 @@ _LOG_SUFFIX = ".tsv"
 _CHUNK_SUFFIX = ".age"
 _NAME_FILE = ".name"
 
+#: Mirrors crypto.TAG_BYTES. Kept here as the layout constant it is, so the
+#: framing above does not make store import crypto.
+_TAG_BYTES = 32
+
 RECIPIENTS = "recipients.txt"
 GITATTRIBUTES = ".gitattributes"
 
@@ -308,6 +312,45 @@ def repo_host_dir(machine_id: str) -> Path:
 def name_seal(machine_id: str) -> Path:
     """Sealed friendly name, so other machines can label this host's entries."""
     return repo_host_dir(machine_id) / "name.age"
+
+
+def mac_key_file() -> Path:
+    """The repo-wide authentication key, sealed to every recipient.
+
+    One file for the whole history rather than one per host or per day: it
+    authenticates *the set of enrolled machines*, not an individual one, so
+    there is nothing to split it by. It is sealed exactly like a day key, which
+    means `grant` already re-seals it to a newly enrolled machine and a machine
+    that has not been granted access yet simply cannot open it -- the same state,
+    with the same remedy, as history it cannot decrypt.
+    """
+    return history_dir() / "mac.age"
+
+
+def frame_chunk(sealed: bytes, tag: bytes) -> bytes:
+    """One chunk file: a fixed-width authentication tag, then the ciphertext.
+
+    A prefix rather than a sibling file, so that everything which answers "what
+    is a chunk" keeps working unchanged -- `is_chunk_path`, the ``*.age`` glob
+    in `GITATTRIBUTES`, `iter_chunks`, and the CI invariant that no chunk is
+    ever rewritten. A second file per chunk would also have doubled the file
+    count that `compact` exists to hold down.
+
+    Fixed width, so splitting needs no delimiter and no length field.
+    """
+    return tag + sealed
+
+
+def split_chunk(blob: bytes) -> tuple[bytes, bytes]:
+    """Inverse of :func:`frame_chunk`: ``(sealed, tag)``.
+
+    Raises :class:`ValueError` on anything too short to be framed, which callers
+    treat exactly like a tag that does not match: an unauthenticated chunk and a
+    malformed one are the same refusal.
+    """
+    if len(blob) <= _TAG_BYTES:
+        raise ValueError("chunk carries no authentication tag")
+    return blob[_TAG_BYTES:], blob[:_TAG_BYTES]
 
 
 def day_key(machine_id: str, day: str) -> Path:

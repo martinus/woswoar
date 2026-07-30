@@ -80,8 +80,18 @@ including days recorded before it ever existed:
 Grant all 2 machines full access? [y/N]
 ```
 
-No rush — until you run it the new machine syncs its own commands normally and
-just reports how many older days it cannot read yet.
+That one command finishes onboarding in both directions: it is what lets the
+newcomer read history from before it existed, *and* what hands it the key every
+chunk is authenticated with, so its own commands start publishing too.
+
+Until you run it the new machine keeps recording locally and says what it is
+waiting for. Nothing is lost — the backlog is published in full by the first
+sync after `grant`.
+
+Authentication matters because the history repo is somewhere anyone with push
+access could write. Every chunk carries a tag computed with a key only your
+enrolled machines can open, checked before the chunk is decrypted, so a repo
+someone else can push to cannot put a command into your Ctrl-R.
 
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared

