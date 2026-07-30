@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -118,47 +119,65 @@ class TestPrivateByDefault(WoswoarTestCase):
     downgrade on any box with a group- or world-readable home.
     """
 
-    def modes(self) -> dict[str, int]:
-        paths = [
-            store.data_dir(),
-            store.config_dir(),
-            store.logs_dir(),
-            *store.logs_dir().rglob("*"),
-        ]
-        return {str(p): p.stat().st_mode & 0o777 for p in paths if p.exists()}
+    def loose(self) -> list[str]:
+        """Paths another account could read, walked independently of the code.
+
+        Deliberately not `store.readable_by_others()`: asking the helper about
+        itself could not catch it forgetting a path, which is the failure this
+        is guarding against.
+        """
+        roots = [store.data_dir(), store.config_dir(), store.cache_dir()]
+        seen = [r for r in roots if r.is_dir()]
+        seen += [p for r in list(seen) for p in r.rglob("*")]
+        return sorted(
+            f"{p} is {oct(p.stat().st_mode & 0o777)}"
+            for p in seen
+            if p.stat().st_mode & 0o077 and store.history_dir() not in [p, *p.parents]
+        )
 
     def first_run(self) -> None:
         """What a real first run writes, through the real entry points.
 
         The shared harness pre-creates the config directory with a plain
-        mkdir, so a test that only appended entries would be asserting about a
-        directory woswoar never wrote.
+        mkdir; removing it first means the assertions are about directories
+        woswoar actually created rather than ones it inherited.
         """
+        shutil.rmtree(store.config_dir())
         store.save_machine(store.machine())
         store.append_entries(MACHINE_ID, [make_entry(1_700_000_000, "git status")])
 
-    def test_everything_written_is_owner_only(self) -> None:
-        self.first_run()
-        for path, mode in self.modes().items():
-            self.assertEqual(mode & 0o077, 0, f"{path} is {oct(mode)}")
-
-    def test_a_stock_umask_cannot_loosen_them(self) -> None:
+    def test_a_stock_umask_cannot_loosen_what_is_written(self) -> None:
         # 022 is the default nearly everywhere, and is exactly what made the
-        # logs 0644 before: `mkdir` and `open(..., "a")` both honour it.
+        # logs 0644: `mkdir` and `open(..., "a")` both honour it. Pinned rather
+        # than inherited, so the test cannot pass vacuously on a strict runner.
         previous = os.umask(0o022)
         self.addCleanup(os.umask, previous)
         self.first_run()
-        for path, mode in self.modes().items():
-            self.assertEqual(mode & 0o077, 0, f"{path} is {oct(mode)}")
+        self.assertEqual(self.loose(), [])
 
     def test_an_older_install_is_retightened(self) -> None:
         self.first_run()
         for path in (store.data_dir(), store.logs_dir(), *store.logs_dir().rglob("*")):
             path.chmod(0o755 if path.is_dir() else 0o644)
-        self.assertTrue(store.world_readable(), "the fixture is not actually loose")
+        self.assertTrue(self.loose(), "the fixture is not actually loose")
 
         store.harden()
-        self.assertEqual(store.world_readable(), [])
+        self.assertEqual(self.loose(), [])
+
+    def test_creating_a_file_does_not_repermission_a_directory_it_found(self) -> None:
+        """`write_atomic` is a durability primitive, not a permissions one.
+
+        It creates missing parents privately, but must not clamp a directory
+        that was already there -- `history/` arrives from `git clone`, and a
+        user-chosen WOSWOAR_DIR is not woswoar's to re-permission. Migration is
+        `harden`'s job precisely so this one can stay out of it.
+        """
+        borrowed = store.data_dir() / "borrowed"
+        borrowed.mkdir(parents=True)
+        borrowed.chmod(0o755)
+        store.write_atomic(borrowed / "note", b"hello")
+        self.assertEqual(borrowed.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((borrowed / "note").stat().st_mode & 0o777, 0o600)
 
     def test_doctor_reports_an_exposed_history(self) -> None:
         self.first_run()

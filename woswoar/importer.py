@@ -416,8 +416,7 @@ def run_atuin(
             # Guarded only against overwriting a name learned from a real sync.
             label = store.name_file(host_id)
             if not label.is_file():
-                label.parent.mkdir(parents=True, exist_ok=True)
-                label.write_text(f"{names[host_id]}\n", encoding="utf-8")
+                store.write_atomic(label, f"{names[host_id]}\n".encode())
 
     return Result(
         parsed=parsed,

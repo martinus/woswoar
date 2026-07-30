@@ -16,7 +16,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import IO, Any, NamedTuple
 
 from .entry import Entry, format_line, parse_line
 
@@ -114,8 +114,14 @@ def log_file(machine_id: str, day: str) -> Path:
 #: the exit status, and every other machine's history once sync has run -- so
 #: anything looser would make installing woswoar a downgrade. The default umask
 #: on most distributions is 022, which is why this cannot be left implicit.
+#:
+#: The shell hook spells 077 itself, because it is copied verbatim rather than
+#: templated; tests/test_shell_hook.py pins the two together.
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+
+#: Group and other bits. "Readable by someone who is not you", once.
+OTHER_BITS = 0o077
 
 
 def private_dir(path: Path) -> Path:
@@ -124,74 +130,81 @@ def private_dir(path: Path) -> Path:
     Each component is created separately because ``Path.mkdir(parents=True,
     mode=...)`` applies the mode to the leaf only and leaves parents at the
     umask default -- which would put a 0755 ``logs/`` above a 0700 host
-    directory and defeat the whole thing. The explicit chmod afterwards covers
-    a umask that would have masked bits out, and re-tightens directories from
-    an install that predates this.
-    """
-    missing: list[Path] = []
-    probe = path
-    while not probe.exists() and probe != probe.parent:
-        missing.append(probe)
-        probe = probe.parent
+    directory and defeat the whole thing.
 
-    for directory in reversed(missing):
-        directory.mkdir(mode=DIR_MODE, exist_ok=True)
-    with contextlib.suppress(OSError):
-        path.chmod(DIR_MODE)
+    Directories that already exist are left exactly as they are. This is called
+    from `write_atomic`, so anything else would make writing a file quietly
+    re-permission whatever directory it was pointed at -- including a
+    ``history/`` that came from ``git clone``. Re-tightening an old tree is
+    :func:`harden`'s job, and keeping the two separate is what lets that
+    docstring be true.
+    """
+    for directory in (*reversed(path.parents), path):
+        if not directory.exists():
+            directory.mkdir(mode=DIR_MODE)
     return path
 
 
-def private_append(path: Path) -> Any:
+def private_append(path: Path, binary: bool = False) -> IO[Any]:
     """Open ``path`` for appending, creating it owner-only if it is not there.
 
     ``open(..., "a")`` creates with 0666 masked by the umask -- 0644 on a stock
     install. The mode only matters at creation, so this is the one moment it
     can be got right.
+
+    ``binary`` because the caller that appends another machine's merged log
+    already holds bytes. Making it decode to fit a text-only helper would put a
+    lossy round trip on data that machine recorded successfully, which is not a
+    decision a function about file modes should be making.
     """
     private_dir(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
+    if binary:
+        return os.fdopen(fd, "ab")
     return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def _private_paths() -> list[Path]:
+    """Everything woswoar owns whose mode is its business.
+
+    Walked rather than listed, so a file added under the data directory later
+    is covered by default instead of by someone remembering. ``history/`` is
+    the one exclusion: it is ciphertext plus a git checkout reaching tens of
+    thousands of files, walking it would make this proportional to the size of
+    the archive rather than to the number of days recorded, and the directory
+    above it being owner-only is what actually stops another user reading it.
+    """
+    roots = [data_dir(), config_dir(), cache_dir()]
+    out = [root for root in roots if root.is_dir()]
+    history = history_dir()
+    for root in list(out):
+        for path in root.rglob("*"):
+            if path == history or history in path.parents:
+                continue
+            out.append(path)
+    return out
 
 
 def harden() -> None:
     """Re-tighten an installation that predates :data:`DIR_MODE`.
 
-    Only the roots and the plaintext logs: the roots are what actually stop
-    another user walking in, and ``history/`` is ciphertext plus a git checkout
-    that can be tens of thousands of files. Cheap enough for `install` and
-    `doctor` to call every time.
+    Separate from :func:`private_dir` on purpose: creating a directory should
+    not silently re-permission one that was already there, but a migration
+    should. `install` is where this runs, because that is the command people
+    re-run to upgrade.
     """
-    for root in (data_dir(), config_dir(), cache_dir()):
-        if root.is_dir():
-            with contextlib.suppress(OSError):
-                root.chmod(DIR_MODE)
-
-    for path in _private_contents():
+    for path in _private_paths():
         with contextlib.suppress(OSError):
             path.chmod(DIR_MODE if path.is_dir() else FILE_MODE)
 
 
-def _private_contents() -> list[Path]:
-    """Everything woswoar owns that holds plaintext or key material.
+def readable_by_others() -> list[Path]:
+    """Everything woswoar owns that another account on this machine could read.
 
-    ``history/`` is left out on purpose: it is ciphertext plus a git checkout
-    that reaches tens of thousands of files, and walking it would make this
-    proportional to the size of the archive rather than to the number of days.
-    The roots above it are owner-only, which is what actually stops another
-    user reading any of it.
+    Named for the check it performs -- the mask is group *and* other, which
+    ``world_readable`` would have misdescribed for anyone adding a caller.
     """
-    out = [logs_dir(), *logs_dir().rglob("*")] if logs_dir().is_dir() else []
-    if config_dir().is_dir():
-        out += [p for p in config_dir().iterdir() if p.is_file()]
-    if cache_file().is_file():
-        out.append(cache_file())
-    return out
-
-
-def world_readable() -> list[Path]:
-    """Anything woswoar owns that another user on this machine could read."""
-    roots = [r for r in (data_dir(), config_dir(), cache_dir()) if r.is_dir()]
-    return [p for p in roots + _private_contents() if p.stat().st_mode & 0o077]
+    return [p for p in _private_paths() if p.stat().st_mode & OTHER_BITS]
 
 
 def write_atomic(path: Path, data: bytes) -> None:

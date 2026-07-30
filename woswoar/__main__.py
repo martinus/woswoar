@@ -61,12 +61,15 @@ def cmd_install(args: argparse.Namespace) -> int:
     import shutil
 
     machine = store.machine()
-    # Before anything is written, and again on every install: an installation
-    # from before woswoar made its own directories owner-only stays wrong
-    # otherwise, and `install` is the command people re-run to upgrade.
-    store.harden()
-    target = store.private_dir(store.data_dir()) / HOOK_NAME
+    store.private_dir(store.data_dir())
+    target = store.data_dir() / HOOK_NAME
     shutil.copyfile(_hook_source(), target)
+    # After the copy, not before: `copyfile` creates at the ambient umask, so
+    # hardening first would leave the one file install itself writes as the one
+    # file its own migration missed. This is also what re-tightens a tree from
+    # a woswoar that predated owner-only directories -- `install` is the
+    # command people re-run to upgrade.
+    store.harden()
 
     print(f"machine : {machine.name} ({machine.id})")
     print(f"logs    : {store.logs_dir()}")
@@ -271,15 +274,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Recorded history is more than ~/.bash_history holds -- the command, the
     # directory, the exit status, and every other machine's history once sync
     # has run -- so anything another user can read is a finding, not a note.
-    exposed = store.world_readable()
-    check(
-        "private",
-        not exposed,
-        f"{store.logs_dir()} is owner-only"
-        if not exposed
-        else f"{len(exposed)} path(s) readable by other users, e.g. {exposed[0]}"
-        " - run 'woswoar install' to fix",
-    )
+    exposed = store.readable_by_others()
+    if exposed:
+        detail = f"{len(exposed)} path(s) other users can read, e.g. {exposed[0]}"
+        detail += " - run 'woswoar install' to fix"
+    else:
+        detail = f"{store.data_dir()} is owner-only"
+    check("private", not exposed, detail)
 
     started = time.perf_counter()
     entries = cache.load_entries()

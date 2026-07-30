@@ -230,11 +230,12 @@ __woswoar_precmd() {
     # the answer changes once a day.
     if [[ $day != "$__woswoar_today" ]]; then
         __woswoar_today=$day
-        if [[ ! -e $__woswoar_logdir/$day.tsv ]]; then
-            umask 077
-            : >"$__woswoar_logdir/$day.tsv" 2>/dev/null
-            umask "$__woswoar_umask"
-        fi
+        # `>>` rather than `>`: it creates when absent and does nothing when
+        # present, so no separate existence test is needed and a day already
+        # underway cannot be truncated.
+        umask 077
+        : >>"$__woswoar_logdir/$day.tsv" 2>/dev/null
+        umask "$__woswoar_umask"
     fi
 
     # One O_APPEND write. Linux serialises these under the inode lock, so
