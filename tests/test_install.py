@@ -7,14 +7,17 @@ which differs the moment two machines disagree about the username.
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from woswoar import store
 from woswoar.__main__ import main, portable_hook_path
 
-from .support import WoswoarTestCase, requires_bash
+from .support import MACHINE_ID, WoswoarTestCase, make_entry, requires_bash
 
 
 class TestPortableHookPath(unittest.TestCase):
@@ -104,6 +107,66 @@ class TestInstall(WoswoarTestCase):
             env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
         ).stdout
         self.assertTrue(Path(resolved).is_file(), f"{resolved} was not written by install")
+
+
+class TestPrivateByDefault(WoswoarTestCase):
+    """Recorded history is at least as private as ~/.bash_history.
+
+    bash creates that 0600. woswoar's logs hold strictly more -- the command,
+    the working directory, the exit status, and every other machine's history
+    once sync has run -- so anything looser would make installing woswoar a
+    downgrade on any box with a group- or world-readable home.
+    """
+
+    def modes(self) -> dict[str, int]:
+        paths = [
+            store.data_dir(),
+            store.config_dir(),
+            store.logs_dir(),
+            *store.logs_dir().rglob("*"),
+        ]
+        return {str(p): p.stat().st_mode & 0o777 for p in paths if p.exists()}
+
+    def first_run(self) -> None:
+        """What a real first run writes, through the real entry points.
+
+        The shared harness pre-creates the config directory with a plain
+        mkdir, so a test that only appended entries would be asserting about a
+        directory woswoar never wrote.
+        """
+        store.save_machine(store.machine())
+        store.append_entries(MACHINE_ID, [make_entry(1_700_000_000, "git status")])
+
+    def test_everything_written_is_owner_only(self) -> None:
+        self.first_run()
+        for path, mode in self.modes().items():
+            self.assertEqual(mode & 0o077, 0, f"{path} is {oct(mode)}")
+
+    def test_a_stock_umask_cannot_loosen_them(self) -> None:
+        # 022 is the default nearly everywhere, and is exactly what made the
+        # logs 0644 before: `mkdir` and `open(..., "a")` both honour it.
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        self.first_run()
+        for path, mode in self.modes().items():
+            self.assertEqual(mode & 0o077, 0, f"{path} is {oct(mode)}")
+
+    def test_an_older_install_is_retightened(self) -> None:
+        self.first_run()
+        for path in (store.data_dir(), store.logs_dir(), *store.logs_dir().rglob("*")):
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        self.assertTrue(store.world_readable(), "the fixture is not actually loose")
+
+        store.harden()
+        self.assertEqual(store.world_readable(), [])
+
+    def test_doctor_reports_an_exposed_history(self) -> None:
+        self.first_run()
+        store.logs_dir().chmod(0o755)
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            main(["doctor"])
+        self.assertRegex(out.getvalue(), r"\[FAIL\] private")
 
 
 if __name__ == "__main__":

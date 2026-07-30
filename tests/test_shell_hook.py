@@ -521,5 +521,30 @@ class TestForkFree(ShellHookTestCase):
         )
 
 
+@requires_bash5
+class TestRecordingIsPrivate(ShellHookTestCase):
+    """The hook creates the log file, so the hook is where its mode is decided.
+
+    Python never touches that file on the recording path, so a fix in `store`
+    alone would not have covered the case this exists for.
+    """
+
+    def test_the_day_file_is_owner_only_under_a_stock_umask(self) -> None:
+        self.run_shell("echo hello\n", env_extra={})
+        files = list((Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts").rglob("*.tsv"))
+        self.assertTrue(files, "nothing was recorded")
+        for path in files:
+            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
+
+    def test_the_hook_leaves_the_shell_umask_alone(self) -> None:
+        """It drops to 077 to create the file; it must put it back.
+
+        Otherwise every file the user creates afterwards would silently become
+        0600 -- a surprising thing for a history tool to do to a shell.
+        """
+        out = self.run_shell("echo start\numask\n")
+        self.assertIn("0022", out)
+
+
 if __name__ == "__main__":
     unittest.main()

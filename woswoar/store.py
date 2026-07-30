@@ -109,6 +109,91 @@ def log_file(machine_id: str, day: str) -> Path:
     return host_dir(machine_id) / f"{day}{_LOG_SUFFIX}"
 
 
+#: Everything woswoar owns is private to its owner. `~/.bash_history` is 0600
+#: and woswoar's logs hold strictly more -- the command, the working directory,
+#: the exit status, and every other machine's history once sync has run -- so
+#: anything looser would make installing woswoar a downgrade. The default umask
+#: on most distributions is 022, which is why this cannot be left implicit.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+
+def private_dir(path: Path) -> Path:
+    """Create ``path`` and any missing parents, owner-only from the moment they exist.
+
+    Each component is created separately because ``Path.mkdir(parents=True,
+    mode=...)`` applies the mode to the leaf only and leaves parents at the
+    umask default -- which would put a 0755 ``logs/`` above a 0700 host
+    directory and defeat the whole thing. The explicit chmod afterwards covers
+    a umask that would have masked bits out, and re-tightens directories from
+    an install that predates this.
+    """
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
+
+    for directory in reversed(missing):
+        directory.mkdir(mode=DIR_MODE, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(DIR_MODE)
+    return path
+
+
+def private_append(path: Path) -> Any:
+    """Open ``path`` for appending, creating it owner-only if it is not there.
+
+    ``open(..., "a")`` creates with 0666 masked by the umask -- 0644 on a stock
+    install. The mode only matters at creation, so this is the one moment it
+    can be got right.
+    """
+    private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def harden() -> None:
+    """Re-tighten an installation that predates :data:`DIR_MODE`.
+
+    Only the roots and the plaintext logs: the roots are what actually stop
+    another user walking in, and ``history/`` is ciphertext plus a git checkout
+    that can be tens of thousands of files. Cheap enough for `install` and
+    `doctor` to call every time.
+    """
+    for root in (data_dir(), config_dir(), cache_dir()):
+        if root.is_dir():
+            with contextlib.suppress(OSError):
+                root.chmod(DIR_MODE)
+
+    for path in _private_contents():
+        with contextlib.suppress(OSError):
+            path.chmod(DIR_MODE if path.is_dir() else FILE_MODE)
+
+
+def _private_contents() -> list[Path]:
+    """Everything woswoar owns that holds plaintext or key material.
+
+    ``history/`` is left out on purpose: it is ciphertext plus a git checkout
+    that reaches tens of thousands of files, and walking it would make this
+    proportional to the size of the archive rather than to the number of days.
+    The roots above it are owner-only, which is what actually stops another
+    user reading any of it.
+    """
+    out = [logs_dir(), *logs_dir().rglob("*")] if logs_dir().is_dir() else []
+    if config_dir().is_dir():
+        out += [p for p in config_dir().iterdir() if p.is_file()]
+    if cache_file().is_file():
+        out.append(cache_file())
+    return out
+
+
+def world_readable() -> list[Path]:
+    """Anything woswoar owns that another user on this machine could read."""
+    roots = [r for r in (data_dir(), config_dir(), cache_dir()) if r.is_dir()]
+    return [p for p in roots + _private_contents() if p.stat().st_mode & 0o077]
+
+
 def write_atomic(path: Path, data: bytes) -> None:
     """Replace ``path``'s contents in one step.
 
@@ -117,7 +202,7 @@ def write_atomic(path: Path, data: bytes) -> None:
     import watermarks, and the sync state. They all go through here so
     a crash mid-write leaves the previous version rather than a corrupt one.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -218,18 +303,16 @@ def machine_file() -> Path:
 
 
 def save_machine(known: Machine) -> None:
-    path = machine_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"id={known.id}", f"name={known.name}"]
     if known.identity:
         lines.append(f"identity={known.identity}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Through write_atomic, which creates via mkstemp at 0600. This file names
+    # the identity key's path; it is not secret, but it is nobody else's.
+    write_atomic(machine_file(), ("\n".join(lines) + "\n").encode("utf-8"))
 
     # Mirrored next to the logs so search can label entries without reading
     # config, and so sync has a single file to seal and share.
-    name_file = host_dir(known.id) / _NAME_FILE
-    name_file.parent.mkdir(parents=True, exist_ok=True)
-    name_file.write_text(f"{known.name}\n", encoding="utf-8")
+    write_atomic(host_dir(known.id) / _NAME_FILE, f"{known.name}\n".encode())
 
 
 def default_machine_name() -> str:
@@ -480,10 +563,9 @@ def append_entries(machine_id: str, entries: list[Entry]) -> dict[str, int]:
     written: dict[str, int] = {}
     for day, group in sorted(by_day.items()):
         path = log_file(machine_id, day)
-        path.parent.mkdir(parents=True, exist_ok=True)
         group.sort(key=lambda e: e.ts)
         payload = "".join(f"{format_line(e)}\n" for e in group)
-        with path.open("a", encoding="utf-8") as handle:
+        with private_append(path) as handle:
             handle.write(payload)
         written[path.name] = len(group)
     return written

@@ -483,10 +483,10 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac:
 
     for day, blocks in pending.items():
         payload = b"".join(blocks)
-        target = store.log_file(host_id, day)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("ab") as handle:
-            handle.write(payload)
+        # Another machine's history is no less private than this one's, and it
+        # lands in the same tree, so it is created with the same mode.
+        with store.private_append(store.log_file(host_id, day)) as handle:
+            handle.write(payload.decode("utf-8", errors="replace"))
         report.lines_imported += payload.count(b"\n")
 
 

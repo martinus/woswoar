@@ -61,8 +61,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     import shutil
 
     machine = store.machine()
-    target = store.data_dir() / HOOK_NAME
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # Before anything is written, and again on every install: an installation
+    # from before woswoar made its own directories owner-only stays wrong
+    # otherwise, and `install` is the command people re-run to upgrade.
+    store.harden()
+    target = store.private_dir(store.data_dir()) / HOOK_NAME
     shutil.copyfile(_hook_source(), target)
 
     print(f"machine : {machine.name} ({machine.id})")
@@ -264,6 +267,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     logs = list(store.iter_log_files())
     info("logs", f"{len(logs)} file(s) in {store.logs_dir()}")
+
+    # Recorded history is more than ~/.bash_history holds -- the command, the
+    # directory, the exit status, and every other machine's history once sync
+    # has run -- so anything another user can read is a finding, not a note.
+    exposed = store.world_readable()
+    check(
+        "private",
+        not exposed,
+        f"{store.logs_dir()} is owner-only"
+        if not exposed
+        else f"{len(exposed)} path(s) readable by other users, e.g. {exposed[0]}"
+        " - run 'woswoar install' to fix",
+    )
 
     started = time.perf_counter()
     entries = cache.load_entries()

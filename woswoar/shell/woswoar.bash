@@ -47,7 +47,19 @@ if [[ -z $__woswoar_id ]]; then
 fi
 
 __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
-mkdir -p "$__woswoar_logdir" 2>/dev/null || return 0
+
+# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p`
+# would otherwise honour the ambient umask, which is 022 almost everywhere, and
+# these files hold more than ~/.bash_history does -- which bash creates 0600.
+#
+# Only creation happens here. Re-tightening a tree from an older woswoar is
+# `woswoar install`'s job: a recursive chmod is proportional to the number of
+# days recorded, and this runs on every interactive shell.
+(umask 077 && mkdir -p "$__woswoar_logdir") 2>/dev/null || return 0
+
+# Captured once, so the hot path can drop to 077 for the one write a day that
+# creates a file and put it straight back without forking to read it.
+__woswoar_umask=$(umask)
 
 # Scratch file for capturing `history 1`. Prefer XDG_RUNTIME_DIR: it is a
 # per-user tmpfs that systemd clears at logout, so a shell killed with -9 cannot
@@ -86,6 +98,8 @@ __woswoar_max=8000
 __woswoar_start=
 __woswoar_status=
 __woswoar_lastnum=
+#: The day whose log file is known to exist already. See __woswoar_precmd.
+__woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.
@@ -208,6 +222,20 @@ __woswoar_precmd() {
 
     local day
     printf -v day '%(%F)T' -1 # local time, matching store.day_for()
+
+    # A file's mode is set when it is created and never again, so the first
+    # write of each day is the only moment this can be got right -- and `>>`
+    # would create it 0644 under the usual umask. Guarded on the day string
+    # rather than testing the file every time: this runs on every command, and
+    # the answer changes once a day.
+    if [[ $day != "$__woswoar_today" ]]; then
+        __woswoar_today=$day
+        if [[ ! -e $__woswoar_logdir/$day.tsv ]]; then
+            umask 077
+            : >"$__woswoar_logdir/$day.tsv" 2>/dev/null
+            umask "$__woswoar_umask"
+        fi
+    fi
 
     # One O_APPEND write. Linux serialises these under the inode lock, so
     # concurrent shells on this host cannot interleave lines.
