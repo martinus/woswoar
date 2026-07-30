@@ -1,4 +1,4 @@
-"""Encryption, delegated entirely to the ``age`` binary.
+"""Encryption and signing, delegated entirely to ``age`` and ``ssh-keygen``.
 
 Python's standard library has no cipher -- only hashing and randomness -- so
 sealing the synced history needs an external tool. ``age`` was chosen because it
@@ -6,8 +6,15 @@ is one small static binary and it accepts **SSH public keys as recipients**,
 which means each machine can use the keypair it already pushes to git with and
 no secret ever has to be copied between machines.
 
+``age`` gives confidentiality and nothing else: it has no notion of a sender, so
+a recipient list published in the repo lets *anyone who can push* seal a chunk
+that every machine will happily open. Authenticity therefore needs a second
+primitive, and ``ssh-keygen -Y sign``/``-Y verify`` is it -- OpenSSH's signature
+mode, which is as much a "one job, already audited, already installed" tool as
+age is. Same rule as encryption: no primitive is composed here, only invoked.
+
 Nothing here knows about history, chunks, or git; it is a thin, testable seam so
-that swapping the backend later touches one file.
+that swapping either backend later touches one file.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
@@ -23,6 +31,13 @@ from .errors import WoswoarError
 
 AGE = "age"
 AGE_KEYGEN = "age-keygen"
+SSH_KEYGEN = "ssh-keygen"
+
+#: Domain separator for chunk signatures. ssh-keygen refuses a signature made
+#: for a different namespace, so a signature harvested from some other use of
+#: the same key -- git commit signing, `ssh-keygen -Y sign` in a script -- can
+#: never be replayed as a woswoar chunk.
+CHUNK_NAMESPACE = "woswoar-chunk"
 
 _TIMEOUT = 120
 
@@ -74,6 +89,17 @@ def require() -> None:
 
 def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:
     require()
+    return _spawn(argv, data, pass_fds)
+
+
+def _spawn(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:
+    """Run a tool and return its stdout, raising :class:`AgeError` on failure.
+
+    Split out from :func:`_run` so the ssh-keygen calls below do not assert that
+    *age* is installed: signing and encryption are separate tools, and reporting
+    a missing age when ssh-keygen is what is absent sends the reader to the
+    wrong package.
+    """
     try:
         result = subprocess.run(
             argv,
@@ -182,6 +208,161 @@ def recipient_for(identity: Path) -> str:
     # both how to skip the subprocess when the identity carries its own
     # `# public key:` comment and how to feed age on stdin when it does not.
     return public_of(identity.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Signing. Answers "who wrote this?", which age cannot.
+# ---------------------------------------------------------------------------
+
+
+def signing_available() -> bool:
+    return shutil.which(SSH_KEYGEN) is not None
+
+
+def require_signing() -> None:
+    if not signing_available():
+        from . import deps
+
+        raise AgeError(
+            "Sync verifies who wrote every chunk before opening it.\n"
+            + deps.report([deps.SSH_KEYGEN])
+        )
+
+
+def generate_signing_key() -> Identity:
+    """Create a fresh unencrypted ed25519 signing keypair.
+
+    Every machine gets a dedicated signing key rather than reusing whichever
+    identity `sync.choose_identity` picked. That identity may be an *age* key,
+    which is X25519 and cannot sign at all, so reuse would work on some machines
+    and fail on others -- one code path that always works beats a branch that
+    only mostly does.
+
+    ssh-keygen can only write a keypair to a path, so this generates into a
+    private temporary directory and hands back the bytes. Storing it is the
+    caller's business, which keeps the "no key material is written by this
+    module" property the encryption half already has.
+    """
+    require_signing()
+    with tempfile.TemporaryDirectory(prefix="woswoar-key-") as scratch:
+        path = Path(scratch) / "signing_key"
+        _spawn(
+            [SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "woswoar", "-f", str(path)],
+        )
+        return Identity(
+            secret=path.read_text(encoding="utf-8"),
+            public=path.with_suffix(".pub").read_text(encoding="utf-8").strip(),
+        )
+
+
+def public_of_signing_key(key: Path) -> str:
+    """Recover a signing key's public half from the private key file."""
+    require_signing()
+    return _spawn([SSH_KEYGEN, "-y", "-f", str(key)]).decode("utf-8").strip()
+
+
+def sign(data: bytes, key: Path) -> str:
+    """Sign ``data`` with the signing key at ``key``, returning armoured text.
+
+    Takes a path, unlike everything on the encryption side, and the exception is
+    forced rather than chosen: ``ssh-keygen -Y sign`` resolves the ``.pub``
+    sibling of whatever ``-f`` names, so handing it ``/dev/fd/N`` fails with
+    "Couldn't load public key" -- the trick that works for age does not work
+    here. The cost is small, because this key is woswoar's own file in its own
+    config directory rather than something in ``~/.ssh`` a sandboxed binary may
+    be refused: `doctor` proves the round trip works on this machine rather than
+    assuming it.
+    """
+    require_signing()
+    argv = [SSH_KEYGEN, "-Y", "sign", "-f", str(key), "-n", CHUNK_NAMESPACE, "-"]
+    return _spawn(argv, data).decode("utf-8")
+
+
+def verify(data: bytes, signature: str, public_key: str, principal: str) -> bool:
+    """Whether ``signature`` is ``public_key``'s signature over ``data``.
+
+    Returns a bool rather than raising: an unverifiable chunk is an ordinary
+    thing to meet in a repo anyone can push to, and sync's job is to skip it and
+    carry on, not to abort. A *missing ssh-keygen* is different and does raise,
+    because silently treating "cannot check" as "not valid" would turn a missing
+    package into apparently-lost history.
+
+    ssh-keygen needs both the allowed-signers list and the signature as real
+    files. Both are public data -- a public key and a signature -- so unlike key
+    material they can go to a temporary directory without weakening anything.
+    """
+    require_signing()
+    with tempfile.TemporaryDirectory(prefix="woswoar-verify-") as scratch:
+        allowed = Path(scratch) / "allowed_signers"
+        allowed.write_text(
+            f'{principal} namespaces="{CHUNK_NAMESPACE}" {public_key.strip()}\n',
+            encoding="utf-8",
+        )
+        sig = Path(scratch) / "chunk.sig"
+        sig.write_text(signature, encoding="utf-8")
+        argv = [SSH_KEYGEN, "-Y", "verify"]
+        argv += ["-f", str(allowed), "-I", principal]
+        argv += ["-n", CHUNK_NAMESPACE, "-s", str(sig)]
+        try:
+            _spawn(argv, data)
+        except AgeError:
+            # Through _spawn rather than subprocess.run so a hung ssh-keygen
+            # becomes the same timeout error every other tool call raises. A
+            # bad signature and a stuck binary both mean "do not merge this",
+            # and only one of them should be able to escape as a raw
+            # TimeoutExpired and abort the whole sync.
+            return False
+        return True
+
+
+def fingerprint(public_key: str) -> str:
+    """A short human-comparable digest of a signing key.
+
+    Shown when a machine is trusted for the first time, because that is a
+    decision nobody can make against 68 characters of base64.
+    """
+    with tempfile.TemporaryDirectory(prefix="woswoar-fp-") as scratch:
+        path = Path(scratch) / "key.pub"
+        path.write_text(public_key.strip() + "\n", encoding="utf-8")
+        try:
+            out = _spawn([SSH_KEYGEN, "-l", "-f", str(path)]).decode("utf-8")
+        except AgeError:
+            return public_key.strip()[:24] + "..."
+    fields = out.split()
+    return fields[1] if len(fields) > 1 else out.strip()
+
+
+def signing_selftest() -> str:
+    """``""`` if ssh-keygen can sign and verify here, else what went wrong.
+
+    The same reasoning as :func:`selftest`: ``ssh-keygen --help`` proves a
+    binary exists, not that it can complete a round trip. Signing is the one
+    place woswoar still hands a tool a *path* to key material, so a confined
+    ssh-keygen fails here exactly the way a confined age failed before it -- and
+    an unsigned chunk is one no other machine will ever accept.
+    """
+    from . import store
+
+    probe = b"woswoar selftest"
+    real = store.signing_key_file()
+    try:
+        with tempfile.TemporaryDirectory(prefix="woswoar-selftest-") as scratch:
+            # The machine's *real* key when it has one, because that is the file
+            # a confined ssh-keygen is refused -- it lives beside the identity
+            # in ~/.config/woswoar that produced the original "permission
+            # denied". Signing a throwaway under /tmp would pass on exactly the
+            # machine this exists to catch.
+            key = real if real.is_file() else Path(scratch) / "signing_key"
+            if key != real:
+                _spawn(
+                    [SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "woswoar", "-f", str(key)]
+                )
+            public = public_of_signing_key(key)
+            if not verify(probe, sign(probe, key), public, "selftest"):
+                return "ssh-keygen signed but would not verify its own signature"
+    except (AgeError, OSError) as exc:
+        return str(exc)
+    return ""
 
 
 def selftest() -> str:

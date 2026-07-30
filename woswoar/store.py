@@ -310,6 +310,59 @@ def name_seal(machine_id: str) -> Path:
     return repo_host_dir(machine_id) / "name.age"
 
 
+def signing_key_file() -> Path:
+    """This machine's private signing key. Never leaves the machine."""
+    return config_dir() / "signing_key"
+
+
+def signer_public(machine_id: str) -> Path:
+    """A host's signing *public* key, published in the repo.
+
+    Being in the repo, this is only a claim -- anyone who can push can rewrite
+    it. What makes it trustworthy is that each machine pins the value it was
+    shown when it first trusted that host; see ``sync.State.signers``.
+    """
+    return repo_host_dir(machine_id) / "signer.pub"
+
+
+#: ssh-keygen's armour is self-delimiting and ends with this line, so a chunk
+#: can carry its signature in front of the ciphertext and still be split apart
+#: without a length field or a format version.
+_SIGNATURE_END = b"-----END SSH SIGNATURE-----\n"
+
+
+def frame_chunk(sealed: bytes, signature: str) -> bytes:
+    """One chunk file: the signature over ``sealed``, then ``sealed`` itself.
+
+    A header rather than a sibling ``.sig`` file, which is what this was first
+    written as. The sibling broke everything that answers "what is a chunk":
+    `is_chunk_path` classified it as rewritable, ``*.age`` in `GITATTRIBUTES`
+    did not match it, and the CI invariant that no chunk is ever modified
+    filtered on ``.age`` and so stopped covering half the committed bytes. It
+    also doubled the file count that `sync.compact` exists to hold down, for a
+    signature that is *larger* than a typical chunk -- 306 bytes against 260.
+
+    Framing costs nothing the sibling was buying: `split_chunk` slices the
+    ciphertext back out in memory, so verification still happens before a byte
+    reaches age or zlib.
+    """
+    return signature.encode("utf-8") + sealed
+
+
+def split_chunk(blob: bytes) -> tuple[bytes, str]:
+    """Inverse of :func:`frame_chunk`: ``(sealed, signature)``.
+
+    Raises :class:`ValueError` on anything that is not framed, which callers
+    treat exactly like a signature that does not verify -- an unsigned chunk
+    and an unparseable one are the same refusal.
+    """
+    marker = blob.find(_SIGNATURE_END)
+    if marker < 0:
+        raise ValueError("chunk carries no signature")
+    cut = marker + len(_SIGNATURE_END)
+    return blob[cut:], blob[:cut].decode("utf-8", errors="replace")
+
+
 def day_key(machine_id: str, day: str) -> Path:
     """The day's identity, sealed to every recipient."""
     return repo_host_dir(machine_id) / _KEYS / f"{day}{_CHUNK_SUFFIX}"

@@ -58,6 +58,15 @@ class Report:
     #: error: it is what a freshly joined machine sees until someone runs
     #: `grant` on a machine that was already a recipient.
     unreadable: set[str] = field(default_factory=set)
+    #: Hosts present in the repo that this machine has not trusted yet. Ordinary
+    #: on a new machine, and cleared by `woswoar trust`.
+    untrusted: set[str] = field(default_factory=set)
+    #: Trusted hosts whose published signing key no longer matches the pinned
+    #: one. Either a re-enrolment or an attack; never silently resolved.
+    changed_signer: set[str] = field(default_factory=set)
+    #: "<host>/<day>" entries whose signature did not verify against the host's
+    #: pinned key. These were refused, not merged.
+    forged: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -161,27 +170,47 @@ def is_repo() -> bool:
 class State:
     """Per-machine progress. Deliberately *not* in the repo: it describes what
     this machine has done, not shared history, and syncing it would manufacture
-    the conflicts the rest of the design avoids."""
+    the conflicts the rest of the design avoids.
+
+    It is also the only trust anchor there is. Everything in the repo can be
+    rewritten by anyone who can push to it, ``signer.pub`` included, so the
+    signing key a host is *held to* has to be remembered somewhere the remote
+    cannot reach -- which is here.
+    """
 
     #: log relpath -> plaintext bytes already sealed into a chunk.
     exported: dict[str, int] = field(default_factory=dict)
     #: "<host>/<day>" -> newest chunk filename already merged into logs/.
     merged: dict[str, str] = field(default_factory=dict)
+    #: host id -> the signing public key this machine accepts for that host.
+    #: A host absent from here is not trusted and its history is not merged.
+    signers: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> State:
         raw = store.load_json(store.state_file())
         exported = raw.get("exported", {})
         merged = raw.get("merged", {})
+        signers = raw.get("signers", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         return cls(
             exported={str(k): int(v) for k, v in exported.items()},
             merged={str(k): str(v) for k, v in merged.items()},
+            # Not part of the pair checked above: a state file written before
+            # signing existed has no `signers` at all, and that is an upgrade,
+            # not corruption. Defaulting it to empty means every host starts
+            # untrusted, which is the safe direction.
+            signers={str(k): str(v) for k, v in signers.items()}
+            if isinstance(signers, dict)
+            else {},
         )
 
     def save(self) -> None:
-        store.save_json(store.state_file(), {"exported": self.exported, "merged": self.merged})
+        store.save_json(
+            store.state_file(),
+            {"exported": self.exported, "merged": self.merged, "signers": self.signers},
+        )
 
 
 @contextmanager
@@ -307,8 +336,41 @@ def unpack(blob: bytes) -> bytes:
     return zlib.decompress(blob)
 
 
+def signing_identity() -> crypto.Identity:
+    """This machine's signing keypair, created on first use.
+
+    Both halves are written and kept: ssh-keygen resolves the public key from
+    the private key's ``.pub`` sibling when signing, so the pair has to stay
+    together on disk rather than being reconstructed in memory.
+    """
+    path = store.signing_key_file()
+    pub_path = path.with_suffix(".pub")
+
+    if not path.is_file():
+        identity = crypto.generate_signing_key()
+        store.write_atomic(path, identity.secret.encode("utf-8"))
+        path.chmod(0o600)
+        store.write_atomic(pub_path, (identity.public + "\n").encode("utf-8"))
+        return identity
+
+    if pub_path.is_file():
+        public = pub_path.read_text(encoding="utf-8").strip()
+    else:
+        # Recoverable rather than fatal: the private half is the irreplaceable
+        # one, and signing needs the sibling to exist.
+        public = crypto.public_of_signing_key(path)
+        store.write_atomic(pub_path, (public + "\n").encode("utf-8"))
+    return crypto.Identity(secret=path.read_text(encoding="utf-8"), public=public)
+
+
 def export(known: Machine, state: State, report: Report, now: int) -> None:
-    """Seal each log file's new lines into a fresh chunk."""
+    """Seal each log file's new lines into a fresh chunk, and sign it.
+
+    The signature covers the *sealed* bytes, not the plaintext, so a reader can
+    establish who wrote a chunk before decrypting or decompressing it.
+    """
+    signing_identity()  # ensure the keypair exists before the loop
+    key = store.signing_key_file()
     for log in store.iter_log_files():
         if log.host_id != known.id:
             continue  # other hosts' logs arrived decrypted; never re-export them
@@ -320,7 +382,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
         sealed = crypto.encrypt_to(pack(data), day_public_key(known, day))
         chunk = store.new_chunk(known.id, day, now)
         chunk.parent.mkdir(parents=True, exist_ok=True)
-        store.write_atomic(chunk, sealed)
+        store.write_atomic(chunk, store.frame_chunk(sealed, crypto.sign(sealed, key)))
 
         state.exported[log.relpath] = new_offset
         report.chunks_written += 1
@@ -333,16 +395,70 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
 
 
 def merge(known: Machine, state: State, report: Report) -> None:
-    """Decrypt every chunk from other hosts that we have not merged yet."""
+    """Decrypt every chunk from other trusted hosts that we have not merged yet.
+
+    A host this machine has not trusted is skipped entirely rather than merged
+    and flagged afterwards. The whole point is that its lines never reach the
+    picker, and "import it, then warn" would put an attacker's command one
+    Enter away from running while the warning scrolled past.
+    """
     for host_id in store.repo_hosts():
         if host_id == known.id:
             continue  # our own plaintext is already the source of truth
         report.hosts_seen.add(host_id)
-        _merge_host(known, host_id, state, report)
+
+        status = trust_status(host_id, state)
+        if status == KEY_CHANGED:
+            # The repo now claims a different key for a host we already trust.
+            # That is either a re-enrolled machine or someone rewriting the
+            # repo, and this cannot tell which -- so it refuses and says so.
+            report.changed_signer.add(host_id)
+            continue
+        if status != TRUSTED:
+            report.untrusted.add(host_id)
+            continue
+
+        _merge_host(known, host_id, state, report, state.signers[host_id])
         _merge_name(known, host_id)
 
 
-def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> None:
+#: What this machine makes of another host's signing key. Stated once, because
+#: three hand-written versions of it disagreed: `merge` refused a host whose key
+#: had changed, `doctor` reported it as trusted, and `trust` offered a host with
+#: no published key at all that `sync` had told the user to go and trust.
+TRUSTED = "trusted"
+UNTRUSTED = "untrusted"
+KEY_CHANGED = "key-changed"
+NO_SIGNER = "no-signer"
+
+
+def trust_status(host_id: str, state: State) -> str:
+    """One of :data:`TRUSTED`, :data:`UNTRUSTED`, :data:`KEY_CHANGED`, :data:`NO_SIGNER`."""
+    published = _published_signer(host_id)
+    pinned = state.signers.get(host_id)
+    if not published:
+        # Nothing to accept even if the user wanted to. A host directory with no
+        # signer.pub is what a fabricated one looks like.
+        return NO_SIGNER
+    if pinned is None:
+        return UNTRUSTED
+    return TRUSTED if pinned == published else KEY_CHANGED
+
+
+def _published_signer(host_id: str) -> str:
+    """What the repo currently claims is ``host_id``'s signing key.
+
+    A claim, not a fact: every byte of the repo is writable by anyone who can
+    push. It is only worth anything when compared against a pinned value.
+    """
+    path = store.signer_public(host_id)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _merge_host(known: Machine, host_id: str, state: State, report: Report, signer: str) -> None:
     #: None marks a day whose key we already failed to open. Caching the failure
     #: matters as much as caching the success: without it, a machine that has
     #: not been granted access yet retries the same doomed `age -d` once per
@@ -372,8 +488,24 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             report.unreadable.add(key)
             continue
 
+        # Verified before the chunk is decrypted or decompressed, so age, zlib
+        # and the parser only ever see bytes an enrolled machine committed to.
+        #
+        # Deliberately *below* the day-key bail rather than above it, even
+        # though "check the signature first" reads better. A day we cannot open
+        # never advances the watermark, so its chunks come round again on every
+        # sync -- and this timer fires every minute. Verifying first meant a
+        # machine waiting for `grant` re-ran ssh-keygen over the entire history
+        # once a minute, which at 20k chunks does not finish inside the tick.
+        # Opening a day key does not touch a single byte of the chunk, so
+        # nothing is decrypted any earlier by ordering it this way.
+        sealed_bytes = _verified_chunk_bytes(chunk, host_id, signer)
+        if sealed_bytes is None:
+            report.forged.add(key)
+            continue
+
         try:
-            sealed = crypto.decrypt_with_secret(chunk.path.read_bytes(), secret)
+            sealed = crypto.decrypt_with_secret(sealed_bytes, secret)
             plaintext = unpack(sealed)
         except (crypto.AgeError, zlib.error, OSError):
             # Same judgement as an unopenable day key above: a chunk we cannot
@@ -397,21 +529,55 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         report.lines_imported += payload.count(b"\n")
 
 
+def _verified_chunk_bytes(chunk: store.Chunk, host_id: str, signer: str) -> bytes | None:
+    """``chunk``'s ciphertext if ``host_id`` really signed it, else ``None``.
+
+    Returns the bytes rather than a bool so the caller decrypts what was
+    actually verified, and so a chunk is read from disk once rather than twice.
+
+    A missing or unparseable signature fails like a wrong one. Letting an
+    unsigned chunk through as "probably an old one" would hand an attacker the
+    downgrade: omit the signature and the check is skipped.
+    """
+    try:
+        sealed, signature = store.split_chunk(chunk.path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return sealed if crypto.verify(sealed, signature, signer, host_id) else None
+
+
+def peer_name(known: Machine, host_id: str) -> str:
+    """A host's friendly name, from the local copy or the sealed one.
+
+    Read-only, and used before the host is trusted: `trust` has to put something
+    on screen a human recognises, and an opaque id is not it. The name is no
+    more trustworthy than anything else in the repo -- which is why it is shown
+    *next to* the signing fingerprint, the thing actually being pinned, rather
+    than instead of it.
+    """
+    local = store.name_file(host_id)
+    if local.is_file():
+        return local.read_text(encoding="utf-8").strip()
+    sealed = store.name_seal(host_id)
+    if not sealed.is_file():
+        return ""
+    try:
+        name = crypto.decrypt_with_file(sealed.read_bytes(), identity_path(known))
+    except (crypto.AgeError, SyncError, OSError):
+        # A name we cannot open is cosmetic; the opaque id still works.
+        return ""
+    return name.decode("utf-8", errors="replace").strip()
+
+
 def _merge_name(known: Machine, host_id: str) -> None:
     """Learn another machine's friendly name, so search can label its entries."""
     local = store.name_file(host_id)
     if local.is_file():
         return
-    sealed = store.name_seal(host_id)
-    if not sealed.is_file():
+    name = peer_name(known, host_id)
+    if not name:
         return
-    try:
-        name = crypto.decrypt_with_file(sealed.read_bytes(), identity_path(known))
-    except (crypto.AgeError, SyncError, OSError):
-        # A name we cannot open is cosmetic; the opaque id still works.
-        return
-    local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_bytes(name)
+    store.write_atomic(local, f"{name}\n".encode())
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +588,7 @@ def _merge_name(known: Machine, host_id: str) -> None:
 def run(push: bool = True, now: int | None = None) -> Report:
     """Export, exchange with the remote, import. Safe to run concurrently."""
     crypto.require()
+    crypto.require_signing()
     if not is_repo():
         raise SyncError("no history repo yet; run 'woswoar init' first")
 
@@ -579,6 +746,7 @@ def initialise(
 ) -> tuple[Machine, Path]:
     """Create or clone the history repo and enrol this machine in it."""
     crypto.require()
+    crypto.require_signing()
 
     chosen = choose_identity(new_identity=new_identity, explicit=identity)
     known = store.machine()._replace(identity=str(chosen))
@@ -636,7 +804,77 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
             crypto.encrypt_to_recipients(f"{known.name}\n".encode(), recipients()),
         )
         changed = True
+
+    # Publishing the signing key is what lets every *other* machine check this
+    # one's chunks. Rewritten if it differs rather than only written when
+    # absent, so regenerating a lost signing key republishes rather than
+    # silently signing with a key nobody will accept.
+    published = store.signer_public(known.id)
+    public = signing_identity().public
+    if _published_signer(known.id) != public:
+        published.parent.mkdir(parents=True, exist_ok=True)
+        store.write_atomic(published, (public + "\n").encode("utf-8"))
+        changed = True
     return changed
+
+
+class Candidate(NamedTuple):
+    """A machine in the repo that this one has not trusted yet."""
+
+    host_id: str
+    label: str
+    signer: str
+    fingerprint: str
+    #: True when we trusted a *different* key for this host before. Re-trusting
+    #: is then a considerably bigger decision than trusting a new machine.
+    replaces: str = ""
+
+
+def untrusted(state: State | None = None) -> list[Candidate]:
+    """Every host whose history this machine is currently refusing.
+
+    Fetches first, for the same reason `readers` does: the machine you are about
+    to trust is usually one that enrolled since the last sync, and deciding
+    against a stale checkout would show you the wrong list.
+    """
+    known = store.machine()
+    with lock():
+        if has_remote():
+            _fetch_and_rebase()
+        current = State.load() if state is None else state
+        out: list[Candidate] = []
+        for host_id in store.repo_hosts():
+            if host_id == known.id:
+                continue
+            status = trust_status(host_id, current)
+            if status in (TRUSTED, NO_SIGNER):
+                continue
+            published = _published_signer(host_id)
+            out.append(
+                Candidate(
+                    host_id=host_id,
+                    label=peer_name(known, host_id) or host_id,
+                    signer=published,
+                    fingerprint=crypto.fingerprint(published),
+                    replaces=current.signers.get(host_id, ""),
+                )
+            )
+        return out
+
+
+def trust(candidates: list[Candidate]) -> int:
+    """Pin each candidate's signing key, so its history starts merging.
+
+    Takes the exact list a human approved rather than re-deriving it, for the
+    same reason `grant` does: re-reading here would trust whatever the repo says
+    *now*, which is not necessarily what was on screen a moment ago.
+    """
+    with lock():
+        state = State.load()
+        for candidate in candidates:
+            state.signers[candidate.host_id] = candidate.signer
+        state.save()
+    return len(candidates)
 
 
 class ReencryptReport(NamedTuple):
@@ -762,7 +1000,9 @@ def compact(before: str) -> tuple[int, int]:
     Returns (days compacted, chunks replaced).
     """
     crypto.require()
+    crypto.require_signing()
     known = store.machine()
+    signing_identity()  # the replacement chunks have to be signed like any other
 
     with lock():
         by_day: dict[str, list[store.Chunk]] = {}
@@ -776,11 +1016,20 @@ def compact(before: str) -> tuple[int, int]:
             if len(chunks) < 2:
                 continue
             secret = open_day_key(known, known.id, day)
+            # Unframed first: these are this machine's own chunks, so the
+            # signature is ours and there is nothing to establish by checking
+            # it -- but the ciphertext still has to be sliced back out before
+            # age sees it.
             plain = b"".join(
-                unpack(crypto.decrypt_with_secret(c.path.read_bytes(), secret)) for c in chunks
+                unpack(
+                    crypto.decrypt_with_secret(store.split_chunk(c.path.read_bytes())[0], secret)
+                )
+                for c in chunks
             )
             merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
-            store.write_atomic(merged, crypto.encrypt_to(pack(plain), crypto.public_of(secret)))
+            sealed = crypto.encrypt_to(pack(plain), crypto.public_of(secret))
+            signature = crypto.sign(sealed, store.signing_key_file())
+            store.write_atomic(merged, store.frame_chunk(sealed, signature))
             for chunk in chunks:
                 chunk.path.unlink()
             days += 1

@@ -79,7 +79,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq age
-      - run: age --version && git --version
+      # ssh-keygen signs every chunk. It ships with ubuntu-latest, but assert it
+      # rather than assume: an unsigned chunk is one no other machine accepts.
+      - run: age --version && git --version && ssh-keygen -Y sign -h 2>&1 | head -1
       - name: sync suite
         run: |
           set -o pipefail

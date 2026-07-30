@@ -83,6 +83,28 @@ Grant all 2 machines full access? [y/N]
 No rush — until you run it the new machine syncs its own commands normally and
 just reports how many older days it cannot read yet.
 
+Then, on each machine that should *read* the newcomer's history, accept its
+signing key once:
+
+```bash
+woswoar trust
+```
+
+Every chunk is signed by the machine that wrote it, and a machine only merges
+history from signing keys it has accepted — so a repo anyone can push to cannot
+put a command into your Ctrl-R. `woswoar trust` shows each new machine's name
+and key fingerprint and asks before pinning it:
+
+```
+These machines publish history you are not currently merging:
+
+  martin@work-laptop
+    id          7f3a9c2138ab04e1
+    signing key SHA256:L4EM9cgvQHKsUnQIpSx87+XDv3eubJTpiDptC4i2jzo
+
+Trust these 1 machine(s)? [y/N]
+```
+
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared
 > dotfiles `.bashrc` works on every machine.

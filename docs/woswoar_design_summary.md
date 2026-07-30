@@ -629,6 +629,15 @@ deflate to *more* than they started as — a one-line chunk is 42 B and becomes
 47 — so the smaller form wins and the tag records which, at a cost of one byte
 on data that already carries a 200 B age header.
 
+**Cost: a signature per chunk.** Each chunk also carries the armoured
+`ssh-keygen -Y sign` block that proves which machine wrote it — a fixed 306 B,
+in front of the ciphertext in the same file. That is more than a small chunk's
+own payload, so the per-chunk overhead roughly doubles; it buys the property
+that no chunk a machine did not sign is ever opened, and a header rather than a
+sibling `.sig` keeps the file count, the `*.age` gitattributes glob and the
+"no chunk is ever rewritten" invariant all working unchanged. `compact` is the
+lever if the bytes matter: one signature per day instead of one per sync.
+
 **Cost: inodes.** At a 5-minute timer and ~40 content-bearing syncs a day, one
 machine produces ~35k chunk files over two years. Git copes, but a fresh clone
 writes a lot of small files. An opt-in `woswoar compact` merges a completed past

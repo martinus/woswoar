@@ -163,5 +163,10 @@ def parse_line(line: str, host: str) -> Entry | None:
         cwd=unescape(cwd),
         exit_code=exit_code,
         duration_ms=duration_ms,
-        cmd=unescape(cmd),
+        # Clamped on the way in as well as on the way out. `format_line`
+        # truncates what this machine writes, but a line can also arrive from
+        # another machine's chunk, where the only thing bounding its length is
+        # whatever wrote it -- and a log file is not the place to discover that
+        # something wrote a megabyte on one line.
+        cmd=truncate(unescape(cmd)),
     )

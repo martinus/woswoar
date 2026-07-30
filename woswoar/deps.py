@@ -14,16 +14,25 @@ from typing import NamedTuple
 
 
 class Tool(NamedTuple):
-    #: Binary on PATH. Also the package name on every distro handled below --
-    #: if that ever stops being true, this grows a per-family mapping rather
-    #: than the callers learning about packaging.
+    #: Binary on PATH.
     name: str
     #: Filled into "needed for ...", so it reads as a reason, not a label.
     needed_for: str
+    #: Distro family -> package, for the tools whose binary and package names
+    #: differ. The comment this replaces promised exactly this mapping "rather
+    #: than the callers learning about packaging"; ssh-keygen is the first tool
+    #: to need it, since it ships inside openssh-client(s).
+    packages: tuple[tuple[str, str], ...] = ()
 
     @property
     def present(self) -> bool:
         return shutil.which(self.name) is not None
+
+    def package(self, family: str) -> str:
+        for candidate, package in self.packages:
+            if candidate == family:
+                return package
+        return self.name
 
 
 #: fzf is listed first because it is the one whose absence breaks the feature
@@ -31,8 +40,22 @@ class Tool(NamedTuple):
 FZF = Tool("fzf", "the Ctrl-R picker")
 AGE = Tool("age", "encrypting history before it is synced")
 GIT = Tool("git", "moving encrypted history between machines")
+#: Ships in openssh-client, which is already present on any machine that pushes
+#: to git over ssh -- but not on one that clones over https, so it is checked
+#: like any other tool rather than assumed.
+SSH_KEYGEN = Tool(
+    "ssh-keygen",
+    "proving which machine wrote a piece of history",
+    packages=(
+        ("fedora", "openssh-clients"),
+        ("rhel", "openssh-clients"),
+        ("centos", "openssh-clients"),
+        ("debian", "openssh-client"),
+        ("ubuntu", "openssh-client"),
+    ),
+)
 
-TOOLS = (FZF, AGE, GIT)
+TOOLS = (FZF, AGE, GIT, SSH_KEYGEN)
 
 #: Distro family -> the command that installs a package there. Deliberately
 #: short: printing a confidently wrong command for a distro nobody tested is
@@ -68,18 +91,25 @@ def _os_release(path: Path | None = None) -> dict[str, str]:
     return values
 
 
-def installer(path: Path | None = None) -> str:
-    """The install command for this machine, or ``""`` if we do not know it.
+def family(path: Path | None = None) -> str:
+    """Which distro family this machine belongs to, or ``""`` if unrecognised.
 
     ``ID_LIKE`` is consulted after ``ID`` so derivatives are covered without
     naming each one: Linux Mint reports ``ID=linuxmint ID_LIKE=ubuntu``.
+
+    Separate from :func:`installer` because package *names* vary by family too,
+    not just the command that installs them.
     """
     release = _os_release(path)
-    candidates = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]
-    for candidate in candidates:
+    for candidate in [release.get("ID", ""), *release.get("ID_LIKE", "").split()]:
         if candidate in _INSTALLERS:
-            return _INSTALLERS[candidate]
+            return candidate
     return ""
+
+
+def installer(path: Path | None = None) -> str:
+    """The install command for this machine, or ``""`` if we do not know it."""
+    return _INSTALLERS.get(family(path), "")
 
 
 def missing(tools: tuple[Tool, ...] = TOOLS) -> list[Tool]:
@@ -87,8 +117,14 @@ def missing(tools: tuple[Tool, ...] = TOOLS) -> list[Tool]:
 
 
 def advice(tools: list[Tool] | tuple[Tool, ...], path: Path | None = None) -> str:
-    """A ready-to-paste install line for ``tools``, or the honest fallback."""
-    names = " ".join(tool.name for tool in tools)
+    """A ready-to-paste install line for ``tools``, or the honest fallback.
+
+    Deduplicated: two tools can live in one package, and telling someone to
+    install ``openssh-client openssh-client`` reads like a bug in the advice.
+    """
+    here = family(path)
+    packages = dict.fromkeys(tool.package(here) for tool in tools)
+    names = " ".join(packages)
     command = installer(path)
     if command:
         return f"{command} {names}"

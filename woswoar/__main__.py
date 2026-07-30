@@ -48,6 +48,27 @@ def portable_hook_path(target: Path) -> str:
         return str(target)
 
 
+def confirm(question: str, refusal: str, yes: bool) -> bool:
+    """Ask before widening what a machine can read or run.
+
+    Shared by `grant` and `trust`, which are the two commands that change who
+    is believed. Both need the same non-tty rule: `sync` runs unattended from a
+    timer, so a prompt nobody can answer must refuse rather than block.
+    """
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            f"\nRefusing to {refusal} without confirmation. Re-run with --yes if you mean it.",
+            file=sys.stderr,
+        )
+        return False
+    if input(f"\n{question} [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Nothing changed.")
+        return False
+    return True
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     """Set up machine identity, install the hook, and wire up .bashrc."""
     import shutil
@@ -233,6 +254,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for line in failure.splitlines():
             print(f"     {line}")
 
+    signer_path = shutil.which("ssh-keygen")
+    if signer_path is None:
+        info("signing", f"not found, needed for 'woswoar sync' - {deps.advice([deps.SSH_KEYGEN])}")
+    else:
+        failure = crypto.signing_selftest()
+        check("signing", not failure, signer_path)
+        for line in failure.splitlines():
+            print(f"     {line}")
+
     # Checked whether or not a repo exists: `init` is exactly when this breaks,
     # and gating it behind is_repo() meant doctor was silent in the one state
     # where someone would think to run it.
@@ -249,6 +279,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if sync.is_repo():
         info("remote", sync.remote_summary())
+        # Through sync.trust_status, not a hand-rolled "is it in signers?":
+        # membership alone reported a host whose key had *changed* as trusted,
+        # which is the one state doctor exists to surface.
+        state = sync.State.load()
+        others = [h for h in store.repo_hosts() if h != store.machine().id]
+        by_status = Counter(sync.trust_status(h, state) for h in others)
+        check(
+            "signers",
+            not by_status[sync.KEY_CHANGED],
+            f"{by_status[sync.KEY_CHANGED]} machine(s) publish a different signing key"
+            " than the one trusted here"
+            if by_status[sync.KEY_CHANGED]
+            else f"{by_status[sync.TRUSTED]} other machine(s) trusted",
+        )
+        waiting = by_status[sync.UNTRUSTED] + by_status[sync.NO_SIGNER]
+        if waiting:
+            info("trust", f"{waiting} machine(s) not trusted yet - run 'woswoar trust'")
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 
@@ -314,6 +361,65 @@ def cmd_sync(args: argparse.Namespace) -> int:
             "then sync here again. Nothing is lost in the meantime.",
             file=sys.stderr,
         )
+
+    if report.untrusted:
+        count = len(report.untrusted)
+        print(
+            f"\n{count} machine(s) in the repo have not been trusted here, so their\n"
+            "history was not merged. Review and accept them with:\n"
+            "    woswoar trust",
+            file=sys.stderr,
+        )
+
+    if report.changed_signer:
+        # Loud and unresolved on purpose. This is the shape an attack takes, and
+        # the honest answer is that woswoar cannot tell it from a re-enrolment.
+        print(
+            f"\nWARNING: {len(report.changed_signer)} machine(s) now publish a different\n"
+            "signing key than the one trusted here. Their history was refused. If you\n"
+            "re-enrolled that machine this is expected - run 'woswoar trust' to accept\n"
+            "the new key. If you did not, someone else can write to your history repo.",
+            file=sys.stderr,
+        )
+
+    if report.forged:
+        print(
+            f"\nWARNING: {len(report.forged)} day(s) of history carried a missing or bad\n"
+            "signature and were refused. Chunks are signed by the machine that wrote\n"
+            "them, so this means the repo contains data that machine did not write.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_trust(args: argparse.Namespace) -> int:
+    """Accept other machines' signing keys, so their history is merged."""
+    from . import sync
+
+    candidates = sync.untrusted()
+    if not candidates:
+        print("Every machine in the repo is already trusted here.")
+        return 0
+
+    print("These machines publish history you are not currently merging:\n")
+    for candidate in candidates:
+        print(f"  {candidate.label}")
+        print(f"    id          {candidate.host_id}")
+        print(f"    signing key {candidate.fingerprint}")
+        if candidate.replaces:
+            print("    NOTE        this REPLACES a different key you trusted before.")
+            print("                Expected only if you re-enrolled that machine.")
+        print()
+    print(
+        "Trusting a machine means running the commands it publishes is one\n"
+        "keypress away in Ctrl-R. Only accept keys you can confirm out of band."
+    )
+
+    if not confirm(f"Trust these {len(candidates)} machine(s)?", "trust machines", args.yes):
+        return 1
+
+    count = sync.trust(candidates)
+    print(f"\ntrusted {count} machine(s); run 'woswoar sync' to merge their history")
     return 0
 
 
@@ -340,20 +446,8 @@ def cmd_grant(args: argparse.Namespace) -> int:
         "\npublishes them. Nothing is decrypted, and nothing else is re-uploaded."
     )
 
-    if not args.yes:
-        if not sys.stdin.isatty():
-            print(
-                "\nRefusing to grant access without confirmation. "
-                "Re-run with --yes if you mean it.",
-                file=sys.stderr,
-            )
-            return 1
-        if input(f"\nGrant all {len(keys)} machines full access? [y/N] ").strip().lower() not in (
-            "y",
-            "yes",
-        ):
-            print("Nothing changed.")
-            return 1
+    if not confirm(f"Grant all {len(keys)} machines full access?", "grant access", args.yes):
+        return 1
 
     report = sync.grant(confirmed=keys)
     print(f"\nre-sealed {report.resealed} key file(s)")
@@ -461,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_grant.set_defaults(func=cmd_grant)
+
+    p_trust = subparsers.add_parser(
+        "trust", help="accept another machine's signing key so its history merges"
+    )
+    p_trust.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_trust.set_defaults(func=cmd_trust)
 
     p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
