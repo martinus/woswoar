@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sqlite3
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -192,6 +191,12 @@ def _atuin_rows(path: Path) -> Iterator[AtuinRow]:
     database of a running atuin: woswoar has no business writing to it, and
     read-only also means we cannot trigger WAL recovery on someone else's file.
     """
+    # Imported here rather than at module scope so that merely *naming* an
+    # importer stays cheap. The CLI has to reach this module to build its
+    # `import` subparser, which every Ctrl-R does, and only this one of the
+    # three sources needs a database.
+    import sqlite3
+
     if not path.is_file():
         raise FileNotFoundError(f"no atuin database at {path}")
 

@@ -12,13 +12,18 @@ Opt-in, because generating that much data takes a few seconds:
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 import unittest
+from pathlib import Path
 
 from woswoar import cache, search, store
 from woswoar.entry import Entry, format_line
 
 from .support import MACHINE_ID, WoswoarTestCase
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ENTRIES = 52_000
 DAYS = 730
@@ -135,24 +140,20 @@ class TestPerformance(WoswoarTestCase):
         parser -- together about half the real cost, which is precisely the half
         an in-process benchmark can never see.
         """
-        import subprocess
-        import sys
-        from pathlib import Path
-
         cache.load_entries()  # warm the cache, as any real shell would have
 
         argv = [sys.executable, "-m", "woswoar", "list", "--scope", "global"]
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
-        subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
+        env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+        run = subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
+        lines = run.stdout.count(b"\n")
 
-        runs = []
-        for _ in range(5):
-            started = time.perf_counter()
-            done = subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
-            runs.append((time.perf_counter() - started) * 1000)
-        runs.sort()
+        # capture_output on the timed runs too: letting 1.5 MB reach the test
+        # runner's own stdout measures the terminal, not woswoar.
+        runs = sorted(
+            self.timed(lambda: subprocess.run(argv, capture_output=True, env=env, timeout=120))[0]
+            for _ in range(5)
+        )
         median = runs[len(runs) // 2]
-        lines = done.stdout.count(b"\n")
 
         print(f"\n  Ctrl-R end to end {median:8.1f} ms  ({lines} lines, whole process)")
         self.assertGreater(lines, 0)

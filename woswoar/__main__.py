@@ -10,15 +10,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, cache, search, store
+from . import __version__, cache, importer, search, store
 from .errors import WoswoarError
-
-#: Mirrors ``importer.KINDS``. Spelled out so building the parser -- which every
-#: Ctrl-R does -- need not import the importer, and with it sqlite3: importing
-#: this module drops from 26.6 to 24.6 ms. That is a small share of the ~105 ms
-#: search path, and the same lazy-import reasoning already applies to `sync`.
-#: Pinned by a test, the way the hook's copy of MAX_CMD_CHARS is.
-IMPORT_KINDS = ("bash", "zsh", "atuin")
 
 HOOK_NAME = "woswoar.bash"
 _BEGIN = "# >>> woswoar >>>"
@@ -87,8 +80,6 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    from . import importer
-
     try:
         result = importer.run(
             args.kind,
@@ -332,7 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.set_defaults(func=cmd_list)
 
     p_import = subparsers.add_parser("import", help="import an existing shell history")
-    p_import.add_argument("kind", choices=IMPORT_KINDS)
+    p_import.add_argument("kind", choices=importer.KINDS)
     p_import.add_argument(
         "--file",
         help="source (default: ~/.bash_history, ~/.zsh_history, "

@@ -270,13 +270,23 @@ about half: a keypress also pays for a fresh interpreter and for fzf. On a real
 | filter, sort, dedup, render | 87 ms |
 | write 1.5 MB to fzf | 105 ms |
 
-Roughly half is fixed startup and half scales with history size. A round of
-micro-optimisation was measured and **reverted**: `gc.disable()`, lazy `tempfile`
-and `hashlib` imports, `attrgetter` as a sort key and a fast path in `escape()`
-each looked worth 1–10 ms in a tight in-process loop, and together moved a
-60-sample interleaved A/B by **+0.1 ms** — a repeated call in a warm process is
-simply not the same machine as a cold one-shot process. Only the lazy `importer`
-import survived, on the grounds that it matches how `sync` is already handled.
+Roughly half is fixed startup and half scales with history size.
+
+A round of micro-optimisation was measured against this. `gc.disable()` and lazy
+`tempfile`/`hashlib` imports looked worth 1–10 ms each in a tight in-process
+loop and were **reverted**: together with the two below they moved a 60-sample
+interleaved A/B by **+0.1 ms**, because a repeated call in a warm process is
+simply not the same machine as a cold one-shot process. `attrgetter` as a sort
+key (2.3 → 1.5 ms on 52k entries) and an early return in `escape()` for the 96%
+of commands that contain none of the four characters it rewrites (10.8 → 6.7 ms
+over 52k calls) were **kept**: both are strictly less work for identical output,
+and neither costs a line of clarity. Neither is visible end to end, and the
+honest reading is that they are below this measurement's noise floor rather than
+that they do nothing.
+
+Deferring the `importer` import was kept for the same reason plus one more: it
+matches how `sync` is already handled, and it moved importing the CLI module
+from 26.6 to 24.6 ms.
 
 Going meaningfully below this needs a structural change, and both candidates are
 worse than the problem:

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -409,33 +410,35 @@ class TestChunkPayload(unittest.TestCase):
 
     def test_round_trip(self) -> None:
         for data in (b"", b"x", b"a line\n", b"repeated line\n" * 500, bytes(range(256))):
-            self.assertEqual(store.unpack_payload(store.pack_payload(data)), data)
+            self.assertEqual(sync.unpack(sync.pack(data)), data)
 
     def test_repetitive_input_shrinks(self) -> None:
         # Shell history is repetitive by nature, and this is the one moment it
         # can be compressed: once sealed, ciphertext is incompressible forever.
         data = b"1700000000\ts1\t~/src\t0\t5\tgit status\n" * 200
-        self.assertLess(len(store.pack_payload(data)), len(data) // 10)
+        self.assertLess(len(sync.pack(data)), len(data) // 10)
 
-    def test_incompressible_input_is_stored_raw(self) -> None:
-        # Deflating a one-line chunk makes it bigger. Taking the smaller of the
-        # two is why the encoding needs a tag at all.
+    def test_a_tiny_chunk_costs_only_a_few_bytes(self) -> None:
+        """Deflate has a floor, and one very short line can land above it.
+
+        This is what `pack` used to avoid by tagging each payload raw-or-
+        deflated and keeping the smaller. It was not worth it: the tag cost a
+        byte on every chunk that *did* compress, which is all but the shortest,
+        and the worst case it bought back is the handful of bytes below --
+        against a sealed chunk that already carries a 200-byte age header.
+        """
         data = b"1700000000\ts1\t~\t0\t5\tls\n"
-        packed = store.pack_payload(data)
-        self.assertEqual(len(packed), len(data) + 1)
-        self.assertEqual(store.unpack_payload(packed), data)
+        self.assertLess(len(sync.pack(data)) - len(data), 8)
 
-    def test_unknown_encoding_is_refused(self) -> None:
+    def test_a_payload_we_cannot_read_is_refused(self) -> None:
         # Loudly, rather than decoding into garbage that then gets appended to
-        # a log file and cached.
-        with self.assertRaises(ValueError):
-            store.unpack_payload(b"\x7fanything")
-        with self.assertRaises(ValueError):
-            store.unpack_payload(b"")
+        # a log file and cached. `_merge_host` turns this into an unreadable
+        # chunk rather than letting it abort the sync.
+        for blob in (b"\x7fanything", b"", b"1700000000\ts1\t~\t0\t5\tls\n"):
+            with self.assertRaises(zlib.error):
+                sync.unpack(blob)
 
 
-@requires_age
-@requires_git
 class TestLayout(SyncTestCase):
     def test_a_chunk_lives_one_directory_below_its_host(self) -> None:
         """`hosts/<id>/2023-11-14/<chunk>` -- the date is one path component.
@@ -462,13 +465,16 @@ class TestLayout(SyncTestCase):
         point of packing the payload first, on input shaped like real history.
         """
         alpha = self.machine("alpha")
-        plaintext = 0
         with alpha.active():
+            # Two syncs, not sixty: `compact` only needs more than one chunk to
+            # merge, and each extra sync is a fetch, a rebase, a push and an
+            # `age` spawn for no additional coverage.
             for i in range(60):
-                cmd = f"git commit -m 'work on feature {i % 7}'"
-                alpha.record("2023-11-14", 1_700_000_000 + i, cmd)
-                plaintext = store.log_file(alpha.id, "2023-11-14").stat().st_size
-                sync.run()
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"git commit -m 'feature {i % 7}'")
+                if i == 29:
+                    sync.run()
+            sync.run()
+            plaintext = store.log_file(alpha.id, "2023-11-14").stat().st_size
             sync.compact(before="2023-11-15")
             sealed = sum(c.path.stat().st_size for c in store.iter_chunks(alpha.id))
 

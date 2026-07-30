@@ -14,7 +14,6 @@ import os
 import secrets
 import tempfile
 import time
-import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -331,10 +330,10 @@ def chunk_dir(machine_id: str, day: str) -> Path:
     Sharding by day keeps any directory to a day's worth of chunks, but the
     date is *one* path component rather than three. Every commit rewrites the
     tree object for each level it touches, so nesting ``2026/07/29`` costs two
-    extra tree objects on every single sync forever. Measured over this
-    project's own history replayed at a 1-minute timer, flattening cut tree
-    bytes by a third and the whole repo by 10% -- for a directory that holds
-    exactly as many entries as before.
+    extra tree objects on every single sync forever, for a directory that holds
+    exactly as many entries either way. Magnitudes are in
+    docs/woswoar_design_summary.md, which is re-measured as a whole; repeating
+    them here is how they go stale.
     """
     return repo_host_dir(machine_id) / day
 
@@ -399,50 +398,6 @@ def is_chunk_path(relpath: str) -> bool:
         and _is_day(parts[2])
         and parts[3].endswith(_CHUNK_SUFFIX)
     )
-
-
-# ---------------------------------------------------------------------------
-# Chunk payload
-# ---------------------------------------------------------------------------
-
-#: A chunk's plaintext is `<tag><body>`. The tag exists so the encoding is not
-#: guessed from the bytes and so a later change fails loudly instead of
-#: decoding garbage -- one byte, on data that is already 200 bytes of age
-#: header.
-_PAYLOAD_RAW = 0
-_PAYLOAD_ZLIB = 1
-
-
-def pack_payload(data: bytes) -> bytes:
-    """Compress a chunk's lines before they are sealed.
-
-    age does not compress, and encrypted output is incompressible by definition
-    -- so once bytes are sealed, neither git's packfile nor anything else can
-    ever shrink them again. Compressing first is the only opportunity there is,
-    and shell history is extremely repetitive: measured on 2 years of real
-    history replayed at a 5-minute timer, this halves the ciphertext and takes
-    the whole repo from 3.7 to 2.2 MB/year. On a single day compacted into one
-    chunk it is closer to 5x.
-
-    Small chunks can compress to *more* than they started as -- a one-line
-    chunk is 42 bytes and deflates to 47 -- so the smaller of the two wins and
-    the tag says which.
-    """
-    packed = zlib.compress(data, 9)
-    if len(packed) < len(data):
-        return bytes([_PAYLOAD_ZLIB]) + packed
-    return bytes([_PAYLOAD_RAW]) + data
-
-
-def unpack_payload(blob: bytes) -> bytes:
-    if not blob:
-        raise ValueError("empty chunk payload")
-    tag, body = blob[0], blob[1:]
-    if tag == _PAYLOAD_RAW:
-        return body
-    if tag == _PAYLOAD_ZLIB:
-        return zlib.decompress(body)
-    raise ValueError(f"unknown chunk payload encoding {tag}; woswoar is too old to read this")
 
 
 def repo_hosts() -> list[str]:
