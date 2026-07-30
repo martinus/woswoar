@@ -194,10 +194,10 @@ def identity_status(known: Machine) -> IdentityStatus:
         return IdentityStatus(False, f"identity {path} is missing - re-run 'woswoar init'")
     if not crypto.available():
         return IdentityStatus(True, f"identity {path} (age missing, cannot verify)")
-    if not crypto.usable(path):
-        return IdentityStatus(
-            False, f"{path} needs a passphrase - try 'woswoar init --new-identity'"
-        )
+    reason = crypto.why_unusable(path)
+    if reason:
+        hint = " - try 'woswoar init --new-identity'" if "passphrase" in reason else ""
+        return IdentityStatus(False, f"{path} {reason}{hint}")
     return IdentityStatus(True, f"identity {path}")
 
 

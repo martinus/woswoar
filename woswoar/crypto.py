@@ -105,8 +105,16 @@ def encrypt_to(data: bytes, recipient: str) -> bytes:
 
 
 def decrypt_with_file(data: bytes, identity: Path) -> bytes:
-    """Open ``data`` using an identity stored on disk (an SSH or age key)."""
-    return _run([AGE, "-d", "-i", str(identity)], data)
+    """Open ``data`` using an identity stored on disk (an SSH or age key).
+
+    Python reads the file and hands age the *bytes*, never the path. Passing
+    a path makes the operation depend on age being able to open it, which is
+    not the same question as whether the user can: a sandboxed age -- snap,
+    flatpak, or anything else confined -- is refused access to ``~/.config``
+    and ``~/.ssh`` and fails with a bare "permission denied" on a file the
+    owner can plainly read.
+    """
+    return decrypt_with_secret(data, identity.read_text(encoding="utf-8"))
 
 
 def decrypt_with_secret(data: bytes, secret: str) -> bytes:
@@ -155,19 +163,41 @@ def recipient_for(identity: Path) -> str:
     pub = identity.with_suffix(identity.suffix + ".pub")
     if pub.is_file():
         return pub.read_text(encoding="utf-8").strip()
-    return _run([AGE_KEYGEN, "-y", str(identity)]).decode("utf-8").strip()
+    # On stdin, not as a path argument -- see decrypt_with_file.
+    return _run([AGE_KEYGEN, "-y"], identity.read_bytes()).decode("utf-8").strip()
 
 
-def usable(identity: Path) -> bool:
-    """Whether this identity can decrypt without a terminal.
+def why_unusable(identity: Path) -> str:
+    """``""`` if this identity can decrypt unattended, else why not.
 
     Checked by actually performing a round trip rather than by inspecting the
     key file, because the thing that matters is whether an unattended sync will
     work, not what format the key claims to be.
+
+    The reason is returned rather than a bare bool because the two failures
+    need different advice and used to be reported as the same one: a key that
+    needs a passphrase wants ``--new-identity``, whereas a key this process
+    cannot even read wants the *file* looked at, and telling someone their
+    unencrypted key needs a passphrase sends them the wrong way entirely.
     """
+    try:
+        identity.read_bytes()
+    except OSError as exc:
+        return f"cannot be read: {exc.strerror}"
+
     try:
         recipient = recipient_for(identity)
         sealed = encrypt_to(b"woswoar", recipient)
-        return decrypt_with_file(sealed, identity) == b"woswoar"
+    except (AgeError, OSError) as exc:
+        return f"no usable public key: {exc}"
+
+    try:
+        if decrypt_with_file(sealed, identity) != b"woswoar":
+            return "age round trip did not return the original"
     except (AgeError, OSError):
-        return False
+        return "needs a passphrase, so an unattended sync could never use it"
+    return ""
+
+
+def usable(identity: Path) -> bool:
+    return not why_unusable(identity)
