@@ -186,6 +186,26 @@ hook, a prompt framework, bash-preexec, atuin and ble.sh all want the DEBUG trap
 and `PROMPT_COMMAND`. Two bugs came out of getting this wrong, both found by
 driving a real interactive bash rather than by reading the code.
 
+**ble.sh needs a different mechanism entirely, and says nothing when it does not
+get one.** It replaces bash's prompt machinery rather than hooking into it:
+`PROMPT_COMMAND` runs once, at the prompt where `.bashrc` finishes, and never
+again, while the DEBUG trap fires only on ble.sh's own internals. Measured with
+a probe independent of woswoar — a plain `PROMPT_COMMAND` entry and a plain
+DEBUG trap, three commands typed — plain bash fired the entry 4 times and ble.sh
+fired it **once**, while the trap fired 71 times, none of them a user command.
+So every part of the normal wiring looks installed and records nothing.
+
+ble.sh offers `blehook PREEXEC` and `blehook PRECMD` instead, and they are a
+better fit than what they replace: PREEXEC is handed the command line as `$1`,
+and PRECMD sees the real `$?`. The hook registers with those when `$BLE_VERSION`
+is set and falls back to trap-and-`PROMPT_COMMAND` otherwise.
+
+This one is worth remembering as a *testing* lesson rather than a shell one. It
+was originally reported as working, because the check piped its input — and
+ble.sh only activates on a tty, so it silently never loaded. Everything about
+that verification looked right except that it was not testing the thing it named.
+Anything involving ble.sh has to run under a real pty.
+
 **The DEBUG trap has to be chained, and cannot be chained at load time.** A bare
 `trap … DEBUG` silently replaced whatever was there, so the other tool simply
 stopped working. The obvious fix — read the existing trap and call it too —

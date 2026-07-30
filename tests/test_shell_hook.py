@@ -299,6 +299,46 @@ class TestCoexistence(ShellHookTestCase):
         self.assertIn("QUOTED[it's fine]", out)
         self.assertEqual(self.commands(), ["echo hello"])
 
+    #: The two things ble.sh gives a consumer, and the only two the hook uses.
+    #: Enough to pin *our* branch; the real thing was verified by hand against
+    #: ble.sh 0.4 in a pty, which CI has no way to install.
+    BLESH_STUB = """
+        BLE_VERSION=0.4.0-stub
+        blehook() { printf '%s\\n' "$1" >> "$BLEHOOK_LOG"; }
+    """
+
+    def blehook_registrations(self, log: Path) -> list[str]:
+        return log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+
+    def test_under_blesh_we_register_with_blehook(self) -> None:
+        """ble.sh does not run PROMPT_COMMAND or fire DEBUG on user commands.
+
+        It replaces bash's prompt machinery outright, so the hook's normal
+        wiring records nothing at all -- silently, because every part of it
+        still looks installed. Recording was completely dead on any machine
+        that loads ble.sh, which is the usual way to run atuin on bash.
+        """
+        log = self.root / "blehook.log"
+        self.run_shell(
+            "true\n",
+            env_extra={"BLEHOOK_LOG": str(log)},
+            before=self.BLESH_STUB,
+        )
+        registered = self.blehook_registrations(log)
+        self.assertIn("PREEXEC+=__woswoar_preexec", registered)
+        self.assertIn("PRECMD+=__woswoar_precmd", registered)
+
+    def test_without_blesh_we_do_not_call_blehook(self) -> None:
+        # The branch has to be a branch, not a belt-and-braces both.
+        log = self.root / "blehook.log"
+        self.run_shell(
+            "true\n",
+            env_extra={"BLEHOOK_LOG": str(log)},
+            before='blehook() { printf "%s\\n" "$1" >> "$BLEHOOK_LOG"; }',
+        )
+        self.assertEqual(self.blehook_registrations(log), [])
+        self.assertEqual(self.commands(), ["true"])
+
     def test_the_prompt_at_which_the_hook_loads_records_nothing(self) -> None:
         # `history 1` at that point is whatever the previous session left
         # behind. The harness types `source .../woswoar.bash`, which used to be

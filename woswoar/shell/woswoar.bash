@@ -247,7 +247,25 @@ __woswoar_widget() {
 # chain onto whoever actually ended up owning the trap rather than whoever
 # happened to load before us -- which makes the order of the lines in .bashrc
 # stop mattering.
-__woswoar_wire_debug() {
+__woswoar_wired=
+
+__woswoar_wire() {
+    [[ -n $__woswoar_wired ]] && return 0
+    __woswoar_wired=1
+
+    # ble.sh does not use either of the mechanisms below. It replaces bash's
+    # prompt machinery outright: PROMPT_COMMAND runs once, at the prompt where
+    # .bashrc finishes, and never again, and the DEBUG trap fires only on
+    # ble.sh's own internals rather than on anything the user typed. Wiring the
+    # trap there records nothing at all -- silently, since every part looks
+    # installed. It offers `blehook` instead, which is a better fit anyway:
+    # PREEXEC is handed the command line as $1, and PRECMD sees the real $?.
+    if [[ -n ${BLE_VERSION-} ]]; then
+        blehook PREEXEC+=__woswoar_preexec
+        blehook PRECMD+=__woswoar_precmd
+        return 0
+    fi
+
     local spec=
     [[ -s $__woswoar_scratch ]] && IFS= read -r -d '' spec <"$__woswoar_scratch"
 
@@ -303,7 +321,7 @@ __woswoar_unboot() {
 # shellcheck disable=SC2016  # single quotes are the point: this expands later
 __woswoar_boot='{
     builtin trap -p DEBUG >"$__woswoar_scratch" 2>/dev/null
-    __woswoar_wire_debug
+    __woswoar_wire
     __woswoar_unboot
 }'
 
@@ -330,6 +348,14 @@ else
     PROMPT_COMMAND=$__woswoar_stamp$'\n'${PROMPT_COMMAND%$'\n'}$'\n'$__woswoar_boot$'\n'__woswoar_precmd
 fi
 unset -v __woswoar_attrs
+
+# Under ble.sh, PROMPT_COMMAND may run only once ever, so the boot entry above
+# is not something to rely on. ble.sh is normally already loaded by the time
+# .bashrc reaches us, so wire straight away when it is; `__woswoar_wire` is
+# idempotent, and boot still covers the case where ble.sh loads after us.
+if [[ -n ${BLE_VERSION-} ]]; then
+    __woswoar_wire
+fi
 
 if [[ -z ${WOSWOAR_NO_BIND:-} ]]; then
     bind -m emacs -x '"\C-r": __woswoar_widget' 2>/dev/null
