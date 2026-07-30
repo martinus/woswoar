@@ -58,9 +58,14 @@ class Report:
     #: error: it is what a freshly joined machine sees until someone runs
     #: `grant` on a machine that was already a recipient.
     unreadable: set[str] = field(default_factory=set)
-    #: "<host>/<day>" entries whose authentication tag did not match. These were
-    #: refused, not merged: nothing holding the repo key wrote them.
-    forged: set[str] = field(default_factory=set)
+    #: "<host>/<day>" entries that could not be authenticated, and so were
+    #: refused rather than merged.
+    #:
+    #: One category on purpose: a missing tag and a wrong tag are the same
+    #: answer. Splitting them on the shape of the bytes was tried and reverted,
+    #: because an attacker omits the tag too -- so the split told the reassuring
+    #: story for exactly the case that most needed reporting.
+    unauthenticated: set[str] = field(default_factory=set)
     #: True when this machine cannot open the repo key yet, so it can neither
     #: publish nor read. Recording carries on regardless; `grant` unblocks it.
     needs_grant: bool = False
@@ -409,10 +414,10 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report, mac:
         try:
             blob, expected = store.split_chunk(chunk.path.read_bytes())
         except (OSError, ValueError):
-            report.forged.add(key)
+            report.unauthenticated.add(key)
             continue
         if not crypto.tag_matches(mac, blob, expected):
-            report.forged.add(key)
+            report.unauthenticated.add(key)
             continue
 
         try:

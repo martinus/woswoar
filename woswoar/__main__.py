@@ -326,12 +326,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    if report.forged:
+    if report.unauthenticated:
         print(
-            f"\nWARNING: {len(report.forged)} day(s) of history failed authentication\n"
-            "and were refused. Every chunk is tagged with a key only your enrolled\n"
-            "machines can open, so this means the repo contains history none of them\n"
-            "wrote - someone else can write to it.",
+            f"\nWARNING: {len(report.unauthenticated)} day(s) of history could not be\n"
+            "authenticated and were refused. Every chunk carries a tag computed with\n"
+            "a key only your enrolled machines can open, so this means the repo\n"
+            "contains history none of them wrote - someone else can write to it.",
             file=sys.stderr,
         )
     return 0

