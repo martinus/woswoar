@@ -181,6 +181,29 @@ def recipient_for(identity: Path) -> str:
     return public_of(identity.read_text(encoding="utf-8"))
 
 
+def selftest() -> str:
+    """``""`` if age can actually do the work here, else what went wrong.
+
+    Generates an identity, seals to it, and reopens it with the key delivered on
+    an inherited pipe as ``/dev/fd/N`` -- the path every real decrypt takes, and
+    the one assumption the "never hand age a path" rule still rests on.
+
+    Needs no repo, no configuration and no disk, which is the point: the failure
+    this exists to catch happens during `init`, before there is anything else to
+    check. ``age --version`` proves only that a binary is on PATH, and a
+    sandboxed age passes that and then cannot open a thing.
+    """
+    probe = b"woswoar selftest"
+    try:
+        identity = generate_identity()
+        sealed = encrypt_to(probe, identity.public)
+        if decrypt_with_secret(sealed, identity.secret) != probe:
+            return "age ran but returned different bytes than it was given"
+    except (AgeError, OSError) as exc:
+        return str(exc)
+    return ""
+
+
 def why_unusable(identity: Path) -> str:
     """``""`` if this identity can decrypt unattended, else why not.
 

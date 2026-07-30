@@ -112,6 +112,16 @@ def load() -> Cache:
 
     if not isinstance(data, Cache) or data.version != CACHE_VERSION:
         return Cache()
+
+    # Right class and right version is not the same as right *shape*. Pickle
+    # restores __dict__ directly and never runs __init__, so a file written by
+    # a build whose Cache had one attribute fewer unpickles cleanly here and
+    # then raises AttributeError deep inside refresh() -- on the Ctrl-R path,
+    # for a file this module promises is disposable. Found in the wild: a
+    # cache predating `unsaved` crashed `woswoar doctor` outright.
+    fresh = Cache()
+    if data.__dict__.keys() != fresh.__dict__.keys():
+        return fresh
     return data
 
 
