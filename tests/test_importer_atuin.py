@@ -432,5 +432,29 @@ class TestFailures(AtuinTestCase):
         self.assertEqual(db.read_bytes(), before)
 
 
+class TestImportIsPrivate(AtuinTestCase):
+    """`import` writes into logs/ too, and used to bypass the store helpers.
+
+    It created a peer's `.name` with a hand-rolled mkdir plus write_text, so
+    `woswoar import` followed by `woswoar doctor` reported an exposure that a
+    current-version command had just caused -- and pointed the user at a
+    migration to fix damage nothing had migrated away from.
+    """
+
+    def test_a_peers_name_file_is_owner_only(self) -> None:
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        db = self.atuin([(BASE, 0, 0, "make -j8", "/src", "s1", "elsewhere:someone")])
+
+        importer.run("atuin", db)
+
+        names = list(store.logs_dir().rglob(".name"))
+        self.assertTrue(names, "no peer name file was written")
+        for path in [*names, *(p.parent for p in names)]:
+            self.assertEqual(
+                path.stat().st_mode & 0o077, 0, f"{path} is {oct(path.stat().st_mode)}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

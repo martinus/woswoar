@@ -119,5 +119,26 @@ class TestLines(unittest.TestCase):
         self.assertEqual(parsed.cmd, "awk -F'\t' '{print $1}'")
 
 
+class TestParsedCommandsAreBounded(unittest.TestCase):
+    def test_an_over_long_line_is_clamped_on_the_way_in(self) -> None:
+        """`format_line` clamps what this machine writes; `parse_line` clamps
+        what arrives.
+
+        A line can reach the logs from another machine's chunk, where the only
+        thing bounding its length is whatever wrote it -- and every consumer
+        from the cache to the picker assumes MAX_CMD_CHARS holds.
+        """
+        raw = "1700000000\ts1\t~\t0\t5\t" + "x" * (MAX_CMD_CHARS * 3)
+        parsed = parse_line(raw, "host")
+        assert parsed is not None
+        self.assertLessEqual(len(parsed.cmd), MAX_CMD_CHARS + len(TRUNCATION_MARKER))
+        self.assertTrue(parsed.cmd.endswith(TRUNCATION_MARKER))
+
+    def test_an_ordinary_command_is_returned_whole(self) -> None:
+        parsed = parse_line("1700000000\ts1\t~\t0\t5\tgit status", "host")
+        assert parsed is not None
+        self.assertEqual(parsed.cmd, "git status")
+
+
 if __name__ == "__main__":
     unittest.main()
