@@ -29,6 +29,25 @@ def _hook_source() -> Path:
         return Path(str(path))
 
 
+def portable_hook_path(target: Path) -> str:
+    """The hook's location written so one ``.bashrc`` can serve every machine.
+
+    A literal ``/home/martinus/...`` in the sourced line means the same shared
+    ``.bashrc`` has to differ per machine as soon as two of them disagree about
+    the username -- which is exactly what a dotfiles repo exists to avoid. The
+    part before ``$HOME`` is the only part that varies, so that is the part
+    that becomes a variable.
+
+    Anything outside ``$HOME`` is written absolute: there is nothing portable
+    to say about it, and guessing would be worse than being explicit.
+    """
+    home = Path.home()
+    try:
+        return f"$HOME/{target.relative_to(home).as_posix()}"
+    except ValueError:
+        return str(target)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     """Set up machine identity, install the hook, and wire up .bashrc."""
     import shutil
@@ -43,7 +62,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     print(f"hook    : {target}")
 
     rcfile = Path(args.rcfile).expanduser() if args.rcfile else Path.home() / ".bashrc"
-    block = f'{_BEGIN}\nsource "{target}"\n{_END}\n'
+    block = f'{_BEGIN}\nsource "{portable_hook_path(target)}"\n{_END}\n'
 
     existing = rcfile.read_text(encoding="utf-8") if rcfile.is_file() else ""
     if _BLOCK.search(existing):
