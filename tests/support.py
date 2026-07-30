@@ -19,6 +19,7 @@ MACHINE_ID = "0123456789abcdef"
 requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
+requires_bash = unittest.skipUnless(shutil.which("bash"), "bash required")
 
 
 def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -> Entry:

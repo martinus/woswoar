@@ -70,7 +70,8 @@ woswoar import bash     # optional: bring your existing history along
 ```
 
 Open a new shell and press <kbd>Ctrl</kbd>+<kbd>R</kbd>. That's it — everything
-below is optional.
+below is optional. To add more machines, see
+[Sync across machines](#sync-across-machines).
 
 If something looks wrong, `woswoar doctor` checks the bash version, fzf, the
 hook and the cache, and tells you what to fix.
@@ -195,30 +196,43 @@ Being straight about the limits is part of the security story:
 
 ---
 
-## Multi-machine sync
+## Sync across machines
 
-Create an empty repository anywhere you can push to — `woswoar-history` on
-GitHub, a bare repo on a NAS, a folder on a USB stick. Then:
+First, create an empty repository anywhere you can push to — `woswoar-history`
+on GitHub, a bare repo on a NAS, a folder on a USB stick. You only do this once,
+ever.
+
+### Then, on each machine
+
+The same four lines everywhere — first machine or fifth, it makes no difference:
 
 ```bash
-# on your first machine
-woswoar init git@github.com:you/woswoar-history.git
-woswoar sync
+pipx install .
+woswoar install                                       # hook it into bash
+woswoar import atuin --this-host-only                 # optional: this machine's past
+woswoar init git@github.com:you/woswoar-history.git   # join the repo
 ```
 
-```bash
-# on every additional machine
-woswoar init git@github.com:you/woswoar-history.git   # enrols this machine
-woswoar sync
-```
+Open a new shell. That machine is now recording and syncing.
+
+### One extra step, from the second machine onwards
+
+On a machine you set up **earlier**, run:
 
 ```bash
-# then once, on a machine that was already enrolled
 woswoar reencrypt
 ```
 
+That is what lets the newcomer read history from before it existed. There is no
+rush: until you run it, the new machine syncs its own commands normally and just
+reports how many older days it cannot read yet.
+
+> [!TIP]
+> `.bashrc` is written with `$HOME`, not your username, so the same one works on
+> every machine — handy if you keep your dotfiles in a repo.
+
 <details>
-<summary>Why that last step exists — and why the new machine can't do it itself</summary>
+<summary>Why that extra step exists — and why the new machine can't do it itself</summary>
 
 History sealed *before* the new machine joined was encrypted to a recipient list
 that did not include it. `reencrypt` re-seals the small per-day keys — not the
