@@ -60,6 +60,9 @@ class Report:
     lines_exported: int = 0
     chunks_merged: int = 0
     lines_imported: int = 0
+    #: This machine's history is on the remote. A state, not an event: a run
+    #: that was already level with the remote and committed nothing sets it
+    #: without sending anything, because there was nothing to send.
     pushed: bool = False
     hosts_seen: set[str] = field(default_factory=set)
     #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
