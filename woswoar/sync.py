@@ -422,12 +422,12 @@ class State:
             return cls()
         state = cls(
             exported={str(k): int(v) for k, v in exported.items()},
-            # Guarded per value, not just on `merged` being a dict. A state
-            # file from before this became a set holds one *string* per day, and
-            # a string is iterable: without this, every day's record turns into
-            # its own characters, every chunk looks unmerged, and the first sync
-            # after upgrading duplicates every peer's history wholesale -- which
-            # is the bug this change exists to fix.
+            # Guarded per value, not just on `merged` being a dict. A value
+            # that is a bare *string* rather than a list is iterable, so without
+            # this every day's record turns into its own characters, every chunk
+            # looks unmerged, and the next sync duplicates every peer's history
+            # wholesale. Forgetting a malformed day and reading it again is the
+            # direction that repeats work rather than dropping history.
             merged={
                 str(k): {str(name) for name in v} for k, v in merged.items() if isinstance(v, list)
             },
@@ -1361,7 +1361,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         if not fresh:
             continue
 
-        day = _Day(host_id, chunk_day, read_manifest(host_id, chunk_day, verify_key))
+        listed = read_manifest(host_id, chunk_day, verify_key)
+        day = _Day(host_id, chunk_day, listed, already)
         pending = chunks if day.rewrite else fresh
 
         for chunk in pending:
@@ -1422,24 +1423,38 @@ class _Day:
 
     Exists so the two things that decide *when* bytes are written -- the day
     boundary and `FLUSH_BYTES` -- are in one place rather than interleaved with
-    decryption, and so "this day is being rewritten" is settled once, from the
-    manifest, instead of discovered part way through.
+    decryption, and so "this day is being rewritten" is settled once, instead of
+    discovered part way through.
 
-    That last part is not tidiness. A day holding a compacted chunk has to be
-    written in a single atomic replacement, so it must never be flushed early;
-    working that out when the subsuming chunk turns up is too late, because
-    chunks before it may already have gone to the file and the replacement
-    would drop them.
+    That last part is not tidiness. A day being rewritten has to be written in a
+    single atomic replacement, so it must never be flushed early; working that
+    out when the subsuming chunk turns up is too late, because chunks before it
+    may already have gone to the file and the replacement would drop them.
     """
 
-    def __init__(self, host_id: str, day: str, listed: dict[str, Entry]) -> None:
+    def __init__(
+        self, host_id: str, day: str, listed: dict[str, Entry], already: frozenset[str]
+    ) -> None:
         self.host_id = host_id
         self.day = day
         self.listed = listed
-        # A compacted chunk is a complete statement of the chunks it names, so
-        # the day is replaced rather than added to -- which is the only answer
+        self.compacted = {name for name, entry in listed.items() if entry.subsumes}
+        # A compacted chunk is a complete statement of the chunks it names, so a
+        # day that gains one is replaced rather than added to -- the only answer
         # right whether the peer had merged all of them, some, or none.
-        self.rewrite = any(entry.subsumes for entry in listed.values())
+        #
+        # "One this machine has not taken in yet", not "the day has one at all".
+        # A compacted chunk keeps its `subsumes` list in the signed manifest for
+        # good, so the second reading stays true for the life of the day, and it
+        # rebuilt the whole day every time that day gained anything: linear per
+        # sync, quadratic over a day, and a day compacted while still being
+        # written reaches ~1440 chunks.
+        #
+        # `already` can answer this because a compacted chunk only ever enters
+        # `state.merged` on a pass that rewrote the file. So a rewrite cut short
+        # by an unopenable day key is still owed on the next pass, with no
+        # second record of what was rebuilt to keep in step with this one.
+        self.rewrite = bool(self.compacted - already)
         self._blocks: list[bytes] = []
         self._bytes = 0
 
@@ -2191,7 +2206,7 @@ def revoke(reader: Reader) -> RevokeReport:
     return RevokeReport(resealed, skipped, pushed=change.remote, still_readable=still_readable)
 
 
-def compact(before: str) -> tuple[int, int, int]:
+def compact(before: str | None = None) -> tuple[int, int, int]:
     """Merge a host's own chunks for completed days into one chunk per day.
 
     Write-once chunks trade bytes for inodes: a 5-minute timer produces roughly
@@ -2205,11 +2220,26 @@ def compact(before: str) -> tuple[int, int, int]:
     `store.new_chunk`'s uniqueness check sound, since that check assumes no
     other process is creating chunks for this host concurrently.
 
+    ``before`` defaults to today, and may not be later than it: compaction is
+    for days that are *finished*. A future one takes in today and every day
+    after it, and those days keep gaining chunks -- so each becomes a day whose
+    local copy every peer rebuilds each time it grows (#69). There is no case
+    where asking for it is what was meant.
+
     Returns (days compacted, chunks replaced, days left alone because merging
     them would exceed `MAX_EXPORT_BYTES`).
     """
     crypto.require()
     crypto.require_signing()
+    # `store.day_for`, so "today" here is the bucket the shell hook records
+    # into rather than a second definition of it.
+    today = store.day_for(int(time.time()))
+    if before is None:
+        before = today
+    elif before > today:
+        raise SyncError(
+            f"--before {before} is in the future; compaction is for days that are finished"
+        )
     known = store.machine()
 
     with lock():

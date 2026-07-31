@@ -736,7 +736,7 @@ def cmd_trust(args: argparse.Namespace) -> int:
 def cmd_compact(args: argparse.Namespace) -> int:
     from . import sync
 
-    days, replaced, skipped = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
+    days, replaced, skipped = sync.compact(before=args.before)
     if not days:
         print("nothing to compact")
     else:
