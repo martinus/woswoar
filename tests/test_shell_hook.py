@@ -689,11 +689,16 @@ class TestConstantParity(unittest.TestCase):
 class TestForkFree(ShellHookTestCase):
     """Recording runs on every prompt, so its cost must not scale with usage."""
 
-    def clone_count(self, command_count: int, env_extra: dict[str, str] | None = None) -> int:
+    def clone_count(
+        self,
+        command_count: int,
+        env_extra: dict[str, str] | None = None,
+        before: str = "",
+    ) -> int:
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
             ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", "bash", "--norc", "-i"],
-            input=f"source {HOOK}\n{script}",
+            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{script}",
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.DEVNULL,
@@ -727,6 +732,33 @@ class TestForkFree(ShellHookTestCase):
                     many,
                     f"record path forks: {few} clones for 3 commands, {many} for 30",
                 )
+
+    #: Each takes a different branch of the PROMPT_COMMAND assembly, and the
+    #: last two are shapes where `__woswoar_unboot`'s exact-match removal can
+    #: miss -- which is when a boot entry stays and forks at every prompt.
+    SHAPES: ClassVar[dict[str, str]] = {
+        "array": "PROMPT_COMMAND=(_other)\n_other() { :; }",
+        "a prior string entry": "_other() { :; }\nPROMPT_COMMAND=_other",
+        "an entry rewritten after us": (
+            "_other() { PROMPT_COMMAND=${PROMPT_COMMAND//$'\\n'/$'\\n'}; }\nPROMPT_COMMAND=_other"
+        ),
+        "ble.sh": "BLE_VERSION=0.4.0-stub\nblehook() { :; }",
+    }
+
+    def test_no_prompt_command_shape_forks_per_prompt(self) -> None:
+        """The one fork the hook has is at the first prompt; it must stay there.
+
+        `__woswoar_boot` forks since #57, and it removes itself by matching its
+        own text in `PROMPT_COMMAND` -- a variable prompt frameworks rewrite
+        freely. A miss used to cost a redirect; now it would cost a fork on every
+        prompt for the life of the shell. The bare-shell case above never
+        exercises a miss, because there is nothing else in the variable.
+        """
+        for label, before in self.SHAPES.items():
+            with self.subTest(shape=label):
+                few = self.clone_count(3, before=before)
+                many = self.clone_count(30, before=before)
+                self.assertEqual(few, many, f"{label}: {few} clones for 3 commands, {many} for 30")
 
 
 @requires_bash5

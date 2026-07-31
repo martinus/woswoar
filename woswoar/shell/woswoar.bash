@@ -436,15 +436,28 @@ __woswoar_unboot() {
 #: substitution is not a function: it forks, but it reads the parent's trap, and
 #: it runs here at top level where there is a trap to read.
 #:
-#: That fork is the one exception to the builtins-only rule above, and it is
-#: only safe because `__woswoar_unboot` removes this entry immediately. Which is
-#: why it must stay ordered *before* `__woswoar_precmd` rather than last: the
+#: That fork is the one exception to the builtins-only rule above, so it is
+#: guarded twice over. `__woswoar_unboot` removes this entry after the first
+#: prompt -- and the `__woswoar_wired` test in front of the substitution means
+#: that even where removal fails, the fork is paid once rather than on every
+#: prompt. Removal *can* fail: it is an exact match on a variable other prompt
+#: frameworks rewrite freely, and it was harmless when this string only wrote a
+#: file. Measured with removal broken: 6 clones for 3 commands and for 30 with
+#: the guard, 9 and 36 without.
+#:
+#: The guard also pays for itself under ble.sh, where `__woswoar_wire` has
+#: already run at source time and the substitution would fork only to have its
+#: argument discarded.
+#:
+#: Ordered before `__woswoar_precmd` rather than last for a related reason: the
 #: string branch removes this text plus the newline after it, so a boot with
-#: nothing following it is never removed and the fork is paid on every command
-#: instead of once. `TestForkFree` catches exactly that.
+#: nothing following it is never removed at all.
+#:
+#: One cost, once per shell: under `set -T` a prior DEBUG handler sees the
+#: substitution as a command it did not run.
 # shellcheck disable=SC2016  # single quotes are the point: this expands later
 __woswoar_boot='{
-    __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null; printf .)"
+    [[ -n $__woswoar_wired ]] || __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null; printf .)"
     __woswoar_unboot
 }'
 
