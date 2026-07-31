@@ -16,6 +16,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from woswoar import cache, crypto, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, main
@@ -1456,7 +1457,8 @@ class TestChunkAuthenticity(SyncTestCase):
         entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
         payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
         # Named far in the future so it sorts above whatever the real machine
-        # has published; a forgery the watermark skips proves nothing.
+        # has published; a forgery that lands among chunks already merged
+        # proves nothing.
         target = work / "hosts" / host_id / day / f"{name}.age"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(crypto.encrypt_to(payload, pub))
@@ -1528,7 +1530,9 @@ class TestChunkAuthenticity(SyncTestCase):
             signer.write_text(f"{verify_key}\n{owner}\n", encoding="utf-8")
             chunk = work / "hosts" / "deadbeefdeadbeef" / "2023-11-14" / "9999999999-ffffff.age"
             body = sync._manifest_body(
-                "deadbeefdeadbeef", "2023-11-14", {chunk.name: sync.digest_of(chunk.read_bytes())}
+                "deadbeefdeadbeef",
+                "2023-11-14",
+                {chunk.name: sync.Entry(sync.digest_of(chunk.read_bytes()))},
             )
             manifest = work / "hosts" / "deadbeefdeadbeef" / "manifests" / "2023-11-14"
             manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -1588,15 +1592,8 @@ class TestChunkAuthenticity(SyncTestCase):
         with alpha.active():
             before = {c.name for c in store.iter_chunks(alpha.id)}
             alpha.record("2023-11-14", 1_700_000_002, "cargo build")
-            # An explicit, strictly later timestamp. Two chunks written in the
-            # same wall-clock second share a prefix and differ only by a random
-            # suffix, so the merge watermark -- a plain string compare -- skips
-            # the second one about half the time and it is never examined at
-            # all. That is issue #27's mechanism, and it made this test flake
-            # 40% of runs; pinning the second is what makes it deterministic.
             sync.run(now=2_000_000_000)
             fresh = ({c.name for c in store.iter_chunks(alpha.id)} - before).pop()
-            self.assertGreater(fresh, max(before), "the tampered chunk must be past the watermark")
 
         def flip(work: Path) -> None:
             target = work / "hosts" / alpha.id / "2023-11-14" / fresh
@@ -1625,7 +1622,9 @@ class TestChunkAuthenticity(SyncTestCase):
             theirs = self.root / "attacker-key"
             crypto.generate_signing_key(theirs)
             body = sync._manifest_body(
-                alpha.id, "2023-11-14", {chunk.name: sync.digest_of(chunk.read_bytes())}
+                alpha.id,
+                "2023-11-14",
+                {chunk.name: sync.Entry(sync.digest_of(chunk.read_bytes()))},
             )
             signature = crypto.sign(body.encode("utf-8"), theirs, sync._MANIFEST_MAGIC)
             manifest = work / "hosts" / alpha.id / "manifests" / "2023-11-14"
@@ -1705,6 +1704,248 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
             report = sync.run(now=1_900_000_000)
             self.assertEqual(report.chunks_written, 1)
             self.assertEqual(report.unsignable, {"2023-11-14"})
+
+
+class TestTheMergeWatermark(SyncTestCase):
+    """What a machine has merged is a *set*, not a high-water mark.
+
+    A single "highest name seen" cannot express "all but that one", and chunk
+    names are only loosely ordered -- two written in the same second differ by a
+    random suffix. So a high-water mark gets both of these wrong, in opposite
+    directions, depending only on iteration order.
+    """
+
+    def alpha_with_two_chunks(self) -> tuple[Fake, Fake, list[store.Chunk]]:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "first command")
+            sync.run(now=1_700_000_500)
+            alpha.record("2023-11-14", 1_700_000_002, "second command")
+            sync.run(now=1_700_000_600)
+            chunks = sorted(store.iter_chunks(alpha.id), key=lambda c: c.name)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        return alpha, beta, chunks
+
+    def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
+        """The silent half, and the worse one.
+
+        If an earlier-named chunk fails while a later-named one succeeds, a
+        high-water mark advances past the failure and that chunk is never looked
+        at again -- its commands are simply missing, with nothing said after the
+        run in which it failed.
+        """
+        alpha, beta, chunks = self.alpha_with_two_chunks()
+        first, _later = chunks
+        original = first.path.read_bytes()
+
+        with alpha.active():
+            # Damaged in place: its digest no longer matches the signed
+            # manifest, so beta refuses it -- while the later chunk is fine.
+            first.path.write_bytes(b"corrupted" + original)
+            sync.run(now=1_700_000_700)
+
+        with beta.active():
+            report = sync.run()
+            self.assertTrue(report.unauthenticated)
+            self.assertIn("second command", beta.commands())
+            self.assertNotIn("first command", beta.commands())
+
+        # Repaired at the source, as a transient failure would be.
+        with alpha.active():
+            first.path.write_bytes(original)
+            sync.run(now=1_700_000_800)
+
+        with beta.active():
+            sync.run()
+            self.assertIn("first command", beta.commands(), "the failed chunk was never retried")
+
+    def test_a_chunk_already_merged_is_not_read_again(self) -> None:
+        """The other half: nothing already consumed may be reconsidered.
+
+        A set says this directly. Under a high-water mark it held only because
+        every later name happened to sort above every earlier one.
+        """
+        _alpha, beta, _chunks = self.alpha_with_two_chunks()
+        with beta.active():
+            self.assertEqual(sync.run().chunks_merged, 2)
+            self.assertEqual(sync.run().chunks_merged, 0)
+            self.assertEqual(len(cache.load_entries()), 2)
+
+
+class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
+    """`compact` replaces a day's chunks with one holding the same lines.
+
+    A peer that already merged the originals must not merge the replacement as
+    though it were new. Whether it did used to be a coin flip: the compacted
+    chunk carries the timestamp of the last chunk it replaced and a fresh random
+    suffix, so it sorted above the old high-water mark about half the time
+    (measured 4/10 before this was fixed).
+    """
+
+    def fleet(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(3):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
+                sync.run(now=1_700_000_500 + i)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        return alpha, beta
+
+    def merged_entries(self, beta: Fake) -> int:
+        with beta.active():
+            sync.run()
+            return len(cache.load_entries())
+
+    def test_a_peer_that_already_merged_the_day_gains_nothing(self) -> None:
+        # Counted as *entries*, not unique commands: `commands()` is a set, and
+        # a set is exactly what hides this. The test that missed this bug for
+        # three releases compared sets.
+        alpha, beta = self.fleet()
+        before = self.merged_entries(beta)
+        self.assertEqual(before, 3)
+
+        with alpha.active():
+            # The suffix pinned to the highest it can be, so the compacted chunk
+            # certainly sorts above the peer's old high-water mark. Left random,
+            # this reproduced about half the time -- which is a coin flip, not a
+            # regression test.
+            with mock.patch("woswoar.store.secrets.token_hex", return_value="ffffff"):
+                days, replaced = sync.compact(before="2023-11-15")
+            self.assertEqual((days, replaced), (1, 3))
+            sync.run(now=1_700_000_900)
+
+        self.assertEqual(self.merged_entries(beta), before, "compaction duplicated merged history")
+
+    def test_a_peer_that_merged_only_part_of_the_day_ends_up_with_all_of_it(self) -> None:
+        """The case a high-water mark cannot get right in either direction.
+
+        Skipping the compacted chunk loses the lines the peer never had;
+        appending it duplicates the ones it did. Neither is acceptable, so a
+        chunk that subsumes others replaces the day rather than adding to it.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_000, "command 0")
+            sync.run(now=1_700_000_500)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(cache.load_entries()), 1)
+
+        # beta is away while alpha records more and then compacts the day.
+        with alpha.active():
+            for i in (1, 2):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
+                sync.run(now=1_700_000_500 + i)
+            sync.compact(before="2023-11-15")
+            sync.run(now=1_700_000_900)
+
+        with beta.active():
+            sync.run()
+            entries = cache.load_entries()
+        self.assertEqual(len(entries), 3, "beta should hold each command exactly once")
+        self.assertEqual({e.cmd for e in entries}, {"command 0", "command 1", "command 2"})
+
+    def test_a_chunk_sorting_below_the_compacted_one_survives(self) -> None:
+        """A day rewritten by a compacted chunk keeps what that chunk does not hold.
+
+        Chunk names carry the timestamp of the sync that wrote them, and the
+        compacted chunk takes the timestamp of the last chunk it replaced -- so
+        a chunk written afterwards with an earlier timestamp sorts *below* it and
+        is merged first. Discarding what had been accumulated would lose it.
+        """
+        alpha, beta = self.fleet()
+        self.assertEqual(self.merged_entries(beta), 3)
+
+        with alpha.active():
+            sync.compact(before="2023-11-15")
+            # Named below the compacted chunk, which took ts 1_700_000_502.
+            alpha.record("2023-11-14", 1_700_000_009, "written after compaction")
+            sync.run(now=1_700_000_400)
+            names = sorted(c.name for c in store.iter_chunks(alpha.id))
+        self.assertLess(names[0], names[1], "the fixture no longer builds the case")
+
+        with beta.active():
+            sync.run()
+            entries = cache.load_entries()
+        self.assertEqual(len(entries), 4)
+        self.assertIn("written after compaction", {e.cmd for e in entries})
+
+
+class TestUpgradingFromAHighWaterMark(SyncTestCase):
+    """A state file written before the watermark became a set.
+
+    Its `merged` values are single strings, and a string is iterable -- so a
+    loader that just iterates them turns one chunk name into twenty-one
+    one-character entries, nothing matches, every chunk looks unmerged, and the
+    first sync after upgrading duplicates every peer's history. That is the very
+    bug this change was made to fix, reintroduced by the fix.
+    """
+
+    def test_a_string_watermark_is_discarded_rather_than_read_as_characters(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            store.save_json(
+                store.state_file(),
+                {"exported": {}, "merged": {"abc/2023-11-14": "1700000000-abcdef.age"}},
+            )
+            merged = sync.State.load().merged
+        self.assertEqual(merged, {}, "the old string was read as a set of characters")
+
+    def test_the_day_is_re_merged_once_and_not_duplicated(self) -> None:
+        """Losing the record costs one re-merge, which must not double the day.
+
+        The chunks are merged again, appended to a log that already holds them.
+        Nothing can prevent that -- the record of what was merged is gone -- but
+        it must be the *only* consequence, and it must not repeat.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "before the upgrade")
+            sync.run(now=1_700_000_500)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(cache.load_entries()), 1)
+
+            # Downgrade the state file to what the previous version wrote.
+            state = store.load_json(store.state_file())
+            state["merged"] = {key: sorted(names)[-1] for key, names in state["merged"].items()}
+            store.save_json(store.state_file(), state)
+
+            sync.run()
+            after = len(cache.load_entries())
+            sync.run()
+            self.assertEqual(len(cache.load_entries()), after, "it re-merged a second time")
+
+    def test_an_idle_sync_does_not_rewrite_the_state_file(self) -> None:
+        """Recording every merged chunk name made this file about a megabyte.
+
+        `run` saves at the end of every sync and the timer fires once a minute,
+        so writing it out to say nothing happened is a lot of disk for no
+        information -- and an idle sync is the overwhelmingly common one.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "something")
+            sync.run(now=1_700_000_500)
+            before = store.state_file().stat().st_mtime_ns
+
+            sync.run(now=1_700_000_600)
+            self.assertEqual(store.state_file().stat().st_mtime_ns, before)
+
+            # And it still writes when there is something to say.
+            alpha.record("2023-11-14", 1_700_000_002, "something else")
+            sync.run(now=1_700_000_700)
+            self.assertNotEqual(store.state_file().stat().st_mtime_ns, before)
 
 
 if __name__ == "__main__":
