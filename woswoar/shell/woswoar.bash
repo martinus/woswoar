@@ -55,13 +55,38 @@ __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 # Only creation happens here. Re-tightening a tree from an older woswoar is
 # `woswoar install`'s job: a recursive chmod is proportional to the number of
 # days recorded, and this runs on every interactive shell.
-(umask 077 && mkdir -p "$__woswoar_logdir") 2>/dev/null || return 0
+#: Per-shell scratch, kept out of the data directory's root so that a file left
+#: behind by a shell whose EXIT trap was already taken is contained and obvious.
+__woswoar_run=$__woswoar_dir/run
+(umask 077 && mkdir -p "$__woswoar_logdir" "$__woswoar_run") 2>/dev/null || return 0
 
-# Scratch file for capturing `history 1`. Prefer XDG_RUNTIME_DIR: it is a
-# per-user tmpfs that systemd clears at logout, so a shell killed with -9 cannot
-# leave the last command lying around in /tmp.
-__woswoar_scratch=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/woswoar-hist.$$
-(umask 077 && : >"$__woswoar_scratch") 2>/dev/null || return 0
+# Scratch file for capturing `history 1`, always in a directory only this user
+# can write. $TMPDIR and /tmp are never used: the name is just a pid, so in a
+# world-writable directory a stranger can pre-create it, and then either the
+# create below fails (recording silently off) or -- without
+# fs.protected_regular -- their mode-666 file survives our O_TRUNC, because
+# truncating changes neither owner nor mode, and they read every command. See
+# issue #24; both need a directory a stranger can write in.
+#
+# Not `mktemp`: it costs an exec in every interactive shell, and once the
+# directory is ours an unpredictable name buys nothing.
+#
+# XDG_RUNTIME_DIR is preferred but not trusted. It is a per-user 0700 tmpfs that
+# systemd clears at logout, so a shell killed with -9 leaves nothing at all --
+# and it is also just an inherited variable. `su` passes on the *calling* user's,
+# which this uid cannot write, and returning there would switch recording off
+# for the whole shell without a word: the very failure above, from the other
+# direction. So a failure falls back rather than gives up.
+#
+# The fallback is disk-backed where a runtime dir is tmpfs, and the capture step
+# reads and writes this file on every command. Measured on btrfs: 306us per
+# command with a runtime dir, 339us without. Accepted -- it only applies to
+# shells that have no XDG_RUNTIME_DIR at all, and 33us is not a keypress.
+__woswoar_scratch=${XDG_RUNTIME_DIR:-$__woswoar_run}/woswoar-hist.$$
+if ! (umask 077 && : >"$__woswoar_scratch") 2>/dev/null; then
+    __woswoar_scratch=$__woswoar_run/woswoar-hist.$$
+    (umask 077 && : >"$__woswoar_scratch") 2>/dev/null || return 0
+fi
 
 # Only claim the EXIT trap if nothing else owns it; clobbering a user's trap
 # would be a far worse bug than leaving one scratch file behind.

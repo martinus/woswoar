@@ -18,6 +18,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from woswoar import cache, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
@@ -65,9 +66,13 @@ requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 
 
 class ShellHookTestCase(WoswoarTestCase):
+    def runtime_dir(self) -> Path:
+        """Where XDG_RUNTIME_DIR points for these runs."""
+        return self.root / "run"
+
     def shell_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """A minimal environment pointing the hook at this test's sandbox."""
-        runtime = self.root / "run"
+        runtime = self.runtime_dir()
         runtime.mkdir(exist_ok=True)
         env = {
             "HOME": str(self.root),
@@ -105,6 +110,13 @@ class ShellHookTestCase(WoswoarTestCase):
             timeout=60,
         )
         return result.stdout
+
+    def shell_value(self, expr: str, env_extra: dict[str, str] | None = None) -> str:
+        """Run the hook, then print one shell expression and read it back."""
+        out = self.run_shell(f'printf "VALUE %s\\n" {expr}\n', env_extra)
+        match = re.search(r"^VALUE (.*)$", out, re.MULTILINE)
+        assert match is not None, f"the shell printed no value:\n{out}"
+        return match.group(1)
 
     def recorded(self) -> list[Entry]:
         """Every entry the hook wrote, oldest first.
@@ -596,13 +608,13 @@ class TestConstantParity(unittest.TestCase):
 class TestForkFree(ShellHookTestCase):
     """Recording runs on every prompt, so its cost must not scale with usage."""
 
-    def clone_count(self, command_count: int) -> int:
+    def clone_count(self, command_count: int, env_extra: dict[str, str] | None = None) -> int:
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
             ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", "bash", "--norc", "-i"],
             input=f"source {HOOK}\n{script}",
             text=True,
-            env=self.shell_env(),
+            env=self.shell_env(env_extra),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             check=False,
@@ -619,13 +631,18 @@ class TestForkFree(ShellHookTestCase):
         # Not "zero forks": startup legitimately runs mkdir and one `trap -p`
         # subshell. What matters is that the per-command path adds nothing, so
         # the count must be identical for 3 and for 30 commands.
-        few = self.clone_count(3)
-        many = self.clone_count(30)
-        self.assertEqual(
-            few,
-            many,
-            f"record path forks: {few} clones for 3 commands, {many} for 30",
-        )
+        #
+        # Both scratch-file branches, because they are chosen at startup and a
+        # fork added to either would be paid on every command of that shell.
+        for label, env in (("runtime dir", None), ("fallback", {"XDG_RUNTIME_DIR": ""})):
+            with self.subTest(scratch=label):
+                few = self.clone_count(3, env)
+                many = self.clone_count(30, env)
+                self.assertEqual(
+                    few,
+                    many,
+                    f"record path forks: {few} clones for 3 commands, {many} for 30",
+                )
 
 
 @requires_bash5
@@ -663,6 +680,79 @@ class TestRecordingIsPrivate(ShellHookTestCase):
         """
         out = self.run_shell("echo start\numask\n")
         self.assertIn("0022", out)
+
+
+@requires_bash5
+class TestTheScratchFileIsPrivate(ShellHookTestCase):
+    """Issue #24: the scratch file's directory decides who can touch it.
+
+    Its contents are read back and, at the first prompt, `eval`ed to chain onto
+    an existing DEBUG trap. That is only safe while nobody else can write it, so
+    what is pinned here is the *directory*, not the filename.
+    """
+
+    HOSTILE: ClassVar[dict[str, str]] = {
+        "XDG_RUNTIME_DIR": "",
+        "TMPDIR": "/nonexistent/hostile",
+    }
+
+    def scratch(self, env_extra: dict[str, str] | None = None) -> str:
+        return self.shell_value('"$__woswoar_scratch"', env_extra)
+
+    def test_it_lives_in_the_runtime_dir_when_there_is_one(self) -> None:
+        self.assertTrue(self.scratch().startswith(str(self.runtime_dir())))
+
+    def test_tmpdir_and_tmp_are_never_consulted(self) -> None:
+        """A predictable name in a world-writable directory is the whole bug.
+
+        The TMPDIR here is perfectly usable, which is the point: an unusable one
+        would prove nothing, because the fallback below would rescue it and the
+        scratch file would land in the right place for the wrong reason.
+        """
+        usable = self.root / "tmpdir"
+        usable.mkdir(exist_ok=True)
+        env = {"XDG_RUNTIME_DIR": "", "TMPDIR": str(usable)}
+
+        path = self.scratch(env)
+        self.assertFalse(path.startswith(str(usable)), f"TMPDIR was consulted: {path}")
+        self.assertTrue(path.startswith(os.environ["WOSWOAR_DIR"]))
+        self.assertEqual(list(usable.iterdir()), [], "the hook wrote into TMPDIR")
+
+        self.run_shell("echo still-recording\n", env_extra=env)
+        self.assertIn("echo still-recording", self.commands())
+
+    def test_an_unwritable_runtime_dir_falls_back_instead_of_giving_up(self) -> None:
+        """XDG_RUNTIME_DIR is inherited, not verified.
+
+        `su` hands over the calling user's, which this uid cannot write. Bailing
+        there switched recording off for the whole shell with no message -- the
+        same silent failure as a squatted /tmp path, reached from the other end.
+        """
+        unwritable = self.root / "unwritable"
+        unwritable.mkdir(exist_ok=True)
+        unwritable.chmod(0o500)
+        self.addCleanup(unwritable.chmod, 0o700)
+
+        env = {"XDG_RUNTIME_DIR": str(unwritable)}
+        self.assertTrue(self.scratch(env).startswith(os.environ["WOSWOAR_DIR"]))
+
+        self.run_shell("echo still-recording\n", env_extra=env)
+        self.assertIn("echo still-recording", self.commands())
+
+    def test_the_file_and_its_directory_are_owner_only(self) -> None:
+        """Stats from Python, not `stat -c`, which is GNU-only.
+
+        `before` gives the EXIT trap away, so the hook declines to claim it and
+        the file outlives the shell -- which is also the case that leaves one
+        behind, and the reason it lives in `run/` rather than the tree root.
+        """
+        self.run_shell("echo hello\n", env_extra=self.HOSTILE, before="trap ':' EXIT")
+
+        run_dir = Path(os.environ["WOSWOAR_DIR"]) / "run"
+        left = list(run_dir.glob("woswoar-hist.*"))
+        self.assertTrue(left, "no scratch file survived, so this asserts nothing")
+        self.assertEqual(left[0].stat().st_mode & 0o077, 0, "readable by others")
+        self.assertEqual(run_dir.stat().st_mode & 0o077, 0, "its directory is reachable")
 
 
 if __name__ == "__main__":
