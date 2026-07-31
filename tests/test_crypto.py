@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from woswoar import crypto, store
+from woswoar import crypto
 
 from .support import requires_age, requires_ssh_keygen
 
@@ -187,29 +187,55 @@ class TestFingerprint(unittest.TestCase):
         self.assertIn("age-keygen", crypto.how_to_check(crypto.fingerprint("age1qqqqwwwwww")))
 
 
-class TestChunkFraming(unittest.TestCase):
-    def test_the_tag_width_store_uses_matches_the_one_crypto_produces(self) -> None:
-        """`store` deliberately does not import `crypto`.
+#: Any namespace will do for these; `sync` owns the real one.
+NS = "woswoar-test"
 
-        `crypto` pulls in subprocess and shutil at module scope, and `store` is
-        imported on every Ctrl-R -- so the width is spelled out in both, and the
-        only thing keeping them equal is this. If they drift, every chunk in an
-        append-only repo is framed at one width and read at another.
+
+@requires_ssh_keygen
+class TestSigning(unittest.TestCase):
+    """Authorship, which age cannot answer and a shared secret cannot either."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="woswoar-sign-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.key = self.tmp / "signing_key"
+        self.public = crypto.generate_signing_key(self.key)
+
+    def test_a_signature_round_trips(self) -> None:
+        signature = crypto.sign(b"a manifest", self.key, NS)
+        self.assertTrue(crypto.verify(b"a manifest", signature, self.public, NS))
+
+    def test_tampered_data_does_not_verify(self) -> None:
+        signature = crypto.sign(b"a manifest", self.key, NS)
+        self.assertFalse(crypto.verify(b"a manifest!", signature, self.public, NS))
+
+    def test_another_machines_signature_does_not_verify(self) -> None:
+        # The property the whole design rests on: holding the *verify* half is
+        # not holding the ability to sign, which is what a shared MAC could
+        # never give and what makes revocation mean anything.
+        other = self.tmp / "other_key"
+        crypto.generate_signing_key(other)
+        signature = crypto.sign(b"a manifest", other, NS)
+        self.assertFalse(crypto.verify(b"a manifest", signature, self.public, NS))
+
+    def test_a_signature_from_another_namespace_does_not_verify(self) -> None:
+        """Namespaces stop a signature made for one purpose counting for another.
+
+        Mutating the namespace to "" must break this, which is what pins that it
+        is actually being passed.
         """
-        self.assertEqual(store._TAG_BYTES, crypto.TAG_BYTES)
-        self.assertEqual(len(crypto.tag(crypto.new_mac_key(), b"x")), store._TAG_BYTES)
+        signed = subprocess.run(
+            ["ssh-keygen", "-Y", "sign", "-q", "-f", str(self.key), "-n", "a-different-namespace"],
+            input=b"a manifest",
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        self.assertFalse(crypto.verify(b"a manifest", signed, self.public, NS))
 
-    def test_a_chunk_round_trips_through_its_frame(self) -> None:
-        key = crypto.new_mac_key()
-        sealed = b"pretend-this-is-age-output"
-        blob = store.frame_chunk(sealed, crypto.tag(key, sealed))
-        back, tag = store.split_chunk(blob)
-        self.assertEqual(back, sealed)
-        self.assertTrue(crypto.tag_matches(key, back, tag))
-
-    def test_a_blob_too_short_to_be_framed_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            store.split_chunk(b"x" * store._TAG_BYTES)
+    def test_the_private_half_is_owner_only(self) -> None:
+        self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

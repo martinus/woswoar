@@ -1,35 +1,36 @@
-"""Encryption, delegated entirely to the ``age`` binary, plus one MAC.
+"""Encryption and signatures, delegated entirely to ``age`` and ``ssh-keygen``.
 
-Python's standard library has no cipher -- only hashing and randomness -- so
-sealing the synced history needs an external tool. ``age`` was chosen because it
-is one small static binary and it accepts **SSH public keys as recipients**,
-which means each machine can use the keypair it already pushes to git with and
-no secret ever has to be copied between machines.
+Python's standard library has no cipher and no signature scheme -- only hashing
+and randomness -- so both halves of this need an external tool.
 
-``age`` answers "who may read this?" and nothing else. It has no notion of a
-sender, and the recipient list is published in the repo, so on its own anyone
-who can push could seal a chunk every machine would open and offer in Ctrl-R.
-Answering "did one of *my* machines write this?" needs a second primitive, and
-that one *is* in the standard library: :func:`tag` is ``hmac`` over the sealed
-bytes with a key that lives encrypted in the repo, readable only by machines
-that are already recipients.
+``age`` answers **"who may read this?"**. It was chosen because it is one small
+static binary and it accepts SSH public keys as recipients, so each machine can
+use the keypair it already pushes to git with and no secret is ever copied
+between machines.
 
-That is the only cryptographic primitive woswoar composes itself, and it is the
-one with nothing to get wrong: no nonce, no mode, no padding, no IV, and a
-constant-time comparison the standard library provides. Everything else is
-still someone else's audited binary.
+``ssh-keygen -Y`` answers **"which machine wrote this?"**, which age cannot: it
+has no notion of a sender, and the recipient list is published in the repo, so
+on its own anyone who can push could seal a chunk every machine would open and
+offer in Ctrl-R.
+
+That second question was once answered with an HMAC over a key shared by the
+whole fleet. It cannot be: whoever holds the key to *check* a tag holds the key
+to *forge* one, so a machine that was enrolled and then revoked could keep
+publishing history every other machine believed (issue #38). Nothing symmetric
+fixes that, which is why signing is asymmetric and per-machine. The private half
+never leaves the machine that made it, because no one else ever needed it.
 
 Nothing here knows about history, chunks, or git; it is a thin, testable seam so
-that swapping the backend later touches one file.
+that swapping either backend later touches one file.
 """
 
 from __future__ import annotations
 
-import hmac
 import os
 import shutil
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -37,14 +38,13 @@ from .errors import WoswoarError
 
 AGE = "age"
 AGE_KEYGEN = "age-keygen"
+SSH_KEYGEN = "ssh-keygen"
 
-#: HMAC-SHA256 output, and so the fixed-width prefix every chunk carries.
-TAG_BYTES = 32
-
-#: Key length. The same 32 as :data:`TAG_BYTES` by coincidence, not by
-#: derivation -- widening the tag is a format change, and re-sizing the key
-#: is not, so reading one from the other would couple two unrelated decisions.
-_KEY_BYTES = 32
+#: What ssh-keygen calls the signer, in an allowed-signers line. A label only:
+#: `verify` builds that line from the key it was handed, so this always matches
+#: itself and can never fail. What binds a signature to a machine is whatever
+#: the *caller* put in the bytes it signed.
+_PRINCIPAL = "woswoar"
 
 _TIMEOUT = 120
 
@@ -54,6 +54,18 @@ class AgeError(WoswoarError):
 
     One class rather than two: every call site caught both and handled them
     identically, so the split was a distinction nothing branched on.
+    """
+
+
+class SigningError(WoswoarError):
+    """ssh-keygen is missing, or could not sign.
+
+    Separate from :class:`AgeError` because the remedy is a different package,
+    and `deps` reports them separately. A caller that does not care which tool
+    failed catches :class:`~woswoar.errors.WoswoarError`, their common base.
+
+    Note that a signature *failing to verify* is not this: that is an ordinary
+    answer about a chunk, not a failure of the tool, so `verify` returns False.
     """
 
 
@@ -97,14 +109,7 @@ def require() -> None:
 def _run(argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:
     require()
     try:
-        result = subprocess.run(
-            argv,
-            input=data,
-            capture_output=True,
-            check=False,
-            timeout=_TIMEOUT,
-            pass_fds=pass_fds,
-        )
+        result = _spawn(argv, data, pass_fds)
     except subprocess.TimeoutExpired as exc:  # pragma: no cover - needs a hung age
         raise AgeError(f"{argv[0]} timed out after {_TIMEOUT}s") from exc
 
@@ -162,16 +167,8 @@ def decrypt_with_secret(data: bytes, secret: str) -> bytes:
     couple of hundred bytes, comfortably inside the pipe buffer, so writing and
     closing before age starts reading cannot deadlock.
     """
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(write_fd, secret.encode("utf-8"))
-        os.close(write_fd)
-        write_fd = -1
-        return _run([AGE, "-d", "-i", f"/dev/fd/{read_fd}"], data, pass_fds=(read_fd,))
-    finally:
-        if write_fd != -1:
-            os.close(write_fd)
-        os.close(read_fd)
+    with _as_fd(secret.encode("utf-8")) as identity_fd:
+        return _run([AGE, "-d", "-i", f"/dev/fd/{identity_fd}"], data, pass_fds=(identity_fd,))
 
 
 def generate_identity() -> Identity:
@@ -197,7 +194,7 @@ def recipient_for(identity: Path) -> str:
     For an SSH key this is the contents of its ``.pub`` sibling, which is what
     other machines will encrypt to; for an age identity, age derives it.
     """
-    pub = identity.with_suffix(identity.suffix + ".pub")
+    pub = public_half(identity)
     if pub.is_file():
         return pub.read_text(encoding="utf-8").strip()
     # Reading the file ourselves, then reusing public_of, which already knows
@@ -261,39 +258,190 @@ def how_to_check(fingerprint: str) -> str:
     return _CHECK_SSH if fingerprint.startswith("SHA256:") else _CHECK_AGE
 
 
+def how_to_check_signer() -> str:
+    """The command that reproduces a *signing* fingerprint on its own machine.
+
+    Beside `how_to_check` and separate from it: a signing key is woswoar's own,
+    not the identity, so sending someone to ``~/.ssh/id_ed25519.pub`` for it
+    would be advice that quietly prints a different key.
+    """
+    return "ssh-keygen -lf ~/.config/woswoar/signing_key.pub"
+
+
 # ---------------------------------------------------------------------------
-# Authenticity. Answers "did one of my machines write this?", which age cannot.
+# Authorship. Answers "which of my machines wrote this?", which age cannot, and
+# which a shared secret cannot either: whoever can check a MAC can forge one.
 # ---------------------------------------------------------------------------
 
 
-def new_mac_key() -> bytes:
-    """A fresh key for :func:`tag`, from the OS random source.
+def signing_available() -> bool:
+    return shutil.which(SSH_KEYGEN) is not None
 
-    ``os.urandom`` rather than ``secrets.token_bytes``, which is a thin wrapper
-    over it: importing ``secrets`` drags in ``random`` and ``bisect`` for ~1.4 ms
-    of interpreter start, and this module is loaded by every `sync`.
+
+def require_signing() -> None:
+    if not signing_available():
+        from . import deps
+
+        raise SigningError(
+            "Sync signs what it publishes, so other machines can tell which one "
+            "wrote it.\n" + deps.report([deps.SSH_KEYGEN])
+        )
+
+
+def generate_signing_key(path: Path) -> str:
+    """Create this machine's signing key at ``path``; return its public half.
+
+    A key of woswoar's own rather than the sync identity, for a reason that is
+    not stylistic: `choose_identity` may hand back an *age* identity, which is
+    X25519 and cannot sign at all. Reusing it would work on machines that happen
+    to sync with an SSH key and fail on the rest.
+
+    The private half never leaves this machine and is never published, which is
+    the whole point -- it is the one thing a revoked machine cannot keep a
+    useful copy of, because nobody else ever needed it to verify.
     """
-    return os.urandom(_KEY_BYTES)
+    require_signing()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # ssh-keygen refuses to overwrite, and would prompt about it on a terminal.
+    path.unlink(missing_ok=True)
+    public_half(path).unlink(missing_ok=True)
+    _run_signer([SSH_KEYGEN, "-t", "ed25519", "-N", "", "-C", "woswoar", "-q", "-f", str(path)])
+    path.chmod(0o600)
+    return signing_public(path)
 
 
-def tag(key: bytes, data: bytes) -> bytes:
-    """The authentication tag for ``data``.
+def public_half(path: Path) -> Path:
+    """The ``.pub`` sibling of a key file.
 
-    Computed over the *sealed* bytes rather than the plaintext, so a reader can
-    establish that a chunk came from one of its own machines before decrypting
-    or decompressing it -- encrypt-then-MAC, the ordering that does not need
-    the recipient to parse hostile input first.
+    One spelling, because ``with_suffix(".pub")`` and ``suffix + ".pub"`` differ
+    for any name containing a dot and agreeing by accident is how they drift.
     """
-    return hmac.new(key, data, "sha256").digest()
+    return path.with_suffix(path.suffix + ".pub")
 
 
-def tag_matches(key: bytes, data: bytes, expected: bytes) -> bool:
-    """Whether ``expected`` is the right tag for ``data``.
+def signing_public(path: Path) -> str:
+    """The verify half of a signing key, as it is published and pinned."""
+    return public_half(path).read_text(encoding="utf-8").strip()
 
-    ``compare_digest`` rather than ``==``: the standard library's constant-time
-    comparison, so the check cannot be turned into an oracle by timing it.
+
+def _spawn(
+    argv: list[str], data: bytes | None = None, pass_fds: tuple[int, ...] = ()
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a tool and hand back the result, judging nothing.
+
+    The three callers want different things from a nonzero exit -- age's is an
+    `AgeError`, ssh-keygen's a `SigningError`, and `verify`'s is simply "no" --
+    so the judgement is theirs. What they agree on is the invocation, and that
+    is here so the timeout, the capture and `check=False` cannot drift apart.
     """
-    return hmac.compare_digest(tag(key, data), expected)
+    return subprocess.run(
+        argv, input=data, capture_output=True, check=False, timeout=_TIMEOUT, pass_fds=pass_fds
+    )
+
+
+def _run_signer(argv: list[str], data: bytes | None = None) -> bytes:
+    try:
+        result = _spawn(argv, data)
+    except FileNotFoundError as exc:
+        raise SigningError(f"{argv[0]} is not installed") from exc
+    except subprocess.TimeoutExpired as exc:  # pragma: no cover - needs a hung ssh-keygen
+        raise SigningError(f"{argv[0]} timed out after {_TIMEOUT}s") from exc
+    if result.returncode != 0:
+        raise SigningError(
+            result.stderr.decode("utf-8", errors="replace").strip() or "signing failed"
+        )
+    return result.stdout
+
+
+def sign(data: bytes, key: Path, namespace: str) -> bytes:
+    """Sign ``data`` with this machine's key, returning the armoured signature.
+
+    The data goes in on stdin and the signature comes back on stdout, so nothing
+    being signed is written to a temporary file. ``-f`` is the one real path any
+    of this needs: ssh-keygen will not take a private key on an inherited
+    descriptor -- ``-f /dev/fd/N`` fails with "Couldn't load public key", which
+    is what stalled the first attempt at this (PR #28). The path it is given is
+    woswoar's own 0600 file in woswoar's own config directory, so the rule that
+    matters -- never name a file of the *user's* that a sandboxed tool cannot
+    open -- is intact.
+    """
+    require_signing()
+    return _run_signer([SSH_KEYGEN, "-Y", "sign", "-q", "-f", str(key), "-n", namespace], data=data)
+
+
+def verify(data: bytes, signature: bytes, verify_key: str, namespace: str) -> bool:
+    """Whether ``signature`` is ``principal``'s signature over ``data``.
+
+    Returns a bool rather than raising, because a signature that does not verify
+    is an ordinary fact about a chunk -- someone published one your machines did
+    not write -- and not a failure of the tool.
+
+    Both inputs reach ssh-keygen on inherited pipes as ``/dev/fd/N``, the same
+    way `decrypt_with_secret` hands age an identity: the allowed-signers list is
+    built here from the single key the caller already decided to trust, so there
+    is no file of trusted keys on disk to be edited behind woswoar's back, and
+    no temporary file to clean up. The question asked is exactly "did *this* key
+    sign this?", never "did anyone in some list sign this?".
+
+    ssh-keygen's own principal matching does no work here and is not asked to:
+    the allowed-signers line is built from the key, so the principal always
+    matches itself. There was an argument for the caller to pass one anyway, to
+    make ssh-keygen's errors readable -- but this captures its output and reads
+    only the exit status, so nobody ever saw them. Binding a signature to a
+    machine is the caller's job, done in the bytes it signs.
+
+    ``namespace`` is not decoration: ssh-keygen refuses a signature made under a
+    different one, which is what stops a signature meant for one purpose being
+    replayed as another. The caller owns it, because the caller owns the format
+    it versions.
+    """
+    require_signing()
+    allowed = f"{_PRINCIPAL} {verify_key}\n".encode()
+    with _as_fd(allowed) as allowed_fd, _as_fd(signature) as signature_fd:
+        result = _spawn(
+            [
+                SSH_KEYGEN,
+                "-Y",
+                "verify",
+                "-q",
+                "-f",
+                f"/dev/fd/{allowed_fd}",
+                "-I",
+                _PRINCIPAL,
+                "-n",
+                namespace,
+                "-s",
+                f"/dev/fd/{signature_fd}",
+            ],
+            data,
+            (allowed_fd, signature_fd),
+        )
+    return result.returncode == 0
+
+
+@contextmanager
+def _as_fd(data: bytes) -> Iterator[int]:
+    """``data`` as a readable ``/dev/fd/N``, for a subprocess to open.
+
+    How both tools are handed key material without a path: age gets an identity
+    this way, ssh-keygen an allowed-signers line and a signature. The rule it
+    serves is the same one -- never name a file a sandboxed tool might not be
+    able to open, and never put a secret in a temporary file.
+
+    Every payload is small: an identity, an allowed-signers line, an armoured
+    signature, a few hundred bytes each. So writing and closing before the child
+    starts reading cannot fill the pipe buffer and deadlock.
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+        yield read_fd
+    finally:
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
 
 
 def selftest() -> str:

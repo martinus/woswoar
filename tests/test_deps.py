@@ -107,14 +107,14 @@ class TestInstallWarnsAboutMissingTools(WoswoarTestCase):
         # failure -- the hook really was installed.
         self.assertEqual(code, 0)
         self.assertIn("woswoar.bash", out.getvalue())
-        for tool in ("fzf", "age", "git"):
+        for tool in ("fzf", "age", "git", "ssh-keygen"):
             self.assertIn(tool, err.getvalue())
 
     def test_a_complete_machine_says_nothing(self) -> None:
         # Put the tools back so `missing()` finds them.
         binaries = self.root / "fullbin"
         binaries.mkdir()
-        for name in ("fzf", "age", "git"):
+        for name in ("fzf", "age", "git", "ssh-keygen"):
             script = binaries / name
             script.write_text("#!/bin/sh\nexit 0\n")
             script.chmod(script.stat().st_mode | stat.S_IXUSR)
