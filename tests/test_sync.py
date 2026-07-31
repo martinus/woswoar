@@ -12,6 +12,7 @@ import os
 import secrets
 import subprocess
 import tempfile
+import time
 import tracemalloc
 import unittest
 import zlib
@@ -1290,6 +1291,30 @@ class TestCompact(SyncTestCase):
             # A finished day is still fine, so the guard is on the future and
             # not on the flag.
             self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+
+    def test_the_default_leaves_today_alone(self) -> None:
+        """`compact()` with no argument means "days that are finished".
+
+        Today is still being written, so compacting it produces exactly the day
+        whose local copy every peer rebuilds each time it grows -- the case #69
+        is about, reached without passing any flag at all.
+        """
+        alpha = self.machine("alpha")
+        today = store.day_for(int(time.time()))
+        with alpha.active():
+            for i in range(2):
+                alpha.record(today, 1_700_000_001 + i, f"today {i}")
+                sync.run()
+                alpha.record("2023-11-14", 1_700_000_001 + i, f"finished {i}")
+                sync.run()
+            live = {c.name for c in store.iter_chunks(alpha.id) if c.day == today}
+
+            self.assertEqual(sync.compact()[0], 1, "the finished day was not compacted")
+            self.assertEqual(
+                {c.name for c in store.iter_chunks(alpha.id) if c.day == today},
+                live,
+                "the default compacted a day still being written",
+            )
 
     def test_compacted_chunk_still_reaches_another_machine(self) -> None:
         alpha = self.machine("alpha")
