@@ -1163,10 +1163,12 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
                 (log.relpath, data, new_offset)
             )
 
-    # The one exit that has provably written nothing, which is what lets `run`
-    # skip the `git add` that would stat the whole working tree to find that out.
+    # Whether anything reached the repo. What lets `run` skip the `git add` that
+    # would otherwise stat the whole working tree to find that out.
+    wrote = False
+
     if not fresh:
-        return False
+        return wrote
 
     # One pass for the whole host, not one per day.
     on_disk: dict[str, set[str]] = {}
@@ -1246,6 +1248,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             state.exported[relpath] = new_offset
 
         write_manifest(known, day, listed)
+        wrote = True
 
         # A chunk under this host's own id that this host never wrote. `merge`
         # skips our own id, so nothing else would ever look at it, and peers
@@ -1259,12 +1262,18 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # no manifest -- this is a report, not the defence.
         report.foreign |= {f"{day}/{name}" for name in on_disk.get(day, set()) - set(listed)}
 
-    # True even on the passes that refused every day they looked at -- an
-    # orphaned day key, a manifest gone missing, one that will not verify. By
-    # here a chunk, a day key or a manifest has all but certainly been written,
-    # and over-reporting costs one `git add` where under-reporting would cost a
-    # commit.
-    return True
+    # Set at the manifest rather than approximated by "we got past the guards".
+    # A day can be refused for an orphaned key, a missing manifest or one that
+    # will not verify, and a refused day never advances `state.exported` -- so
+    # its tail is fresh again next run, and every run after that. Answering
+    # "probably wrote" there would mean a full stat of the working tree once a
+    # minute for the life of that machine, in precisely the stuck state this
+    # exists to relieve.
+    #
+    # The manifest is the right place to set it: every repo write in the loop
+    # above -- minting a day key, sealing a chunk -- happens in the same
+    # iteration, ahead of it.
+    return wrote
 
 
 # ---------------------------------------------------------------------------
@@ -1586,12 +1595,20 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # Measured at 20k chunks: an idle sync drops from 20.6 ms to 10.3 ms,
         # and stops growing with the size of the history.
         #
-        # A run that died between writing a file and committing it leaves that
-        # file unstaged, and this does not strand it. The watermark was not
-        # saved either, so the next run with anything to export writes again --
-        # and `add -A` on *that* run stages the leftovers alongside the new
-        # files. The same catch-up covers a `recipients.txt` edited by hand,
-        # which no amount of asking woswoar's own writers would ever notice.
+        # A run that died between writing a chunk and committing it leaves that
+        # chunk unstaged, and this does not strand it: the watermark was not
+        # saved either, so the next run with anything to export writes the same
+        # lines again, and `add -A` on *that* run stages the leftovers too.
+        #
+        # That argument is about `export`, whose write and whose watermark are
+        # one all-or-nothing unit. It does not carry to `publish_signer`, whose
+        # write *is* its own watermark: the file survives the crash, so the next
+        # run reads it back, agrees with it, and reports writing nothing. The
+        # file then waits for an unrelated export. Benign -- a machine in that
+        # state publishes nothing, so peers keep seeing the old key beside the
+        # old chunks it signed -- and `grant`, `revoke` and `init` still sweep
+        # the tree unconditionally, which is also what catches a
+        # `recipients.txt` edited by hand.
         committed = _commit() if published or exported else False
 
         if remote:

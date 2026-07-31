@@ -1844,15 +1844,14 @@ class TestTheMergeWatermark(SyncTestCase):
             sync.grant()
         return alpha, beta, chunks
 
-    def publish_repo_edit(self, message: str) -> None:
+    def publish_repo_edit(self) -> None:
         """Commit and push a change made to the repo behind `sync`'s back.
 
         `sync` commits only when it wrote something itself, so a test that edits
         the repo directly has to publish the edit rather than wait for the next
         sync to stage it. Call from inside the editing machine's `active()`.
         """
-        sync.git("add", "-A")
-        sync.git("commit", "-q", "-m", message)
+        sync._commit()
         sync._push(sync.read_repo())
 
     def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
@@ -1871,7 +1870,7 @@ class TestTheMergeWatermark(SyncTestCase):
             # Damaged in place: its digest no longer matches the signed
             # manifest, so beta refuses it -- while the later chunk is fine.
             first.path.write_bytes(b"corrupted" + original)
-            self.publish_repo_edit("corrupt the first chunk")
+            self.publish_repo_edit()
 
         with beta.active():
             report = sync.run()
@@ -1882,7 +1881,7 @@ class TestTheMergeWatermark(SyncTestCase):
         # Repaired at the source, as a transient failure would be.
         with alpha.active():
             first.path.write_bytes(original)
-            self.publish_repo_edit("repair the first chunk")
+            self.publish_repo_edit()
 
         with beta.active():
             sync.run()
@@ -3121,6 +3120,33 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
         beta = self.machine("beta")
         with beta.active():
             self.assertIn(fresh, store.signer_public(alpha.id).read_text(encoding="utf-8"))
+
+    def test_a_day_that_can_never_be_exported_does_not_cost_a_stat_every_run(self) -> None:
+        """The state where answering "probably wrote" would undo the whole fix.
+
+        A day refused for a missing key never advances `state.exported`, so its
+        tail is fresh again on every run for the life of the machine. An `export`
+        that reported "wrote something" merely for having looked would then stat
+        the entire working tree once a minute, forever, in exactly the stuck
+        state this is meant to relieve.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+            # The sealed half gone: `export` refuses the day rather than
+            # re-minting a key peers could never open. See `orphaned_day_key`.
+            store.day_key(alpha.id, "2023-11-14").unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+
+            first = self.git_calls()
+            self.assertIn("2023-11-14", sync.run().orphaned)
+            for _ in range(3):
+                calls = self.git_calls()
+                self.assertEqual(
+                    [c for c in calls if c.startswith("add")], [], f"first run was {first}"
+                )
 
     def test_files_left_by_a_run_that_died_are_committed_by_the_next_one(self) -> None:
         """The catch-up that makes skipping the `add` safe.
