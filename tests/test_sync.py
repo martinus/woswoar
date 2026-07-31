@@ -897,10 +897,10 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
             beta.record(day, ts, cmd)
             known = store.machine()
             with sync.lock():
-                sync._fetch_and_rebase()
+                sync._fetch_and_rebase(sync.read_repo())
                 sync.export(known, sync.State.load(), sync.Report(), ts)
                 sync._commit()
-                sync._push()
+                sync._push(sync.read_repo())
 
     def revoke_beta(self, alpha: Fake, beta: Fake) -> None:
         with beta.active():
@@ -938,7 +938,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
         with beta.active():
             day = "2023-11-14"
             with sync.lock():
-                sync._fetch_and_rebase()
+                sync._fetch_and_rebase(sync.read_repo())
                 pub = store.day_key_public(alpha.id, day)
                 entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
                 sealed = crypto.encrypt_to(
@@ -949,7 +949,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(sealed)
                 sync._commit()
-                sync._push()
+                sync._push(sync.read_repo())
 
         with gamma.active():
             sync.run()
@@ -2064,7 +2064,7 @@ class TestADecompressionBomb(SyncTestCase):
             listed[path.name] = sync.Entry(sync.digest_of(sealed))
             sync.write_manifest(store.machine(), day, listed)
             sync._commit()
-            sync._push()
+            sync._push(sync.read_repo())
 
         with beta.active():
             report = sync.run()
@@ -2279,7 +2279,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
             victim.unlink()
             sync._commit()
-            sync._push()
+            sync._push(sync.read_repo())
 
         with alpha.active():
             sync.run()
@@ -2860,6 +2860,204 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             with mock.patch.object(sync, "read_manifest", counted):
                 sync.run()
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
+
+
+class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
+    """`sync` runs from a one-minute timer, so each fork is a recurring cost.
+
+    The numbers are a ceiling, not a description: they exist so that adding a
+    git call to this path is a decision somebody makes rather than one that
+    happens. Raise them deliberately when a call earns its place.
+    """
+
+    def git_calls(self) -> list[str]:
+        """Every git subcommand one `sync.run()` spawns, in order.
+
+        Counted at `sync.git`, which is the only place in the package that
+        spawns git -- the same seam the chunk-read counters in this file use,
+        and it needs no argv sniffing to tell git from `age`.
+        """
+        real = sync.git
+        seen: list[str] = []
+
+        def spy(*args: str, **kwargs: object) -> str:
+            seen.append(" ".join(args[:2]))
+            return real(*args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(sync, "git", spy):
+            sync.run()
+        return seen
+
+    def test_an_idle_sync_forks_git_five_times(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            calls = self.git_calls()
+        self.assertLessEqual(len(calls), 5, calls)
+        # The identity and the remote come from one config read, not three.
+        self.assertEqual([c for c in calls if c.startswith("config")], ["config --list"])
+        self.assertEqual([c for c in calls if c.startswith("remote")], [])
+        # Level with the remote, so neither replaying nor sending is any work.
+        self.assertEqual([c for c in calls if c.startswith(("rebase", "push"))], [])
+        # The branch cannot change mid-run, so it is asked for once.
+        self.assertEqual([c for c in calls if c.startswith("branch")], ["branch --show-current"])
+
+    def test_a_sync_with_something_to_say_still_pushes(self) -> None:
+        """The half that would silently stop publishing if the skip overreached.
+
+        `_fetch_and_rebase` decides "level with the remote" *before* this run's
+        chunk is committed, so a skip keyed on that alone strands every machine
+        that was up to date a moment ago -- which is every machine, every time.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.run()  # idle: leaves alpha level with the remote
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+            calls = self.git_calls()
+        self.assertIn("push --quiet", calls)
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status", "make -j8"})
+
+    def test_a_sync_that_only_receives_does_not_push(self) -> None:
+        """Adopting a peer's commit leaves nothing of our own to send.
+
+        `push` opens a connection to the remote whether or not it has anything
+        to say, and this fires on every machine every time any peer records a
+        command -- so it is the most frequent needless round trip there is.
+        """
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            calls = self.git_calls()
+            self.assertIn("rebase --autostash", calls)
+            self.assertNotIn("push --quiet", calls)
+            self.assertEqual(beta.commands(), {"git status"})
+
+    def test_a_machine_ahead_of_the_remote_still_pushes(self) -> None:
+        """The trap in deciding "level" from anything but where HEAD lands.
+
+        A commit the remote has not seen makes `origin/<branch>` an *ancestor*
+        of HEAD. Every cheap test for "up to date" -- `merge --ff-only`, "the
+        rebase replayed nothing", "the fetch changed no ref" -- passes in that
+        state, and a machine that believes it would stop publishing silently and
+        for good, because the condition never clears by itself.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            # A commit that never reached the remote -- what a compaction, or a
+            # run that died between committing and pushing, leaves behind.
+            store.recipients_file().write_text(
+                store.recipients_file().read_text(encoding="utf-8") + "\n", "utf-8"
+            )
+            sync.git("commit", "-qam", "unpushed")
+            calls = self.git_calls()
+            self.assertIn("push --quiet", calls)
+            # The branch is read rather than assumed: the harness's bare remote
+            # is created with no `-b`, so it is whatever `init.defaultBranch`
+            # says on the machine running the suite.
+            branch = sync.read_repo().branch
+            head, upstream = sync._resolve("HEAD", f"refs/remotes/origin/{branch}")
+            self.assertEqual(head, upstream)
+
+    def test_a_sync_behind_the_remote_still_rebases(self) -> None:
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()  # picks up alpha's chunk, so it cannot be level first
+            beta.record("2023-11-14", 1_700_000_002, "make -j8")
+            sync.run()
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_003, "cargo build")
+            calls = self.git_calls()
+            self.assertTrue(any(c.startswith("rebase") for c in calls), calls)
+            # Asserted at the git level rather than through `commands()`: alpha
+            # cloned before beta existed and has not been told beta is real, so
+            # it holds the chunk without yet being willing to read it.
+            self.assertTrue(list(store.chunk_dir(beta.id, "2023-11-14").glob("*.age")))
+        # And once it is told, the history the rebase brought in is readable.
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+            self.assertIn("make -j8", alpha.commands())
+
+
+class TestResolvingSeveralRefsInOneFork(SyncTestCase):
+    def test_a_ref_that_does_not_exist_comes_back_empty(self) -> None:
+        """`rev-parse` echoes an argument it cannot resolve instead of dropping it.
+
+        Taking that echo for an object id would make an unborn branch look like
+        it matched the remote, and skip both the rebase and the push for good.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            head, missing = sync._resolve("HEAD", "refs/remotes/origin/no-such-branch")
+            self.assertEqual(len(head), 40)
+            self.assertEqual(missing, "")
+
+    def test_an_unborn_head_resolves_to_nothing(self) -> None:
+        """The state `init` is in while enrolling the very first machine."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            branch = sync.read_repo().branch
+            sync.git("update-ref", "-d", "HEAD")
+            self.assertEqual(sync._resolve("HEAD", f"refs/remotes/origin/{branch}"), ["", ""])
+
+
+class TestTheCommitIdentityIsStillPinned(SyncTestCase):
+    def test_a_repo_missing_the_identity_gets_it_back(self) -> None:
+        """Reading the config in one fork must not stop it being *written*.
+
+        Without an identity, `commit` fails on a machine with no gitconfig --
+        which is the machine woswoar is most likely to be installed on.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.git("config", "--unset", "user.name", check=False)
+            sync.git("config", "--unset", "user.email", check=False)
+            self.assertEqual(sync.read_repo().name, "")
+
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            self.assertEqual(sync.read_repo().name, sync.COMMIT_NAME)
+            self.assertEqual(sync.read_repo().email, sync.COMMIT_EMAIL)
+            self.assertIn(sync.COMMIT_NAME, sync.git("log", "-1", "--format=%an"))
+
+    def test_a_repo_with_no_remote_is_seen_to_have_none(self) -> None:
+        """The remote is now inferred from config keys rather than `git remote`.
+
+        Getting that wrong in the optimistic direction would make a local-only
+        repo try to push on every timer tick, and fail every time.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            self.assertTrue(sync.read_repo().has_remote)
+            sync.git("remote", "remove", "origin")
+            self.assertFalse(sync.read_repo().has_remote)
+
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            report = sync.run()
+            self.assertEqual(report.chunks_written, 1)
+            self.assertFalse(report.pushed)
 
 
 if __name__ == "__main__":

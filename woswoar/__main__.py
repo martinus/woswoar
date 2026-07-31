@@ -416,7 +416,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         f"across {len(report.hosts_seen)} other host(s)"
     )
     if report.pushed:
-        print("pushed to remote")
+        print("in sync with the remote")
     elif not sync.has_remote():
         print("no remote configured - history is local only")
 
