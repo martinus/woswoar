@@ -183,7 +183,8 @@ rolls.
 
 The result is verified rather than asserted: CI runs the hook under `strace` with
 3 commands and with 30, and requires the clone count to be *identical*. Not zero
-— startup legitimately forks for `mkdir` and one `trap -p` subshell — but flat,
+— startup legitimately forks for `mkdir` and two `trap -p` subshells, one to see
+whether the EXIT trap is free and one to read any prior DEBUG trap — but flat,
 which is the property that actually matters.
 
 ### Sharing the shell with everything else

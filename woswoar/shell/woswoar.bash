@@ -162,6 +162,12 @@ __woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.
+#
+# Two sections below are deliberately outside that rule and say so at their own
+# headers: the Ctrl-R widget, which runs on a keypress, and the boot string,
+# which runs once at the first prompt and then removes itself. Everything on the
+# per-command path is builtins, and CI proves it by counting clones for 3
+# commands and for 30.
 # ---------------------------------------------------------------------------
 
 # Escapes $1 into __woswoar_escaped. Mirrors escape() in woswoar/entry.py --
@@ -361,11 +367,23 @@ __woswoar_wire() {
     fi
 
     # The spec arrives as an argument, from a command substitution in the
-    # PROMPT_COMMAND string. It used to be written to the scratch file and read
-    # back here, which put the `eval` below's input on disk for no reason --
-    # defence in depth after #24 made the directory unreachable by anyone else,
-    # and it leaves the scratch file with the one job it is named for.
+    # PROMPT_COMMAND string. It used to travel through the scratch file, which
+    # meant a file that could not be written produced an *empty* spec -- and an
+    # empty spec is indistinguishable from "there was no prior trap", so the
+    # hook replaced whoever owned it and that tool silently stopped working for
+    # the life of the shell. A missing file must not be able to look like an
+    # absent trap. Taking the `eval` below's input off disk is the second
+    # reason, and after #24 only defence in depth.
+    # The only caller that legitimately passes nothing is the ble.sh branch
+    # above, which has already returned. So an empty argument here means the
+    # command substitution in the boot string failed to fork -- and empty is
+    # otherwise indistinguishable from "there is no prior trap", which would
+    # clobber another tool's handler: the same silent failure by a different
+    # route. `printf .` gives "I could not look" an answer of its own, and the
+    # answer to that is to install nothing rather than to guess.
     local spec=${1-}
+    [[ -n $spec ]] || return 0
+    spec=${spec%.}
 
     # `trap -p` prints a command that would restore the trap, with the handler
     # requoted -- `trap -- 'handler' DEBUG`. Re-splitting that as an array
@@ -417,9 +435,16 @@ __woswoar_unboot() {
 #: reports nothing from inside a function or a sourced file. A command
 #: substitution is not a function: it forks, but it reads the parent's trap, and
 #: it runs here at top level where there is a trap to read.
+#:
+#: That fork is the one exception to the builtins-only rule above, and it is
+#: only safe because `__woswoar_unboot` removes this entry immediately. Which is
+#: why it must stay ordered *before* `__woswoar_precmd` rather than last: the
+#: string branch removes this text plus the newline after it, so a boot with
+#: nothing following it is never removed and the fork is paid on every command
+#: instead of once. `TestForkFree` catches exactly that.
 # shellcheck disable=SC2016  # single quotes are the point: this expands later
 __woswoar_boot='{
-    __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null)"
+    __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null; printf .)"
     __woswoar_unboot
 }'
 

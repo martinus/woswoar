@@ -240,12 +240,14 @@ class TestCoexistence(ShellHookTestCase):
     #: The shape of a common .bashrc: a title hook owning both. `_title_prompt`
     #: prints `$?` because that is what a real prompt does with it, and it is
     #: the only way to notice woswoar handing everyone downstream a 0.
-    PRIOR = """
+    PRIOR_TRAP = """
         _title_preexec() { printf 'PREEXEC[%s]\\n' "$BASH_COMMAND"; }
         _title_prompt() { printf 'PROMPT[%s]\\n' "$?"; }
         trap '_title_preexec' DEBUG
-        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_title_prompt"
     """
+    PRIOR = (
+        PRIOR_TRAP + '        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_title_prompt"\n'
+    )
 
     def test_an_existing_debug_trap_still_fires(self) -> None:
         # A bare `trap ... DEBUG` in the hook silently replaced it, so the other
@@ -253,17 +255,6 @@ class TestCoexistence(ShellHookTestCase):
         out = self.run_shell("echo hello\n", before=self.PRIOR)
         self.assertIn("PREEXEC[echo hello]", out)
         self.assertEqual(self.commands(), ["echo hello"])
-
-    #: Runs as an ordinary PROMPT_COMMAND entry, which woswoar orders *ahead*
-    #: of its own boot string -- so it breaks the scratch file in the window
-    #: where the boot string used to write the trap spec into it.
-    SABOTAGE = """
-        _sabotage() {
-            [[ -n ${__woswoar_scratch-} ]] || return 0
-            rm -f -- "$__woswoar_scratch" && mkdir -p -- "$__woswoar_scratch"
-        }
-        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_sabotage"
-    """
 
     def test_a_prior_trap_survives_a_scratch_file_that_cannot_be_written(self) -> None:
         """Issue #57: chaining must not depend on a file round trip.
@@ -278,25 +269,63 @@ class TestCoexistence(ShellHookTestCase):
         the file it captures `history 1` into is gone. What must not also be lost
         is somebody else's DEBUG trap.
         """
-        out = self.run_shell("echo hello\n", before=self.PRIOR + self.SABOTAGE)
+        # An ordinary PROMPT_COMMAND entry, which woswoar orders *ahead* of its
+        # own boot string -- so it breaks the file in the window where the boot
+        # string used to write the trap spec into it. It announces itself
+        # because its guard makes silence ambiguous: were `__woswoar_scratch`
+        # ever renamed, `_sabotage` would return 0 having sabotaged nothing and
+        # this test would pass while asserting what its sibling above already
+        # asserts.
+        sabotage = """
+            _sabotage() {
+                [[ -n ${__woswoar_scratch-} ]] || return 0
+                rm -f -- "$__woswoar_scratch" && mkdir -p -- "$__woswoar_scratch"
+                printf 'SABOTAGED\\n'
+            }
+            PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_sabotage"
+        """
+        out = self.run_shell("echo hello\n", before=self.PRIOR + sabotage)
+        self.assertIn("SABOTAGED", out)
+        self.assertIn("PREEXEC[echo hello]", out)
+        self.assertEqual(self.commands(), [], "the scratch file survived the sabotage")
+
+    def test_a_trap_that_could_not_be_read_installs_nothing(self) -> None:
+        """An unreadable prior trap must not be mistaken for an absent one.
+
+        The spec reaches `__woswoar_wire` through a command substitution, and a
+        substitution that cannot fork yields an empty string -- which read as
+        "nobody owns DEBUG" would clobber the owner. That is the same silent
+        failure the scratch file used to cause, reached by the other route, so
+        the empty case has to mean "I could not look" and install nothing.
+
+        Driven by calling `__woswoar_wire` with an empty spec directly: the real
+        trigger is `fork` failing under `RLIMIT_NPROC`, which a test cannot ask
+        for without deciding how the rest of the shell behaves once it is there.
+        """
+        out = self.run_shell(
+            "__woswoar_wired=\n"
+            "trap '_title_preexec' DEBUG\n"
+            "__woswoar_wire ''\n"
+            "printf 'TRAP[%s]\\n' \"$(trap -p DEBUG)\"\n"
+            "echo hello\n",
+            before=self.PRIOR_TRAP,
+        )
+        # The trap is read back in the same shell: a second `run_shell` would be
+        # a fresh one, where nothing had gone wrong and woswoar wired normally.
+        self.assertIn("TRAP[trap -- '_title_preexec' DEBUG]", out)
         self.assertIn("PREEXEC[echo hello]", out)
 
     def test_a_prior_trap_survives_an_array_prompt_command(self) -> None:
         """bash 5.1's array form is a separate branch, and it was untested.
 
-        `__woswoar_boot` is an array *element* there rather than part of a
-        newline-joined string, and #57 moved the trap spec into a command
-        substitution inside it. If an element were evaluated somewhere that
-        cannot see the parent's DEBUG trap, chaining would break for every user
-        of a prompt framework that sets the array -- silently, since every part
-        would still look installed.
+        Coverage, not a regression test for #57: it passes with #57 reverted
+        too. It is here because `__woswoar_boot` is an array *element* on this
+        branch rather than part of a newline-joined string, and #57 put a command
+        substitution inside it -- which made it worth establishing that an
+        element is evaluated somewhere that can see the parent's DEBUG trap.
+        Nothing covered that before, for either shape of the boot string.
         """
-        array = """
-            _title_preexec() { printf 'PREEXEC[%s]\\n' "$BASH_COMMAND"; }
-            _title_prompt() { printf 'PROMPT[%s]\\n' "$?"; }
-            trap '_title_preexec' DEBUG
-            PROMPT_COMMAND=(_title_prompt)
-        """
+        array = self.PRIOR_TRAP + "        PROMPT_COMMAND=(_title_prompt)\n"
         out = self.run_shell("sleep 0.2\n", before=array)
         self.assertIn("PREEXEC[sleep 0.2]", out)
         self.assertIn("PROMPT[0]", out)
@@ -680,9 +709,12 @@ class TestForkFree(ShellHookTestCase):
         return total
 
     def test_clone_count_does_not_scale_with_commands(self) -> None:
-        # Not "zero forks": startup legitimately runs mkdir and one `trap -p`
-        # subshell. What matters is that the per-command path adds nothing, so
-        # the count must be identical for 3 and for 30 commands.
+        # Not "zero forks": startup legitimately runs mkdir and two `trap -p`
+        # subshells -- one to see whether the EXIT trap is free, one at the first
+        # prompt to read any prior DEBUG trap. What matters is that the
+        # per-command path adds nothing, so the count must be identical for 3 and
+        # for 30 commands. That also pins the boot string removing itself: were
+        # it left in PROMPT_COMMAND, its substitution would fork every time.
         #
         # Both scratch-file branches, because they are chosen at startup and a
         # fork added to either would be paid on every command of that shell.
