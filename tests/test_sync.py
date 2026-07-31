@@ -1255,6 +1255,34 @@ class TestCompact(SyncTestCase):
             self.assertEqual((days, replaced), (1, 5))
             self.assertEqual(len(list(store.iter_chunks(alpha.id))), 1)
 
+    def test_a_before_in_the_future_is_refused(self) -> None:
+        """Issue #69: the only trigger that repeats indefinitely.
+
+        `--before 2099-01-01` takes in today and every day after it, and those
+        days keep gaining chunks -- so each is a day whose local copy peers must
+        rebuild every time it grows. A day compacted while still being written
+        reaches ~1440 chunks. There is no case where asking for it is the intent.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            before = {c.name for c in store.iter_chunks(alpha.id)}
+
+        # stderr, captured here rather than by `run_cli`, which is stdout only.
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            code, _ = self.run_cli(alpha, "compact", "--before", "2099-01-01")
+        self.assertEqual(code, 1)
+        self.assertIn("in the future", errors.getvalue())
+        with alpha.active():
+            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+
+        # A finished day is still fine, so the guard is on the future and not on
+        # the flag.
+        code, _ = self.run_cli(alpha, "compact", "--before", "2023-12-01")
+        self.assertEqual(code, 0)
+
     def test_compacted_chunk_still_reaches_another_machine(self) -> None:
         alpha = self.machine("alpha")
         beta = self.machine("beta")
@@ -2816,6 +2844,116 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             # arrived that they already had.
             self.assertEqual(report.chunks_merged, 1, "a re-read chunk was counted as new")
             self.assertEqual(len(set(beta.commands())), 5)
+
+    def chunks_read(self, machine: Fake) -> int:
+        """How many chunks one sync on ``machine`` actually decrypts."""
+        reads = 0
+        real = sync.open_chunk
+
+        def counted(path: Path, expected: str) -> bytes:
+            nonlocal reads
+            reads += 1
+            return real(path, expected)
+
+        with machine.active(), mock.patch.object(sync, "open_chunk", counted):
+            sync.run()
+        return reads
+
+    def merged_lines(self, machine: Fake, host: Fake, day: str = "2023-11-14") -> int:
+        """Lines in the local copy of a day, *not* deduplicated.
+
+        `commands()` is a set, so it cannot see a day written twice over -- which
+        is the shape a rewrite that should have happened and did not leaves
+        behind.
+        """
+        with machine.active():
+            text = store.log_file(host.id, day).read_text(encoding="utf-8")
+        return len(text.splitlines())
+
+    def test_a_compacted_day_that_keeps_growing_re_reads_only_what_is_new(self) -> None:
+        """Issue #69: `subsumes` stays in the manifest, so it cannot mean "rebuild".
+
+        A rewrite re-reads every chunk the manifest lists, which is right on the
+        pass the compacted chunk arrives and wrong on every pass after it. Keyed
+        on the day merely *having* one, a day that gains a chunk per sync re-read
+        one more chunk each time -- linear per sync, quadratic over the day, and
+        a day compacted while still being written reaches ~1440 chunks.
+        """
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+        self.chunks_read(beta)  # the pass that adopts the compaction
+
+        for i in range(6):
+            with alpha.active():
+                alpha.record("2023-11-14", 1_700_000_600 + i, f"later {i}")
+                sync.run()
+            # One: the chunk that is actually new. Before #69 this was 2, 3,
+            # 4 ... as the day's own chunks were re-read alongside it.
+            self.assertEqual(self.chunks_read(beta), 1, f"pass {i} re-read the day")
+
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 10)
+        self.assertEqual(self.merged_lines(beta, alpha), 10)
+
+    def test_compacting_a_second_time_does_rebuild(self) -> None:
+        """The record is the *set* of compacted chunks, not a flag or a count.
+
+        A second compaction replaces one compacted chunk with another, so a flag
+        would not change and neither would a count. The peer would then treat the
+        new compacted chunk -- a complete statement of the whole day -- as one
+        more chunk to append, and write the day twice over.
+        """
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            sync.compact(before="2023-12-01")
+            sync.run()
+        self.chunks_read(beta)
+
+        with alpha.active():
+            for i in range(2):
+                alpha.record("2023-11-14", 1_700_000_600 + i, f"later {i}")
+                sync.run()
+        self.chunks_read(beta)
+        self.assertEqual(self.merged_lines(beta, alpha), 6)
+
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+        self.chunks_read(beta)
+        self.assertEqual(self.merged_lines(beta, alpha), 6, "the day was written twice over")
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 6)
+
+    def test_a_rewrite_that_lost_a_chunk_is_tried_again(self) -> None:
+        """Recording the rebuild before it succeeded would make the day short.
+
+        The record says "this day was rebuilt from these compacted chunks". If a
+        chunk fails on the pass that rewrites -- an unopenable day key, a chunk
+        that does not match its digest -- the day on disk does not have it, and
+        writing the record anyway means the day is never rebuilt again: the peer
+        appends whatever arrives next to a copy that was never rebuilt at all.
+        """
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            sync.compact(before="2023-12-01")
+            sync.run()
+
+        def refuse(path: Path, expected: str) -> bytes:
+            raise ValueError(f"{path.name} is not the chunk its manifest names")
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+            report = sync.run()
+        self.assertIn(f"{alpha.id}/2023-11-14", report.unauthenticated)
+
+        # The next pass must still owe a rewrite. If the failed one was recorded
+        # as done, this appends the compacted chunk to a day that still holds
+        # every line it replaces.
+        self.chunks_read(beta)
+        self.assertEqual(self.merged_lines(beta, alpha), 4, "the day was written twice over")
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 4)
 
     def test_an_ordinary_day_stays_incremental(self) -> None:
         """Only a rewrite re-reads. Otherwise every sync would redo the day.
