@@ -21,8 +21,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+      # No `cache: pip` here: it was tried and measured, and it made this job
+      # slower -- 13s to 17s. The dev deps are floors rather than pins, so pip
+      # still pays a resolution round-trip on a hit, and the cache only saves
+      # the wheel downloads, which cost less than restoring and saving it.
+      #
       # shellcheck comes from pip rather than apt so the version CI enforces is
       # the same one `pip install -e .[dev]` gives you locally.
       - run: pip install -e .[dev]
