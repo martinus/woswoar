@@ -586,6 +586,15 @@ def day_of_log(relpath: str) -> str:
     return relpath.rsplit("/", 1)[-1].removesuffix(_LOG_SUFFIX)
 
 
+def day_of_key(path: Path) -> str:
+    """``hosts/<id>/keys/2026-07-29.age`` -> ``2026-07-29``.
+
+    The inverse of `day_key`, and here rather than at the caller for the same
+    reason `iter_day_keys` is: the suffix is this module's to know.
+    """
+    return path.name.removesuffix(_CHUNK_SUFFIX)
+
+
 def append_entries(machine_id: str, entries: list[Entry]) -> dict[str, int]:
     """Append entries to their day files, returning lines written per file.
 

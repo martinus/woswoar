@@ -76,7 +76,44 @@ Enrolling a new laptop means publishing a public key — nothing sensitive trave
 and nothing sensitive is stored in the repo.
 
 Widening who can read the archive is therefore a deliberate act: `woswoar grant`
-lists the machines and asks before it re-seals anything.
+lists the machines and asks before it re-seals anything. Narrowing it is
+`woswoar revoke <fingerprint>`.
+
+<details>
+<summary>What revoking does, and the three things it cannot do</summary>
+
+`woswoar revoke` appends a **tombstone** to `recipients.txt` rather than
+deleting the line. The file is `merge=union` — the property that makes two
+machines enrolling at once conflict-free — and union keeps both sides of every
+difference, so a deleted line comes straight back from any peer that still has
+it. Every machine subtracts the tombstoned key on its next fetch, and the
+withdrawal is permanent: a key that reappears below its own tombstone stays out,
+because whoever the revocation was aimed at has push access by assumption.
+
+The remaining sealed keys are then re-sealed without it, so a copy of the repo
+taken afterwards cannot be opened with that key at all, and every day key minted
+from then on excludes it.
+
+What it does **not** do, all three said on screen before you confirm:
+
+- **It does not un-publish anything.** History already in the repo stays
+  readable by that key if it kept a copy.
+- **It does not revoke git access.** If the key got in through a stolen token or
+  a mis-scoped deploy key, that credential needs rotating too, or it can simply
+  fetch again.
+- **It does not stop that machine writing history yours will accept.** The
+  authentication key above is shared across your fleet, and rotating it would
+  make every existing chunk fail authentication, so it cannot be rotated without
+  rebuilding the repo.
+
+There is also a bounded window on reads: a day key is minted once and every
+chunk of that day is sealed to it, so commands recorded on a day whose key
+already exists stay readable by the revoked machine. In practice that is the
+rest of today, and `revoke` prints exactly which days. Rotating those mid-day
+would strand the chunks already sealed to them on every machine that has not
+merged them yet.
+
+</details>
 
 <details>
 <summary>What that prompt shows, and why not just the names</summary>
@@ -133,6 +170,8 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | Forged history is refused | a chunk sealed to a host's published day key, but untagged, is rejected and reported |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
 | The repo key never leaks | the key's bytes appear nowhere in the committed tree |
+| A revoked machine stops receiving history | two real machines through a bare repo: after `revoke`, the revoked one still has what came before and never gets what comes after |
+| A revocation cannot be undone by pushing | re-adding the key, by command or by appending the line, leaves it subtracted |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
@@ -162,3 +201,8 @@ Being straight about the limits is part of the security story:
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run
 >   `woswoar grant` from another machine.
+> - **Revoking is forward-looking only.** `woswoar revoke` stops a machine
+>   receiving new history; it cannot take back what was already published, and
+>   the revoked machine keeps the shared authentication key, so it can still
+>   write history your machines accept. A key that has genuinely fallen into
+>   someone else's hands is a reason to rebuild the repo, not only to revoke.

@@ -71,6 +71,10 @@ class Report:
     #: True when this machine cannot open the repo key yet, so it can neither
     #: publish nor read. Recording carries on regardless; `grant` unblocks it.
     needs_grant: bool = False
+    #: ...unless this machine's own key was revoked, in which case `grant` never
+    #: will, and saying otherwise sends someone to another machine to run a
+    #: command that cannot help. Only meaningful with `needs_grant`.
+    revoked: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +112,22 @@ def remote_summary() -> str:
 #: handing age the path -- which is what makes labelling possible at all.
 _LABEL_SEP = " # "
 
+#: Marks a line as a *withdrawal* of the key that follows it rather than an
+#: enrolment of it.
+#:
+#: A tombstone rather than deleting the line, because `.gitattributes` marks
+#: this file ``merge=union`` -- the thing that makes two machines enrolling at
+#: once conflict-free. Union keeps both sides of every difference, so a line
+#: deleted here and still present in any peer's checkout comes straight back on
+#: the next rebase. Dropping ``merge=union`` to make deletion stick would
+#: reintroduce exactly the conflicts the append-only design exists to avoid, on
+#: the one file every machine writes.
+#:
+#: ``-`` cannot collide with a key: age recipients start ``age1`` and SSH keys
+#: with their type. `add_recipient` refuses one that would, so this stays a
+#: decision about the first character rather than a guess.
+_REVOKED = "-"
+
 
 def _recipient_lines() -> list[str]:
     path = store.recipients_file()
@@ -116,12 +136,83 @@ def _recipient_lines() -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+class _Line(NamedTuple):
+    """One parsed line of recipients.txt. The file's grammar, stated once.
+
+    Both passes over the file go through this. Parsing the key inline in one of
+    them and through a helper in the other is how the two drift: a field added
+    to the line format then has to be added to two parsers that must agree, and
+    nothing fails when only one of them is updated.
+    """
+
+    withdrawn: bool
+    key: str
+    label: str
+
+
+def _parse(line: str) -> _Line:
+    key, _, label = line.removeprefix(_REVOKED).partition(_LABEL_SEP)
+    return _Line(line.startswith(_REVOKED), key.strip(), label.strip())
+
+
+def _revoked_in(lines: list[str]) -> set[str]:
+    parsed = (_parse(line) for line in lines)
+    return {entry.key for entry in parsed if entry.withdrawn}
+
+
+def revoked_keys() -> set[str]:
+    """Every key withdrawn by a tombstone, whether or not it is still listed."""
+    return _revoked_in(_recipient_lines())
+
+
+def _append_recipient_line(line: str) -> None:
+    """Add one line to recipients.txt, keeping it one line per record.
+
+    The only writer. Both callers -- enrolling a key and withdrawing one --
+    need the same three things right: append rather than rewrite, do not run
+    two records together when the file has no trailing newline, and replace the
+    file atomically. `revoke` grew its own copy of that first, which put the
+    newline rule in two places on the one file every machine in the fleet
+    writes and that ``merge=union`` makes unforgiving about stray lines.
+    """
+    path = store.recipients_file()
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    separator = "" if not existing or existing.endswith("\n") else "\n"
+    store.write_atomic(path, f"{existing}{separator}{line}\n".encode())
+
+
+def _this_machine_revoked(known: Machine) -> bool:
+    """Whether this machine is the one that was withdrawn.
+
+    Answerable locally and without any key: `recipients.txt` is plaintext, a
+    revoked machine can still fetch it, and its own public key is on disk. Which
+    is the point -- the machine that most needs to be told is the one that can
+    no longer decrypt anything to be told with.
+    """
+    try:
+        return crypto.recipient_for(identity_path(known)).strip() in revoked_keys()
+    except (WoswoarError, OSError):
+        return False
+
+
 def _labelled_recipients() -> list[tuple[str, str]]:
     """``(key, label)`` for every enrolled machine, deduplicated by key.
 
     Deduplicated because `.gitattributes` marks this file ``merge=union``, so a
     machine that appends a labelled line where another has the same key
     unlabelled leaves both, and age rejects a repeated recipient.
+
+    Tombstones are collected in a pass of their own first, not skipped as they
+    are met: union merges interleave two machines' appends in whatever order the
+    rebase produces, so a withdrawal can perfectly well land *above* the
+    enrolment it withdraws. Subtracting in one pass would then depend on line
+    order, which nothing guarantees.
+
+    Withdrawal is deliberately permanent: a key that reappears below its own
+    tombstone stays out. Re-enrolling a machine means giving it a new identity,
+    which is the cheap half of the operation -- whereas "whoever the revocation
+    was aimed at can un-revoke themselves by appending the line again" is not a
+    property worth having, and they have push access by assumption.
 
     The label is woswoar's own trailing comment when present and the SSH key's
     comment field otherwise. It is never derived from the key -- an abbreviated
@@ -134,17 +225,21 @@ def _labelled_recipients() -> list[tuple[str, str]]:
     covers C0 only, which is what a *record* needs; making it safe to put on a
     terminal is `Reader.display_name`.
     """
+    lines = _recipient_lines()
+    revoked = _revoked_in(lines)
+
     out: dict[str, str] = {}
-    for line in _recipient_lines():
-        key, _, label = line.partition(_LABEL_SEP)
-        key = key.strip()
-        if not key or key in out:
+    for line in lines:
+        entry = _parse(line)
+        # Tombstones need no case of their own: their key is in `revoked` by
+        # construction, so the same test that drops the enrolment drops them.
+        if not entry.key or entry.key in out or entry.key in revoked:
             continue
-        label = label.strip()
+        label = entry.label
         if not label:
-            fields = key.split(None, 2)
+            fields = entry.key.split(None, 2)
             label = fields[2] if len(fields) > 2 else "(unnamed)"
-        out[key] = make_inert(label)
+        out[entry.key] = make_inert(label)
     return list(out.items())
 
 
@@ -562,7 +657,13 @@ def run(push: bool = True, now: int | None = None) -> Report:
             # shell hook keeps recording into logs/, the backlog exports whole
             # on the first sync after `grant`, and a timer firing every minute
             # must not turn a normal waiting state into a stream of failures.
+            #
+            # Which of the two states this is decides the advice, so it is
+            # settled here rather than left to the caller: "ask someone to run
+            # grant" is exactly wrong for a machine that was revoked, and it is
+            # the message that machine would see forever.
             report.needs_grant = True
+            report.revoked = _this_machine_revoked(known)
             return report
 
         export(known, state, report, int(time.time()) if now is None else now, mac)
@@ -853,6 +954,88 @@ def readers() -> list[Reader]:
         ]
 
 
+class _AccessChange(NamedTuple):
+    identity: Path
+    known: Machine
+    remote: bool
+
+
+@contextmanager
+def _access_change() -> Iterator[_AccessChange]:
+    """The protocol every command that changes who can read history follows.
+
+    Fetch, act under the lock, commit, push -- in that order, and the order is
+    the point. Reading `recipients.txt` before the fetch re-seals to a stale
+    list and reports full success while granting or revoking nothing, which is
+    a silent wrong answer rather than a failure.
+
+    `_reseal` factored out the *loop* the access-changing commands share; this
+    is the transaction around it, which is the half that encodes the ordering.
+    Leaving it copied per command made the hazard `_reseal`'s docstring names
+    -- picked up by widening access and forgotten by narrowing it -- true one
+    level up, where nothing would fail loudly.
+
+    Raising inside the block skips the commit and the push, so a refusal leaves
+    the working tree as it was rather than half-applied.
+    """
+    crypto.require()
+    if not is_repo():
+        raise SyncError("no history repo yet; run 'woswoar init' first")
+
+    known = store.machine()
+    identity = identity_path(known)
+    _ensure_repo_config()
+    remote = has_remote()
+
+    # The same lock sync takes: this rewrites files in the working tree, and a
+    # timer-driven sync must not be reading them halfway through.
+    with lock():
+        if remote:
+            _fetch_and_rebase()
+        yield _AccessChange(identity, known, remote)
+        _commit()
+        if remote:
+            _push()
+
+
+def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
+    """Re-seal every sealed-to-recipients file to ``keys``. ``(resealed, skipped)``.
+
+    The mechanism both `grant` and `revoke` are made of, and the reason they are
+    two commands rather than one flag: the files rewritten and the way they are
+    rewritten are identical, and only the intent behind the recipient list
+    differs. One loop means a file that starts being sealed to the recipients
+    cannot be picked up by widening access and forgotten by narrowing it.
+
+    Only a machine that is *already* a recipient can do this: re-sealing means
+    opening the existing file first. That is the point rather than a limitation
+    -- if a machine nobody had granted access to could re-seal old keys, the
+    encryption would not be worth anything.
+    """
+    # The repo key first: it is what a newly enrolled machine needs before it
+    # can authenticate anything at all, and unlike the per-host keys there is
+    # exactly one of it.
+    sealed = [store.mac_key_file()]
+    for host_id in store.repo_hosts():
+        sealed.extend(store.iter_day_keys(host_id))
+        sealed.append(store.name_seal(host_id))
+
+    resealed = skipped = 0
+    for path in sealed:
+        if not path.is_file():
+            continue
+        try:
+            plain = crypto.decrypt_with_file(path.read_bytes(), identity)
+        except (crypto.AgeError, OSError):
+            # Not ours to re-seal: keys sealed before this machine joined, or
+            # left behind by one since removed.
+            skipped += 1
+            continue
+        store.write_atomic(path, crypto.encrypt_to_recipients(plain, keys))
+        resealed += 1
+    return resealed, skipped
+
+
 def grant(approved: list[str] | None = None) -> ReencryptReport:
     """Re-seal every key file to the current recipient list, and publish it.
 
@@ -875,11 +1058,8 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
     untouched. Any machine already enrolled can do it for every host, because
     all hosts seal their keys to the same recipient list.
 
-    Only a machine that is *already* a recipient can do this: re-sealing means
-    opening the existing key first. That is the point rather than a limitation
-    -- if a machine nobody had granted access to could re-seal old keys, the
-    encryption would not be worth anything. So the new machine cannot onboard
-    itself, and one that cannot open a key skips it silently.
+    `_reseal` explains why only an already-enrolled machine can do this, so the
+    new machine cannot onboard itself and one that cannot open a key skips it.
 
     Fetching first is not optional, for the same reason `run` exports after
     fetching: the recipient list this re-seals to is a *file in the working
@@ -890,27 +1070,13 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
     This is one of only two operations that rewrite an existing file. It is
     deliberately explicit rather than part of sync.
     """
-    crypto.require()
-    if not is_repo():
-        raise SyncError("no history repo yet; run 'woswoar init' first")
-
-    known = store.machine()
-    identity = identity_path(known)
-    _ensure_repo_config()
-    remote = has_remote()
-    resealed = skipped = 0
-
-    # The same lock sync takes: this rewrites files in the working tree, and a
-    # timer-driven sync must not be reading them halfway through.
-    with lock():
-        if remote:
-            _fetch_and_rebase()
-
-        # Read *after* the fetch, never before. The whole point of this command
-        # is to seal to a machine that enrolled since the last sync, so taking
-        # the list from a pre-fetch checkout would re-seal everything to the old
-        # recipients and report full success. Reading it once here also saves
-        # re-parsing the file for every one of a few thousand key files.
+    with _access_change() as change:
+        # Read *after* the fetch `_access_change` did, never before. The whole
+        # point of this command is to seal to a machine that enrolled since the
+        # last sync, so taking the list from a pre-fetch checkout would re-seal
+        # everything to the old recipients and report full success. Reading it
+        # once here also saves re-parsing the file for every one of a few
+        # thousand key files.
         keys = recipients()
         if approved is not None and sorted(keys) != sorted(approved):
             raise SyncError(
@@ -918,26 +1084,7 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
                 "run 'woswoar grant' again to see the current list"
             )
 
-        # The repo key first: it is what a newly enrolled machine needs before
-        # it can authenticate anything at all, and unlike the per-host keys
-        # there is exactly one of it.
-        sealed = [store.mac_key_file()]
-        for host_id in store.repo_hosts():
-            sealed.extend(store.iter_day_keys(host_id))
-            sealed.append(store.name_seal(host_id))
-
-        for path in sealed:
-            if not path.is_file():
-                continue
-            try:
-                plain = crypto.decrypt_with_file(path.read_bytes(), identity)
-            except (crypto.AgeError, OSError):
-                # Not ours to re-seal: keys sealed before this machine
-                # joined, or left behind by one since removed.
-                skipped += 1
-                continue
-            store.write_atomic(path, crypto.encrypt_to_recipients(plain, keys))
-            resealed += 1
+        resealed, skipped = _reseal(change.identity, keys)
 
         if approved is not None:
             # Recorded rather than counted: what the next confirmation subtracts
@@ -949,11 +1096,109 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
             state.granted = keys
             state.save()
 
-        _commit()
-        if remote:
-            _push()
+    return ReencryptReport(resealed, skipped, pushed=change.remote)
 
-    return ReencryptReport(resealed, skipped, pushed=remote)
+
+class RevokeReport(NamedTuple):
+    """What `revoke` did, and -- just as much -- what it could not do."""
+
+    resealed: int
+    skipped: int
+    pushed: bool
+    #: Days *this host* has a key for already and is still recording into, so
+    #: commands added to them stay readable by the revoked key. In practice
+    #: today. Reported rather than left to be worked out, because it is the one
+    #: gap someone might act on.
+    #:
+    #: Per-host, and the wording that carries it says so: every other enrolled
+    #: machine has the same gap for the days it is recording into, and this one
+    #: cannot see which those are.
+    still_readable: list[str]
+
+
+def find_reader(fingerprint: str) -> Reader:
+    """The one enrolled machine ``fingerprint`` names, or a useful refusal.
+
+    Matched on the fingerprint rather than the name, because the name is the
+    part anyone with push access can choose -- revoking by a string an attacker
+    wrote is how you revoke the wrong machine. A unique prefix is accepted, the
+    way git takes a short commit id; an ambiguous one is refused rather than
+    resolved, since guessing here removes somebody's access.
+    """
+    wanted = fingerprint.strip()
+    if not wanted:
+        raise SyncError("no fingerprint given; run 'woswoar grant' to see them")
+
+    candidates = [reader for reader in readers() if reader.fingerprint.startswith(wanted)]
+    if not candidates:
+        raise SyncError(f"no enrolled machine has a fingerprint starting {wanted!r}")
+    if len(candidates) > 1:
+        shown = "\n".join(f"  {reader.fingerprint}" for reader in candidates)
+        raise SyncError(f"{wanted!r} matches {len(candidates)} machines:\n{shown}")
+    return candidates[0]
+
+
+def _still_readable(host_id: str) -> list[str]:
+    """Days this host has both a key for and a log it may still append to."""
+    keyed = {store.day_of_key(path) for path in store.iter_day_keys(host_id)}
+    logged = {
+        store.day_of_log(log.relpath) for log in store.iter_log_files() if log.host_id == host_id
+    }
+    return sorted(keyed & logged)
+
+
+def revoke(reader: Reader) -> RevokeReport:
+    """Withdraw one machine's access, and re-seal what is left without it.
+
+    Three things happen, and it is worth being exact about which of them is a
+    guarantee:
+
+    1. A tombstone is appended, so every machine subtracts this key from the
+       recipient list on its next fetch. Permanent, and survives ``merge=union``
+       -- see `_REVOKED`.
+    2. Every sealed key file is re-sealed to the remaining recipients, so a copy
+       of the repo taken *after* this cannot be opened with that key.
+    3. Day keys minted from now on exclude it, which is what actually stops the
+       revoked machine reading tomorrow's commands.
+
+    What this cannot undo: anything the revoked machine already read or already
+    cloned, and any day whose key it already holds -- reported as
+    ``still_readable`` rather than left for the caller to work out. Rotating
+    those mid-day is not an option: a day key is minted once and every chunk of
+    that day is sealed to it, so replacing it would strand the chunks already
+    written on every machine that has not merged them yet.
+
+    It also does not touch git access -- a revoked machine can still fetch --
+    and it still holds the authentication key, so it can still *write* history
+    other machines will accept. Those want the git credential rotated and, for
+    the authentication key, a rebuilt repo.
+    """
+    if reader.is_mine:
+        raise SyncError(
+            "that is this machine's own key; revoking it here would lock this "
+            "machine out of its own history. Run 'woswoar revoke' from another one."
+        )
+
+    with _access_change() as change:
+        # Checked before the tombstone is written, so a refusal leaves the file
+        # as it was rather than tombstoned-but-not-re-sealed.
+        if set(recipients()) <= {reader.key}:
+            raise SyncError(
+                "that is the only machine left; revoking it would seal the "
+                "history to nobody and lose it. Enrol another machine first."
+            )
+
+        # No date in the tombstone: the commit carries one already, and a date
+        # written into a shared file is a date the machine that wrote it chose.
+        _append_recipient_line(f"{_REVOKED}{reader.key}{_LABEL_SEP}revoked")
+
+        # Read back rather than filtered by hand. What a tombstone subtracts is
+        # `_labelled_recipients`' rule, and a second copy of it here is a second
+        # thing to keep in step -- the reason the file is written first.
+        resealed, skipped = _reseal(change.identity, recipients())
+        still_readable = _still_readable(change.known.id)
+
+    return RevokeReport(resealed, skipped, pushed=change.remote, still_readable=still_readable)
 
 
 def compact(before: str) -> tuple[int, int]:
@@ -1035,11 +1280,21 @@ def add_recipient(recipient: str, label: str = "") -> bool:
     key = recipient.strip()
     if "\n" in key:
         raise SyncError(f"the public key for this machine is not one line: {key!r}")
+    if key.startswith(_REVOKED):
+        # No real key starts with "-", so this is not a shape anyone reaches by
+        # accident -- but one that did would be indistinguishable from a
+        # tombstone, and would silently withdraw whatever key followed it.
+        raise SyncError(f"a public key may not start with {_REVOKED!r}: {key!r}")
+    if key in revoked_keys():
+        # Loudly, and not as "already enrolled". Appending the line would be
+        # harmless -- `_labelled_recipients` subtracts it either way -- but this
+        # machine would then record and sync for days while reading nothing, and
+        # the reason would sit in a file it never prints.
+        raise SyncError(
+            "this key was revoked, and a revocation is permanent. Re-enrol this "
+            "machine with a new identity:  woswoar init <url> --new-identity"
+        )
     if key in recipients():
         return False
-    path = store.recipients_file()
-    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    separator = "" if not existing or existing.endswith("\n") else "\n"
-    line = f"{key}{_LABEL_SEP}{make_inert(label)}" if label else key
-    store.write_atomic(path, f"{existing}{separator}{line}\n".encode())
+    _append_recipient_line(f"{key}{_LABEL_SEP}{make_inert(label)}" if label else key)
     return True
