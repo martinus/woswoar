@@ -126,6 +126,21 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _restore_remedy(path: str) -> str:
+    """How to recover a file a peer deleted from the history repo.
+
+    Deleting one is a commit like any other and woswoar never rewrites history,
+    so the blob is still reachable in every clone. Shared by the two files this
+    can happen to, so the recipe cannot drift between their messages.
+    """
+    return (
+        "It is still in git history -- woswoar never rewrites it, so every clone\n"
+        "has the blob. To put it back:\n"
+        f"    git -C <history> log --diff-filter=D -- {path}\n"
+        f"    git -C <history> show <commit>^:{path} > that path\n"
+    )
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     try:
         result = importer.run(
@@ -289,6 +304,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         trust = sync.trust_status(store.machine())
         check("trust", trust.ok, trust.detail)
 
+        # One stat per day this machine has published. Worth doing every time
+        # because `export` only revisits a day that still has lines to publish,
+        # so a day finished before its manifest went is never looked at again.
+        unmanifested = sync.days_missing_a_manifest()
+        if unmanifested:
+            detail = (
+                f"{len(unmanifested)} published day(s) have no signed list, e.g."
+                f" {unmanifested[0]} - peers refuse every chunk this machine"
+                " published on them"
+            )
+        else:
+            detail = "all present"
+        check("manifests", not unmanifested, detail)
+
         # A listing, no decryption, so it is cheap enough to do every time --
         # and the state is otherwise silent, which is the whole problem with it.
         orphaned = sync.orphaned_days()
@@ -446,14 +475,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
             "it are still there. Those chunks are unreadable by every machine, and a\n"
             "new key would not change that -- so nothing more is written for those\n"
             "days rather than adding chunks nobody will ever read.\n"
-            "The commands themselves are still in this machine's own logs, and the\n"
-            "deleted key is still in git history -- woswoar never rewrites it, so\n"
-            "every clone has the blob. To put it back:\n"
-            "    git -C <history> log --diff-filter=D -- hosts/<id>/keys/<day>.age\n"
-            "    git -C <history> show <commit>^:hosts/<id>/keys/<day>.age > that path\n"
+            "The commands themselves are still in this machine's own logs.\n"
+            f"{_restore_remedy('hosts/<id>/keys/<day>.age')}"
             "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
             "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
             "this machine starts a new key and publishes again.",
+            file=sys.stderr,
+        )
+
+    if report.manifest_missing:
+        lost = ", ".join(sorted(report.manifest_missing))
+        print(
+            f"\nWARNING: {len(report.manifest_missing)} day(s) of this machine's own\n"
+            f"history cannot be published: {lost}\n"
+            "The signed list this machine published for them is gone from the\n"
+            "repository. Signing a replacement would name only what is written now,\n"
+            "so every chunk published earlier that day would stop being one any peer\n"
+            "accepts. Nothing is written for those days instead.\n"
+            f"{_restore_remedy('hosts/<id>/manifests/<day>')}"
+            "'woswoar doctor' prints the days.",
             file=sys.stderr,
         )
 

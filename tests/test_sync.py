@@ -2469,5 +2469,136 @@ class TestAnOrphanedDayKey(SyncTestCase):
             self.assertIn("2023-11-14", text)
 
 
+class TestADeletedManifest(SyncTestCase):
+    """Issue #63, the sibling of #42 in the other rewritable file.
+
+    `read_manifest` returns nothing for "absent" and for "will not verify"
+    alike, and only the second was guarded. So a deleted manifest looked exactly
+    like a day never published: the fresh one signed at the end of `export`
+    named only what that run wrote, and every chunk published earlier that day
+    stopped being one any peer would accept.
+    """
+
+    def published_day(self) -> Fake:
+        """One machine with one day published, which is all but one test needs.
+
+        A peer costs an `ssh-keygen` and a clone, so the one test that needs one
+        makes it itself rather than every test paying for it.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "first")
+            sync.run()
+        return alpha
+
+    def test_nothing_is_written_for_the_day(self) -> None:
+        alpha = self.published_day()
+        with alpha.active():
+            path = store.day_manifest(alpha.id, "2023-11-14")
+            before = {c.name for c in store.iter_chunks(alpha.id)}
+            self.assertTrue(any(name in path.read_text(encoding="utf-8") for name in before))
+
+            path.unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "second")
+            report = sync.run()
+
+            self.assertEqual(report.chunks_written, 0)
+            self.assertEqual(report.manifest_missing, {"2023-11-14"})
+            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+            # The disowning itself: a replacement would name only this run.
+            self.assertFalse(path.exists(), "a replacement manifest was signed")
+
+    def test_restoring_it_publishes_the_pending_line(self) -> None:
+        """The lines stay in `logs/`, so the day is recoverable, not lost."""
+        # Before alpha publishes, so beta is already a recipient when the day
+        # key is minted -- otherwise it would need a `grant` as well, which is
+        # a different mechanism and not what this test is about.
+        beta = self.machine("beta")
+        alpha = self.published_day()
+        with alpha.active():
+            path = store.day_manifest(alpha.id, "2023-11-14")
+            original = path.read_bytes()
+            path.unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "second")
+            sync.run()
+
+            store.write_atomic(path, original)
+            report = sync.run()
+            self.assertEqual(report.manifest_missing, set())
+            self.assertEqual(report.chunks_written, 1)
+
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        self.accept_everyone(beta)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(sorted(beta.commands()), ["first", "second"])
+
+    def test_a_day_never_published_here_is_not_refused(self) -> None:
+        """A chunk under our id proves only that somebody wrote one.
+
+        Keying on chunks rather than on this machine's own watermark would let
+        anyone who can push plant one on a day we have not published and block
+        that day for good.
+        """
+        alpha = self.published_day()
+        with alpha.active():
+            planted = store.chunk_dir(alpha.id, "2023-11-20")
+            planted.mkdir(parents=True, exist_ok=True)
+            (planted / "9999999999-ffffff.age").write_bytes(b"whatever an attacker likes")
+
+            alpha.record("2023-11-20", 1_700_500_000, "mine")
+            report = sync.run()
+
+            self.assertEqual(report.manifest_missing, set())
+            self.assertEqual(report.chunks_written, 1)
+            self.assertTrue(store.day_manifest(alpha.id, "2023-11-20").exists())
+
+    def test_sync_says_which_day_and_how_to_get_it_back(self) -> None:
+        alpha = self.published_day()
+        with alpha.active():
+            store.day_manifest(alpha.id, "2023-11-14").unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "second")
+            errors = io.StringIO()
+            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
+                main(["sync"])
+
+        said = errors.getvalue()
+        self.assertIn("2023-11-14", said)
+        self.assertIn("--diff-filter=D", said)
+
+    def test_doctor_is_quiet_when_every_published_day_has_its_manifest(self) -> None:
+        """Keyed on what this machine published, not on log files on disk.
+
+        A day recorded but never exported has no manifest either, and reporting
+        it would be a hard red for the ordinary state of a day still being
+        written. The watermark is what tells the two apart.
+        """
+        alpha = self.published_day()
+        with alpha.active():
+            alpha.record("2023-11-20", 1_700_500_000, "not yet published")
+            self.assertEqual(sync.days_missing_a_manifest(), [])
+            _, text = self.run_cli(alpha, "doctor")
+            self.assertIn("[ok] manifests", text)
+
+    def test_doctor_finds_a_quiet_day_sync_never_looks_at(self) -> None:
+        """A day fully exported before the deletion never returns to `export`."""
+        alpha = self.published_day()
+        with alpha.active():
+            _, healthy = self.run_cli(alpha, "doctor")
+            self.assertIn("[ok] manifests", healthy)
+
+            store.day_manifest(alpha.id, "2023-11-14").unlink()
+            self.assertEqual(sync.days_missing_a_manifest(), ["2023-11-14"])
+
+            code, text = self.run_cli(alpha, "doctor")
+            self.assertEqual(code, 1)
+            self.assertIn("[FAIL] manifests", text)
+            self.assertIn("2023-11-14", text)
+
+
 if __name__ == "__main__":
     unittest.main()
