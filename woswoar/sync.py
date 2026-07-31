@@ -373,28 +373,6 @@ def is_repo() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _names_by_day(raw: object) -> dict[str, set[str]]:
-    """A ``"<host>/<day>" -> chunk names`` map out of whatever the file holds.
-
-    Guarded per value, not just on the whole thing being a dict. A state file
-    from before `merged` became a set holds one *string* per day, and a string
-    is iterable: without this, every day's record turns into its own characters,
-    every chunk looks unmerged, and the first sync after upgrading duplicates
-    every peer's history wholesale.
-
-    Shared by `merged` and `rebuilt` because they are the same shape and want
-    the same answer when malformed: forget that day and read it again, which
-    repeats work rather than dropping history.
-    """
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        str(key): {str(name) for name in value}
-        for key, value in raw.items()
-        if isinstance(value, list)
-    }
-
-
 @dataclass
 class State:
     """Per-machine progress. Deliberately *not* in the repo: it describes what
@@ -429,15 +407,6 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
-    #: "<host>/<day>" -> the compacted chunks the local copy of that day was last
-    #: rebuilt from, sorted.
-    #:
-    #: A compacted chunk keeps its `subsumes` list in the signed manifest for
-    #: good, so "does this day contain a compacted chunk" stays true forever and
-    #: cannot mean "rebuild it". Keyed on the *set* rather than a count or a
-    #: flag: compacting twice replaces one compacted chunk with another, and
-    #: neither the count nor a flag would change.
-    rebuilt: dict[str, set[str]] = field(default_factory=dict)
     #: What was on disk when this was loaded, so `save` can tell whether there
     #: is anything to write. Not part of the state itself.
     _loaded: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
@@ -449,12 +418,19 @@ class State:
         merged = raw.get("merged", {})
         granted = raw.get("granted", [])
         signers = raw.get("signers", {})
-        rebuilt = raw.get("rebuilt", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         state = cls(
             exported={str(k): int(v) for k, v in exported.items()},
-            merged=_names_by_day(merged),
+            # Guarded per value, not just on `merged` being a dict. A value
+            # that is a bare *string* rather than a list is iterable, so without
+            # this every day's record turns into its own characters, every chunk
+            # looks unmerged, and the next sync duplicates every peer's history
+            # wholesale. Forgetting a malformed day and reading it again is the
+            # direction that repeats work rather than dropping history.
+            merged={
+                str(k): {str(name) for name in v} for k, v in merged.items() if isinstance(v, list)
+            },
             # A malformed list costs the prompt its memory, which shows every
             # machine as new -- the safe direction to be wrong in.
             granted=[str(k) for k in granted] if isinstance(granted, list) else [],
@@ -464,7 +440,6 @@ class State:
             signers={str(k): str(v) for k, v in signers.items()}
             if isinstance(signers, dict)
             else {},
-            rebuilt=_names_by_day(rebuilt),
         )
         state._loaded = state.as_json()
         return state
@@ -481,7 +456,6 @@ class State:
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
             "signers": dict(self.signers),
-            "rebuilt": {key: sorted(names) for key, names in self.rebuilt.items()},
         }
 
     def save(self) -> None:
@@ -1388,21 +1362,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             continue
 
         listed = read_manifest(host_id, chunk_day, verify_key)
-        # A rewrite is owed when the day's *compacted* chunks are not the ones
-        # the local copy was last rebuilt from -- not merely when it has some.
-        # A compacted chunk keeps its `subsumes` list in the manifest forever,
-        # so "has one" stays true for the life of the day, and keying on it
-        # rebuilt the whole day every time it gained anything: linear per sync,
-        # quadratic over a day still being written, and a day compacted while
-        # live reaches ~1440 chunks.
-        compacted = {name for name, entry in listed.items() if entry.subsumes}
-        day = _Day(host_id, chunk_day, listed, compacted != state.rebuilt.get(key, set()))
+        day = _Day(host_id, chunk_day, listed, already)
         pending = chunks if day.rewrite else fresh
-
-        # Whether every chunk the manifest lists reached the file this pass. A
-        # rewrite that lost one to an unopenable key must not be recorded as
-        # done, or the day is never rebuilt again and stays short for good.
-        complete = True
 
         for chunk in pending:
             if chunk.name not in day.listed:
@@ -1426,7 +1387,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             secret = day_keys[chunk_day]
             if secret is None:
                 report.unreadable.add(key)
-                complete = False
                 continue
 
             # Authenticated before it is decrypted or decompressed, so age, zlib
@@ -1436,7 +1396,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
             except (OSError, ValueError):
                 report.unauthenticated.add(key)
-                complete = False
                 continue
 
             try:
@@ -1449,7 +1408,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # and every other host's readable chunks, on this run and every
                 # run after it.
                 report.unreadable.add(key)
-                complete = False
                 continue
 
             day.add(plaintext, report)
@@ -1458,8 +1416,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 report.chunks_merged += 1
 
         day.flush(report)
-        if compacted and complete:
-            state.rebuilt[key] = compacted
 
 
 class _Day:
@@ -1467,8 +1423,8 @@ class _Day:
 
     Exists so the two things that decide *when* bytes are written -- the day
     boundary and `FLUSH_BYTES` -- are in one place rather than interleaved with
-    decryption, and so "this day is being rewritten" is settled once, from the
-    manifest, instead of discovered part way through.
+    decryption, and so "this day is being rewritten" is settled once, instead of
+    discovered part way through.
 
     That last part is not tidiness. A day being rewritten has to be written in a
     single atomic replacement, so it must never be flushed early; working that
@@ -1476,16 +1432,29 @@ class _Day:
     may already have gone to the file and the replacement would drop them.
     """
 
-    def __init__(self, host_id: str, day: str, listed: dict[str, Entry], rewrite: bool) -> None:
+    def __init__(
+        self, host_id: str, day: str, listed: dict[str, Entry], already: frozenset[str]
+    ) -> None:
         self.host_id = host_id
         self.day = day
         self.listed = listed
-        # Decided by the caller, which is the only place that knows what this
-        # machine last rebuilt the day from. A compacted chunk is a complete
-        # statement of the chunks it names, so a day that has gained one is
-        # replaced rather than added to -- the only answer right whether the
-        # peer had merged all of them, some, or none.
-        self.rewrite = rewrite
+        self.compacted = {name for name, entry in listed.items() if entry.subsumes}
+        # A compacted chunk is a complete statement of the chunks it names, so a
+        # day that gains one is replaced rather than added to -- the only answer
+        # right whether the peer had merged all of them, some, or none.
+        #
+        # "One this machine has not taken in yet", not "the day has one at all".
+        # A compacted chunk keeps its `subsumes` list in the signed manifest for
+        # good, so the second reading stays true for the life of the day, and it
+        # rebuilt the whole day every time that day gained anything: linear per
+        # sync, quadratic over a day, and a day compacted while still being
+        # written reaches ~1440 chunks.
+        #
+        # `already` can answer this because a compacted chunk only ever enters
+        # `state.merged` on a pass that rewrote the file. So a rewrite cut short
+        # by an unopenable day key is still owed on the next pass, with no
+        # second record of what was rebuilt to keep in step with this one.
+        self.rewrite = bool(self.compacted - already)
         self._blocks: list[bytes] = []
         self._bytes = 0
 
