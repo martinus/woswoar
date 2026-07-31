@@ -24,13 +24,10 @@ _LOGS = "logs"
 _HISTORY = "history"
 _HOSTS = "hosts"
 _KEYS = "keys"
+_MANIFESTS = "manifests"
 _LOG_SUFFIX = ".tsv"
 _CHUNK_SUFFIX = ".age"
 _NAME_FILE = ".name"
-
-#: Mirrors crypto.TAG_BYTES. Kept here as the layout constant it is, so the
-#: framing above does not make store import crypto.
-_TAG_BYTES = 32
 
 RECIPIENTS = "recipients.txt"
 GITATTRIBUTES = ".gitattributes"
@@ -433,43 +430,48 @@ def name_seal(machine_id: str) -> Path:
     return repo_host_dir(machine_id) / "name.age"
 
 
-def mac_key_file() -> Path:
-    """The repo-wide authentication key, sealed to every recipient.
+def signing_key_file() -> Path:
+    """This machine's signing key. Local, and never published or synced.
 
-    One file for the whole history rather than one per host or per day: it
-    authenticates *the set of enrolled machines*, not an individual one, so
-    there is nothing to split it by. It is sealed exactly like a day key, which
-    means `grant` already re-seals it to a newly enrolled machine and a machine
-    that has not been granted access yet simply cannot open it -- the same state,
-    with the same remedy, as history it cannot decrypt.
+    In the config directory beside the age identity, not in the repo: the public
+    half is what other machines need, and the private half is the one thing that
+    makes a revoked machine's signatures worthless to it -- so it is also the one
+    thing that must never be sealed to anybody, however trusted.
     """
-    return history_dir() / "mac.age"
+    return config_dir() / "signing_key"
 
 
-def frame_chunk(sealed: bytes, tag: bytes) -> bytes:
-    """One chunk file: a fixed-width authentication tag, then the ciphertext.
+def signer_public(machine_id: str) -> Path:
+    """A host's published verify key, and the recipient that owns the host.
 
-    A prefix rather than a sibling file, so that everything which answers "what
-    is a chunk" keeps working unchanged -- `is_chunk_path`, the ``*.age`` glob
-    in `GITATTRIBUTES`, `iter_chunks`, and the CI invariant that no chunk is
-    ever rewritten. A second file per chunk would also have doubled the file
-    count that `compact` exists to hold down.
+    Two lines, and the second is why this file exists at all rather than the
+    verify key living in `recipients.txt`: revocation names an *age recipient*,
+    while chunks live under a *host id*, and nothing else in the repo joins the
+    two. It could not go in `recipients.txt` either -- an age recipient may
+    itself be an SSH key, `ssh-ed25519 AAAA... comment`, so a second key in that
+    field could not be told from the first one's comment.
 
-    Fixed width, so splitting needs no delimiter and no length field.
+    Anyone who can push can rewrite this, so nothing here is believed. It is
+    what `trust` *shows* a human, once; what is believed afterwards is the copy
+    pinned in local state.
     """
-    return tag + sealed
+    return repo_host_dir(machine_id) / "signer.pub"
 
 
-def split_chunk(blob: bytes) -> tuple[bytes, bytes]:
-    """Inverse of :func:`frame_chunk`: ``(sealed, tag)``.
+def day_manifest(machine_id: str, day: str) -> Path:
+    """The signed list of a host-day's chunks.
 
-    Raises :class:`ValueError` on anything too short to be framed, which callers
-    treat exactly like a tag that does not match: an unauthenticated chunk and a
-    malformed one are the same refusal.
+    Deliberately not one signature per chunk, which is what made the first
+    attempt at this unusable: a signature costs a subprocess, and a machine
+    waiting for `grant` re-checks everything it has not merged on every timer
+    tick. One manifest per host-day turns that from once per chunk into once per
+    day -- about 3.6 s over a year of three machines, against nearly two minutes.
+
+    Rewritten as the day goes on, so it lives outside the `hosts/<id>/<day>/`
+    chunk directories that `is_chunk_path` marks write-once. Only the owning
+    host ever writes it, so it cannot conflict, and it needs no merge driver.
     """
-    if len(blob) <= _TAG_BYTES:
-        raise ValueError("chunk carries no authentication tag")
-    return blob[_TAG_BYTES:], blob[:_TAG_BYTES]
+    return repo_host_dir(machine_id) / _MANIFESTS / day
 
 
 def day_key(machine_id: str, day: str) -> Path:

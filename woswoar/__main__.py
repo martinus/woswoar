@@ -267,8 +267,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if sync.is_repo():
         info("remote", sync.remote_summary())
-        status = sync.repo_key_status(store.machine())
-        check("repo key", status.ok, status.detail)
+        status = sync.signing_status(store.machine())
+        check("signing", status.ok, status.detail)
+
+        trust = sync.trust_status(store.machine())
+        check("trust", trust.ok, trust.detail)
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 
@@ -302,7 +305,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_init(args: argparse.Namespace) -> int:
     from . import crypto, sync
 
-    known, identity = sync.initialise(
+    known, identity, pinned = sync.initialise(
         remote=args.remote,
         new_identity=args.new_identity,
         identity=Path(args.identity).expanduser() if args.identity else None,
@@ -317,6 +320,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     # that reason, and this is the listing someone reads first.
     for key in sync.recipients():
         print(f"  {crypto.fingerprint(key)}")
+    if pinned:
+        # Trust on first use: this is the moment, and the only moment, that a
+        # machine accepts others without a human comparing anything. Printed so
+        # there is something to compare against afterwards.
+        print(f"\nAccepted the {len(pinned)} machine(s) already publishing here:")
+        for verify_key in pinned:
+            print(f"  {crypto.fingerprint(verify_key)}")
+        print("Check these against the machines themselves if the repository is shared.")
+
     if args.remote:
         print("\nNext: 'woswoar sync'.")
         print("On a machine that already has access, run 'woswoar grant' so this")
@@ -330,21 +342,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
     report = sync.run(push=not args.no_push)
     if report.revoked:
         print(
-            "This machine's access to the shared history was revoked, so it can\n"
-            "no longer publish or read it. This is not something 'woswoar grant'\n"
-            "can undo -- a revocation is permanent, deliberately.\n\n"
+            "This machine's access to the shared history was revoked, so nothing\n"
+            "is published from here and every other machine refuses what it already\n"
+            "published. This is not something 'woswoar grant' can undo -- a\n"
+            "revocation is permanent, deliberately.\n\n"
             "Commands are still being recorded locally, and 'woswoar list' still\n"
             "shows everything this machine had before. To take part again, enrol\n"
             "with a fresh identity:  woswoar init <url> --new-identity",
-            file=sys.stderr,
-        )
-        return 0
-    if report.needs_grant:
-        print(
-            "This machine cannot publish or read history yet: the repo's\n"
-            f"authentication key was sealed before it enrolled.\n{_GRANT_REMEDY}\n"
-            "Commands are still being recorded locally and will be published in\n"
-            "full once this is done.",
             file=sys.stderr,
         )
         return 0
@@ -366,12 +370,58 @@ def cmd_sync(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    if report.untrusted:
+        print(
+            f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
+            "told to accept, so none of it was merged. That is what a machine enrolled\n"
+            "since this one last looked is supposed to look like.\n"
+            "    woswoar trust",
+            file=sys.stderr,
+        )
+
+    if report.unpinned:
+        print(
+            f"\n{len(report.unpinned)} machine(s) were withdrawn by a revocation. Nothing\n"
+            "they publish is accepted here any more, including history they published\n"
+            "before it that this machine had not yet merged.",
+            file=sys.stderr,
+        )
+
+    if report.changed_signer:
+        print(
+            f"\nWARNING: {len(report.changed_signer)} machine(s) now sign with a different\n"
+            "key than the one accepted here, and nothing from them was merged. That is\n"
+            "either a machine that was re-enrolled or someone rewriting the repository,\n"
+            "and woswoar cannot tell which. If you re-enrolled it, accept the new key:\n"
+            "    woswoar trust --replace",
+            file=sys.stderr,
+        )
+
+    if report.unsignable:
+        print(
+            f"\nWARNING: {len(report.unsignable)} day(s) of this machine's own history\n"
+            "could not be published, because the signed list already in the repository\n"
+            "for them is not one this machine can verify. Publishing a replacement\n"
+            "would disown everything it published earlier on those days.\n"
+            "If this machine's signing key was replaced, that is why: days it signed\n"
+            "with the old one stay as they are, and new days publish normally.",
+            file=sys.stderr,
+        )
+
+    if report.foreign:
+        print(
+            f"\nWARNING: {len(report.foreign)} chunk(s) sit under this machine's own id\n"
+            "that it never published. They were not signed and will not be offered to\n"
+            "anyone, but someone else can write into this repository.",
+            file=sys.stderr,
+        )
+
     if report.unauthenticated:
         print(
             f"\nWARNING: {len(report.unauthenticated)} day(s) of history could not be\n"
-            "authenticated and were refused. Every chunk carries a tag computed with\n"
-            "a key only your enrolled machines can open, so this means the repo\n"
-            "contains history none of them wrote - someone else can write to it.",
+            "authenticated and were refused. Every machine signs a list of the chunks\n"
+            "it published, so this means the repo contains history none of your\n"
+            "machines put its name to - someone else can write to it.",
             file=sys.stderr,
         )
     return 0
@@ -500,9 +550,10 @@ def cmd_revoke(args: argparse.Namespace) -> int:
         "\n    stays readable by that key if it kept a copy."
         "\n  - It does not revoke git access. If the key got in through a stolen"
         "\n    token or deploy key, rotate that too, or it can simply fetch again."
-        "\n  - It does not stop that machine WRITING history yours will accept."
-        "\n    The authentication key is shared and cannot be rotated without"
-        "\n    rebuilding the repo."
+        "\n\nWhat it does do, from now on: nothing that machine publishes is accepted"
+        "\nby any of your machines. That includes history it published before now"
+        "\nwhich they have not merged yet, so run 'woswoar sync' on them first if"
+        "\nyou want to keep it."
     )
 
     if not _confirm("Revoke this machine's access?", args.yes):
@@ -537,6 +588,59 @@ def cmd_revoke(args: argparse.Namespace) -> int:
             "on one of those as well.",
             file=sys.stderr,
         )
+    return 0
+
+
+def cmd_trust(args: argparse.Namespace) -> int:
+    """Accept another machine's history on *this* machine."""
+    from . import crypto, sync
+
+    candidates = sync.trust_candidates()
+    fresh = [c for c in candidates if not c.pinned]
+    changed = [c for c in candidates if c.changed]
+
+    if args.replace:
+        candidates = changed
+        heading = "These machines now sign with a different key than the one accepted here."
+    else:
+        candidates = fresh
+        heading = "These machines publish history this one has not been told to accept."
+
+    if not candidates:
+        if changed and not args.replace:
+            print(
+                f"{len(changed)} machine(s) changed their signing key. Accepting a new key\n"
+                "for a machine you already accepted needs:  woswoar trust --replace",
+                file=sys.stderr,
+            )
+            return 1
+        print("nothing to accept; every machine publishing here is already accepted")
+        return 0
+
+    print(f"{heading}\n")
+    for candidate in candidates:
+        print(f"  {candidate.fingerprint}  {candidate.display_name()}")
+        if candidate.pinned:
+            print(f"    replacing  {candidate.pinned_fingerprint}")
+    print(
+        "\nCheck a fingerprint on the machine it belongs to:"
+        f"\n    {crypto.how_to_check_signer()}"
+        "\n\nThis is a decision for this machine only. Nothing is published, and every"
+        "\nother machine has to be told separately -- which is the point: the"
+        "\nrepository can be rewritten by anyone who can push to it, so what a"
+        "\nmachine accepts cannot be decided by anything kept in it."
+    )
+    if changed and args.replace:
+        print(
+            "\nA changed key is either a machine you re-enrolled or someone rewriting\nthe"
+            " repository. woswoar cannot tell those apart; you can."
+        )
+
+    if not _confirm(f"Accept history from {len(candidates)} machine(s) here?", args.yes):
+        return 1
+
+    sync.trust(candidates)
+    print(f"\naccepted {len(candidates)} machine(s); run 'woswoar sync' to merge their history")
     return 0
 
 
@@ -635,6 +739,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_revoke.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_revoke.set_defaults(func=cmd_revoke)
+
+    p_trust = subparsers.add_parser(
+        "trust", help="accept another machine's published history on this machine"
+    )
+    p_trust.add_argument(
+        "--replace",
+        action="store_true",
+        help="accept a new signing key for a machine already accepted",
+    )
+    p_trust.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_trust.set_defaults(func=cmd_trust)
 
     p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")

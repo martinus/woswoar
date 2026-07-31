@@ -14,16 +14,23 @@ from typing import NamedTuple
 
 
 class Tool(NamedTuple):
-    #: Binary on PATH. Also the package name on every distro handled below --
-    #: if that ever stops being true, this grows a per-family mapping rather
-    #: than the callers learning about packaging.
+    #: Binary on PATH, and the package name wherever `packages` does not say
+    #: otherwise.
     name: str
     #: Filled into "needed for ...", so it reads as a reason, not a label.
     needed_for: str
+    #: Distro family -> package name, for the tools whose binary and package are
+    #: not called the same thing. `name`'s comment used to promise this mapping
+    #: would appear rather than callers learning about packaging; ssh-keygen is
+    #: what made it necessary, since it ships inside openssh-client(s).
+    packages: tuple[tuple[str, str], ...] = ()
 
     @property
     def present(self) -> bool:
         return shutil.which(self.name) is not None
+
+    def package(self, family: str) -> str:
+        return dict(self.packages).get(family, self.name)
 
 
 #: fzf is listed first because it is the one whose absence breaks the feature
@@ -31,8 +38,19 @@ class Tool(NamedTuple):
 FZF = Tool("fzf", "the Ctrl-R picker")
 AGE = Tool("age", "encrypting history before it is synced")
 GIT = Tool("git", "moving encrypted history between machines")
+SSH_KEYGEN = Tool(
+    "ssh-keygen",
+    "signing history, so machines can tell which one wrote it",
+    packages=(
+        ("fedora", "openssh-clients"),
+        ("rhel", "openssh-clients"),
+        ("centos", "openssh-clients"),
+        ("debian", "openssh-client"),
+        ("ubuntu", "openssh-client"),
+    ),
+)
 
-TOOLS = (FZF, AGE, GIT)
+TOOLS = (FZF, AGE, GIT, SSH_KEYGEN)
 
 #: Distro family -> the command that installs a package there. Deliberately
 #: short: printing a confidently wrong command for a distro nobody tested is
@@ -68,8 +86,8 @@ def _os_release(path: Path | None = None) -> dict[str, str]:
     return values
 
 
-def installer(path: Path | None = None) -> str:
-    """The install command for this machine, or ``""`` if we do not know it.
+def family(path: Path | None = None) -> str:
+    """This machine's distro family, or ``""`` if it is not one we know.
 
     ``ID_LIKE`` is consulted after ``ID`` so derivatives are covered without
     naming each one: Linux Mint reports ``ID=linuxmint ID_LIKE=ubuntu``.
@@ -78,8 +96,13 @@ def installer(path: Path | None = None) -> str:
     candidates = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]
     for candidate in candidates:
         if candidate in _INSTALLERS:
-            return _INSTALLERS[candidate]
+            return candidate
     return ""
+
+
+def installer(path: Path | None = None) -> str:
+    """The install command for this machine, or ``""`` if we do not know it."""
+    return _INSTALLERS.get(family(path), "")
 
 
 def missing(tools: tuple[Tool, ...] = TOOLS) -> list[Tool]:
@@ -87,8 +110,13 @@ def missing(tools: tuple[Tool, ...] = TOOLS) -> list[Tool]:
 
 
 def advice(tools: list[Tool] | tuple[Tool, ...], path: Path | None = None) -> str:
-    """A ready-to-paste install line for ``tools``, or the honest fallback."""
-    names = " ".join(tool.name for tool in tools)
+    """A ready-to-paste install line for ``tools``, or the honest fallback.
+
+    Package names, not binary names: ``sudo dnf install ssh-keygen`` is a
+    command that fails, and a fix that does not work is worse than no fix.
+    """
+    where = family(path)
+    names = " ".join(dict.fromkeys(tool.package(where) for tool in tools))
     command = installer(path)
     if command:
         return f"{command} {names}"

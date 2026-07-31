@@ -44,6 +44,11 @@ jobs:
         # Sync tests skip themselves without it, and a silently skipped suite
         # looks exactly like a passing one.
         run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - name: ssh-keygen is present
+        # Signing needs it. Present on ubuntu-latest, asserted rather than
+        # assumed for the same reason as bash below: a silently skipped suite
+        # looks exactly like a passing one.
+        run: ssh-keygen -Y sign -h 2>&1 | head -1; command -v ssh-keygen
       - name: bash version
         # The hook needs bash 5 for $EPOCHSECONDS / $EPOCHREALTIME. ubuntu-latest
         # ships it, but fail loudly rather than silently skipping the hook tests.
@@ -79,7 +84,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq age
-      - run: age --version && git --version
+      - run: age --version && git --version && command -v ssh-keygen
       - name: sync suite
         run: |
           set -o pipefail
@@ -182,9 +187,11 @@ jobs:
           run_as beta sync
           run_as beta list --scope global | grep -q 'secret-marker-command'
 
-          # The point of the tag: a chunk none of these machines wrote is
-          # refused. Sealed to alpha's published day key, which is in the clear
-          # on purpose, so this is exactly what push access alone can build.
+          # The point of the signature: a chunk none of these machines put its
+          # name to is refused. Sealed to alpha's published day key, which is in
+          # the clear on purpose, so this is exactly what push access alone can
+          # build -- and it is a perfectly well-formed chunk. What the attacker
+          # cannot do is get it into a manifest alpha signed.
           ATTACK="$BASE/attacker"
           git clone --quiet "$BASE/origin.git" "$ATTACK"
           DAY_PUB=$(cat "$ATTACK/hosts/$ALPHA_ID/keys/2023-11-14.pub")
@@ -198,3 +205,18 @@ jobs:
 
           run_as beta sync
           ! run_as beta list --scope global | grep -q 'forged-marker-command'
+
+          # The other direction, which is the ceremony this design costs: alpha
+          # cloned before beta existed, so it has never been told to accept
+          # beta. Its history is refused until a human at alpha says otherwise.
+          BETA_ID=$(grep '^id=' "$BASE/beta/conf/woswoar/machine" | cut -d= -f2)
+          mkdir -p "$BASE/beta/data/logs/hosts/$BETA_ID"
+          printf '1700000100\ts1\t~\t0\t5\tbeta-marker-command\n' \
+            > "$BASE/beta/data/logs/hosts/$BETA_ID/2023-11-14.tsv"
+          run_as beta sync
+          run_as alpha sync
+          ! run_as alpha list --scope global | grep -q 'beta-marker-command'
+
+          run_as alpha trust --yes
+          run_as alpha sync
+          run_as alpha list --scope global | grep -q 'beta-marker-command'

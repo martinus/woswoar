@@ -24,9 +24,11 @@ shells out to
 tool with one job. woswoar's crypto module is a
 [small subprocess wrapper](../woswoar/crypto.py). There is no key derivation, no
 nonce management and no mode selection to get wrong, because none of it lives
-here. The one primitive woswoar does call directly is `hmac` from the standard
-library, for the chunk tags above — the one with no nonce, no mode, no padding
-and a constant-time comparison provided for you.
+here. Signatures are the same story: `ssh-keygen -Y sign` and `-Y verify`, the
+tool that is already on the machine because you push to git with it. woswoar
+composes no primitive of its own — the manifest it signs is a list of filenames
+and SHA-256 digests, and everything cryptographic about it happens inside
+somebody else's audited binary.
 
 woswoar also never hands age a *path* — it reads key files itself and pipes the
 bytes. That sounds like a detail until you meet a sandboxed age that can run
@@ -43,30 +45,67 @@ writing a chunk never has to open the sealed one. On its own that means
 **anyone who can push to the repo could seal a chunk every machine would open
 and offer you in Ctrl-R**, one keypress from running.
 
-So the repo also holds a random authentication key, sealed to the recipients
-exactly like a day key, and every chunk carries an HMAC-SHA256 tag over its
-ciphertext. Chunks are authenticated *before* they are decrypted, so a chunk
-your machines did not write is never opened at all.
+So every machine signs what it publishes. Each one holds an Ed25519 key that
+never leaves it, and per day it signs a **manifest** — the list of chunks it
+published that day and their digests. A chunk is opened only if a manifest
+signed by the machine whose directory it sits in vouches for exactly those
+bytes. Signing and verification are `ssh-keygen -Y`, which you already have.
 
-Holding that key is the same thing as being one of your enrolled machines, so
-this needs no new command and no new key to manage: `woswoar grant`, which
-already re-seals the per-day keys to a newly enrolled machine, re-seals this one
-too.
+Once per day and machine, not once per chunk: an earlier attempt signed each
+chunk and cost 3.3 ms every time, so a machine waiting to be granted access
+re-checked the whole archive on every timer tick and never finished. A manifest
+turns a year of three machines from nearly two minutes into about 3.6 seconds.
+
+<details>
+<summary>Why not one shared key, which is simpler?</summary>
+
+Because it was, and it could not be made to work. Until #38 the repo held one
+HMAC key sealed to all recipients, and any machine that had ever been enrolled
+kept those 32 bytes forever — so a machine you had **revoked** could still
+publish history every other machine believed.
+
+That is not a bug in the arrangement, it is the arrangement: with any shared
+secret, whoever can *check* a chunk can *forge* one. Rotating the key does not
+help, because every existing chunk was tagged with the old one and a machine
+cloning fresh would refuse the whole archive. Only asymmetric signatures
+separate "can verify" from "can sign", which is why each machine now has a key
+of its own and why nobody else ever needs the private half.
+
+</details>
 
 <details>
 <summary>What this does and does not stop</summary>
 
 Stopped: anyone with push access to the repo — a stolen token, a mis-scoped
 deploy key, the git host itself — fabricating history or tampering with what a
-machine already published.
+machine already published. Also stopped, and this is what #38 added: a machine
+you have revoked, which still holds its own signing key and every manifest it
+ever signed, but no longer has a peer willing to accept them.
 
-Not stopped: one of your *own* enrolled machines. The key is shared across them,
-so a compromised machine could publish history attributed to another of your
-machines. It could already publish anything under its own name and read
-everything, so the marginal loss is attribution between machines you own — the
-deliberate trade for having no per-machine keys to accept, compare or revoke.
+Not stopped: one of your *own* currently enrolled machines, publishing under its
+own name. It is a machine you trust; that is what trusting it means.
 
 </details>
+
+## 🤝 Each machine decides for itself which machines it believes
+
+The signing keys are published in the repo — and the repo is exactly what this
+defends against, since anyone who can push can rewrite `hosts/<id>/signer.pub`
+along with the history it vouches for. So what a machine *believes* is kept
+outside the repo, in its own `state.json`, and:
+
+> **Repo state may only ever remove trust, never add it.**
+
+Adding needs a person at that machine (`woswoar trust`, which shows a
+fingerprint and writes nothing to the repository). Removing is safe to do
+automatically, because it can only ever cause a refusal and never an injection —
+so a revocation published by any of your machines takes effect on all of them at
+their next sync, with nobody having to run anything.
+
+The cost is real and worth stating: **enrolling a machine now needs `woswoar
+trust` on each machine that will read it**, on top of `woswoar grant` once. A
+machine that clones later pins whatever it finds at that moment, so the ceremony
+only runs in one direction.
 
 ## 🔑 No secret is ever copied between machines
 
@@ -101,10 +140,12 @@ What it does **not** do, all three said on screen before you confirm:
 - **It does not revoke git access.** If the key got in through a stolen token or
   a mis-scoped deploy key, that credential needs rotating too, or it can simply
   fetch again.
-- **It does not stop that machine writing history yours will accept.** The
-  authentication key above is shared across your fleet, and rotating it would
-  make every existing chunk fail authentication, so it cannot be rotated without
-  rebuilding the repo.
+What it **does** do, and this is what #38 added: from that moment nothing that
+machine publishes is accepted by any of your machines, under its own name or
+anyone else's. It keeps its signing key — nobody can take that back — but every
+peer drops it on the next sync, with nobody having to run anything. The cost is
+that history it published *before* the revocation and your machines have not
+merged yet is refused too, so sync them first if you want it.
 
 There is also a bounded window on reads: a day key is minted once and every
 chunk of that day is sealed to it, so commands recorded on a day whose key
@@ -167,9 +208,13 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
 | History is never rewritten | `git log --diff-filter=MD` over chunk files must be **empty** |
 | age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
-| Forged history is refused | a chunk sealed to a host's published day key, but untagged, is rejected and reported |
+| Forged history is refused | a chunk sealed to a host's published day key, but absent from that host's signed manifest, is rejected and reported |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
-| The repo key never leaks | the key's bytes appear nowhere in the committed tree |
+| A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
+| Nor under another machine's name | the same, written into a peer's host directory, where that peer never looks |
+| A manifest cannot be moved | a real, correctly signed manifest copied to another day is refused; host and day are inside the signed bytes |
+| A machine never signs what it did not write | a chunk planted under a machine's own id stays out of the manifest it signs, and is reported |
+| A changed signing key is never waved through | the peer refuses, keeps the old pin, and says so |
 | A revoked machine stops receiving history | two real machines through a bare repo: after `revoke`, the revoked one still has what came before and never gets what comes after |
 | A revocation cannot be undone by pushing | re-adding the key, by command or by appending the line, leaves it subtracted |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
@@ -192,17 +237,27 @@ Being straight about the limits is part of the security story:
 >   not your disk. Use full-disk encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
 >   when they synced, and roughly how many commands you ran per day.
-> - **One key across your machines.** Authentication proves a chunk came from
->   your fleet, not which machine in it. See the note above.
+> - **Trust on first use.** Cloning pins whatever machines the repository shows
+>   at that moment. A machine planted *before* you clone is accepted; one that
+>   appears afterwards is refused until you say otherwise. `woswoar init` prints
+>   the fingerprints it pinned, and that printout is the only thing standing
+>   between you and a repository that lied at exactly the right moment.
+> - **A confirmation on every machine.** Enrolling a laptop needs `woswoar
+>   trust` on each machine that will read it. That is the price of an anchor the
+>   remote cannot rewrite.
 > - **Secrets you type are still secrets.** `WOSWOAR_IGNORE` skips
 >   credential-shaped commands by default (`*TOKEN=`, `*SECRET=`, `--password`,
 >   …), and bash's own `HISTCONTROL`/`HISTIGNORE` are honoured for free — but no
 >   pattern catches everything.
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run
->   `woswoar grant` from another machine.
-> - **Revoking is forward-looking only.** `woswoar revoke` stops a machine
->   receiving new history; it cannot take back what was already published, and
->   the revoked machine keeps the shared authentication key, so it can still
->   write history your machines accept. A key that has genuinely fallen into
->   someone else's hands is a reason to rebuild the repo, not only to revoke.
+>   `woswoar grant` from another machine. If it loses its *signing* key it mints
+>   a new one and carries on recording, but every peer refuses its history until
+>   a human there runs `woswoar trust --replace` — deliberately, because a
+>   changed signing key and an impersonation look identical from the outside.
+> - **Revoking cannot take back what was already published.** `woswoar revoke`
+>   stops a machine both reading and publishing from that moment on, but a copy
+>   it already made is a copy it keeps. It also refuses history that machine
+>   published *before* the revocation which your other machines had not merged
+>   yet, so sync them first if you want it. A key that has genuinely fallen into
+>   someone else's hands is still a reason to rebuild the repo.
