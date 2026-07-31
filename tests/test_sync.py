@@ -2968,10 +2968,12 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             sync.git("commit", "-qam", "unpushed")
             calls = self.git_calls()
             self.assertIn("push --quiet", calls)
-            self.assertEqual(
-                sync._resolve("HEAD", "refs/remotes/origin/main")[0],
-                sync._resolve("HEAD", "refs/remotes/origin/main")[1],
-            )
+            # The branch is read rather than assumed: the harness's bare remote
+            # is created with no `-b`, so it is whatever `init.defaultBranch`
+            # says on the machine running the suite.
+            branch = sync.read_repo().branch
+            head, upstream = sync._resolve("HEAD", f"refs/remotes/origin/{branch}")
+            self.assertEqual(head, upstream)
 
     def test_a_sync_behind_the_remote_still_rebases(self) -> None:
         alpha = self.machine("alpha")
@@ -3016,8 +3018,9 @@ class TestResolvingSeveralRefsInOneFork(SyncTestCase):
         """The state `init` is in while enrolling the very first machine."""
         alpha = self.machine("alpha")
         with alpha.active():
+            branch = sync.read_repo().branch
             sync.git("update-ref", "-d", "HEAD")
-            self.assertEqual(sync._resolve("HEAD", "refs/remotes/origin/main"), ["", ""])
+            self.assertEqual(sync._resolve("HEAD", f"refs/remotes/origin/{branch}"), ["", ""])
 
 
 class TestTheCommitIdentityIsStillPinned(SyncTestCase):
