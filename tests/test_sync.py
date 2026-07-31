@@ -2845,19 +2845,22 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(report.chunks_merged, 1, "a re-read chunk was counted as new")
             self.assertEqual(len(set(beta.commands())), 5)
 
-    def chunks_read(self, machine: Fake) -> int:
-        """How many chunks one sync on ``machine`` actually decrypts."""
-        reads = 0
+    def chunks_read(self, machine: Fake) -> list[str]:
+        """The chunks one sync on ``machine`` actually decrypts, in order.
+
+        Names rather than a count, because a re-read is far easier to read about
+        when the assertion can say which chunks came back.
+        """
+        opened: list[str] = []
         real = sync.open_chunk
 
-        def counted(path: Path, expected: str) -> bytes:
-            nonlocal reads
-            reads += 1
-            return real(path, expected)
+        def counted(path: Path, digest: str) -> bytes:
+            opened.append(path.name)
+            return real(path, digest)
 
         with machine.active(), mock.patch.object(sync, "open_chunk", counted):
             sync.run()
-        return reads
+        return opened
 
     def merged_lines(self, machine: Fake, host: Fake, day: str = "2023-11-14") -> int:
         """Lines in the local copy of a day, *not* deduplicated.
@@ -2891,7 +2894,8 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
                 sync.run()
             # One: the chunk that is actually new. Before #69 this was 2, 3,
             # 4 ... as the day's own chunks were re-read alongside it.
-            self.assertEqual(self.chunks_read(beta), 1, f"pass {i} re-read the day")
+            opened = self.chunks_read(beta)
+            self.assertEqual(len(opened), 1, f"pass {i} re-read the day: {opened}")
 
         with beta.active():
             self.assertEqual(len(beta.commands()), 10)
@@ -2966,17 +2970,9 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_100, "later")
             sync.run()
 
+        opened = self.chunks_read(beta)
+        self.assertEqual(len(opened), 1, f"the whole day was re-read: {opened}")
         with beta.active():
-            opened: list[str] = []
-            real = sync.open_chunk
-
-            def counted(path: Path, digest: str) -> bytes:
-                opened.append(path.name)
-                return real(path, digest)
-
-            with mock.patch.object(sync, "open_chunk", counted):
-                sync.run()
-            self.assertEqual(len(opened), 1, f"the whole day was re-read: {opened}")
             self.assertEqual(len(beta.commands()), 5)
 
     def test_a_day_with_nothing_new_reads_no_manifest(self) -> None:

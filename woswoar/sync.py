@@ -373,6 +373,28 @@ def is_repo() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _names_by_day(raw: object) -> dict[str, set[str]]:
+    """A ``"<host>/<day>" -> chunk names`` map out of whatever the file holds.
+
+    Guarded per value, not just on the whole thing being a dict. A state file
+    from before `merged` became a set holds one *string* per day, and a string
+    is iterable: without this, every day's record turns into its own characters,
+    every chunk looks unmerged, and the first sync after upgrading duplicates
+    every peer's history wholesale.
+
+    Shared by `merged` and `rebuilt` because they are the same shape and want
+    the same answer when malformed: forget that day and read it again, which
+    repeats work rather than dropping history.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): {str(name) for name in value}
+        for key, value in raw.items()
+        if isinstance(value, list)
+    }
+
+
 @dataclass
 class State:
     """Per-machine progress. Deliberately *not* in the repo: it describes what
@@ -415,7 +437,7 @@ class State:
     #: cannot mean "rebuild it". Keyed on the *set* rather than a count or a
     #: flag: compacting twice replaces one compacted chunk with another, and
     #: neither the count nor a flag would change.
-    rebuilt: dict[str, list[str]] = field(default_factory=dict)
+    rebuilt: dict[str, set[str]] = field(default_factory=dict)
     #: What was on disk when this was loaded, so `save` can tell whether there
     #: is anything to write. Not part of the state itself.
     _loaded: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
@@ -432,15 +454,7 @@ class State:
             return cls()
         state = cls(
             exported={str(k): int(v) for k, v in exported.items()},
-            # Guarded per value, not just on `merged` being a dict. A state
-            # file from before this became a set holds one *string* per day, and
-            # a string is iterable: without this, every day's record turns into
-            # its own characters, every chunk looks unmerged, and the first sync
-            # after upgrading duplicates every peer's history wholesale -- which
-            # is the bug this change exists to fix.
-            merged={
-                str(k): {str(name) for name in v} for k, v in merged.items() if isinstance(v, list)
-            },
+            merged=_names_by_day(merged),
             # A malformed list costs the prompt its memory, which shows every
             # machine as new -- the safe direction to be wrong in.
             granted=[str(k) for k in granted] if isinstance(granted, list) else [],
@@ -450,14 +464,7 @@ class State:
             signers={str(k): str(v) for k, v in signers.items()}
             if isinstance(signers, dict)
             else {},
-            # A malformed record costs one rebuild of that day, which re-reads
-            # chunks it already had. Wrong in the direction that repeats work
-            # rather than the one that drops history.
-            rebuilt={
-                str(k): [str(name) for name in v] for k, v in rebuilt.items() if isinstance(v, list)
-            }
-            if isinstance(rebuilt, dict)
-            else {},
+            rebuilt=_names_by_day(rebuilt),
         )
         state._loaded = state.as_json()
         return state
@@ -474,7 +481,7 @@ class State:
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
             "signers": dict(self.signers),
-            "rebuilt": {key: list(names) for key, names in self.rebuilt.items()},
+            "rebuilt": {key: sorted(names) for key, names in self.rebuilt.items()},
         }
 
     def save(self) -> None:
@@ -1388,8 +1395,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # rebuilt the whole day every time it gained anything: linear per sync,
         # quadratic over a day still being written, and a day compacted while
         # live reaches ~1440 chunks.
-        compacted = sorted(name for name, entry in listed.items() if entry.subsumes)
-        day = _Day(host_id, chunk_day, listed, compacted != state.rebuilt.get(key, []))
+        compacted = {name for name, entry in listed.items() if entry.subsumes}
+        day = _Day(host_id, chunk_day, listed, compacted != state.rebuilt.get(key, set()))
         pending = chunks if day.rewrite else fresh
 
         # Whether every chunk the manifest lists reached the file this pass. A
