@@ -1053,6 +1053,51 @@ def pack(data: bytes) -> bytes:
 MAX_CHUNK_BYTES = 64 * 1024 * 1024
 
 
+#: Most plaintext this machine will put in one chunk.
+#:
+#: `MAX_CHUNK_BYTES` is what a *reader* refuses. Nothing used to stop a writer
+#: exceeding it: `read_tail` is bounded by "everything since the last export",
+#: not by size, so a machine importing a decade of history in one go could seal
+#: a chunk every peer would then refuse -- silently and permanently, because
+#: `state.exported` has already moved past those bytes and its own copy in
+#: `logs/` looks fine.
+#:
+#: Eight times under the reader's cap rather than just below it, so the two
+#: numbers can move independently and the writer never has to reason about
+#: compression -- this bounds the plaintext, which is exactly what the reader
+#: measures. An entire imported bash_history is 4.43 MiB, so nothing anyone
+#: actually has is split at all; this is the shape of the failure, not its
+#: likelihood, and one-sided invariants are the ones that stay true.
+MAX_EXPORT_BYTES = 8 * 1024 * 1024
+
+
+def split_for_export(data: bytes, limit: int = MAX_EXPORT_BYTES) -> Iterator[bytes]:
+    """``data`` in pieces of at most ``limit`` bytes, split only at line ends.
+
+    A piece has to be whole lines: a chunk is decrypted, decompressed and parsed
+    line by line, so a record cut in half would be dropped by one reader and
+    never seen by any.
+
+    A single line longer than the limit is yielded whole rather than split,
+    which is why the limit is "at most" only for lines that fit. It cannot
+    happen today -- `entry.MAX_CMD_CHARS` bounds a record to about 8 KB against
+    a limit of 8 MiB -- but splitting mid-record to honour a size bound would
+    trade a bound nobody is near for corruption everybody would see.
+    """
+    start = 0
+    while len(data) - start > limit:
+        cut = data.rfind(b"\n", start, start + limit)
+        if cut < 0:
+            # No line end within the budget: take the whole over-long line.
+            cut = data.find(b"\n", start + limit)
+            if cut < 0:
+                break
+        yield data[start : cut + 1]
+        start = cut + 1
+    if start < len(data):
+        yield data[start:]
+
+
 def unpack(blob: bytes, limit: int = MAX_CHUNK_BYTES) -> bytes:
     """Inverse of :func:`pack`, refusing anything implausibly large.
 
@@ -1170,14 +1215,27 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             continue
 
         for relpath, data, new_offset in tails:
-            sealed = crypto.encrypt_to(pack(data), day_public_key(known, day))
-            written = store.new_chunk(known.id, day, now)
-            store.write_atomic(written, sealed)
-            listed[written.name] = Entry(digest_of(sealed))
+            # Split rather than capped: a reader refuses a chunk over
+            # `MAX_CHUNK_BYTES`, and the writer used to be able to exceed that
+            # with no idea it had. See `MAX_EXPORT_BYTES`. A day already holds
+            # many chunks, so this needs no format change and is invisible to
+            # anything whose tail fits -- which is everything anyone has.
+            public = day_public_key(known, day)
+            for piece in split_for_export(data, MAX_EXPORT_BYTES):
+                sealed = crypto.encrypt_to(pack(piece), public)
+                written = store.new_chunk(known.id, day, now)
+                store.write_atomic(written, sealed)
+                listed[written.name] = Entry(digest_of(sealed))
 
+                report.chunks_written += 1
+                report.lines_exported += piece.count(b"\n")
+
+            # The pieces are exactly this tail, so the watermark lands where one
+            # chunk would have left it. Advancing per piece would buy nothing:
+            # `state.save()` runs only at the end of a successful `run`, so a run
+            # that dies part way through persists no watermark at all. What it
+            # does leave is chunks in no manifest, which is issue #66.
             state.exported[relpath] = new_offset
-            report.chunks_written += 1
-            report.lines_exported += data.count(b"\n")
 
         write_manifest(known, day, listed)
 
@@ -2039,7 +2097,7 @@ def revoke(reader: Reader) -> RevokeReport:
     return RevokeReport(resealed, skipped, pushed=change.remote, still_readable=still_readable)
 
 
-def compact(before: str) -> tuple[int, int]:
+def compact(before: str) -> tuple[int, int, int]:
     """Merge a host's own chunks for completed days into one chunk per day.
 
     Write-once chunks trade bytes for inodes: a 5-minute timer produces roughly
@@ -2053,7 +2111,8 @@ def compact(before: str) -> tuple[int, int]:
     `store.new_chunk`'s uniqueness check sound, since that check assumes no
     other process is creating chunks for this host concurrently.
 
-    Returns (days compacted, chunks replaced).
+    Returns (days compacted, chunks replaced, days left alone because merging
+    them would exceed `MAX_EXPORT_BYTES`).
     """
     crypto.require()
     crypto.require_signing()
@@ -2068,6 +2127,7 @@ def compact(before: str) -> tuple[int, int]:
 
         days = 0
         replaced = 0
+        skipped = 0
         for day, chunks in sorted(by_day.items()):
             if len(chunks) < 2:
                 continue
@@ -2098,14 +2158,14 @@ def compact(before: str) -> tuple[int, int]:
                     "launder a chunk this machine did not write."
                 )
             try:
-                plain = b"".join(
+                plaintexts = [
                     unpack(
                         crypto.decrypt_with_secret(
                             open_chunk(c.path, listed[c.name].digest), secret
                         )
                     )
                     for c in chunks
-                )
+                ]
             except (ValueError, zlib.error) as exc:
                 # `zlib.error` as well as `ValueError`, which it is not a
                 # subclass of: `open_chunk` raises the second and `unpack` the
@@ -2113,6 +2173,23 @@ def compact(before: str) -> tuple[int, int]:
                 # decompress -- damaged, or past `MAX_CHUNK_BYTES` -- escape as
                 # a bare zlib traceback instead of the guided refusal.
                 raise SyncError(f"refusing to compact {day}: {exc}") from exc
+
+            # Compaction is the other producer of chunks, so it is bound by the
+            # same budget: joining a whole day unbounded would rebuild exactly
+            # the over-cap chunk `MAX_EXPORT_BYTES` exists to prevent, and then
+            # unlink the smaller ones that were fine -- leaving a day no peer
+            # can read and no way to re-export it.
+            #
+            # Skipped rather than merged in batches. Batching was tried and
+            # backed out: it leaves some of a day's chunks unmerged, and a peer
+            # rebuilding a compacted day drops every chunk it had already
+            # merged (issue #67), so partial compaction turns a space
+            # optimisation into history loss. A day this large stays as the
+            # small chunks it already is, which is correct if untidy.
+            plain = b"".join(plaintexts)
+            if len(plain) > MAX_EXPORT_BYTES:
+                skipped += 1
+                continue
 
             merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
             sealed = crypto.encrypt_to(pack(plain), crypto.public_of(secret))
@@ -2133,7 +2210,7 @@ def compact(before: str) -> tuple[int, int]:
         if days:
             _commit()
 
-    return days, replaced
+    return days, replaced, skipped
 
 
 def add_recipient(recipient: str) -> bool:

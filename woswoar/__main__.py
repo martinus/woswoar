@@ -736,12 +736,20 @@ def cmd_trust(args: argparse.Namespace) -> int:
 def cmd_compact(args: argparse.Namespace) -> int:
     from . import sync
 
-    days, replaced = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
+    days, replaced, skipped = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
     if not days:
         print("nothing to compact")
     else:
         print(f"compacted {replaced} chunk(s) into {days} (one per day)")
         print("Run 'woswoar sync' to publish. Note this rewrites history.")
+    if skipped:
+        # Not a failure: those days are already stored as chunks a peer can
+        # read, which is the property that matters. Merging them would produce
+        # one no peer would accept.
+        print(
+            f"{skipped} day(s) left alone: merging them would exceed the chunk size "
+            "limit, so they stay as the smaller chunks they already are."
+        )
     return 0
 
 
