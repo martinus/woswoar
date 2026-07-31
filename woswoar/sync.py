@@ -1519,9 +1519,10 @@ def run(push: bool = True, now: int | None = None) -> Report:
     if not store.recipients_file().is_file():
         raise SyncError("no recipients.txt in the history repo; run 'woswoar init'")
 
-    _ensure_repo_config()
+    config = _repo_config()
+    _ensure_repo_config(config)
     report = Report()
-    remote = push and has_remote()
+    remote = push and config.has_remote
 
     with lock():
         state = State.load()
@@ -1531,8 +1532,10 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # stale list would produce a key that machines enrolled since the last
         # sync can never open -- silently, and permanently, because the repo is
         # append-only.
-        if remote:
-            _fetch_and_rebase()
+        # One `branch --show-current` for the run: nothing here checks a branch
+        # out, so it cannot change under us, and it was being asked twice.
+        branch = _branch() if remote else ""
+        in_sync = _fetch_and_rebase(branch) if remote else False
 
         # Before anything is trusted, and only ever subtracting -- see
         # `apply_withdrawals`.
@@ -1548,10 +1551,16 @@ def run(push: bool = True, now: int | None = None) -> Report:
             publish_signer(known)
             export(known, state, report, int(time.time()) if now is None else now)
 
-        _commit()
+        committed = _commit()
 
         if remote:
-            _push()
+            # `push` contacts the remote even with nothing to send, which is the
+            # slowest thing an idle run does. If the fetch above found us level
+            # with the remote and nothing was committed since, there is nothing
+            # to send -- and `pushed` still holds, since it means this machine's
+            # history is on the remote, not that bytes moved.
+            if committed or not in_sync:
+                _push(branch)
             report.pushed = True
 
         merge(known, state, report)
@@ -1569,8 +1578,27 @@ def _branch() -> str:
     return git("branch", "--show-current")
 
 
-def _fetch_and_rebase() -> None:
-    """Adopt the remote's history under ours.
+#: Object ids as `rev-parse` prints them. Both lengths, because a repo may be
+#: SHA-256 rather than SHA-1 -- woswoar never creates one, but it is handed the
+#: repo the user cloned.
+_HEX = frozenset("0123456789abcdef")
+
+
+def _resolve(*refs: str) -> list[str]:
+    """Resolve several refs in one fork; an unresolvable one comes back empty.
+
+    `rev-parse --verify` takes a single ref, so asking about two costs two forks.
+    Plain `rev-parse` takes any number, but *echoes* an argument it could not
+    resolve instead of failing that line, hence the shape check.
+    """
+    printed = git("rev-parse", *refs, check=False).splitlines()
+    if len(printed) != len(refs):
+        return [""] * len(refs)
+    return [line if len(line) in (40, 64) and _HEX.issuperset(line) else "" for line in printed]
+
+
+def _fetch_and_rebase(branch: str | None = None) -> bool:
+    """Adopt the remote's history under ours; say whether we now match it.
 
     Fetch-then-rebase rather than ``git pull --rebase`` because the tracking ref
     may legitimately not exist: cloning an *empty* remote configures a branch
@@ -1578,28 +1606,39 @@ def _fetch_and_rebase() -> None:
     enrol. Checking the fetched ref directly handles that and the ordinary case
     with one code path.
 
+    HEAD is resolved in the same fork, and a HEAD already equal to the fetched
+    ref skips the rebase -- git would replay nothing, and this is the shape of
+    every idle run of the one-minute timer. Returning that fact also lets the
+    caller skip a push that would contact the remote to send nothing.
+
     The rebase cannot conflict over chunks -- every machine only ever adds files
     below its own host id. ``recipients.txt`` is the single shared file, and
     ``.gitattributes`` marks it ``merge=union`` so both sides' keys survive.
     """
-    branch = _branch()
+    if branch is None:
+        branch = _branch()
     git("fetch", "--quiet", "origin")
-    if not git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", check=False):
-        return
+    local, upstream = _resolve("HEAD", f"refs/remotes/origin/{branch}")
+    if not upstream:
+        return False
+    if local == upstream:
+        return True
     try:
         git("rebase", "--autostash", f"origin/{branch}")
     except SyncError:
         git("rebase", "--abort", check=False)
         raise
+    return False
 
 
-def _push() -> None:
+def _push(branch: str | None = None) -> None:
     """Publish, retrying once if someone else pushed while we worked."""
-    branch = _branch()
+    if branch is None:
+        branch = _branch()
     try:
         git("push", "--quiet", "-u", "origin", branch)
     except SyncError:
-        _fetch_and_rebase()
+        _fetch_and_rebase(branch)
         git("push", "--quiet", "-u", "origin", branch)
 
 
@@ -1611,14 +1650,48 @@ COMMIT_NAME = "woswoar"
 COMMIT_EMAIL = "woswoar@localhost"
 
 
-def _ensure_repo_config() -> None:
-    if git("config", "user.name", check=False) != COMMIT_NAME:
+class RepoConfig(NamedTuple):
+    """What a run needs to know about the repo, from one `git config` read.
+
+    Three separate forks before -- `user.name`, `user.email`, and `git remote` --
+    on a timer that fires every minute, to learn things that change about once in
+    the life of a clone. `git remote` reads the same local config file: it prints
+    the names in the `remote.<name>.url` keys that are already in hand here.
+    """
+
+    has_remote: bool
+    name: str
+    email: str
+
+
+def _repo_config() -> RepoConfig:
+    values: dict[str, str] = {}
+    for line in git("config", "--list", "--local", check=False).splitlines():
+        key, _, value = line.partition("=")
+        values[key] = value
+    return RepoConfig(
+        has_remote=any(key.startswith("remote.") and key.endswith(".url") for key in values),
+        name=values.get("user.name", ""),
+        email=values.get("user.email", ""),
+    )
+
+
+def _ensure_repo_config(config: RepoConfig | None = None) -> None:
+    """Pin the commit identity, writing only what is actually wrong.
+
+    Takes an already-read config from the callers that have one -- those are the
+    ones on the timer; the rest are one-shot commands where a fork does not
+    matter.
+    """
+    if config is None:
+        config = _repo_config()
+    if config.name != COMMIT_NAME:
         git("config", "user.name", COMMIT_NAME)
-    if git("config", "user.email", check=False) != COMMIT_EMAIL:
+    if config.email != COMMIT_EMAIL:
         git("config", "user.email", COMMIT_EMAIL)
 
 
-def _commit() -> None:
+def _commit() -> bool:
     # `--verbose` prints one "add '<path>'"/"remove '<path>'" line per staged
     # path and nothing at all when the index already matches, so the same
     # command that stages also answers "is there anything to commit". The
@@ -1626,8 +1699,9 @@ def _commit() -> None:
     # working tree that is tens of thousands of chunks after a couple of years,
     # on a timer that now fires every minute.
     if not git("add", "-A", "--verbose"):
-        return
+        return False
     git("commit", "-q", "-m", COMMIT_MESSAGE)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1889,8 +1963,9 @@ def _access_change() -> Iterator[_AccessChange]:
 
     known = store.machine()
     identity = identity_path(known)
-    _ensure_repo_config()
-    remote = has_remote()
+    config = _repo_config()
+    _ensure_repo_config(config)
+    remote = config.has_remote
 
     # The same lock sync takes: this rewrites files in the working tree, and a
     # timer-driven sync must not be reading them halfway through.

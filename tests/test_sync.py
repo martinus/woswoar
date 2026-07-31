@@ -18,6 +18,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from woswoar import cache, crypto, search, store, sync
@@ -2864,3 +2865,139 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
+    """`sync` runs from a one-minute timer, so each fork is a recurring cost.
+
+    The numbers are a ceiling, not a description: they exist so that adding a
+    git call to this path is a decision somebody makes rather than one that
+    happens. Raise them deliberately when a call earns its place.
+    """
+
+    def git_calls(self) -> list[str]:
+        real = subprocess.run
+        seen: list[str] = []
+
+        def spy(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+            if argv and Path(argv[0]).name == "git":
+                seen.append(" ".join(argv[1:3]))
+            return real(argv, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", spy):
+            sync.run()
+        return seen
+
+    def test_an_idle_sync_forks_git_five_times(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            calls = self.git_calls()
+        self.assertLessEqual(len(calls), 5, calls)
+        # The identity and the remote come from one config read, not three.
+        self.assertEqual([c for c in calls if c.startswith("config")], ["config --list"])
+        self.assertEqual([c for c in calls if c.startswith("remote")], [])
+        # Level with the remote, so neither replaying nor sending is any work.
+        self.assertEqual([c for c in calls if c.startswith(("rebase", "push"))], [])
+        # The branch cannot change mid-run, so it is asked for once.
+        self.assertEqual([c for c in calls if c.startswith("branch")], ["branch --show-current"])
+
+    def test_a_sync_with_something_to_say_still_pushes(self) -> None:
+        """The half that would silently stop publishing if the skip overreached.
+
+        `_fetch_and_rebase` decides "level with the remote" *before* this run's
+        chunk is committed, so a skip keyed on that alone strands every machine
+        that was up to date a moment ago -- which is every machine, every time.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.run()  # idle: leaves alpha level with the remote
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+            calls = self.git_calls()
+        self.assertIn("push --quiet", calls)
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status", "make -j8"})
+
+    def test_a_sync_behind_the_remote_still_rebases(self) -> None:
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()  # picks up alpha's chunk, so it cannot be level first
+            beta.record("2023-11-14", 1_700_000_002, "make -j8")
+            sync.run()
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_003, "cargo build")
+            calls = self.git_calls()
+            self.assertTrue(any(c.startswith("rebase") for c in calls), calls)
+            # Asserted at the git level rather than through `commands()`: alpha
+            # cloned before beta existed and has not been told beta is real, so
+            # it holds the chunk without yet being willing to read it.
+            self.assertTrue(list(store.chunk_dir(beta.id, "2023-11-14").glob("*.age")))
+        # And once it is told, the history the rebase brought in is readable.
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+            self.assertIn("make -j8", alpha.commands())
+
+
+class TestResolvingSeveralRefsInOneFork(SyncTestCase):
+    def test_a_ref_that_does_not_exist_comes_back_empty(self) -> None:
+        """`rev-parse` echoes an argument it cannot resolve instead of dropping it.
+
+        Taking that echo for an object id would make an unborn branch look like
+        it matched the remote, and skip both the rebase and the push for good.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            head, missing = sync._resolve("HEAD", "refs/remotes/origin/no-such-branch")
+            self.assertEqual(len(head), 40)
+            self.assertEqual(missing, "")
+
+    def test_an_unborn_head_resolves_to_nothing(self) -> None:
+        """The state `init` is in while enrolling the very first machine."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.git("update-ref", "-d", "HEAD")
+            self.assertEqual(sync._resolve("HEAD", "refs/remotes/origin/main"), ["", ""])
+
+
+class TestTheCommitIdentityIsStillPinned(SyncTestCase):
+    def test_a_repo_missing_the_identity_gets_it_back(self) -> None:
+        """Reading the config in one fork must not stop it being *written*.
+
+        Without an identity, `commit` fails on a machine with no gitconfig --
+        which is the machine woswoar is most likely to be installed on.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.git("config", "--unset", "user.name", check=False)
+            sync.git("config", "--unset", "user.email", check=False)
+            self.assertEqual(sync._repo_config().name, "")
+
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            self.assertEqual(sync._repo_config().name, sync.COMMIT_NAME)
+            self.assertEqual(sync._repo_config().email, sync.COMMIT_EMAIL)
+            self.assertIn(sync.COMMIT_NAME, sync.git("log", "-1", "--format=%an"))
+
+    def test_the_remote_is_read_from_the_same_config(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            self.assertEqual(sync._repo_config().has_remote, sync.has_remote())
+            sync.git("remote", "remove", "origin")
+            self.assertFalse(sync._repo_config().has_remote)
+            self.assertEqual(sync._repo_config().has_remote, sync.has_remote())
