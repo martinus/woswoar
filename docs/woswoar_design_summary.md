@@ -20,7 +20,7 @@ git sync with age encryption.
 ## Architecture
 
 ```
-bash hook  ──►  plaintext TSV logs  ──►  pickle cache  ──►  scope filter  ──►  fzf
+bash hook  ──►  plaintext TSV logs  ──►  parse cache  ──►  scope filter  ──►  fzf
    (record)          (truth)             (speed only)        (Python)         (UI)
                         │
                         └──►  age-encrypted chunks  ──►  git  ──►  remote
@@ -47,7 +47,7 @@ Two rules that everything else follows from:
   state.json                  sync watermarks (local, never synced)
 ~/.config/woswoar/machine     id + name
 ~/.config/woswoar/imported.json
-~/.cache/woswoar/cache.pickle
+~/.cache/woswoar/cache.txt
 ```
 
 **Machine identity is an opaque random hex string**, not `user@hostname`. Path
@@ -292,14 +292,18 @@ semicolon-joined. This is bash's behaviour, not something woswoar can recover.
 
 ## Cache
 
-```python
-{"version": 1,
- "files": {relpath: [Entry, ...]},                 # grouped per file
- "meta":  {relpath: (size, mtime_ns, offset, head)}}
+Plain text, not a pickle — it is read on every Ctrl-R, and unpickling executes
+what it reads before any check can run. Separated by NUL and the two bytes after
+it, which no field can hold, so nothing needs escaping:
+
+```
+woswoar-cache-2
+<relpath> <host> <size> <mtime_ns> <offset> <head hex>     one header per file
+<ts> <session> <cwd> <exit> <duration_ms> <cmd>            then its entries
 ```
 
 `Entry` is a `NamedTuple`, not the `@dataclass(slots=True)` originally sketched:
-identical attribute access, materially cheaper to unpickle, and the whole
+identical attribute access, materially cheaper to deserialise, and the whole
 history is loaded on every Ctrl-R.
 
 Entries are grouped **per file** rather than kept in one flat list. That costs a
@@ -385,10 +389,10 @@ from 26.6 to 24.6 ms.
 Going meaningfully below this needs a structural change, and both candidates are
 worse than the problem:
 
-- **Stop materialising 55k `Entry` objects.** Unpickling plain tuples is 16 ms
-  against 34, but reconstructing the NamedTuples costs the 13 ms back, so the
-  gain only exists if search indexes tuples positionally. Worth ~20 ms of 105,
-  paid for in readability across the whole search path.
+- **Stop materialising 55k `Entry` objects.** Deserialising plain tuples is
+  16 ms against 34, but reconstructing the NamedTuples costs the 13 ms back, so
+  the gain only exists if search indexes tuples positionally. Worth ~20 ms of
+  105, paid for in readability across the whole search path.
 - **A resident daemon**, which is what the no-server design exists to avoid.
 
 So 105 ms stands. fzf renders as it reads, so what a user perceives is closer to
@@ -813,7 +817,7 @@ changed only at onboarding); `merge=union` in `.gitattributes` resolves it.
 
 ## Dependencies
 
-Runtime: **Python standard library only** — `dataclasses`, `pathlib`, `pickle`,
+Runtime: **Python standard library only** — `dataclasses`, `pathlib`,
 `subprocess`, `tempfile`, `time`, `secrets`, `hashlib`, `json`, `argparse`.
 
 External binaries: `fzf` (the UI), and `age` plus `git` (sync only). Development only: `ruff`, `mypy`, `shellcheck`.

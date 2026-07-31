@@ -95,7 +95,7 @@ CI measures the file count so it can't drift unnoticed.
     hosts/<id>/2026/07/29/<synctime>-<rand>.age
   state.json                own: plaintext bytes encrypted so far
                             others: last chunk merged, per (host, day)
-~/.cache/woswoar/cache.pickle
+~/.cache/woswoar/cache.txt
 ```
 
 `woswoar sync` is then:
@@ -150,7 +150,7 @@ tests/
 .github/workflows/ci.yml
 ```
 
-`Entry` is a `NamedTuple` rather than the doc's `@dataclass(slots=True)` — same attribute access, materially cheaper to unpickle.
+`Entry` is a `NamedTuple` rather than the doc's `@dataclass(slots=True)` — same attribute access, materially cheaper to deserialise.
 
 CLI: `search`, `list`, `import`, `install`, `stats`, `doctor`; `sync`/`reencrypt` stubbed with a clear "milestone 2" error.
 
@@ -212,7 +212,7 @@ Fold the resolved decisions back in so the doc stays the source of truth: the 6-
 | `immutability` | *(milestone 2)* After a simulated multi-day, multi-machine run, asserts `git log --diff-filter=MD --name-only -- 'hosts/**/*.age'` is **empty** — no chunk was ever modified or deleted. This is an exact invariant, not a heuristic, and it's what makes a future refactor unable to silently reintroduce whole-file re-encryption. |
 | `repo-growth` | *(milestone 2)* Simulates 40 syncs × 200 lines over several days, runs `git gc`, and asserts packed `.git` stays within ~2× the plaintext size and the working-tree file count matches the predicted chunk count. Emits the measured per-chunk `age` overhead so the estimates above get replaced by real numbers. |
 
-Unit tests (stdlib `unittest`): escape/unescape round-trip over tabs, newlines, backslashes, unicode and oversized commands; cache fresh-build / append / truncation / deleted-file / corrupt-pickle paths; scope filtering and dedup ordering; importer for bash with and without `HISTTIMEFORMAT`, zsh extended format, multi-line entries, idempotent re-import.
+Unit tests (stdlib `unittest`): escape/unescape round-trip over tabs, newlines, backslashes, unicode and oversized commands; cache fresh-build / append / truncation / deleted-file / corrupt-cache paths; scope filtering and dedup ordering; importer for bash with and without `HISTTIMEFORMAT`, zsh extended format, multi-line entries, idempotent re-import.
 
 ## Manual verification
 

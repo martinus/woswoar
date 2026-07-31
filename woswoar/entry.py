@@ -51,7 +51,8 @@ class Entry(NamedTuple):
     """One recorded command.
 
     A ``NamedTuple`` rather than a ``dataclass(slots=True)``: identical
-    attribute access, but materially cheaper to pickle and unpickle, which
+    attribute access, but a plain tuple underneath, so the cache can build
+    52,000 of them with ``tuple.__new__`` and never run Python per field. That
     matters because the whole history is loaded on every Ctrl-R.
     """
 

@@ -77,7 +77,8 @@ def cache_dir() -> Path:
 
 
 def cache_file() -> Path:
-    return cache_dir() / "cache.pickle"
+    """The parse cache. Not a pickle: see the note in :mod:`woswoar.cache`."""
+    return cache_dir() / "cache.txt"
 
 
 def logs_dir() -> Path:

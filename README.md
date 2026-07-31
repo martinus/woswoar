@@ -199,7 +199,7 @@ truthful. Re-running an import is idempotent.
 ## How it works
 
 ```
-bash hook  ──►  plaintext TSV logs  ──►  pickle cache  ──►  scope filter  ──►  fzf
+bash hook  ──►  plaintext TSV logs  ──►  parse cache  ──►  scope filter  ──►  fzf
                         │
                         └──►  age-encrypted chunks  ──►  git  ──►  remote
 ```
