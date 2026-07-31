@@ -18,7 +18,6 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any
 from unittest import mock
 
 from woswoar import cache, crypto, search, store, sync
@@ -898,10 +897,10 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
             beta.record(day, ts, cmd)
             known = store.machine()
             with sync.lock():
-                sync._fetch_and_rebase()
+                sync._fetch_and_rebase(sync.read_repo())
                 sync.export(known, sync.State.load(), sync.Report(), ts)
                 sync._commit()
-                sync._push()
+                sync._push(sync.read_repo())
 
     def revoke_beta(self, alpha: Fake, beta: Fake) -> None:
         with beta.active():
@@ -939,7 +938,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
         with beta.active():
             day = "2023-11-14"
             with sync.lock():
-                sync._fetch_and_rebase()
+                sync._fetch_and_rebase(sync.read_repo())
                 pub = store.day_key_public(alpha.id, day)
                 entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
                 sealed = crypto.encrypt_to(
@@ -950,7 +949,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(sealed)
                 sync._commit()
-                sync._push()
+                sync._push(sync.read_repo())
 
         with gamma.active():
             sync.run()
@@ -2065,7 +2064,7 @@ class TestADecompressionBomb(SyncTestCase):
             listed[path.name] = sync.Entry(sync.digest_of(sealed))
             sync.write_manifest(store.machine(), day, listed)
             sync._commit()
-            sync._push()
+            sync._push(sync.read_repo())
 
         with beta.active():
             report = sync.run()
@@ -2280,7 +2279,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
             victim.unlink()
             sync._commit()
-            sync._push()
+            sync._push(sync.read_repo())
 
         with alpha.active():
             sync.run()
@@ -2863,10 +2862,6 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     """`sync` runs from a one-minute timer, so each fork is a recurring cost.
 
@@ -2876,15 +2871,20 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     """
 
     def git_calls(self) -> list[str]:
-        real = subprocess.run
+        """Every git subcommand one `sync.run()` spawns, in order.
+
+        Counted at `sync.git`, which is the only place in the package that
+        spawns git -- the same seam the chunk-read counters in this file use,
+        and it needs no argv sniffing to tell git from `age`.
+        """
+        real = sync.git
         seen: list[str] = []
 
-        def spy(argv: list[str], *args: Any, **kwargs: Any) -> Any:
-            if argv and Path(argv[0]).name == "git":
-                seen.append(" ".join(argv[1:3]))
-            return real(argv, *args, **kwargs)
+        def spy(*args: str, **kwargs: object) -> str:
+            seen.append(" ".join(args[:2]))
+            return real(*args, **kwargs)  # type: ignore[arg-type]
 
-        with mock.patch.object(subprocess, "run", spy):
+        with mock.patch.object(sync, "git", spy):
             sync.run()
         return seen
 
@@ -2986,18 +2986,31 @@ class TestTheCommitIdentityIsStillPinned(SyncTestCase):
         with alpha.active():
             sync.git("config", "--unset", "user.name", check=False)
             sync.git("config", "--unset", "user.email", check=False)
-            self.assertEqual(sync._repo_config().name, "")
+            self.assertEqual(sync.read_repo().name, "")
 
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            self.assertEqual(sync._repo_config().name, sync.COMMIT_NAME)
-            self.assertEqual(sync._repo_config().email, sync.COMMIT_EMAIL)
+            self.assertEqual(sync.read_repo().name, sync.COMMIT_NAME)
+            self.assertEqual(sync.read_repo().email, sync.COMMIT_EMAIL)
             self.assertIn(sync.COMMIT_NAME, sync.git("log", "-1", "--format=%an"))
 
-    def test_the_remote_is_read_from_the_same_config(self) -> None:
+    def test_a_repo_with_no_remote_is_seen_to_have_none(self) -> None:
+        """The remote is now inferred from config keys rather than `git remote`.
+
+        Getting that wrong in the optimistic direction would make a local-only
+        repo try to push on every timer tick, and fail every time.
+        """
         alpha = self.machine("alpha")
         with alpha.active():
-            self.assertEqual(sync._repo_config().has_remote, sync.has_remote())
+            self.assertTrue(sync.read_repo().has_remote)
             sync.git("remote", "remove", "origin")
-            self.assertFalse(sync._repo_config().has_remote)
-            self.assertEqual(sync._repo_config().has_remote, sync.has_remote())
+            self.assertFalse(sync.read_repo().has_remote)
+
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            report = sync.run()
+            self.assertEqual(report.chunks_written, 1)
+            self.assertFalse(report.pushed)
+
+
+if __name__ == "__main__":
+    unittest.main()

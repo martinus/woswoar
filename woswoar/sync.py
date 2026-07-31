@@ -140,7 +140,8 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
 
 
 def has_remote() -> bool:
-    return bool(git("remote", check=False))
+    """For the callers that want only this. The definition lives in `Repo`."""
+    return read_repo().has_remote
 
 
 def remote_summary() -> str:
@@ -808,8 +809,9 @@ def trust_candidates() -> list[Candidate]:
     machine that appeared since this one last looked.
     """
     with lock():
-        if has_remote():
-            _fetch_and_rebase()
+        repo = read_repo()
+        if repo.has_remote:
+            _fetch_and_rebase(repo)
 
         known = store.machine()
         state = State.load()
@@ -1522,10 +1524,10 @@ def run(push: bool = True, now: int | None = None) -> Report:
     if not store.recipients_file().is_file():
         raise SyncError("no recipients.txt in the history repo; run 'woswoar init'")
 
-    config = _repo_config()
-    _ensure_repo_config(config)
+    repo = read_repo()
+    _ensure_repo_config(repo)
     report = Report()
-    remote = push and config.has_remote
+    remote = push and repo.has_remote
 
     with lock():
         state = State.load()
@@ -1535,10 +1537,7 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # stale list would produce a key that machines enrolled since the last
         # sync can never open -- silently, and permanently, because the repo is
         # append-only.
-        # One `branch --show-current` for the run: nothing here checks a branch
-        # out, so it cannot change under us, and it was being asked twice.
-        branch = _branch() if remote else ""
-        in_sync = _fetch_and_rebase(branch) if remote else False
+        in_sync = _fetch_and_rebase(repo) if remote else False
 
         # Before anything is trusted, and only ever subtracting -- see
         # `apply_withdrawals`.
@@ -1563,22 +1562,13 @@ def run(push: bool = True, now: int | None = None) -> Report:
             # to send -- and `pushed` still holds, since it means this machine's
             # history is on the remote, not that bytes moved.
             if committed or not in_sync:
-                _push(branch)
+                _push(repo)
             report.pushed = True
 
         merge(known, state, report)
         state.save()
 
     return report
-
-
-def _branch() -> str:
-    """The current branch, including before the first commit exists.
-
-    `rev-parse --abbrev-ref HEAD` cannot answer on an unborn HEAD, which is
-    exactly the state `init` is in when it enrols the first machine.
-    """
-    return git("branch", "--show-current")
 
 
 #: Object ids as `rev-parse` prints them. Both lengths, because a repo may be
@@ -1600,7 +1590,7 @@ def _resolve(*refs: str) -> list[str]:
     return [line if len(line) in (40, 64) and _HEX.issuperset(line) else "" for line in printed]
 
 
-def _fetch_and_rebase(branch: str | None = None) -> bool:
+def _fetch_and_rebase(repo: Repo) -> bool:
     """Adopt the remote's history under ours; say whether we now match it.
 
     Fetch-then-rebase rather than ``git pull --rebase`` because the tracking ref
@@ -1618,31 +1608,27 @@ def _fetch_and_rebase(branch: str | None = None) -> bool:
     below its own host id. ``recipients.txt`` is the single shared file, and
     ``.gitattributes`` marks it ``merge=union`` so both sides' keys survive.
     """
-    if branch is None:
-        branch = _branch()
     git("fetch", "--quiet", "origin")
-    local, upstream = _resolve("HEAD", f"refs/remotes/origin/{branch}")
+    local, upstream = _resolve("HEAD", f"refs/remotes/origin/{repo.branch}")
     if not upstream:
         return False
     if local == upstream:
         return True
     try:
-        git("rebase", "--autostash", f"origin/{branch}")
+        git("rebase", "--autostash", f"origin/{repo.branch}")
     except SyncError:
         git("rebase", "--abort", check=False)
         raise
     return False
 
 
-def _push(branch: str | None = None) -> None:
+def _push(repo: Repo) -> None:
     """Publish, retrying once if someone else pushed while we worked."""
-    if branch is None:
-        branch = _branch()
     try:
-        git("push", "--quiet", "-u", "origin", branch)
+        git("push", "--quiet", "-u", "origin", repo.branch)
     except SyncError:
-        _fetch_and_rebase(branch)
-        git("push", "--quiet", "-u", "origin", branch)
+        _fetch_and_rebase(repo)
+        git("push", "--quiet", "-u", "origin", repo.branch)
 
 
 #: Commit metadata is one of the few things in the repo that is *not* encrypted,
@@ -1653,44 +1639,47 @@ COMMIT_NAME = "woswoar"
 COMMIT_EMAIL = "woswoar@localhost"
 
 
-class RepoConfig(NamedTuple):
-    """What a run needs to know about the repo, from one `git config` read.
+class Repo(NamedTuple):
+    """What a command needs to know about the git repo, read once up front.
 
-    Three separate forks before -- `user.name`, `user.email`, and `git remote` --
-    on a timer that fires every minute, to learn things that change about once in
-    the life of a clone. `git remote` reads the same local config file: it prints
-    the names in the `remote.<name>.url` keys that are already in hand here.
+    Every field was its own `git` fork before, repeated by each helper that
+    wanted it: `user.name` and `user.email` read every run to be written
+    approximately never, `git remote`, and `branch --show-current` twice per
+    sync. None of it can change under a command -- woswoar never checks a branch
+    out, and the identity is written at `init` -- so reading it once and passing
+    it down is the whole saving, on a timer that fires every minute.
+
+    `git remote` needs no fork of its own: it prints the names in the
+    `remote.<name>.url` keys of the same local config read here.
     """
 
     has_remote: bool
     name: str
     email: str
+    branch: str
 
 
-def _repo_config() -> RepoConfig:
+def read_repo() -> Repo:
     values: dict[str, str] = {}
     for line in git("config", "--list", "--local", check=False).splitlines():
         key, _, value = line.partition("=")
         values[key] = value
-    return RepoConfig(
+    return Repo(
         has_remote=any(key.startswith("remote.") and key.endswith(".url") for key in values),
         name=values.get("user.name", ""),
         email=values.get("user.email", ""),
+        # `branch --show-current` rather than `rev-parse --abbrev-ref HEAD`,
+        # which cannot answer on an unborn HEAD -- exactly the state `init` is
+        # in when it enrols the first machine.
+        branch=git("branch", "--show-current"),
     )
 
 
-def _ensure_repo_config(config: RepoConfig | None = None) -> None:
-    """Pin the commit identity, writing only what is actually wrong.
-
-    Takes an already-read config from the callers that have one -- those are the
-    ones on the timer; the rest are one-shot commands where a fork does not
-    matter.
-    """
-    if config is None:
-        config = _repo_config()
-    if config.name != COMMIT_NAME:
+def _ensure_repo_config(repo: Repo) -> None:
+    """Pin the commit identity, writing only what is actually wrong."""
+    if repo.name != COMMIT_NAME:
         git("config", "user.name", COMMIT_NAME)
-    if config.email != COMMIT_EMAIL:
+    if repo.email != COMMIT_EMAIL:
         git("config", "user.email", COMMIT_EMAIL)
 
 
@@ -1781,13 +1770,15 @@ def initialise(
     if remote and not has_remote():
         git("remote", "add", "origin", remote)
 
-    _ensure_repo_config()
+    # After the remote is added, not before: that is what decides `has_remote`.
+    repo = read_repo()
+    _ensure_repo_config(repo)
 
     # Adopt the remote's state before enrolling, so we append to the real
     # recipients.txt rather than creating a competing one.
-    publishing = has_remote()
+    publishing = repo.has_remote
     if publishing:
-        _fetch_and_rebase()
+        _fetch_and_rebase(repo)
 
     if _write_repo_metadata(known, chosen):
         _commit()
@@ -1812,7 +1803,7 @@ def initialise(
     # `grant` run elsewhere cannot include it, so onboarding would appear to
     # succeed and then silently fail to grant access to any older history.
     if publishing:
-        _push()
+        _push(repo)
 
     return known, chosen, pinned
 
@@ -1907,8 +1898,9 @@ def readers() -> list[Reader]:
     parses either side of the prompt, so they could describe different sets.
     """
     with lock():
-        if has_remote():
-            _fetch_and_rebase()
+        repo = read_repo()
+        if repo.has_remote:
+            _fetch_and_rebase(repo)
         granted = set(State.load().granted)
         enrolled = recipients()
         owners = _host_owners()
@@ -1966,19 +1958,19 @@ def _access_change() -> Iterator[_AccessChange]:
 
     known = store.machine()
     identity = identity_path(known)
-    config = _repo_config()
-    _ensure_repo_config(config)
-    remote = config.has_remote
+    repo = read_repo()
+    _ensure_repo_config(repo)
+    remote = repo.has_remote
 
     # The same lock sync takes: this rewrites files in the working tree, and a
     # timer-driven sync must not be reading them halfway through.
     with lock():
         if remote:
-            _fetch_and_rebase()
+            _fetch_and_rebase(repo)
         yield _AccessChange(identity, known, remote)
         _commit()
         if remote:
-            _push()
+            _push(repo)
 
 
 def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
