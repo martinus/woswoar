@@ -262,9 +262,10 @@ Being straight about the limits is part of the security story:
 >   credential-shaped commands by default — assignments like
 >   `AWS_SECRET_ACCESS_KEY=`, options like `--password`, credentials inside a
 >   URL, and `Authorization` headers — and bash's own `HISTCONTROL`/`HISTIGNORE`
->   are honoured for free. But **no pattern catches everything**, and a secret
->   with no tell (`deploy.sh AKIA…`) is indistinguishable from any other
->   argument. [What it does and does not catch](shell-integration.md#commands-that-are-never-recorded)
+>   are honoured for free. `woswoar import` applies the same rules to history
+>   recorded long before woswoar existed, and additionally recognises well-known
+>   token formats, which is where the risk is concentrated. But **no pattern
+>   catches everything**. [What it does and does not catch](shell-integration.md#commands-that-are-never-recorded)
 >   is written down; read it before relying on it.
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run

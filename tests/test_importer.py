@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import io
 import os
+import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from woswoar import cache, importer
+from woswoar.__main__ import main
 
 from .support import WoswoarTestCase
 
@@ -68,7 +72,9 @@ class TestParseZsh(unittest.TestCase):
         self.assertEqual([p.cmd for p in parsed], ["earlier", "later"])
 
 
-class TestImportRun(WoswoarTestCase):
+class ImportTestCase(WoswoarTestCase):
+    """Fixture only. Subclassing a class that *has* tests would re-run them."""
+
     def _source(self, name: str, content: str) -> Path:
         path = self.root / name
         return self._rewrite(path, content)
@@ -81,6 +87,8 @@ class TestImportRun(WoswoarTestCase):
         os.utime(path, (MTIME, MTIME))
         return path
 
+
+class TestImportRun(ImportTestCase):
     def _commands(self) -> set[str]:
         return {e.cmd for e in cache.load_entries()}
 
@@ -154,6 +162,167 @@ class TestImportRun(WoswoarTestCase):
         source = self._source("hist", "#1753000000\nawk -F'\t' '{print $1}'\n")
         importer.run("bash", source)
         self.assertEqual(cache.load_entries()[0].cmd, "awk -F'\t' '{print $1}'")
+
+
+class TestImportDropsCredentials(ImportTestCase):
+    """Issue #52: import read years of history that no filter had ever seen.
+
+    The hook filters what you type from now on. Import brings in a
+    `~/.bash_history` recorded before woswoar existed -- which is the file most
+    likely to contain a secret, and it flows straight to logs/, into an
+    encrypted chunk, into git, and out to every machine. `docs/security.md`
+    says publication cannot be taken back.
+    """
+
+    HISTORY = (
+        "#1753000000\ngit status\n"
+        "#1753000100\nexport AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI\n"
+        "#1753000200\ncurl -u admin:hunter2 https://api.example.com\n"
+        "#1753000300\ndeploy.sh AKIAIOSFODNN7EXAMPLE\n"
+        "#1753000400\nninja -C build\n"
+    )
+
+    def test_a_credential_shaped_line_is_not_imported(self) -> None:
+        result = importer.run("bash", self._source("h", self.HISTORY))
+        self.assertEqual(
+            sorted(e.cmd for e in cache.load_entries()), ["git status", "ninja -C build"]
+        )
+        self.assertEqual(result.credentials, 3)
+        self.assertEqual(result.imported, 2)
+
+    def test_the_secret_never_reaches_the_log_file(self) -> None:
+        """The assertion that matters: not just absent from the API, absent from disk."""
+        importer.run("bash", self._source("h", self.HISTORY))
+        logs = (Path(os.environ["WOSWOAR_DIR"]) / "logs").rglob("*.tsv")
+        written = "".join(p.read_text(encoding="utf-8") for p in logs)
+        self.assertNotIn("wJalrXUtnFEMI", written)
+        self.assertNotIn("hunter2", written)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", written)
+        self.assertIn("git status", written)
+
+    def test_a_dry_run_reports_what_it_would_drop(self) -> None:
+        result = importer.run("bash", self._source("h", self.HISTORY), dry_run=True)
+        self.assertEqual(result.credentials, 3)
+        self.assertEqual(cache.load_entries(), [])
+
+    def test_dropped_lines_do_not_come_back_on_a_second_import(self) -> None:
+        """Idempotency is by count and by (ts, cmd); a filtered line is in neither.
+
+        It must not be re-offered, and must not shift the watermark such that a
+        later real command is skipped instead.
+        """
+        source = self._source("h", self.HISTORY)
+        importer.run("bash", source)
+        again = importer.run("bash", source)
+        self.assertEqual(again.imported, 0)
+        self.assertEqual(
+            sorted(e.cmd for e in cache.load_entries()), ["git status", "ninja -C build"]
+        )
+
+    def test_a_repeated_secret_is_counted_as_a_secret_each_time(self) -> None:
+        """The filter runs before the duplicate bookkeeping, and the count says so.
+
+        If a filtered line were added to the seen-set first, the second copy
+        would be reported as a collapsed duplicate rather than as a credential.
+        Both were credential-shaped; the number the user is shown should say
+        that, because it is the number they will judge the filter by.
+        """
+        twice = "#1753000100\nexport AWS_SECRET_ACCESS_KEY=x\n" * 2
+        result = importer.run("bash", self._source("h", twice))
+        self.assertEqual(result.credentials, 2)
+        self.assertEqual(result.collapsed, 0)
+        self.assertEqual(result.imported, 0)
+
+    def test_a_huge_pasted_command_does_not_stall_the_import(self) -> None:
+        """The filter must see the truncated command, not the raw one.
+
+        Ten of the rules scan with `[^|;&]*`, which is quadratic in the length
+        of the line. A 97 KB pasted script measured 636ms on its own before
+        this was fixed, and a history can hold many. Those bytes can never be
+        published either -- `truncate` cuts the command at MAX_CMD_CHARS on the
+        way to disk -- so scanning them was pure waste.
+        """
+        paste = "curl -X POST https://api.example.com/v1/things " * 2000
+        source = self._source("h", f"#1753000000\n{paste}\n#1753000100\ngit status\n")
+        start = time.monotonic()
+        importer.run("bash", source)
+        elapsed = time.monotonic() - start
+
+        # 9ms healthy, 870ms scanning the raw command: two orders of magnitude
+        # of headroom either side of this bound.
+        self.assertLess(elapsed, 0.2, "the import filter is scanning untruncated commands")
+        self.assertIn("git status", [e.cmd for e in cache.load_entries()])
+
+    def test_the_users_own_extra_pattern_applies_to_imports_too(self) -> None:
+        os.environ["WOSWOAR_IGNORE_EXTRA"] = "ninja"
+        self.addCleanup(os.environ.pop, "WOSWOAR_IGNORE_EXTRA", None)
+        result = importer.run("bash", self._source("h", self.HISTORY))
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["git status"])
+        self.assertEqual(result.credentials, 4)
+
+
+class TestImportReporting(ImportTestCase):
+    """What the user is told. A silent drop is its own bug: someone looking for
+    a command they know they ran needs to learn that the filter took it, not be
+    left thinking woswoar lost it."""
+
+    def run_main(self, *argv: str) -> tuple[int, str]:
+        """Both streams merged, and the exit code, which two of these need.
+
+        Named `run_main` rather than `run_cli`: `tests/test_sync.py` already has
+        a `run_cli` that returns stdout only, deliberately, so that "it warned"
+        assertions cannot pass on stderr. Two helpers with one name and
+        different contracts is worse than two names.
+        """
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(out):
+            code = main(list(argv))
+        return code, out.getvalue()
+
+    def test_the_dropped_count_is_reported(self) -> None:
+        source = self._source("h", TestImportDropsCredentials.HISTORY)
+        _, text = self.run_main("import", "bash", "--file", str(source))
+        self.assertIn("3 skipped as credential-shaped", text)
+
+    def test_nothing_is_said_when_nothing_was_dropped(self) -> None:
+        source = self._source("h", "#1753000000\ngit status\n")
+        _, text = self.run_main("import", "bash", "--file", str(source))
+        self.assertNotIn("credential-shaped", text)
+
+    def test_a_dry_run_lists_what_it_would_drop(self) -> None:
+        """A count alone is unauditable: 17 over a decade tells nobody which 17.
+
+        Dropping is irreversible, so there has to be one mode where a false
+        positive can be seen before it happens.
+        """
+        source = self._source("h", TestImportDropsCredentials.HISTORY)
+        _, text = self.run_main("import", "bash", "--file", str(source), "--dry-run")
+        self.assertIn("would skip as credential-shaped", text)
+        self.assertIn("AWS_SECRET_ACCESS_KEY", text)
+
+    def test_a_real_import_never_lists_them(self) -> None:
+        """The listing exists to be read once, not to be piped into a file."""
+        source = self._source("h", TestImportDropsCredentials.HISTORY)
+        _, text = self.run_main("import", "bash", "--file", str(source))
+        self.assertNotIn("would skip", text)
+        self.assertNotIn("wJalrXUtnFEMI", text)
+
+    def test_a_listed_command_cannot_drive_the_terminal(self) -> None:
+        """It is untrusted text from a history file, printed to a real tty."""
+        source = self._source("h", "#1753000000\nexport TOKEN=\x1b[31mred\x07\n")
+        _, text = self.run_main("import", "bash", "--file", str(source), "--dry-run")
+        self.assertIn("would skip as credential-shaped", text)
+        self.assertNotIn("\x1b", text)
+
+    def test_an_uncompilable_extra_pattern_stops_the_import(self) -> None:
+        """Importing unfiltered would be the opposite of what the user asked for."""
+        os.environ["WOSWOAR_IGNORE_EXTRA"] = "([unclosed"
+        self.addCleanup(os.environ.pop, "WOSWOAR_IGNORE_EXTRA", None)
+        source = self._source("h", TestImportDropsCredentials.HISTORY)
+        code, text = self.run_main("import", "bash", "--file", str(source))
+        self.assertEqual(code, 1)
+        self.assertIn("WOSWOAR_IGNORE_EXTRA", text)
+        self.assertEqual(cache.load_entries(), [], "history was imported unfiltered anyway")
 
 
 if __name__ == "__main__":

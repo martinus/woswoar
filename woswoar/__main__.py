@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import __version__, cache, importer, search, store
+from .entry import make_inert
 from .errors import WoswoarError
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
@@ -136,15 +137,24 @@ def cmd_import(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"woswoar: {exc}", file=sys.stderr)
         return 1
-
     prefix = "would import" if args.dry_run else "imported"
     notes = []
     if result.skipped:
         notes.append(f"{result.skipped} already present")
     if result.collapsed:
         notes.append(f"{result.collapsed} same-second duplicates collapsed")
+    if result.credentials:
+        notes.append(f"{result.credentials} skipped as credential-shaped")
     print(f"{result.source}: {result.parsed} parsed, {prefix} {result.imported}", end="")
     print(f", {', '.join(notes)}" if notes else "")
+
+    if result.dropped:
+        # Only ever populated by --dry-run. Printed so a false positive can be
+        # spotted before it is dropped for real, and to stderr so that piping
+        # the summary somewhere does not write a secret to a file.
+        print("\nwould skip as credential-shaped:", file=sys.stderr)
+        for command in result.dropped:
+            print(f"  {make_inert(command)}", file=sys.stderr)
 
     if len(result.per_host) > 1:
         print("\nper machine:")

@@ -456,5 +456,45 @@ class TestImportIsPrivate(AtuinTestCase):
             )
 
 
+class TestAtuinImportDropsCredentials(AtuinTestCase):
+    """The atuin path needs its own guard: it is a separate loop in `run_atuin`.
+
+    Worse than the bash file, in fact -- an atuin database holds every machine
+    the user ever synced, so one import can publish other machines' secrets too.
+    """
+
+    def rows(self, host: str = "box:someone") -> list[tuple[object, ...]]:
+        return [
+            (BASE, SECOND, 0, "git status", "/tmp", "s1", host),
+            (BASE + SECOND, SECOND, 0, "export GITHUB_TOKEN=ghp_secretvalue", "/tmp", "s1", host),
+            (BASE + 2 * SECOND, SECOND, 0, "psql postgres://u:pw@db/app", "/tmp", "s1", host),
+            (BASE + 3 * SECOND, SECOND, 0, "ninja -C build", "/tmp", "s1", host),
+        ]
+
+    def test_credential_shaped_rows_are_not_imported(self) -> None:
+        result = importer.run("atuin", self.atuin(self.rows()))
+        self.assertEqual(
+            sorted(e.cmd for e in cache.load_entries()), ["git status", "ninja -C build"]
+        )
+        self.assertEqual(result.credentials, 2)
+
+    def test_the_secret_never_reaches_the_log_file(self) -> None:
+        importer.run("atuin", self.atuin(self.rows()))
+        logs = (Path(os.environ["WOSWOAR_DIR"]) / "logs").rglob("*.tsv")
+        written = "".join(p.read_text(encoding="utf-8") for p in logs)
+        self.assertNotIn("ghp_secretvalue", written)
+        self.assertNotIn("u:pw@db", written)
+        self.assertIn("git status", written)
+
+    def test_a_second_import_does_not_resurrect_them(self) -> None:
+        db = self.atuin(self.rows())
+        importer.run("atuin", db)
+        again = importer.run("atuin", db)
+        self.assertEqual(again.imported, 0)
+        self.assertEqual(
+            sorted(e.cmd for e in cache.load_entries()), ["git status", "ninja -C build"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
