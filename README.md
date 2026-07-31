@@ -219,10 +219,17 @@ the timer fires.
 ## Development
 
 ```bash
-python -m unittest discover -s . -t . -p 'test_*.py'    # 194 tests
+python -m tools.run_tests                               # 301 tests, sharded, ~6s
+python -m unittest discover -s . -t . -p 'test_*.py'    # the same suite, serially
 WOSWOAR_BENCH=1 python -m unittest tests.test_perf      # latency on 52k entries
-ruff check . && ruff format --check . && mypy woswoar tests
+ruff check . && ruff format --check . && mypy woswoar tests tools
 ```
+
+The suite is about 88% subprocess wait — it drives real `age`, `git` and
+`ssh-keygen` rather than mocking them — so sharding it across processes takes it
+from ~19s to ~6s. Both commands run the same tests; the runner additionally
+fails if any test it discovered never reported back, which is a way a parallel
+run can be green that a serial one cannot.
 
 CI runs lint, tests on Python 3.10/3.12/3.14, the shell-hook and fork-free
 checks, a two-machine end-to-end sync against real `age` and real `git`,

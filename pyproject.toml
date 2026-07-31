@@ -36,7 +36,7 @@ path = "woswoar/__init__.py"
 packages = ["woswoar"]
 
 [tool.hatch.build.targets.sdist]
-include = ["woswoar", "tests", "docs", "README.md", "LICENSE"]
+include = ["woswoar", "tests", "tools", "docs", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100
