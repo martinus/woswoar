@@ -137,9 +137,12 @@ def remote_summary() -> str:
     return remotes[0] if remotes else "none (history is local only)"
 
 
-#: Separates a recipient from the human label woswoar appends after it. age
-#: never sees the label, because woswoar parses this file itself rather than
-#: handing age the path -- which is what makes labelling possible at all.
+#: Separates a key from the text after it. Only two things ever wrote such
+#: text: `revoke`, which marks a tombstone, and -- until #22 -- an enrolment
+#: label holding `$USER@$(uname -n)`, published in cleartext in the one file of
+#: the repo that is not encrypted. Names come from the sealed `name.age` now,
+#: so what follows a key is a constant or nothing, and `_parse` still strips
+#: whatever a file written by an older woswoar left here.
 _LABEL_SEP = " # "
 
 #: Marks a line as a *withdrawal* of the key that follows it rather than an
@@ -177,12 +180,25 @@ class _Line(NamedTuple):
 
     withdrawn: bool
     key: str
+    #: Whatever followed the key. Nothing reads it: enrolment labels are gone
+    #: and a tombstone's is a constant. Kept because `_parse` has to know the
+    #: grammar in order to strip it from lines older versions wrote.
     label: str
 
 
 def _parse(line: str) -> _Line:
+    """One line of recipients.txt, as a key this machine can compare.
+
+    The key is normalised here, not only where one is produced, and that is what
+    makes the property `crypto.recipient_for` claims actually hold. A line
+    written before SSH comments were stripped still carries `user@host`, so a
+    producer-side strip alone enrols the same key a second time -- same
+    fingerprint, listed twice in `grant`, and a tombstone matching only one of
+    the two spellings. Normalising what is read makes enrolment, deduplication
+    and withdrawal agree by construction, including with the file's own past.
+    """
     key, _, label = line.removeprefix(_REVOKED).partition(_LABEL_SEP)
-    return _Line(line.startswith(_REVOKED), key.strip(), label.strip())
+    return _Line(line.startswith(_REVOKED), crypto.without_comment(key.strip()), label.strip())
 
 
 def _revoked_in(lines: list[str]) -> set[str]:
@@ -229,12 +245,12 @@ def _this_machine_revoked(known: Machine) -> bool:
         return False
 
 
-def _labelled_recipients() -> list[tuple[str, str]]:
-    """``(key, label)`` for every enrolled machine, deduplicated by key.
+def recipients() -> list[str]:
+    """Every enrolled machine's public key, in the form age wants on `-r`.
 
-    Deduplicated because `.gitattributes` marks this file ``merge=union``, so a
-    machine that appends a labelled line where another has the same key
-    unlabelled leaves both, and age rejects a repeated recipient.
+    Deduplicated, because `.gitattributes` marks the file ``merge=union``, so
+    two machines appending the same key leaves both lines and age rejects a
+    repeated recipient.
 
     Tombstones are collected in a pass of their own first, not skipped as they
     are met: union merges interleave two machines' appends in whatever order the
@@ -248,42 +264,91 @@ def _labelled_recipients() -> list[tuple[str, str]]:
     was aimed at can un-revoke themselves by appending the line again" is not a
     property worth having, and they have push access by assumption.
 
-    The label is woswoar's own trailing comment when present and the SSH key's
-    comment field otherwise. It is never derived from the key -- an abbreviated
-    key used to be the last-resort label, which let a *chosen* label impersonate
-    one. `crypto.fingerprint` is the thing to show when the identity matters;
-    this is only a name.
-
-    Made inert on the way in. Every byte of it was written by whoever added the
-    key, and on a shared repo that is not necessarily one of your machines. That
-    covers C0 only, which is what a *record* needs; making it safe to put on a
-    terminal is `Reader.display_name`.
+    Read here rather than handed to age as a path: `crypto` never names a file
+    in $HOME, because a sandboxed age cannot open one.
     """
     lines = _recipient_lines()
     revoked = _revoked_in(lines)
 
-    out: dict[str, str] = {}
+    out: dict[str, None] = {}
     for line in lines:
-        entry = _parse(line)
         # Tombstones need no case of their own: their key is in `revoked` by
         # construction, so the same test that drops the enrolment drops them.
-        if not entry.key or entry.key in out or entry.key in revoked:
-            continue
-        label = entry.label
-        if not label:
-            fields = entry.key.split(None, 2)
-            label = fields[2] if len(fields) > 2 else "(unnamed)"
-        out[entry.key] = make_inert(label)
-    return list(out.items())
+        key = _parse(line).key
+        if key and key not in revoked:
+            out.setdefault(key, None)
+    return list(out)
 
 
-def recipients() -> list[str]:
-    """Every enrolled machine's public key, in the form age wants on `-r`.
+#: Stands in for a machine whose name this one has not learned yet -- it has
+#: enrolled but its `name.age` has not been merged here. Not a name, which is
+#: why `Reader.shares_name` ignores it: three machines waiting to be named do
+#: not share anything, and saying they do turns the one signal that means
+#: "look closely" into noise on an ordinary first sync.
+UNNAMED = "(unnamed)"
 
-    Read here rather than handed to age as a path: `crypto` never names a file
-    in $HOME, because a sandboxed age cannot open one.
+
+def _host_owners() -> dict[str, str]:
+    """``owning recipient -> host id``, from what each host publishes.
+
+    Built once per prompt rather than rescanned per recipient: `read_signer`
+    opens a file per host, so asking "which host owns this key?" separately for
+    each of them is quadratic -- 0.35 ms at five machines, 89 ms at a hundred.
+
+    Untrusted, like everything else `signer.pub` says: it decides a *label*, and
+    a label is shown quoted beside a fingerprint that cannot be chosen.
     """
-    return [key for key, _ in _labelled_recipients()]
+    owners: dict[str, str] = {}
+    for host_id in store.repo_hosts():
+        signer = read_signer(host_id)
+        if signer is not None:
+            owners.setdefault(signer.owner, host_id)
+    return owners
+
+
+def name_of(recipient: str) -> str:
+    """A human name for an enrolled machine, for a prompt to show.
+
+    Not read from `recipients.txt`, and that is the point of #22. The label
+    woswoar used to write there was `$USER@$(uname -n)`, published in cleartext
+    in the one file of the repo that is deliberately not encrypted -- while the
+    host directories beside it are opaque hex precisely so a leaked archive does
+    not name the machines. The name was already being published *sealed*, in
+    `hosts/<id>/name.age`, so it is taken from there instead.
+
+    Resolved through the local mirror `_merge_name` writes, so this costs no
+    subprocess and works for a machine that has synced. One that has not shows
+    ``(unnamed)`` and its fingerprint, which is the identity anyway -- a name is
+    a convenience and was never the thing being consented to.
+    """
+    return name_for(_host_owners().get(recipient)).text
+
+
+class Name(NamedTuple):
+    """A machine's name, and whether it is one.
+
+    ``known`` is a field rather than a comparison against `UNNAMED` because the
+    placeholder is a string a *peer* can write: sealing a `name.age` needs no
+    secret, so anything spelled here can be spelled there. Telling the two apart
+    by their text would let a machine call itself `(unnamed)` and slip out of
+    the duplicate-name warning it is the point of.
+    """
+
+    text: str
+    known: bool
+
+
+def name_for(host_id: str | None) -> Name:
+    """The name a host publishes, or the placeholder if this machine has none.
+
+    Read from the local mirror `_merge_name` writes rather than
+    `store.host_names()`, whose fallback is the opaque id -- an id beside a
+    fingerprint is two unreadable strings where one would do.
+    """
+    if host_id is None:
+        return Name(UNNAMED, known=False)
+    name = store.host_name(host_id)
+    return Name(make_inert(name), known=True) if name else Name(UNNAMED, known=False)
 
 
 def is_repo() -> bool:
@@ -644,7 +709,7 @@ def trust_candidates() -> list[Candidate]:
 
         known = store.machine()
         state = State.load()
-        names = {key: label for key, label in _labelled_recipients()}
+        live = set(recipients())
 
         out: list[Candidate] = []
         for host_id in store.repo_hosts():
@@ -654,19 +719,19 @@ def trust_candidates() -> list[Candidate]:
             if signer is None:
                 continue
             # Only hosts whose owning recipient is *live* are offered. That
-            # covers both cases in one test, because `_labelled_recipients`
-            # already subtracts tombstoned keys: a withdrawn machine is not in
-            # `names`, and neither is a host nothing ties to a recipient -- which
+            # covers both cases in one test, because `recipients` already
+            # subtracts tombstoned keys: a withdrawn machine is not in
+            # `live`, and neither is a host nothing ties to a recipient -- which
             # must also stay unacceptable, or the tombstone that would stop it
             # later would have nothing to act on.
-            if signer.owner not in names:
+            if signer.owner not in live:
                 continue
             pinned = state.signers.get(host_id)
             out.append(
                 Candidate(
                     host_id=host_id,
                     verify_key=signer.verify_key,
-                    label=names[signer.owner],
+                    label=name_for(host_id).text,
                     fingerprint=crypto.fingerprint(signer.verify_key),
                     pinned=pinned,
                     pinned_fingerprint=crypto.fingerprint(pinned) if pinned else "",
@@ -1484,7 +1549,7 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
         changed = True
 
     recipient = crypto.recipient_for(identity).strip()
-    if add_recipient(recipient, label=known.name):
+    if add_recipient(recipient):
         changed = True
 
     # Published before the first chunk is, so a peer that fetches between
@@ -1566,7 +1631,8 @@ def readers() -> list[Reader]:
         if has_remote():
             _fetch_and_rebase()
         granted = set(State.load().granted)
-        labelled = _labelled_recipients()
+        enrolled = recipients()
+        owners = _host_owners()
 
         # Not fatal if this machine's own key cannot be worked out: the list is
         # still true, it just loses the "(this machine)" note. `grant` is the
@@ -1576,17 +1642,18 @@ def readers() -> list[Reader]:
         except (WoswoarError, OSError):
             mine = ""
 
-        names = Counter(label for _, label in labelled)
+        labelled = [(key, name_for(owners.get(key))) for key in enrolled]
+        names = Counter(name.text for _, name in labelled if name.known)
         return [
             Reader(
                 key=key,
-                label=label,
+                label=name.text,
                 fingerprint=crypto.fingerprint(key),
                 is_new=key not in granted,
                 is_mine=key == mine,
-                shares_name=names[label] > 1,
+                shares_name=name.known and names[name.text] > 1,
             )
-            for key, label in labelled
+            for key, name in labelled
         ]
 
 
@@ -1829,7 +1896,7 @@ def revoke(reader: Reader) -> RevokeReport:
         _append_recipient_line(f"{_REVOKED}{reader.key}{_LABEL_SEP}revoked")
 
         # Read back rather than filtered by hand. What a tombstone subtracts is
-        # `_labelled_recipients`' rule, and a second copy of it here is a second
+        # `recipients`' rule, and a second copy of it here is a second
         # thing to keep in step -- the reason the file is written first.
         resealed, skipped = _reseal(change.identity, recipients())
         still_readable = _still_readable(change.known.id)
@@ -1927,19 +1994,20 @@ def compact(before: str) -> tuple[int, int]:
     return days, replaced
 
 
-def add_recipient(recipient: str, label: str = "") -> bool:
-    """Append a public key to recipients.txt if its key is not already listed.
+def add_recipient(recipient: str) -> bool:
+    """Append a public key to recipients.txt if it is not already listed.
 
-    The label is the name `grant` shows a human beside the key's fingerprint;
-    without it the prompt lists opaque age keys and cannot be consented to in
-    any real sense.
+    Nothing but the key. woswoar used to append ``# $USER@$(uname -n)`` here so
+    that `grant` had a name to show, which published a username and a hostname
+    in the one file of the repo that is deliberately plaintext -- while the host
+    directories beside it are opaque hex for exactly the opposite reason. The
+    name comes from the sealed `name.age` now; see `name_of`.
 
-    One line per key, guaranteed rather than assumed: both halves come from this
-    machine's own files, and a newline in either would append a second entry
-    that nobody added. The label is made inert, which is enough because it is
-    free text; a key with a newline in it is malformed rather than merely ugly,
-    so it is refused instead of rewritten into something age would reject later
-    and less clearly.
+    One line per key, guaranteed rather than assumed: the key comes from this
+    machine's own files, and a newline in it would append a second entry that
+    nobody added. It is refused rather than rewritten, because a key with a
+    newline in it is malformed rather than merely ugly, and age would reject it
+    later and less clearly.
     """
     key = recipient.strip()
     if "\n" in key:
@@ -1951,7 +2019,7 @@ def add_recipient(recipient: str, label: str = "") -> bool:
         raise SyncError(f"a public key may not start with {_REVOKED!r}: {key!r}")
     if key in revoked_keys():
         # Loudly, and not as "already enrolled". Appending the line would be
-        # harmless -- `_labelled_recipients` subtracts it either way -- but this
+        # harmless -- `recipients` subtracts it either way -- but this
         # machine would then record and sync for days while reading nothing, and
         # the reason would sit in a file it never prints.
         raise SyncError(
@@ -1960,5 +2028,5 @@ def add_recipient(recipient: str, label: str = "") -> bool:
         )
     if key in recipients():
         return False
-    _append_recipient_line(f"{key}{_LABEL_SEP}{make_inert(label)}" if label else key)
+    _append_recipient_line(key)
     return True

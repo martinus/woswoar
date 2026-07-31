@@ -14,6 +14,14 @@ encrypted before it is committed. Even the *directory names* in the repo are
 opaque random hex, because paths are not encrypted by anything and
 `hosts/martin@desktop/` would publish your machine names for free.
 
+The one file that is deliberately plaintext, `recipients.txt`, holds public
+keys and nothing else. It used to carry `$USER@$(uname -n)` beside each one so
+that `woswoar grant` had a name to show, and an SSH key's own trailing comment
+went with it — which published exactly what the opaque directories were there
+to withhold. The name comes from the sealed `name.age` now, and the comment is
+stripped before the key is written; a test walks every committed byte and
+fails if a machine name appears in any of them.
+
 ## 🧊 No self-rolled cryptography
 
 Almost no crypto in this codebase, and none of the parts that are easy to get
@@ -211,6 +219,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | A failed chunk is retried, not dropped | an earlier chunk that fails while a later one succeeds is merged once it is repaired |
 | age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
 | Forged history is refused | a chunk sealed to a host's published day key, but absent from that host's signed manifest, is rejected and reported |
+| The repo names no machine | every committed byte is searched for the username and hostname; a leaked archive says how many machines there are, not which |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
 | A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
 | A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
@@ -239,7 +248,8 @@ Being straight about the limits is part of the security story:
 >   same machine. Encryption protects the *synced copy*,
 >   not your disk. Use full-disk encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
->   when they synced, and roughly how many commands you ran per day.
+>   when they synced, and roughly how many commands you ran per day. Not *which*
+>   machines: no username or hostname is committed.
 > - **Trust on first use.** Cloning pins whatever machines the repository shows
 >   at that moment. A machine planted *before* you clone is accepted; one that
 >   appears afterwards is refused until you say otherwise. `woswoar init` prints

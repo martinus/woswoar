@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import secrets
 import subprocess
 import tempfile
 import tracemalloc
@@ -25,7 +26,7 @@ from woswoar.entry import Entry, format_line
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support
-from .support import requires_age, requires_git
+from .support import requires_age, requires_git, requires_ssh_keygen
 
 #: One authoritative list, plus HOME which only these tests need to redirect.
 _ENV = (*support.ENV_KEYS, "HOME")
@@ -94,16 +95,27 @@ class Fake:
     def commands(self) -> set[str]:
         return {e.cmd for e in cache.load_entries()}
 
-    def append_recipient(self, label: str) -> str:
-        """Add a key to recipients.txt behind woswoar's back, and return it.
+    def append_recipient(self, name: str = "") -> str:
+        """Enrol a machine behind woswoar's back, and return its recipient.
 
-        Written straight to the file rather than through `sync.add_recipient`,
-        because that is what the other end of a shared repo looks like: a line
-        that arrived by `git pull`, with a label nothing here sanitised.
+        Written straight into the repo rather than through `sync.add_recipient`,
+        because that is what the other end of a shared repo looks like: files
+        that arrived by `git pull`, whose contents nothing here sanitised.
+
+        ``name`` fabricates the host directory that gives the key a name --
+        `signer.pub` to claim it and a `.name` mirror to hold it -- because that
+        is where a name lives now. It is not a trusted path: sealing a file to
+        the published recipients needs no secret, so a name is still attacker
+        text and is still shown quoted beside a fingerprint.
         """
         key = crypto.generate_identity().public
         with store.recipients_file().open("a", encoding="utf-8") as handle:
-            handle.write(f"{key}{sync._LABEL_SEP}{label}\n")
+            handle.write(f"{key}\n")
+        if name:
+            host = secrets.token_hex(8)
+            verify_key = crypto.generate_signing_key(self.root / f"signer-{host}")
+            store.write_atomic(store.signer_public(host), f"{verify_key}\n{key}\n".encode())
+            store.write_atomic(store.name_file(host), f"{name}\n".encode())
         return key
 
 
@@ -534,27 +546,21 @@ class TestGrantConfirmation(SyncTestCase):
             labels = {reader.label for reader in sync.readers()}
         self.assertIn("martinus@box", labels)
 
-    def test_an_unlabelled_key_gets_a_handle_that_is_not_the_key(self) -> None:
-        """recipients.txt written by an older woswoar, or hand-edited.
+    def test_a_key_with_no_name_yet_is_not_named_after_itself(self) -> None:
+        """The fallback label used to be an abbreviation of the key.
 
-        The fallback label used to be an abbreviation of the key, which let a
-        *chosen* label impersonate one -- and that is the whole weakness: a name
-        in this file is written by whoever added the key.
+        That let a *chosen* label impersonate one, which was the whole weakness.
+        A name can no longer be derived from a key at all -- it comes from the
+        sealed `name.age` or it is the placeholder -- so this pins the placeholder
+        rather than the abbreviation it replaced.
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            key = crypto.generate_identity().public
-            store.recipients_file().write_text(f"{key}\n", encoding="utf-8")
-            (reader,) = sync.readers()
+            key = alpha.append_recipient()
+            (reader,) = [r for r in sync.readers() if r.key == key]
 
-        self.assertTrue(reader.label)
-        self.assertNotIn(sync._LABEL_SEP, reader.key)
-        # Split on the abbreviation's own ellipsis, so a label built out of both
-        # ends of the key is caught rather than only one made of a single run.
-        self.assertFalse(
-            any(part and part in key for part in reader.label.split("...")),
-            f"the label {reader.label!r} is made out of the key it names",
-        )
+        self.assertEqual(reader.label, sync.UNNAMED)
+        self.assertFalse(any(part and part in key for part in reader.label.split("...")))
 
     def test_a_key_listed_twice_is_offered_to_age_once(self) -> None:
         """`recipients.txt` is `merge=union`.
@@ -598,29 +604,15 @@ class TestGrantConfirmation(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            alpha.append_recipient(label="martin@laptop\x1b[2K\x1b[1A")
+            alpha.append_recipient(name="martin@laptop\x1b[2K\x1b[1A")
             for reader in sync.readers():
                 self.assertNotIn("\x1b", reader.label)
                 self.assertNotIn("\n", reader.label)
 
-    def test_a_label_written_here_cannot_forge_a_second_entry(self) -> None:
-        """The label comes from this machine's config file, so it is not
-        guaranteed to be one line just because a name usually is."""
-        alpha = self.machine("alpha")
-        with alpha.active():
-            before = len(sync.recipients())
-            intruder = crypto.generate_identity().public
-            sync.add_recipient(
-                crypto.generate_identity().public,
-                label=f"laptop\n{intruder}{sync._LABEL_SEP}desktop",
-            )
-            self.assertEqual(len(sync.recipients()), before + 1)
-            self.assertNotIn(intruder, sync.recipients())
-
     def test_a_key_that_is_not_one_line_is_refused_rather_than_written(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active(), self.assertRaises(sync.SyncError) as caught:
-            sync.add_recipient(f"{crypto.generate_identity().public}\nage1intruder", label="laptop")
+            sync.add_recipient(f"{crypto.generate_identity().public}\nage1intruder")
         self.assertIn("not one line", str(caught.exception))
 
     def test_two_keys_with_one_name_are_told_apart(self) -> None:
@@ -630,7 +622,7 @@ class TestGrantConfirmation(SyncTestCase):
         """
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
-            alpha.append_recipient(label="martin@laptop")
+            alpha.append_recipient(name="martin@laptop")
             readers = sync.readers()
 
         self.assertEqual({reader.label for reader in readers}, {"martin@laptop"})
@@ -640,14 +632,46 @@ class TestGrantConfirmation(SyncTestCase):
     def test_a_name_nobody_else_uses_is_not_flagged(self) -> None:
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
-            alpha.append_recipient(label="martin@desktop")
+            alpha.append_recipient(name="martin@desktop")
             self.assertFalse(any(reader.shares_name for reader in sync.readers()))
+
+    def test_machines_whose_name_is_not_known_yet_do_not_count_as_duplicates(self) -> None:
+        """Names arrive with a sync, so several can be pending at once.
+
+        `(unnamed)` is a placeholder, not a name. Counting it as one turns the
+        signal that means "look closely at these two" into something an ordinary
+        first sync prints about every machine that has not been merged yet.
+        """
+        alpha = self.machine("alpha", display="martin@laptop")
+        with alpha.active():
+            for _ in range(3):
+                alpha.append_recipient()
+            unnamed = [r for r in sync.readers() if r.label == sync.UNNAMED]
+            self.assertEqual(len(unnamed), 3)
+            self.assertFalse(any(r.shares_name for r in unnamed))
+
+            # And the placeholder is not a name a peer can claim its way into.
+            # Sealing a `name.age` needs no secret, so anything spelled here can
+            # be spelled there; two peers claiming it are told apart from a
+            # machine whose name simply has not arrived.
+            alpha.append_recipient(name=sync.UNNAMED)
+            alpha.append_recipient(name=sync.UNNAMED)
+            flagged = [r for r in sync.readers() if r.shares_name]
+            self.assertEqual(len(flagged), 2)
+            still_unknown = [r for r in sync.readers() if not r.shares_name]
+            self.assertEqual(len([r for r in still_unknown if r.label == sync.UNNAMED]), 3)
+
+            # A real repeat is still called out.
+            alpha.append_recipient(name="martin@laptop")
+            named = [r for r in sync.readers() if r.label == "martin@laptop"]
+        self.assertEqual(len(named), 2)
+        self.assertTrue(all(r.shares_name for r in named))
 
     def test_the_machine_the_human_is_sitting_at_is_marked(self) -> None:
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
             mine = crypto.recipient_for(sync.identity_path(store.machine())).strip()
-            alpha.append_recipient(label="martin@desktop")
+            alpha.append_recipient(name="martin@desktop")
             marked = [reader.key for reader in sync.readers() if reader.is_mine]
         self.assertEqual(marked, [mine])
 
@@ -658,7 +682,7 @@ class TestRevokeSubtraction(SyncTestCase):
     def test_a_revoked_key_stops_being_a_recipient(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            gone = alpha.append_recipient(label="old-laptop")
+            gone = alpha.append_recipient(name="old-laptop")
             self.assertIn(gone, sync.recipients())
 
             sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
@@ -688,11 +712,11 @@ class TestRevokeSubtraction(SyncTestCase):
         premise. Re-enrolling a real machine means a new identity."""
         alpha = self.machine("alpha")
         with alpha.active():
-            gone = alpha.append_recipient(label="old-laptop")
+            gone = alpha.append_recipient(name="old-laptop")
             sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
 
             with self.assertRaises(sync.SyncError) as caught:
-                sync.add_recipient(gone, label="back-again")
+                sync.add_recipient(gone)
             self.assertIn("revocation is permanent", str(caught.exception))
 
             # And appending the line by hand, which is all push access buys,
@@ -762,7 +786,7 @@ class TestRevokeSubtraction(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "recorded today")
             sync.run()
-            gone = alpha.append_recipient(label="old-laptop")
+            gone = alpha.append_recipient(name="old-laptop")
             report = sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
         self.assertEqual(report.still_readable, ["2023-11-14"])
 
@@ -782,7 +806,7 @@ class TestRevokeSubtraction(SyncTestCase):
             # Only one recipient, and it is not this machine -- so `is_mine`
             # does not catch it and the emptiness guard is what has to.
             store.recipients_file().write_text("", encoding="utf-8")
-            only = alpha.append_recipient(label="only-one")
+            only = alpha.append_recipient(name="only-one")
             (other,) = sync.readers()
             with self.assertRaises(sync.SyncError) as caught:
                 sync.revoke(other)
@@ -830,7 +854,7 @@ class TestRevokeSubtraction(SyncTestCase):
     def test_a_key_shaped_like_a_tombstone_is_refused(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active(), self.assertRaises(sync.SyncError) as caught:
-            sync.add_recipient(f"-{crypto.generate_identity().public}", label="sneaky")
+            sync.add_recipient(f"-{crypto.generate_identity().public}")
         self.assertIn("may not start with", str(caught.exception))
 
 
@@ -1011,13 +1035,13 @@ class TestFindReader(SyncTestCase):
     def test_a_full_fingerprint_selects_one_machine(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            other = alpha.append_recipient(label="old-laptop")
+            other = alpha.append_recipient(name="old-laptop")
             self.assertEqual(sync.find_reader(crypto.fingerprint(other)).key, other)
 
     def test_an_unambiguous_prefix_is_enough(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            other = alpha.append_recipient(label="old-laptop")
+            other = alpha.append_recipient(name="old-laptop")
             found = sync.find_reader(crypto.fingerprint(other)[:20])
         self.assertEqual(found.key, other)
 
@@ -1025,7 +1049,7 @@ class TestFindReader(SyncTestCase):
         # Guessing here removes somebody's access.
         alpha = self.machine("alpha")
         with alpha.active():
-            alpha.append_recipient(label="old-laptop")
+            alpha.append_recipient(name="old-laptop")
             with self.assertRaises(sync.SyncError) as caught:
                 sync.find_reader("age1")
         self.assertIn("matches 2 machines", str(caught.exception))
@@ -1041,7 +1065,7 @@ class TestRevokeConfirmation(SyncTestCase):
     def test_without_yes_and_without_a_terminal_nothing_changes(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            gone = alpha.append_recipient(label="old-laptop")
+            gone = alpha.append_recipient(name="old-laptop")
 
         code, _ = self.run_cli(alpha, "revoke", crypto.fingerprint(gone))
         self.assertEqual(code, 1)
@@ -1054,7 +1078,7 @@ class TestRevokeConfirmation(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            gone = alpha.append_recipient(label="old-laptop")
+            gone = alpha.append_recipient(name="old-laptop")
 
         code, out = self.run_cli(alpha, "revoke", crypto.fingerprint(gone), "--yes")
         self.assertEqual(code, 0)
@@ -1095,7 +1119,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         # Exactly what push access alone buys: append a key labelled like one of
         # the machines that is already there.
         with alpha.active():
-            forged = alpha.append_recipient(label="martin@laptop")
+            forged = alpha.append_recipient(name="martin@laptop")
             new = [reader for reader in sync.readers() if reader.is_new]
 
         self.assertEqual([reader.key for reader in new], [forged])
@@ -1104,7 +1128,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         alpha = self.machine("alpha", display="martin@laptop")
         self.run_cli(alpha, "grant", "--yes")
         with alpha.active():
-            alpha.append_recipient(label="martin@laptop")
+            alpha.append_recipient(name="martin@laptop")
 
         code, out = self.run_cli(alpha, "grant", "--yes")
         self.assertEqual(code, 0)
@@ -1124,7 +1148,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         hostile = "  martin@desktop\u202e"
         alpha = self.machine("alpha", display="martin@laptop")
         with alpha.active():
-            alpha.append_recipient(label=hostile)
+            alpha.append_recipient(name=hostile)
 
         _, out = self.run_cli(alpha, "grant", "--yes")
         self.assertIn("martin@desktop", out)
@@ -1149,7 +1173,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         alpha = self.machine("alpha")
         self.run_cli(alpha, "grant", "--yes")
         with alpha.active():
-            alpha.append_recipient(label="martin@desktop")
+            alpha.append_recipient(name="martin@desktop")
 
         code, _ = self.run_cli(alpha, "grant")
         self.assertEqual(code, 1)
@@ -2110,6 +2134,124 @@ class TestADecompressionBomb(SyncTestCase):
 
         self.assertEqual(len(entries), before, "a flush duplicated a rewritten day")
         self.assertEqual(len({e.cmd for e in entries}), before)
+
+
+class TestRecipientsPublishNoNames(SyncTestCase):
+    """#22: the one plaintext file in the repo named every machine.
+
+    `docs/security.md` says host directories are opaque hex so that a leaked
+    archive does not publish usernames and hostnames. `recipients.txt` undid
+    that one file over -- with woswoar's own `$USER@$(uname -n)` label, and
+    again with the SSH key's own comment, which ssh-keygen writes by default.
+    """
+
+    @requires_ssh_keygen
+    def test_an_ssh_recipient_loses_its_comment(self) -> None:
+        """The second half of #22, and the one that leaks without woswoar's help.
+
+        An SSH public key ends in a free-text comment, conventionally
+        `user@host`, and `ssh-keygen` puts it there by default. Publishing the
+        key verbatim publishes that -- twice since signatures landed, because
+        `signer.pub` names the owning recipient too.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            key = self.root / "with-a-comment"
+            subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-q",
+                    "-C",
+                    "martinus@secret-box",
+                    "-f",
+                    str(key),
+                ],
+                check=True,
+                timeout=60,
+            )
+            recipient = crypto.recipient_for(key)
+            self.assertNotIn("secret-box", recipient)
+            # And it is still a recipient age will seal to.
+            crypto.encrypt_to_recipients(b"payload", [recipient])
+
+    @requires_ssh_keygen
+    def test_a_file_written_before_the_comment_was_stripped_enrols_one_key(self) -> None:
+        """The upgrade case, and the one a producer-side strip alone gets wrong.
+
+        `recipients.txt` already holds the key with its comment. Normalising
+        only what this machine *writes* leaves the old spelling live beside the
+        new one: the same key enrolled twice, listed twice by `grant` under one
+        fingerprint, and a tombstone matching only one of the two.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            key = self.root / "legacy_id_ed25519"
+            subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-q",
+                    "-C",
+                    "martinus@secret-box",
+                    "-f",
+                    str(key),
+                ],
+                check=True,
+                timeout=60,
+            )
+            with_comment = key.with_suffix(".pub").read_text(encoding="utf-8").strip()
+            store.recipients_file().write_text(
+                f"{with_comment}{sync._LABEL_SEP}martinus@box\n", encoding="utf-8"
+            )
+
+            machine = store.machine()._replace(identity=str(key))
+            store.save_machine(machine)
+            sync._write_repo_metadata(machine, key)
+
+            enrolled = sync.recipients()
+        self.assertEqual(len(enrolled), 1, "the same key was enrolled under two spellings")
+        self.assertNotIn("secret-box", enrolled[0])
+
+    def test_nothing_in_the_repo_names_the_machine(self) -> None:
+        """The claim, checked across every committed byte rather than one file.
+
+        `docs/security.md` says the repo does not publish machine names. This is
+        what makes that a guarantee instead of a sentence.
+        """
+        alpha = self.machine("alpha", display="martinus@secret-box")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            # `.git` included, deliberately: it is where git would record an
+            # author identity, so leaving it out would skip the weakest link in
+            # the claim. `_ensure_repo_config` pins the author to a constant,
+            # and this is what keeps that true.
+            committed = b"".join(
+                path.read_bytes() for path in store.history_dir().rglob("*") if path.is_file()
+            )
+        self.assertNotIn(b"secret-box", committed)
+        self.assertNotIn(b"martinus", committed)
+
+    def test_no_name_is_written_into_recipients_at_all(self) -> None:
+        """#22: the label used to be `$USER@$(uname -n)`, in cleartext.
+
+        The host directories beside it are opaque hex precisely so a leaked
+        archive does not name the machines, and this file undid that one line
+        over. There is now nothing in it but keys.
+        """
+        alpha = self.machine("alpha", display="martinus@secret-box")
+        with alpha.active():
+            written = store.recipients_file().read_text(encoding="utf-8")
+        self.assertNotIn("secret-box", written)
+        self.assertNotIn("martinus", written)
+        self.assertNotIn(sync._LABEL_SEP, written)
 
 
 if __name__ == "__main__":

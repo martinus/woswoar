@@ -193,23 +193,47 @@ def recipient_for(identity: Path) -> str:
 
     For an SSH key this is the contents of its ``.pub`` sibling, which is what
     other machines will encrypt to; for an age identity, age derives it.
+
+    Normalised through `without_comment`, and here rather than at the call
+    sites, because this string is not only handed to age: it is written to
+    `recipients.txt`, compared for deduplication, and named by a tombstone. Two
+    machines disagreeing about whether the comment is part of it would enrol the
+    same key twice and revoke neither.
     """
     pub = public_half(identity)
     if pub.is_file():
-        return pub.read_text(encoding="utf-8").strip()
+        return without_comment(pub.read_text(encoding="utf-8").strip())
     # Reading the file ourselves, then reusing public_of, which already knows
     # both how to skip the subprocess when the identity carries its own
     # `# public key:` comment and how to feed age on stdin when it does not.
     return public_of(identity.read_text(encoding="utf-8"))
 
 
+def without_comment(recipient: str) -> str:
+    """A recipient with any trailing SSH comment removed.
+
+    An SSH public key ends in a free-text comment, conventionally
+    ``user@host`` -- so publishing one publishes a username and a hostname, in
+    the one file in the repo that is deliberately plaintext. The repo goes to
+    lengths to avoid that: host directories are opaque hex precisely so a
+    leaked archive does not name the machines.
+
+    age never needed it. It reads the type and the key material and ignores the
+    rest, so dropping it costs nothing and is not a downgrade of any kind.
+    """
+    fields = recipient.split()
+    if len(fields) > 2 and fields[0].startswith("ssh-"):
+        return " ".join(fields[:2])
+    return recipient
+
+
 def fingerprint(recipient: str) -> str:
     """A short name for a recipient that is derived from the key, not chosen.
 
-    The label beside a key in ``recipients.txt`` is free text, appended by
-    whoever added the key, and `merge=union` keeps both sides of any conflict.
-    So a human asked to approve *a label* is approving a string an attacker with
-    push access wrote -- ``martin@laptop`` twice, and one of them is not.
+    The name shown beside a key is free text a machine publishes about itself,
+    in a `name.age` that sealing needs no secret to write. So a human asked to
+    approve *a name* is approving a string an attacker with push access chose --
+    ``martin@laptop`` twice, and one of them is not.
 
     For an SSH key this is byte-for-byte what ``ssh-keygen -lf id_ed25519.pub``
     prints, which is the point: it can be checked against the machine itself

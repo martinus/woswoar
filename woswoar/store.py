@@ -354,6 +354,19 @@ def default_machine_name() -> str:
     return f"{user}@{host}"
 
 
+def host_name(machine_id: str) -> str:
+    """A host's friendly name, or ``""`` if none has arrived here yet.
+
+    The one place that knows where a name is kept. `sync.name_for` wants the
+    empty answer so it can say "(unnamed)"; `host_names` wants the id instead,
+    so the fallback belongs to the callers rather than here.
+    """
+    try:
+        return name_file(machine_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def host_names() -> dict[str, str]:
     """Map machine id -> friendly name for every host present in the logs.
 
@@ -368,11 +381,7 @@ def host_names() -> dict[str, str]:
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
-        name_file = entry / _NAME_FILE
-        try:
-            names[entry.name] = name_file.read_text(encoding="utf-8").strip() or entry.name
-        except OSError:
-            names[entry.name] = entry.name
+        names[entry.name] = host_name(entry.name) or entry.name
     return names
 
 
