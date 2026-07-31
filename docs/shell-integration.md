@@ -177,7 +177,7 @@ Measured on a real **54,943-entry** history across ~750 daily files:
 | record a command | **~150 µs**, 0 forks |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
 
-No index, no SQLite — a pickle cache that only re-reads what changed is enough,
+No index, no SQLite — a parse cache that only re-reads what changed is enough,
 and CI re-measures it on every push.
 
 <details>
@@ -188,7 +188,7 @@ and CI re-measures it on every push.
 | Python interpreter start | 8.8 ms |
 | importing woswoar | 29 ms |
 | building the argparse parser | 36 ms |
-| loading the cache (unpickling 55k entries) | 67 ms |
+| loading the cache (deserialising 55k entries) | 67 ms |
 | filter, sort, dedup, render | 87 ms |
 | writing 1.5 MB to fzf | 105 ms |
 

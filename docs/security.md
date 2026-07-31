@@ -199,6 +199,13 @@ with `--identity <path>` or `--new-identity`.
 
 ## 📦 Minimal supply chain
 
+No on-disk format woswoar reads can execute code. The parse cache under
+`~/.cache` is read on every Ctrl-R and used to be a pickle, which runs whatever
+the file says *before* any validation the caller might do; it is now plain text
+that a `split` cannot execute. That file is `0600`, so this was never a
+cross-user hole — what it removes is the step from "something could write one
+file in your home directory" to "something runs as you".
+
 The runtime dependency list is **empty**, and
 [intended to stay that way](../pyproject.toml). No PyPI packages, no transitive
 tree, no post-install scripts, no crate lockfile to audit — the only Python that
@@ -232,6 +239,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
+| The cache cannot execute | a pickle that would run code on load is written to the cache path; it is refused and a witness file never appears |
 | Search stays fast | latency measured on 52,000 entries |
 
 ## ⚠️ What is *not* protected
