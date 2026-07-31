@@ -865,15 +865,51 @@ def pack(data: bytes) -> bytes:
     return zlib.compress(data, 9)
 
 
-def unpack(blob: bytes) -> bytes:
-    """Inverse of :func:`pack`.
+#: The most a single chunk may decompress to.
+#:
+#: deflate reaches about 1030:1, so an unbounded `zlib.decompress` turns a
+#: 204 KB commit into 200 MiB of log and 420 MiB of RSS -- measured -- and a
+#: 10 MB one into roughly 10 GB, on a timer that fires every minute and asks
+#: nobody. The cap is what stops one machine deciding how much memory every
+#: other machine spends.
+#:
+#: Sized against what a real chunk holds, measured on generated history:
+#:
+#:     a typical day                        0.03 MiB
+#:     a very heavy day                     0.35 MiB
+#:     an entire bash_history, imported     4.43 MiB
+#:
+#: so 64 MiB is about fifteen times the largest legitimate case anyone has --
+#: importing a whole shell history in one go -- and still two hundred times
+#: smaller than what the same bytes could otherwise expand to. The case it does
+#: refuse is a single chunk holding tens of thousands of *maximum-length*
+#: commands, which is 383 MiB of plaintext; that is legal but has never
+#: happened, and refusing it is reported rather than silent.
+MAX_CHUNK_BYTES = 64 * 1024 * 1024
 
-    Not defensive on purpose: zlib rejects anything that is not a deflate
-    stream, so a payload written by some future format fails here rather than
-    being appended to a log as garbage. Callers treat that like any other
-    unreadable chunk.
+
+def unpack(blob: bytes, limit: int = MAX_CHUNK_BYTES) -> bytes:
+    """Inverse of :func:`pack`, refusing anything implausibly large.
+
+    Not defensive about *shape* on purpose: zlib rejects anything that is not a
+    deflate stream, so a payload written by some future format fails here rather
+    than being appended to a log as garbage.
+
+    It is defensive about *size*, which is a different question and the one the
+    original version did not ask. `decompressobj` is what allows that: it stops
+    at ``limit`` instead of allocating whatever the stream asks for, so the
+    refusal costs one bounded buffer rather than the allocation being refused.
     """
-    return zlib.decompress(blob)
+    engine = zlib.decompressobj()
+    out = engine.decompress(blob, limit)
+    if not engine.eof:
+        # `eof` alone, not `eof or unconsumed_tail`: a stream stopped by the
+        # limit leaves both, and a truncated one leaves eof clear with no tail,
+        # so the tail says nothing the first test has not. The two are told
+        # apart for the message only -- to a caller they are one refusal.
+        stopped_early = "is longer than" if engine.unconsumed_tail else "was truncated before"
+        raise zlib.error(f"chunk {stopped_early} the {limit} byte limit")
+    return out
 
 
 def export(known: Machine, state: State, report: Report, now: int) -> None:
@@ -1031,16 +1067,19 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     #: chunk rather than once per day -- tens of thousands of subprocess spawns
     #: instead of hundreds, on precisely the first sync a new machine runs.
     day_keys: dict[str, str | None] = {}
-    #: Likewise for manifests, which cost a subprocess each. One per day rather
-    #: than one per chunk is the whole reason signatures are affordable here:
-    #: over a year of three machines that is ~3.6 s against nearly two minutes.
-    manifests: dict[str, dict[str, Entry]] = {}
-    pending: dict[str, list[bytes]] = {}
-    #: Days whose local log is being replaced rather than appended to, because a
-    #: chunk arrived that subsumes others.
-    replaced: set[str] = set()
+    day = _Day(host_id, "")
 
+    # `iter_chunks` walks day directory by day directory, in order, so a day is
+    # finished the moment the day changes. That is what bounds memory: at most
+    # one day is ever held, rather than a whole host's worth. Holding everything
+    # until the loop ended was the other half of #20, and flushing "whichever
+    # days are safe to write" instead left the compacted ones -- which is every
+    # day of a fully compacted archive -- held anyway.
     for chunk in store.iter_chunks(host_id):
+        if chunk.day != day.day:
+            day.flush(report)
+            day = _Day(host_id, chunk.day)
+
         key = f"{host_id}/{chunk.day}"
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
@@ -1048,10 +1087,12 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         if chunk.name in state.merged.get(key, ()):
             continue
 
-        if chunk.day not in manifests:
-            manifests[chunk.day] = read_manifest(host_id, chunk.day, verify_key)
-        listed = manifests[chunk.day]
-        if chunk.name not in listed:
+        if not day.opened:
+            # Manifests cost a subprocess each. One per day rather than one per
+            # chunk is the whole reason signatures are affordable here: over a
+            # year of three machines that is ~3.6 s against nearly two minutes.
+            day.open(read_manifest(host_id, chunk.day, verify_key))
+        if chunk.name not in day.listed:
             # No signed statement that this host wrote this. Covers a missing,
             # unsigned, mis-signed or mis-addressed manifest as well as a chunk
             # simply absent from a good one -- see `Report.unauthenticated`.
@@ -1075,7 +1116,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # Authenticated before it is decrypted or decompressed, so age, zlib and
         # the parser only ever see bytes one of this user's own machines wrote.
         try:
-            blob = open_chunk(chunk.path, listed[chunk.name].digest)
+            blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
         except (OSError, ValueError):
             report.unauthenticated.add(key)
             continue
@@ -1084,43 +1125,68 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             plaintext = unpack(crypto.decrypt_with_secret(blob, secret))
         except (crypto.AgeError, zlib.error, OSError):
             # Same judgement as an unopenable day key above: a chunk we cannot
-            # consume -- damaged, or written by a woswoar that packs it some
-            # other way -- must not abort the sync. Aborting would block this
-            # machine's own export and every other host's readable chunks, on
-            # this run and every run after it.
+            # consume -- damaged, written by a woswoar that packs it some other
+            # way, or expanding past `MAX_CHUNK_BYTES` -- must not abort the
+            # sync. Aborting would block this machine's own export and every
+            # other host's readable chunks, on this run and every run after it.
             report.unreadable.add(key)
             continue
 
-        if listed[chunk.name].subsumes:
-            # A compacted chunk: the same lines its originals held, under a new
-            # name. Appending it to a day this machine already merged would
-            # duplicate every one of them, and skipping it would lose whatever
-            # arrived after the last sync. It is a complete statement of the
-            # chunks it names, so the day is rewritten rather than added to, and
-            # all three cases -- merged all of them, some, or none -- land on
-            # the same content.
-            #
-            # Marking the day is all it does: what has been accumulated stays,
-            # in chunk-name order, so a chunk that is *not* subsumed and happens
-            # to sort below the compacted one is still written. Replacing the
-            # accumulated blocks instead was tried and drops exactly that chunk.
-            #
-            # The subsumed names are left in the merged set on purpose. They are
-            # already there from when this machine merged the originals, and
-            # that membership is what stops those lines being written twice if
-            # the original files are still visible -- a peer mid-fetch, or a
-            # repo someone put them back into.
-            replaced.add(chunk.day)
-        pending.setdefault(chunk.day, []).append(plaintext)
+        day.add(plaintext, report)
         state.merged.setdefault(key, set()).add(chunk.name)
         report.chunks_merged += 1
 
-    if pending:
-        store.private_dir(store.host_dir(host_id))
-    for day, blocks in pending.items():
-        payload = b"".join(blocks)
-        path = store.log_file(host_id, day)
-        if day in replaced:
+    day.flush(report)
+
+
+class _Day:
+    """One host-day's merged plaintext, on its way to the log file.
+
+    Exists so the two things that decide *when* bytes are written -- the day
+    boundary and `FLUSH_BYTES` -- are in one place rather than interleaved with
+    decryption, and so "this day is being rewritten" is settled once, from the
+    manifest, instead of discovered part way through.
+
+    That last part is not tidiness. A day holding a compacted chunk has to be
+    written in a single atomic replacement, so it must never be flushed early;
+    working that out when the subsuming chunk turns up is too late, because
+    chunks before it may already have gone to the file and the replacement
+    would drop them.
+    """
+
+    def __init__(self, host_id: str, day: str) -> None:
+        self.host_id = host_id
+        self.day = day
+        self.listed: dict[str, Entry] = {}
+        self.opened = False
+        self.rewrite = False
+        self._blocks: list[bytes] = []
+        self._bytes = 0
+
+    def open(self, listed: dict[str, Entry]) -> None:
+        self.listed = listed
+        self.opened = True
+        # A compacted chunk is a complete statement of the chunks it names, so
+        # the day is replaced rather than added to -- which is the only answer
+        # right whether the peer had merged all of them, some, or none.
+        self.rewrite = any(entry.subsumes for entry in listed.values())
+
+    def add(self, plaintext: bytes, report: Report) -> None:
+        self._blocks.append(plaintext)
+        self._bytes += len(plaintext)
+        if self._bytes > FLUSH_BYTES and not self.rewrite:
+            self._write(report, rewrite=False)
+
+    def flush(self, report: Report) -> None:
+        if self._blocks:
+            self._write(report, rewrite=self.rewrite)
+
+    def _write(self, report: Report, rewrite: bool) -> None:
+        payload = b"".join(self._blocks)
+        self._blocks = []
+        self._bytes = 0
+        path = store.log_file(self.host_id, self.day)
+        if rewrite:
             # One atomic replacement, not unlink-then-append: search runs
             # outside the sync lock and reads these files, so a truncate leaves
             # a window where a day looks empty or half-written, and a crash in
@@ -1134,9 +1200,17 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         else:
             # Another machine's history is no less private than this one's, and
             # it lands in the same tree, so it is created with the same mode.
+            # Both write paths make the directory themselves.
             with store.private_append(path, binary=True) as handle:
                 handle.write(payload)
             report.lines_imported += payload.count(b"\n")
+
+
+#: How much merged plaintext to hold before writing it out. Not a correctness
+#: bound -- `MAX_CHUNK_BYTES` is -- just the point at which holding more stops
+#: buying fewer file opens. One open per day was the old behaviour and is still
+#: what happens for any host with less than this waiting.
+FLUSH_BYTES = 8 * 1024 * 1024
 
 
 def _line_count(path: Path) -> int:
@@ -1823,7 +1897,12 @@ def compact(before: str) -> tuple[int, int]:
                     )
                     for c in chunks
                 )
-            except ValueError as exc:
+            except (ValueError, zlib.error) as exc:
+                # `zlib.error` as well as `ValueError`, which it is not a
+                # subclass of: `open_chunk` raises the second and `unpack` the
+                # first, so catching only one let a chunk that will not
+                # decompress -- damaged, or past `MAX_CHUNK_BYTES` -- escape as
+                # a bare zlib traceback instead of the guided refusal.
                 raise SyncError(f"refusing to compact {day}: {exc}") from exc
 
             merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))

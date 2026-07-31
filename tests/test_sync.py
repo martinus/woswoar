@@ -11,6 +11,7 @@ import io
 import os
 import subprocess
 import tempfile
+import tracemalloc
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
@@ -110,7 +111,21 @@ class Fake:
 @requires_git
 class SyncTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="woswoar-sync-")
+        # `ignore_cleanup_errors` because git may still be finishing
+        # background maintenance in the repo when the directory goes: it
+        # creates a file under `.git` between the walk and the rmdir, and
+        # `rmtree` fails with "Directory not empty". Measured at about one
+        # run in forty, on this change and on main alike, so it is a
+        # teardown race rather than anything under test -- and a suite that
+        # reddens at random teaches people to re-run it rather than read it.
+        # `ignore_cleanup_errors` because git may still be finishing background
+        # maintenance in the repo when the directory goes: it creates a file
+        # under `.git` between the walk and the rmdir, and `rmtree` fails with
+        # "Directory not empty". Measured at about one run in forty, on this
+        # branch and on main alike, so it is a teardown race rather than
+        # anything under test -- and a suite that reddens at random teaches
+        # people to re-run it rather than read it.
+        self._tmp = tempfile.TemporaryDirectory(prefix="woswoar-sync-", ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
@@ -134,6 +149,21 @@ class SyncTestCase(unittest.TestCase):
     def git_in_repo(self, fake: Fake, *args: str) -> str:
         with fake.active():
             return sync.git(*args)
+
+    def history_across_days(self, days: int, per_day: int) -> tuple[Fake, Fake]:
+        """alpha with `days` days of `per_day` commands, each its own chunk,
+        and a beta that has been granted but has merged nothing yet."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for day in range(days):
+                base = 1_700_000_000 + day * 100_000
+                for i in range(per_day):
+                    alpha.record(f"2023-11-{14 + day:02d}", base + i, f"day {day} command {i}")
+                    sync.run(now=base + 500 + i)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        return alpha, beta
 
     def accept_everyone(self, fake: Fake) -> None:
         """Accept every machine publishing here, as a human at ``fake`` would.
@@ -488,7 +518,8 @@ class TestChunkPayload(unittest.TestCase):
         # Loudly, rather than decoding into garbage that then gets appended to
         # a log file and cached. `_merge_host` turns this into an unreadable
         # chunk rather than letting it abort the sync.
-        for blob in (b"\x7fanything", b"", b"1700000000\ts1\t~\t0\t5\tls\n"):
+        truncated = zlib.compress(b"x" * 5000)[:20]
+        for blob in (b"\x7fanything", b"", b"1700000000\ts1\t~\t0\t5\tls\n", truncated):
             with self.assertRaises(zlib.error):
                 sync.unpack(blob)
 
@@ -1784,17 +1815,6 @@ class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
     (measured 4/10 before this was fixed).
     """
 
-    def fleet(self) -> tuple[Fake, Fake]:
-        alpha = self.machine("alpha")
-        with alpha.active():
-            for i in range(3):
-                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
-                sync.run(now=1_700_000_500 + i)
-        beta = self.machine("beta")
-        with alpha.active():
-            sync.grant()
-        return alpha, beta
-
     def merged_entries(self, beta: Fake) -> int:
         with beta.active():
             sync.run()
@@ -1804,7 +1824,7 @@ class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
         # Counted as *entries*, not unique commands: `commands()` is a set, and
         # a set is exactly what hides this. The test that missed this bug for
         # three releases compared sets.
-        alpha, beta = self.fleet()
+        alpha, beta = self.history_across_days(days=1, per_day=3)
         before = self.merged_entries(beta)
         self.assertEqual(before, 3)
 
@@ -1860,7 +1880,7 @@ class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
         a chunk written afterwards with an earlier timestamp sorts *below* it and
         is merged first. Discarding what had been accumulated would lose it.
         """
-        alpha, beta = self.fleet()
+        alpha, beta = self.history_across_days(days=1, per_day=3)
         self.assertEqual(self.merged_entries(beta), 3)
 
         with alpha.active():
@@ -1946,6 +1966,150 @@ class TestUpgradingFromAHighWaterMark(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_002, "something else")
             sync.run(now=1_700_000_700)
             self.assertNotEqual(store.state_file().stat().st_mtime_ns, before)
+
+
+class TestADecompressionBomb(SyncTestCase):
+    """One machine must not decide how much memory the others spend.
+
+    deflate reaches about 1030:1, so an unbounded decompress turned a 204 KB
+    commit into 200 MiB of log and 420 MiB of RSS -- on a timer that fires every
+    minute and asks nobody. Signing (#38) means the chunk has to come from a
+    machine you accepted, which is why this is not a P0; it is still one
+    compromised machine against every other one.
+    """
+
+    def test_a_bomb_is_refused_rather_than_expanded(self) -> None:
+        bomb = zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9)
+        self.assertLess(len(bomb), 1024 * 1024, "the fixture should be small to be a bomb")
+        with self.assertRaises(zlib.error):
+            sync.unpack(bomb)
+
+    def test_the_boundary_is_where_it_says_it_is(self) -> None:
+        """Exactly at the cap is legitimate; one byte past it is not.
+
+        An off-by-one here either refuses a chunk a machine legitimately sent or
+        leaves the last doubling unbounded, and neither shows up in a test that
+        only tries a 200 MiB bomb.
+        """
+        limit = sync.MAX_CHUNK_BYTES
+        self.assertEqual(len(sync.unpack(zlib.compress(b"x" * limit, 9))), limit)
+        with self.assertRaises(zlib.error):
+            sync.unpack(zlib.compress(b"x" * (limit + 1), 9))
+
+    def test_the_refusal_costs_a_bounded_allocation(self) -> None:
+        """`decompressobj` stops at the limit; `decompress` allocates first.
+
+        Refusing *after* materialising the payload would leave the memory
+        exhaustion in place and merely decline to write the file, so this
+        measures what `sync.unpack` actually allocates rather than asserting a
+        property of the standard library -- which is what it did first, and
+        which passed perfectly well with the fix reverted.
+        """
+        bomb = zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 4), 9)
+        tracemalloc.start()
+        try:
+            with self.assertRaises(zlib.error):
+                sync.unpack(bomb)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # The bomb expands to four times the cap, so unbounded this peaks at
+        # 256 MiB; bounded it peaks around 128 MiB -- the 64 MiB buffer plus the
+        # doubling zlib does while filling it. Three times the cap sits in the
+        # gap with room on both sides, which a tighter bound did not.
+        self.assertLess(peak, sync.MAX_CHUNK_BYTES * 3)
+
+    def test_a_bomb_in_a_real_chunk_is_reported_and_merges_nothing(self) -> None:
+        """Through the whole path: it is refused like any other unusable chunk,
+        the sync completes, and everything else still merges."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "an ordinary command")
+            sync.run(now=1_700_000_500)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+
+            # A chunk alpha signs, holding a payload that unpacks far too big.
+            day = "2023-11-14"
+            pub = store.day_key_public(alpha.id, day).read_text(encoding="utf-8").strip()
+            sealed = crypto.encrypt_to(zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9), pub)
+            path = store.chunk_dir(alpha.id, day) / "1900000000-ffffff.age"
+            path.write_bytes(sealed)
+            listed = sync.read_manifest(alpha.id, day, sync.signing_public())
+            listed[path.name] = sync.Entry(sync.digest_of(sealed))
+            sync.write_manifest(store.machine(), day, listed)
+            sync._commit()
+            sync._push()
+
+        with beta.active():
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{day}", report.unreadable)
+            self.assertEqual(beta.commands(), {"an ordinary command"})
+            log = store.log_file(alpha.id, day)
+            self.assertLess(log.stat().st_size, 1024, "the bomb reached the log file")
+
+    def test_a_real_import_sized_chunk_still_merges(self) -> None:
+        """The cap has to sit above what a legitimate machine actually sends.
+
+        A whole bash_history imported at once measures about 4.4 MiB, so this
+        drives a chunk of that size through the real path.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(20_000):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i} " + "x" * 60)
+            report = sync.run(now=1_700_000_500)
+            self.assertEqual(report.lines_exported, 20_000)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            self.assertEqual(sync.run().lines_imported, 20_000)
+
+    def test_a_hosts_plaintext_is_not_all_held_before_anything_is_written(self) -> None:
+        """The other half of #20: peak memory grew with the chunks waiting.
+
+        Observed through how often the day is written: below the threshold it is
+        one write per day, as it always was; above it, the merge writes as it
+        goes instead of holding everything until the loop ends.
+        """
+        _alpha, beta = self.history_across_days(days=2, per_day=6)
+
+        original = sync._Day._write
+        with (
+            beta.active(),
+            mock.patch.object(sync, "FLUSH_BYTES", 1),
+            mock.patch.object(sync._Day, "_write", autospec=True, side_effect=original) as spy,
+        ):
+            sync.run()
+            writes = spy.call_count
+        self.assertGreater(writes, 2, "a whole host was held before anything was written")
+
+    def test_flushing_part_way_through_loses_and_duplicates_nothing(self) -> None:
+        """And what it writes is still exactly right.
+
+        Driven with the threshold set absurdly low, so the flush fires between
+        almost every chunk -- across days, and with a day that is being
+        *rewritten* rather than appended to in the mix. That day must be exempt:
+        a peer that already merged it and then flushed the compacted chunk early
+        would append a copy of everything it already had.
+        """
+        alpha, beta = self.history_across_days(days=2, per_day=6)
+        with beta.active():
+            sync.run()
+            before = len(cache.load_entries())
+
+        with alpha.active():
+            sync.compact(before="2023-11-15")
+            sync.run(now=1_700_200_000)
+
+        with beta.active(), mock.patch.object(sync, "FLUSH_BYTES", 1):
+            sync.run()
+            entries = cache.load_entries()
+
+        self.assertEqual(len(entries), before, "a flush duplicated a rewritten day")
+        self.assertEqual(len({e.cmd for e in entries}), before)
 
 
 if __name__ == "__main__":

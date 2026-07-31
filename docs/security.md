@@ -212,6 +212,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
 | Forged history is refused | a chunk sealed to a host's published day key, but absent from that host's signed manifest, is rejected and reported |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
+| A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
 | A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
 | Nor under another machine's name | the same, written into a peer's host directory, where that peer never looks |
 | A manifest cannot be moved | a real, correctly signed manifest copied to another day is refused; host and day are inside the signed bytes |
