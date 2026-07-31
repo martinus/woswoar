@@ -289,6 +289,34 @@ class TestCoexistence(ShellHookTestCase):
         self.assertIn("PREEXEC[echo hello]", out)
         self.assertEqual(self.commands(), [], "the scratch file survived the sabotage")
 
+    def test_the_boot_entry_removes_itself_from_every_shape(self) -> None:
+        """It has done its job after the first prompt, and it is not free.
+
+        `__woswoar_unboot` matches the boot text exactly, once per branch of the
+        PROMPT_COMMAND assembly, so each branch can miss on its own. What a miss
+        costs is measured in the comment above `__woswoar_unboot` -- ~12us of
+        re-testing a flag on every command -- and until #57 that was the whole
+        price. It is now also the difference between forking once at the first
+        prompt and forking at every one, which is why the shapes are enumerated
+        rather than represented by the bare shell.
+        """
+        shapes = {
+            "bare": "",
+            "string": "_other() { :; }\nPROMPT_COMMAND=_other",
+            "array": "_other() { :; }\nPROMPT_COMMAND=(_other)",
+        }
+        for label, before in shapes.items():
+            with self.subTest(shape=label):
+                out = self.run_shell(
+                    'echo one\nprintf "PC:%s\\n" "${PROMPT_COMMAND[*]}"\n', before=before
+                )
+                # Searched over the whole output rather than one captured line:
+                # the string form joins its entries with newlines, so the value
+                # is not a line. Nothing else the shell prints or echoes back
+                # contains this name, and `PC:` proves the printf itself ran.
+                self.assertIn("PC:", out)
+                self.assertNotIn("__woswoar_wire", out)
+
     def test_a_trap_that_could_not_be_read_installs_nothing(self) -> None:
         """An unreadable prior trap must not be mistaken for an absent one.
 
