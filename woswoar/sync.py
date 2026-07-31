@@ -33,6 +33,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1325,76 +1326,90 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     #: chunk rather than once per day -- tens of thousands of subprocess spawns
     #: instead of hundreds, on precisely the first sync a new machine runs.
     day_keys: dict[str, str | None] = {}
-    day = _Day(host_id, "")
 
-    # `iter_chunks` walks day directory by day directory, in order, so a day is
-    # finished the moment the day changes. That is what bounds memory: at most
-    # one day is ever held, rather than a whole host's worth. Holding everything
-    # until the loop ended was the other half of #20, and flushing "whichever
-    # days are safe to write" instead left the compacted ones -- which is every
-    # day of a fully compacted archive -- held anyway.
-    for chunk in store.iter_chunks(host_id):
-        if chunk.day != day.day:
-            day.flush(report)
-            day = _Day(host_id, chunk.day)
-
-        key = f"{host_id}/{chunk.day}"
+    # Grouped by day rather than streamed chunk by chunk, because whether a day
+    # is being *rewritten* has to be known before deciding which of its chunks
+    # to read -- and that answer is in the manifest. `iter_chunks` yields a
+    # day's chunks contiguously, which is what makes one group one day.
+    #
+    # A rewrite replaces the day's log file outright, so it has to be rebuilt
+    # from every chunk the manifest lists, not from the ones this run happens to
+    # find new. Skipping the already-merged ones first, as this used to, meant a
+    # single chunk appended after a compaction rewrote the day down to just that
+    # chunk and discarded everything before it, on every peer, silently. That is
+    # reachable by `compact` and then `import`, which writes into past days.
+    #
+    # Laziness is kept where it pays: a day with nothing new never reads its
+    # manifest, and a manifest costs a subprocess. Over a year of three machines
+    # that is the difference between ~3.6s and nearly two minutes.
+    for chunk_day, group in groupby(store.iter_chunks(host_id), key=lambda c: c.day):
+        chunks = list(group)
+        key = f"{host_id}/{chunk_day}"
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
         # empty record that is then written out on every sync forever.
-        if chunk.name in state.merged.get(key, ()):
+        # A copy, not the live set: `state.merged` is updated as each chunk is
+        # merged below, and aliasing it made "was this already merged" answer
+        # yes for a chunk this very run had just added.
+        already = frozenset(state.merged.get(key, ()))
+        fresh = [chunk for chunk in chunks if chunk.name not in already]
+        if not fresh:
             continue
 
-        if not day.opened:
-            # Manifests cost a subprocess each. One per day rather than one per
-            # chunk is the whole reason signatures are affordable here: over a
-            # year of three machines that is ~3.6 s against nearly two minutes.
-            day.open(read_manifest(host_id, chunk.day, verify_key))
-        if chunk.name not in day.listed:
-            # No signed statement that this host wrote this. Covers a missing,
-            # unsigned, mis-signed or mis-addressed manifest as well as a chunk
-            # simply absent from a good one -- see `Report.unauthenticated`.
-            report.unauthenticated.add(key)
-            continue
+        day = _Day(host_id, chunk_day, read_manifest(host_id, chunk_day, verify_key))
+        pending = chunks if day.rewrite else fresh
 
-        if chunk.day not in day_keys:
+        for chunk in pending:
+            if chunk.name not in day.listed:
+                # No signed statement that this host wrote this. Covers a
+                # missing, unsigned, mis-signed or mis-addressed manifest as
+                # well as a chunk simply absent from a good one -- see
+                # `Report.unauthenticated`.
+                report.unauthenticated.add(key)
+                continue
+
+            if chunk_day not in day_keys:
+                try:
+                    day_keys[chunk_day] = open_day_key(known, host_id, chunk_day)
+                except (crypto.AgeError, SyncError):
+                    # Sealed before this machine was enrolled, and no one has
+                    # run `grant` yet. Skip it without recording it as merged,
+                    # so a later sync picks it up -- and above all without
+                    # aborting, or one unreadable day would block this machine's
+                    # own export too.
+                    day_keys[chunk_day] = None
+            secret = day_keys[chunk_day]
+            if secret is None:
+                report.unreadable.add(key)
+                continue
+
+            # Authenticated before it is decrypted or decompressed, so age, zlib
+            # and the parser only ever see bytes one of this user's own machines
+            # wrote.
             try:
-                day_keys[chunk.day] = open_day_key(known, host_id, chunk.day)
-            except (crypto.AgeError, SyncError):
-                # Sealed before this machine was enrolled, and no one has run
-                # `grant` yet. Skip it without recording it as merged, so a
-                # later sync picks it up -- and above all without aborting, or
-                # one unreadable day would block this machine's own export too.
-                day_keys[chunk.day] = None
-        secret = day_keys[chunk.day]
-        if secret is None:
-            report.unreadable.add(key)
-            continue
+                blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
+            except (OSError, ValueError):
+                report.unauthenticated.add(key)
+                continue
 
-        # Authenticated before it is decrypted or decompressed, so age, zlib and
-        # the parser only ever see bytes one of this user's own machines wrote.
-        try:
-            blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
-        except (OSError, ValueError):
-            report.unauthenticated.add(key)
-            continue
+            try:
+                plaintext = unpack(crypto.decrypt_with_secret(blob, secret))
+            except (crypto.AgeError, zlib.error, OSError):
+                # Same judgement as an unopenable day key above: a chunk we
+                # cannot consume -- damaged, written by a woswoar that packs it
+                # some other way, or expanding past `MAX_CHUNK_BYTES` -- must not
+                # abort the sync. Aborting would block this machine's own export
+                # and every other host's readable chunks, on this run and every
+                # run after it.
+                report.unreadable.add(key)
+                continue
 
-        try:
-            plaintext = unpack(crypto.decrypt_with_secret(blob, secret))
-        except (crypto.AgeError, zlib.error, OSError):
-            # Same judgement as an unopenable day key above: a chunk we cannot
-            # consume -- damaged, written by a woswoar that packs it some other
-            # way, or expanding past `MAX_CHUNK_BYTES` -- must not abort the
-            # sync. Aborting would block this machine's own export and every
-            # other host's readable chunks, on this run and every run after it.
-            report.unreadable.add(key)
-            continue
+            day.add(plaintext, report)
+            state.merged.setdefault(key, set()).add(chunk.name)
+            if chunk.name not in already:
+                report.chunks_merged += 1
 
-        day.add(plaintext, report)
-        state.merged.setdefault(key, set()).add(chunk.name)
-        report.chunks_merged += 1
-
-    day.flush(report)
+        day.flush(report)
 
 
 class _Day:
@@ -1412,22 +1427,16 @@ class _Day:
     would drop them.
     """
 
-    def __init__(self, host_id: str, day: str) -> None:
+    def __init__(self, host_id: str, day: str, listed: dict[str, Entry]) -> None:
         self.host_id = host_id
         self.day = day
-        self.listed: dict[str, Entry] = {}
-        self.opened = False
-        self.rewrite = False
-        self._blocks: list[bytes] = []
-        self._bytes = 0
-
-    def open(self, listed: dict[str, Entry]) -> None:
         self.listed = listed
-        self.opened = True
         # A compacted chunk is a complete statement of the chunks it names, so
         # the day is replaced rather than added to -- which is the only answer
         # right whether the peer had merged all of them, some, or none.
         self.rewrite = any(entry.subsumes for entry in listed.values())
+        self._blocks: list[bytes] = []
+        self._bytes = 0
 
     def add(self, plaintext: bytes, report: Report) -> None:
         self._blocks.append(plaintext)
@@ -2180,12 +2189,14 @@ def compact(before: str) -> tuple[int, int, int]:
             # unlink the smaller ones that were fine -- leaving a day no peer
             # can read and no way to re-export it.
             #
-            # Skipped rather than merged in batches. Batching was tried and
-            # backed out: it leaves some of a day's chunks unmerged, and a peer
-            # rebuilding a compacted day drops every chunk it had already
-            # merged (issue #67), so partial compaction turns a space
-            # optimisation into history loss. A day this large stays as the
-            # small chunks it already is, which is correct if untidy.
+            # Skipped rather than merged in batches. Batching was backed out
+            # when a peer rebuilding a compacted day still dropped every chunk
+            # it had already merged; that was #67 and is fixed, so batching is
+            # safe again and would compact these days properly -- see #70. It
+            # is not done here because the batch budget then bounds peak merge
+            # memory, which wants measuring rather than assuming. A day this
+            # large stays as the small chunks it already is, which is correct
+            # if untidy.
             plain = b"".join(plaintexts)
             if len(plain) > MAX_EXPORT_BYTES:
                 skipped += 1

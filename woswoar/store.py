@@ -545,7 +545,13 @@ class Chunk(NamedTuple):
 
 
 def iter_chunks(machine_id: str) -> Iterator[Chunk]:
-    """Every sealed chunk belonging to one host, oldest first."""
+    """Every sealed chunk belonging to one host, oldest first.
+
+    A day's chunks are contiguous, and days come in order: the outer loop walks
+    one day directory at a time. `sync._merge_host` groups on that -- it holds
+    one day at a time to bound memory, and a day appearing twice would make the
+    second group overwrite the log file the first had just written.
+    """
     root = repo_host_dir(machine_id)
     if not root.is_dir():
         return
