@@ -207,6 +207,8 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | The hook forks nothing | recording runs under `strace`; the clone/fork/execve count must be **0** |
 | Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
 | History is never rewritten | `git log --diff-filter=MD` over chunk files must be **empty** |
+| Compaction does not duplicate history | a peer that already merged a day, and one that merged only part of it, both end up holding each command exactly once |
+| A failed chunk is retried, not dropped | an earlier chunk that fails while a later one succeeds is merged once it is repaired |
 | age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
 | Forged history is refused | a chunk sealed to a host's published day key, but absent from that host's signed manifest, is rejected and reported |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |

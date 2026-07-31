@@ -303,8 +303,20 @@ class State:
 
     #: log relpath -> plaintext bytes already sealed into a chunk.
     exported: dict[str, int] = field(default_factory=dict)
-    #: "<host>/<day>" -> newest chunk filename already merged into logs/.
-    merged: dict[str, str] = field(default_factory=dict)
+    #: "<host>/<day>" -> the chunk filenames already merged into logs/.
+    #:
+    #: A set, not a high-water mark. A single "highest name seen" cannot say
+    #: "all of these except that one", and chunk names are only loosely ordered:
+    #: two written in the same wall-clock second share a timestamp and differ by
+    #: a random suffix. So a mark got it wrong in both directions -- a chunk that
+    #: failed while a later-named one succeeded was skipped for good, and a
+    #: chunk that failed while being the newest was re-read every minute forever.
+    #:
+    #: A set here and a sorted list in the file. JSON has no set, and converting
+    #: at that boundary is the only place that knows about the file -- `merge`
+    #: kept its own mirror to get a fast membership test, which was one more
+    #: thing to keep in step and rebuilt itself once per chunk.
+    merged: dict[str, set[str]] = field(default_factory=dict)
     #: Keys a human at this machine last approved in `grant`. Local like the
     #: rest of State, and here that is the whole point: "which machines are new
     #: since *you* last agreed to this?" is a question only this machine can
@@ -317,6 +329,9 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
+    #: What was on disk when this was loaded, so `save` can tell whether there
+    #: is anything to write. Not part of the state itself.
+    _loaded: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def load(cls) -> State:
@@ -327,9 +342,17 @@ class State:
         signers = raw.get("signers", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
-        return cls(
+        state = cls(
             exported={str(k): int(v) for k, v in exported.items()},
-            merged={str(k): str(v) for k, v in merged.items()},
+            # Guarded per value, not just on `merged` being a dict. A state
+            # file from before this became a set holds one *string* per day, and
+            # a string is iterable: without this, every day's record turns into
+            # its own characters, every chunk looks unmerged, and the first sync
+            # after upgrading duplicates every peer's history wholesale -- which
+            # is the bug this change exists to fix.
+            merged={
+                str(k): {str(name) for name in v} for k, v in merged.items() if isinstance(v, list)
+            },
             # A malformed list costs the prompt its memory, which shows every
             # machine as new -- the safe direction to be wrong in.
             granted=[str(k) for k in granted] if isinstance(granted, list) else [],
@@ -340,17 +363,38 @@ class State:
             if isinstance(signers, dict)
             else {},
         )
+        state._loaded = state.as_json()
+        return state
+
+    def as_json(self) -> dict[str, object]:
+        """This state as the file holds it.
+
+        Every container is rebuilt rather than shared, so the snapshot `save`
+        compares against cannot be mutated from underneath by whoever holds the
+        `State`.
+        """
+        return {
+            "exported": dict(self.exported),
+            "merged": {key: sorted(names) for key, names in self.merged.items()},
+            "granted": list(self.granted),
+            "signers": dict(self.signers),
+        }
 
     def save(self) -> None:
-        store.save_json(
-            store.state_file(),
-            {
-                "exported": self.exported,
-                "merged": self.merged,
-                "granted": self.granted,
-                "signers": self.signers,
-            },
-        )
+        """Write, unless nothing changed since it was loaded.
+
+        Recording every merged chunk name rather than a high-water mark made
+        this file two orders of magnitude bigger -- about 1 MiB at 35k chunks --
+        and `run` saves at the end of every sync, on a one-minute timer. Writing
+        a megabyte a minute to say nothing happened is a lot of disk for no
+        information, and an idle sync is the overwhelmingly common one. `cache`
+        makes the same call for the same reason.
+        """
+        current = self.as_json()
+        if current == self._loaded:
+            return
+        store.save_json(store.state_file(), current)
+        self._loaded = current
 
 
 @contextmanager
@@ -719,7 +763,20 @@ def _manifest_header(host_id: str, day: str) -> str:
     return f"{_MANIFEST_MAGIC} {host_id} {day}"
 
 
-def _manifest_body(host_id: str, day: str, digests: dict[str, str]) -> str:
+class Entry(NamedTuple):
+    """One line of a manifest: a chunk, and what it replaced.
+
+    ``subsumes`` is empty for an ordinary chunk and holds the names `compact`
+    merged into this one otherwise. It is in the *signed* bytes because it
+    decides what a peer does with the chunk, and anything that decides that has
+    to be something only the publishing machine can say.
+    """
+
+    digest: str
+    subsumes: tuple[str, ...] = ()
+
+
+def _manifest_body(host_id: str, day: str, entries: dict[str, Entry]) -> str:
     """The signed part of a manifest: what this host claims it wrote that day.
 
     The header names the host and the day, so a genuine manifest cannot be
@@ -731,19 +788,21 @@ def _manifest_body(host_id: str, day: str, digests: dict[str, str]) -> str:
     a sync that adds nothing rewrites nothing.
     """
     lines = [_manifest_header(host_id, day)]
-    lines += [f"{name} {digests[name]}" for name in sorted(digests)]
+    for name in sorted(entries):
+        entry = entries[name]
+        lines.append(" ".join([name, entry.digest, *entry.subsumes]))
     return "\n".join(lines) + "\n"
 
 
-def write_manifest(known: Machine, day: str, digests: dict[str, str]) -> None:
+def write_manifest(known: Machine, day: str, entries: dict[str, Entry]) -> None:
     """Sign this host's chunk list for ``day`` and write it."""
-    body = _manifest_body(known.id, day, digests)
+    body = _manifest_body(known.id, day, entries)
     signature = crypto.sign(body.encode("utf-8"), store.signing_key_file(), _MANIFEST_MAGIC)
     blob = signature.decode("utf-8").strip() + _MANIFEST_SEPARATOR + body
     store.write_atomic(store.day_manifest(known.id, day), blob.encode("utf-8"))
 
 
-def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, str]:
+def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, Entry]:
     """The digests ``host_id`` signed for ``day``, or ``{}`` if it did not.
 
     Empty rather than an exception for an unsigned, malformed, mis-signed or
@@ -773,12 +832,13 @@ def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, str]:
     if not lines or lines[0] != _manifest_header(host_id, day):
         return {}
 
-    digests: dict[str, str] = {}
+    entries: dict[str, Entry] = {}
     for line in lines[1:]:
-        name, _, value = line.partition(" ")
-        if name and value:
-            digests[name] = value
-    return digests
+        name, _, rest = line.partition(" ")
+        digest, _, subsumed = rest.partition(" ")
+        if name and digest:
+            entries[name] = Entry(digest, tuple(subsumed.split()))
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +937,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             sealed = crypto.encrypt_to(pack(data), day_public_key(known, day))
             written = store.new_chunk(known.id, day, now)
             store.write_atomic(written, sealed)
-            listed[written.name] = digest_of(sealed)
+            listed[written.name] = Entry(digest_of(sealed))
 
             state.exported[relpath] = new_offset
             report.chunks_written += 1
@@ -974,14 +1034,18 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     #: Likewise for manifests, which cost a subprocess each. One per day rather
     #: than one per chunk is the whole reason signatures are affordable here:
     #: over a year of three machines that is ~3.6 s against nearly two minutes.
-    manifests: dict[str, dict[str, str]] = {}
+    manifests: dict[str, dict[str, Entry]] = {}
     pending: dict[str, list[bytes]] = {}
+    #: Days whose local log is being replaced rather than appended to, because a
+    #: chunk arrived that subsumes others.
+    replaced: set[str] = set()
 
     for chunk in store.iter_chunks(host_id):
         key = f"{host_id}/{chunk.day}"
-        # Chunk names are zero-padded timestamps, so "newer than the watermark"
-        # is a plain string comparison.
-        if chunk.name <= state.merged.get(key, ""):
+        # `get`, not `setdefault`: a day this machine only ever *looks* at --
+        # never granted, or a manifest it cannot verify -- must not gain an
+        # empty record that is then written out on every sync forever.
+        if chunk.name in state.merged.get(key, ()):
             continue
 
         if chunk.day not in manifests:
@@ -999,7 +1063,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 day_keys[chunk.day] = open_day_key(known, host_id, chunk.day)
             except (crypto.AgeError, SyncError):
                 # Sealed before this machine was enrolled, and no one has run
-                # `grant` yet. Skip it without advancing the watermark so a
+                # `grant` yet. Skip it without recording it as merged, so a
                 # later sync picks it up -- and above all without aborting, or
                 # one unreadable day would block this machine's own export too.
                 day_keys[chunk.day] = None
@@ -1011,7 +1075,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # Authenticated before it is decrypted or decompressed, so age, zlib and
         # the parser only ever see bytes one of this user's own machines wrote.
         try:
-            blob = open_chunk(chunk.path, listed[chunk.name])
+            blob = open_chunk(chunk.path, listed[chunk.name].digest)
         except (OSError, ValueError):
             report.unauthenticated.add(key)
             continue
@@ -1027,19 +1091,59 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             report.unreadable.add(key)
             continue
 
+        if listed[chunk.name].subsumes:
+            # A compacted chunk: the same lines its originals held, under a new
+            # name. Appending it to a day this machine already merged would
+            # duplicate every one of them, and skipping it would lose whatever
+            # arrived after the last sync. It is a complete statement of the
+            # chunks it names, so the day is rewritten rather than added to, and
+            # all three cases -- merged all of them, some, or none -- land on
+            # the same content.
+            #
+            # Marking the day is all it does: what has been accumulated stays,
+            # in chunk-name order, so a chunk that is *not* subsumed and happens
+            # to sort below the compacted one is still written. Replacing the
+            # accumulated blocks instead was tried and drops exactly that chunk.
+            #
+            # The subsumed names are left in the merged set on purpose. They are
+            # already there from when this machine merged the originals, and
+            # that membership is what stops those lines being written twice if
+            # the original files are still visible -- a peer mid-fetch, or a
+            # repo someone put them back into.
+            replaced.add(chunk.day)
         pending.setdefault(chunk.day, []).append(plaintext)
-        state.merged[key] = chunk.name
+        state.merged.setdefault(key, set()).add(chunk.name)
         report.chunks_merged += 1
 
     if pending:
         store.private_dir(store.host_dir(host_id))
     for day, blocks in pending.items():
         payload = b"".join(blocks)
-        # Another machine's history is no less private than this one's, and it
-        # lands in the same tree, so it is created with the same mode.
-        with store.private_append(store.log_file(host_id, day), binary=True) as handle:
-            handle.write(payload)
-        report.lines_imported += payload.count(b"\n")
+        path = store.log_file(host_id, day)
+        if day in replaced:
+            # One atomic replacement, not unlink-then-append: search runs
+            # outside the sync lock and reads these files, so a truncate leaves
+            # a window where a day looks empty or half-written, and a crash in
+            # it loses the day silently. `write_atomic` also owns the 0600.
+            before = _line_count(path)
+            store.write_atomic(path, payload)
+            # Only the growth. A peer that already held the whole day and then
+            # received its compaction gained nothing, and saying it merged five
+            # thousand lines would be a lie in the reassuring direction.
+            report.lines_imported += max(0, payload.count(b"\n") - before)
+        else:
+            # Another machine's history is no less private than this one's, and
+            # it lands in the same tree, so it is created with the same mode.
+            with store.private_append(path, binary=True) as handle:
+                handle.write(payload)
+            report.lines_imported += payload.count(b"\n")
+
+
+def _line_count(path: Path) -> int:
+    try:
+        return path.read_bytes().count(b"\n")
+    except OSError:
+        return 0
 
 
 def _merge_name(known: Machine, host_id: str) -> None:
@@ -1712,7 +1816,11 @@ def compact(before: str) -> tuple[int, int]:
                 )
             try:
                 plain = b"".join(
-                    unpack(crypto.decrypt_with_secret(open_chunk(c.path, listed[c.name]), secret))
+                    unpack(
+                        crypto.decrypt_with_secret(
+                            open_chunk(c.path, listed[c.name].digest), secret
+                        )
+                    )
                     for c in chunks
                 )
             except ValueError as exc:
@@ -1724,7 +1832,12 @@ def compact(before: str) -> tuple[int, int]:
             for chunk in chunks:
                 chunk.path.unlink()
                 del listed[chunk.name]
-            listed[merged.name] = digest_of(sealed)
+            # What it replaced, recorded and signed. A peer that already merged
+            # any of those must not merge this as if it were new history, and it
+            # cannot work that out from the bytes -- the lines are the same ones.
+            listed[merged.name] = Entry(
+                digest_of(sealed), tuple(sorted(chunk.name for chunk in chunks))
+            )
             write_manifest(known, day, listed)
             days += 1
             replaced += len(chunks)

@@ -720,7 +720,7 @@ happens on a timer where nothing is waiting for it.
 2. **Fetch and rebase first.**
 3. Seal each own log file's unsealed tail into a new chunk; commit.
 4. Push, retrying once after a fetch/rebase if someone else pushed meanwhile.
-5. For each other host, decrypt chunks newer than the merge watermark and append
+5. For each other host, decrypt chunks it has not already merged and append
    the plaintext to `logs/`.
 
 > Step 2 has to come before step 3, and this was learned the hard way. Creating

@@ -505,8 +505,11 @@ def chunk_dir(machine_id: str, day: str) -> Path:
 def new_chunk(machine_id: str, day: str, ts: int) -> Path:
     """A chunk path that has never existed before.
 
-    Zero-padded seconds sort chronologically as strings, which is what lets the
-    merge watermark be a plain string comparison.
+    Zero-padded seconds sort chronologically as strings, so a day's chunks are
+    walked oldest-first. That ordering is a convenience, not a guarantee: two
+    chunks written in the same second differ only by the random suffix, which is
+    why what a machine has merged is recorded as a *set* of names rather than a
+    high-water mark.
 
     Uniqueness is a guarantee, not a probability. A collision would silently
     overwrite an already-sealed chunk, destroying committed history in a design
@@ -525,7 +528,7 @@ def new_chunk(machine_id: str, day: str, ts: int) -> Path:
 
 class Chunk(NamedTuple):
     day: str
-    #: Filename only. Sorts chronologically, and is what the watermark stores.
+    #: Filename only. Sorts chronologically, and is what `State.merged` records.
     name: str
     path: Path
 
