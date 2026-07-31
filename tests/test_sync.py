@@ -2254,5 +2254,220 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         self.assertNotIn(sync._LABEL_SEP, written)
 
 
+class TestAnOrphanedDayKey(SyncTestCase):
+    """Issue #42: a public day key whose sealed half has gone.
+
+    `sync.orphaned_day_key` explains the state. What these pin is that it is
+    reachable by a stranger rather than only by bad luck, and that reaching it
+    costs the day's future history rather than passing unnoticed.
+    """
+
+    def test_a_peer_can_delete_another_machines_sealed_key(self) -> None:
+        """The reachability the priority rests on, through a real bare repo."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "ours")
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        self.accept_everyone(beta)
+
+        with beta.active():
+            sync.run()
+            victim = store.day_key(alpha.id, "2023-11-14")
+            self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
+            victim.unlink()
+            sync._commit()
+            sync._push()
+
+        with alpha.active():
+            sync.run()
+            self.assertFalse(store.day_key(alpha.id, "2023-11-14").is_file())
+            self.assertTrue(store.day_key_public(alpha.id, "2023-11-14").is_file())
+
+        # What was published before the deletion is still readable by a machine
+        # that had already merged it. That is what makes "copy the key back from
+        # another clone" real advice rather than wishful.
+        with beta.active():
+            sync.run()
+            self.assertIn("ours", beta.commands())
+
+    def test_nothing_more_is_written_for_a_day_whose_key_is_gone(self) -> None:
+        """The bug: sync used to mint over the top and report success."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "before")
+            sync.run()
+            before = {c.name for c in store.iter_chunks(alpha.id)}
+
+            store.day_key(alpha.id, "2023-11-14").unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "after")
+            report = sync.run()
+
+            self.assertEqual(report.chunks_written, 0)
+            self.assertEqual(report.orphaned, {"2023-11-14"})
+            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+
+    def test_the_lines_stay_pending_rather_than_being_lost(self) -> None:
+        """Refusing must not consume them: `logs/` is the only copy left."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "before")
+            sync.run()
+            sealed = store.day_key(alpha.id, "2023-11-14").read_bytes()
+            store.day_key(alpha.id, "2023-11-14").unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "after")
+            sync.run()
+
+            # Put the sealed half back, which is what copying it from another
+            # clone amounts to, and the pending line publishes on the next
+            # ordinary sync.
+            store.write_atomic(store.day_key(alpha.id, "2023-11-14"), sealed)
+            report = sync.run()
+            self.assertEqual(report.orphaned, set())
+            self.assertGreater(report.chunks_written, 0)
+
+    def test_a_day_with_no_chunks_yet_simply_mints_a_new_key(self) -> None:
+        """Half-written pairs are ordinary; only chunks make them unrecoverable."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            # A real key, not a malformed one: a bad recipient would make age
+            # fail loudly and the test would pass for the wrong reason. This is
+            # the silent case -- a usable public half whose secret is gone.
+            stale = crypto.generate_identity()
+            pub = store.day_key_public(alpha.id, "2023-11-14")
+            pub.parent.mkdir(parents=True, exist_ok=True)
+            pub.write_text(stale.public + "\n", encoding="utf-8")
+
+            alpha.record("2023-11-14", 1_700_000_001, "first")
+            report = sync.run()
+
+            self.assertEqual(report.orphaned, set())
+            self.assertEqual(report.chunks_written, 1)
+            self.assertTrue(store.day_key(alpha.id, "2023-11-14").is_file())
+            self.assertNotEqual(
+                pub.read_text(encoding="utf-8").strip(),
+                stale.public,
+                "the stale public half was reused, so the chunk is already lost",
+            )
+
+    def test_an_interrupted_mint_leaves_the_recoverable_half(self) -> None:
+        """Ordering is the guarantee: sealed half first, public half second.
+
+        Written the other way round, a crash between the two produces exactly
+        the state this whole class is about, from woswoar's own hand rather than
+        a stranger's. This way the crash window leaves a sealed key with no
+        public half, which is simply re-minted.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "first")
+            real = store.write_atomic
+            calls: list[Path] = []
+
+            def die_after_first(path: Path, data: bytes) -> None:
+                calls.append(path)
+                if len(calls) > 1:
+                    raise OSError("interrupted between the two writes")
+                real(path, data)
+
+            with (
+                mock.patch.object(store, "write_atomic", die_after_first),
+                self.assertRaises(OSError),
+            ):
+                sync.day_public_key(store.machine(), "2023-11-14")
+
+            self.assertTrue(store.day_key(alpha.id, "2023-11-14").is_file(), "sealed half missing")
+            self.assertFalse(store.day_key_public(alpha.id, "2023-11-14").is_file())
+            self.assertFalse(
+                sync.orphaned_day_key(alpha.id, "2023-11-14"),
+                "an interrupted mint produced the destructive state",
+            )
+
+    def test_sync_says_which_day_it_refused(self) -> None:
+        """The refusal is only useful if the user is told. Through the CLI.
+
+        `Report.orphaned` is an internal field; what `docs/security.md` claims
+        is that woswoar *says so*, and only stderr proves that.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "before")
+            sync.run()
+            store.day_key(alpha.id, "2023-11-14").unlink()
+            alpha.record("2023-11-14", 1_700_000_002, "after")
+
+            errors = io.StringIO()
+            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
+                main(["sync"])
+
+        said = errors.getvalue()
+        self.assertIn("2023-11-14", said)
+        self.assertIn("cannot be published", said)
+        # The recovery it offers has to be the one that works: the deleted key
+        # is still a blob in git, because woswoar never rewrites history.
+        self.assertIn("--diff-filter=D", said)
+
+    def test_doctor_is_quiet_about_a_half_written_pair_with_no_chunks(self) -> None:
+        """No chunks means nothing is lost, and the next sync mints over it.
+
+        Reporting it would be a hard red for a state that heals itself, and the
+        sentence doctor prints -- "chunks encrypted to them cannot be read" --
+        would be false. `export` and `orphaned_days` have to agree on that, and
+        they drifted apart once already.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "ours")
+            sync.run()
+
+            pub = store.day_key_public(alpha.id, "2099-01-01")
+            pub.parent.mkdir(parents=True, exist_ok=True)
+            pub.write_text(crypto.generate_identity().public + "\n", encoding="utf-8")
+
+            self.assertEqual(sync.orphaned_days(), [])
+            _, text = self.run_cli(alpha, "doctor")
+            self.assertIn("[ok] day keys", text)
+
+    def test_compact_skips_the_day_rather_than_aborting(self) -> None:
+        """One unreadable day used to leave every later day uncompacted."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for day in ("2023-11-14", "2023-11-15"):
+                for i in range(2):
+                    alpha.record(day, 1_700_000_001 + i, f"{day}-{i}")
+                    sync.run()
+            store.day_key(alpha.id, "2023-11-14").unlink()
+
+            days, replaced = sync.compact(before="2023-12-01")
+
+            self.assertEqual(days, 1, "the healthy day was not compacted")
+            self.assertGreater(replaced, 0)
+            self.assertGreater(
+                len(list(store.chunk_dir(alpha.id, "2023-11-14").iterdir())),
+                1,
+                "the unreadable day was touched",
+            )
+
+    def test_doctor_finds_it_before_more_chunks_pile_up(self) -> None:
+        """Through the command, not the helper: the formatting is the fiddly part."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "ours")
+            sync.run()
+            self.assertEqual(sync.orphaned_days(), [])
+            code, healthy = self.run_cli(alpha, "doctor")
+            self.assertIn("[ok] day keys", healthy)
+
+            store.day_key(alpha.id, "2023-11-14").unlink()
+            self.assertEqual(sync.orphaned_days(), [(alpha.id, "2023-11-14")])
+
+            code, text = self.run_cli(alpha, "doctor")
+            self.assertEqual(code, 1, "doctor stayed green with an unreadable day")
+            self.assertIn("[FAIL] day keys", text)
+            self.assertIn("2023-11-14", text)
+
+
 if __name__ == "__main__":
     unittest.main()

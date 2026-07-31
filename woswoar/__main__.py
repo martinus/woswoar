@@ -288,6 +288,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
         trust = sync.trust_status(store.machine())
         check("trust", trust.ok, trust.detail)
+
+        # A listing, no decryption, so it is cheap enough to do every time --
+        # and the state is otherwise silent, which is the whole problem with it.
+        orphaned = sync.orphaned_days()
+        if orphaned:
+            host, day = orphaned[0]
+            detail = (
+                f"{len(orphaned)} sealed key(s) missing, e.g. {host[:8]}/{day}"
+                " - chunks encrypted to them cannot be read by any machine"
+            )
+        else:
+            detail = "all sealed"
+        check("day keys", not orphaned, detail)
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 
@@ -421,6 +434,26 @@ def cmd_sync(args: argparse.Namespace) -> int:
             "would disown everything it published earlier on those days.\n"
             "If this machine's signing key was replaced, that is why: days it signed\n"
             "with the old one stay as they are, and new days publish normally.",
+            file=sys.stderr,
+        )
+
+    if report.orphaned:
+        lost = ", ".join(sorted(report.orphaned))
+        print(
+            f"\nWARNING: {len(report.orphaned)} day(s) of this machine's own history\n"
+            f"cannot be published: {lost}\n"
+            "Their sealed key is missing from the repository while chunks encrypted to\n"
+            "it are still there. Those chunks are unreadable by every machine, and a\n"
+            "new key would not change that -- so nothing more is written for those\n"
+            "days rather than adding chunks nobody will ever read.\n"
+            "The commands themselves are still in this machine's own logs, and the\n"
+            "deleted key is still in git history -- woswoar never rewrites it, so\n"
+            "every clone has the blob. To put it back:\n"
+            "    git -C <history> log --diff-filter=D -- hosts/<id>/keys/<day>.age\n"
+            "    git -C <history> show <commit>^:hosts/<id>/keys/<day>.age > that path\n"
+            "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
+            "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
+            "this machine starts a new key and publishes again.",
             file=sys.stderr,
         )
 
