@@ -83,12 +83,45 @@ Priority is *implementation order*, not just severity. When ranking, weigh:
 State the reasoning in the issue when the ranking is not obvious from the title.
 If new information changes the picture, relabel the issue and say why.
 
+## 6. Never discard a change you cannot get back
+
+`git checkout -- <file>`, `git restore`, `git stash` and `git reset --hard` have
+each destroyed uncommitted work here. There is no reflog for a tree that was
+never committed, so the only recovery is to write it again from memory — the
+single largest waste of a session so far, twice over.
+
+- Commit a checkpoint before anything that rewrites files in bulk. Mutation
+  testing especially: it edits sources in a loop and restores them in a
+  `finally`, and an interrupted run leaves the tree mutated.
+- To undo your own edit, rewrite the text you changed. Do not discard the file.
+- Tell subagents explicitly when they may not write. A review agent asked only
+  to *read* a diff has reverted the tree on its own initiative; verify the tree
+  yourself before believing a report that mentions touching it.
+
+## 7. Branch before the first commit
+
+Not after. Undoing a commit that landed on `main` means branching at `HEAD` and
+then `git reset --hard origin/main` — the operation rule 6 is about.
+
 ## Repository conventions worth matching
 
 - Comments explain **why**, especially why an obvious alternative was rejected.
   Match that density; it is deliberate.
 - The shell hook must not fork on the per-command path, and CI asserts it.
-- `ruff check`, `ruff format --check`, `mypy` (strict) and `shellcheck` all run
-  in CI. Run them before pushing.
 - Claims in `docs/security.md` are backed by tests, not prose. If you change
   what the code guarantees, change the claim and the test together.
+- Preflight before pushing — the same checks CI runs, in one line:
+
+  ```sh
+  ruff check . && ruff format --check . && mypy woswoar tests \
+    && shellcheck --shell=bash woswoar/shell/woswoar.bash \
+    && python -m unittest discover -s . -t . -p 'test_*.py'
+  ```
+
+- Run mutation tests with `python -B` **and** delete `woswoar/__pycache__`
+  between mutations. A `.pyc` is validated against `(mtime_seconds, size)`, so
+  two mutations that change a file by the same number of bytes inside one second
+  run each other's cached bytecode — which reports a test as surviving when it
+  does not, and has sent a correct test to be rewritten as "decoration".
+- Before blaming your branch for a CI failure, measure the same job on `main`,
+  enough times to see a one-in-forty flake. Two runs of green proves nothing.
