@@ -254,6 +254,33 @@ class TestCoexistence(ShellHookTestCase):
         self.assertIn("PREEXEC[echo hello]", out)
         self.assertEqual(self.commands(), ["echo hello"])
 
+    #: Runs as an ordinary PROMPT_COMMAND entry, which woswoar orders *ahead*
+    #: of its own boot string -- so it breaks the scratch file in the window
+    #: where the boot string used to write the trap spec into it.
+    SABOTAGE = """
+        _sabotage() {
+            [[ -n ${__woswoar_scratch-} ]] || return 0
+            rm -f -- "$__woswoar_scratch" && mkdir -p -- "$__woswoar_scratch"
+        }
+        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_sabotage"
+    """
+
+    def test_a_prior_trap_survives_a_scratch_file_that_cannot_be_written(self) -> None:
+        """Issue #57: chaining must not depend on a file round trip.
+
+        The prior handler's spec used to travel from the boot string to
+        `__woswoar_wire` through the scratch file. A shell where that file could
+        not be written therefore read an *empty* spec, concluded there was no
+        prior trap, and replaced whoever owned it -- so the other tool stopped
+        working, silently, for the life of the shell.
+
+        Recording is genuinely off in this shell, which is the honest outcome:
+        the file it captures `history 1` into is gone. What must not also be lost
+        is somebody else's DEBUG trap.
+        """
+        out = self.run_shell("echo hello\n", before=self.PRIOR + self.SABOTAGE)
+        self.assertIn("PREEXEC[echo hello]", out)
+
     def test_durations_survive_chaining(self) -> None:
         self.run_shell("sleep 0.2\n", before=self.PRIOR)
         by_cmd = self.by_cmd()
@@ -686,9 +713,11 @@ class TestRecordingIsPrivate(ShellHookTestCase):
 class TestTheScratchFileIsPrivate(ShellHookTestCase):
     """Issue #24: the scratch file's directory decides who can touch it.
 
-    Its contents are read back and, at the first prompt, `eval`ed to chain onto
-    an existing DEBUG trap. That is only safe while nobody else can write it, so
-    what is pinned here is the *directory*, not the filename.
+    Its contents are read back on every command, so what is pinned here is the
+    *directory*, not the filename -- the name is only a pid. Until #57 the file
+    also carried the trap spec that `__woswoar_wire` evaluates; it does not any
+    more, which is one fewer reason to care what is in it, not a reason to stop
+    caring who can write it.
     """
 
     HOSTILE: ClassVar[dict[str, str]] = {

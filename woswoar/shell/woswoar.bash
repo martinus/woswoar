@@ -360,8 +360,12 @@ __woswoar_wire() {
         return 0
     fi
 
-    local spec=
-    [[ -s $__woswoar_scratch ]] && IFS= read -r -d '' spec <"$__woswoar_scratch"
+    # The spec arrives as an argument, from a command substitution in the
+    # PROMPT_COMMAND string. It used to be written to the scratch file and read
+    # back here, which put the `eval` below's input on disk for no reason --
+    # defence in depth after #24 made the directory unreachable by anyone else,
+    # and it leaves the scratch file with the one job it is named for.
+    local spec=${1-}
 
     # `trap -p` prints a command that would restore the trap, with the handler
     # requoted -- `trap -- 'handler' DEBUG`. Re-splitting that as an array
@@ -410,12 +414,12 @@ __woswoar_unboot() {
 
 #: Runs at the first prompt and then deletes itself. A string, not a function,
 #: because only a string element is evaluated at top level, and `trap -p DEBUG`
-#: reports nothing from inside a function or a sourced file. Ordered before
-#: __woswoar_precmd so both can use the scratch file.
+#: reports nothing from inside a function or a sourced file. A command
+#: substitution is not a function: it forks, but it reads the parent's trap, and
+#: it runs here at top level where there is a trap to read.
 # shellcheck disable=SC2016  # single quotes are the point: this expands later
 __woswoar_boot='{
-    builtin trap -p DEBUG >"$__woswoar_scratch" 2>/dev/null
-    __woswoar_wire
+    __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null)"
     __woswoar_unboot
 }'
 
