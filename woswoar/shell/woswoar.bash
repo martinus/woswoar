@@ -162,6 +162,12 @@ __woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.
+#
+# Two sections below are deliberately outside that rule and say so at their own
+# headers: the Ctrl-R widget, which runs on a keypress, and the boot string,
+# which runs once at the first prompt and then removes itself. Everything on the
+# per-command path is builtins, and CI proves it by counting clones for 3
+# commands and for 30.
 # ---------------------------------------------------------------------------
 
 # Escapes $1 into __woswoar_escaped. Mirrors escape() in woswoar/entry.py --
@@ -360,8 +366,24 @@ __woswoar_wire() {
         return 0
     fi
 
-    local spec=
-    [[ -s $__woswoar_scratch ]] && IFS= read -r -d '' spec <"$__woswoar_scratch"
+    # The spec arrives as an argument, from a command substitution in the
+    # PROMPT_COMMAND string. It used to travel through the scratch file, which
+    # meant a file that could not be written produced an *empty* spec -- and an
+    # empty spec is indistinguishable from "there was no prior trap", so the
+    # hook replaced whoever owned it and that tool silently stopped working for
+    # the life of the shell. A missing file must not be able to look like an
+    # absent trap. Taking the `eval` below's input off disk is the second
+    # reason, and after #24 only defence in depth.
+    # The only caller that legitimately passes nothing is the ble.sh branch
+    # above, which has already returned. So an empty argument here means the
+    # command substitution in the boot string failed to fork -- and empty is
+    # otherwise indistinguishable from "there is no prior trap", which would
+    # clobber another tool's handler: the same silent failure by a different
+    # route. `printf .` gives "I could not look" an answer of its own, and the
+    # answer to that is to install nothing rather than to guess.
+    local spec=${1-}
+    [[ -n $spec ]] || return 0
+    spec=${spec%.}
 
     # `trap -p` prints a command that would restore the trap, with the handler
     # requoted -- `trap -- 'handler' DEBUG`. Re-splitting that as an array
@@ -410,12 +432,32 @@ __woswoar_unboot() {
 
 #: Runs at the first prompt and then deletes itself. A string, not a function,
 #: because only a string element is evaluated at top level, and `trap -p DEBUG`
-#: reports nothing from inside a function or a sourced file. Ordered before
-#: __woswoar_precmd so both can use the scratch file.
+#: reports nothing from inside a function or a sourced file. A command
+#: substitution is not a function: it forks, but it reads the parent's trap, and
+#: it runs here at top level where there is a trap to read.
+#:
+#: That fork is the one exception to the builtins-only rule above, so it is
+#: guarded twice over. `__woswoar_unboot` removes this entry after the first
+#: prompt -- and the `__woswoar_wired` test in front of the substitution means
+#: that even where removal fails, the fork is paid once rather than on every
+#: prompt. Removal *can* fail: it is an exact match on a variable other prompt
+#: frameworks rewrite freely, and it was harmless when this string only wrote a
+#: file. Measured with removal broken: 6 clones for 3 commands and for 30 with
+#: the guard, 9 and 36 without.
+#:
+#: The guard also pays for itself under ble.sh, where `__woswoar_wire` has
+#: already run at source time and the substitution would fork only to have its
+#: argument discarded.
+#:
+#: Ordered before `__woswoar_precmd` rather than last for a related reason: the
+#: string branch removes this text plus the newline after it, so a boot with
+#: nothing following it is never removed at all.
+#:
+#: One cost, once per shell: under `set -T` a prior DEBUG handler sees the
+#: substitution as a command it did not run.
 # shellcheck disable=SC2016  # single quotes are the point: this expands later
 __woswoar_boot='{
-    builtin trap -p DEBUG >"$__woswoar_scratch" 2>/dev/null
-    __woswoar_wire
+    [[ -n $__woswoar_wired ]] || __woswoar_wire "$(builtin trap -p DEBUG 2>/dev/null; printf .)"
     __woswoar_unboot
 }'
 
