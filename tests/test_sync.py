@@ -3103,6 +3103,42 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             sync.run()
             self.assertEqual(beta.commands(), {"git status", "make -j8"})
 
+    def test_a_republished_signer_is_committed_even_with_nothing_to_export(self) -> None:
+        """The other writer on this path, and the one with no chunk beside it.
+
+        `publish_signer` writes about once in a machine's life -- but when it
+        does, it may well be the *only* thing that run wrote. Dropping its answer
+        leaves this machine's verify key uncommitted, and a peer that cannot read
+        it refuses every chunk this host has ever signed.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+            # A *changed* key, not a deleted file: rewriting the same bytes
+            # leaves the worktree matching HEAD, so there would be nothing to
+            # commit and the assertion below would hold either way.
+            key = store.signing_key_file()
+            key.unlink()
+            crypto.public_half(key).unlink()
+            fresh = crypto.generate_signing_key(key)
+
+            published = store.signer_public(alpha.id)
+            sync.run()  # nothing new to export: the signer is all there is
+
+            self.assertIn(fresh, published.read_text(encoding="utf-8"))
+            self.assertEqual(
+                sync.git("status", "--porcelain", "--", str(published)),
+                "",
+                "the republished signer was left uncommitted",
+            )
+
+        # And it reached the remote, which is the point of publishing it.
+        beta = self.machine("beta")
+        with beta.active():
+            self.assertIn(fresh, store.signer_public(alpha.id).read_text(encoding="utf-8"))
+
     def test_files_left_by_a_run_that_died_are_committed_by_the_next_one(self) -> None:
         """The catch-up that makes skipping the `add` safe.
 
