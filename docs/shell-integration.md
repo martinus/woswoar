@@ -59,6 +59,77 @@ Switch scope without leaving the picker:
 `WOSWOAR_NO_BIND=1` skips the <kbd>Ctrl</kbd>+<kbd>R</kbd> binding entirely if
 you would rather keep another tool's.
 
+## Commands that are never recorded
+
+Anything bash itself keeps out of history is invisible to woswoar, so
+`HISTCONTROL=ignorespace` (a leading space) and `HISTIGNORE` work exactly as they
+already do — a command bash declines to store is never seen here.
+
+On top of that, `$WOSWOAR_IGNORE` is an extended regex matched against every
+command, and anything it matches is dropped before it reaches a file that gets
+synced. What the default catches:
+
+| | example |
+|---|---|
+| an assignment whose name reads like a credential | `AWS_SECRET_ACCESS_KEY=…`, `PGPASSWORD=…`, `API_KEY=…` |
+| a long option that names one | `--password`, `--token`, `--secret-key`, `--with-token`, `--from-literal=` |
+| credentials inside a URL | `https://user:token@github.com/…` |
+| an `Authorization` header | `curl -H "Authorization: Bearer …"` |
+| three tools that exist to take a password — and only these three | `sshpass`, `htpasswd`, `openssl passwd` |
+| the short options that carry one | `curl -u`, `mysql -p<pw>`, `docker login -p`, `ssh-keygen -N` |
+
+### What it does not catch
+
+This list is the point of this section, and every line of it is pinned by a test
+(`DOCUMENTED_GAPS` in `tests/test_shell_hook.py`) so it cannot quietly stop being
+true. **No pattern catches everything**:
+
+- **A secret with no tell.** `deploy.sh AKIAIOSFODNN7EXAMPLE` looks like any
+  other argument. Nothing can find that.
+- **A tool that is not on the list above**, or one that takes its secret as a
+  positional argument or a bare flag: `redis-cli -a`, `az login -p`,
+  `mongosh -p`, `aws configure set aws_secret_access_key …`,
+  `vault kv put … value=…`, `smbclient -U user%pass`. These *are* secrets and
+  they *are* recorded. Chasing them means an unbounded list of program names,
+  and the filter is priced per character on every prompt — so they are written
+  down here instead of half-covered.
+- **A bare `KEY=` or `PASS=`.** `KEY` and `PASS` are matched only after an
+  underscore (`SSH_KEY=`, `DB_PASS=`), because matching them anywhere would eat
+  `MONKEY=`, `KEYS=` and `PASSAGE=`. Deleting real history silently is the worse
+  failure.
+- **Lower-case assignments.** `token=abc` is not matched; `TOKEN=abc` is.
+- **A heredoc or a pasted multi-line block**, where the secret is on a line bash
+  never put in history as its own command.
+- **Anything typed into a prompt** rather than onto the command line — which is
+  why `mysql -p` with no value, `docker login` with no `-p`, and `gh auth login`
+  without `--with-token` are all deliberately recorded: there is no secret on
+  the line.
+
+It errs the other way once: `docker login --password-stdin` is dropped even
+though the password arrives on stdin. Over-matching a login command costs one
+history entry, so it is not worth another alternative to exclude.
+
+### Adding a rule of your own
+
+`WOSWOAR_IGNORE_EXTRA` is joined onto the default:
+
+```bash
+export WOSWOAR_IGNORE_EXTRA='deploy-to-prod|MYCORP_[A-Z_]*='
+```
+
+Prefer this to overriding `WOSWOAR_IGNORE`. Replacing the default means copying
+~450 characters into your `.bashrc` and never receiving the next fix to them —
+and the default grew precisely because an earlier version missed
+`AWS_SECRET_ACCESS_KEY=`. Setting `WOSWOAR_IGNORE=` empty disables the filter
+entirely.
+
+> [!TIP]
+> The filter runs on every command and bash recompiles the regex each time, so
+> its cost is proportional to the pattern's *length*, not to how much of it can
+> match. Broadening the default to the table above measured **1.8×** the previous
+> pattern's cost and **+12%** on the whole record path. A much longer custom
+> pattern is felt on every prompt.
+
 ## What it costs
 
 Measured on a real **54,943-entry** history across ~750 daily files:

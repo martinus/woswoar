@@ -149,13 +149,20 @@ inside a live shell:
 | | |
 |---|---|
 | capture (`history 1 > f; read -d '' < f`) | 30 µs |
-| `WOSWOAR_IGNORE` regex test | 12 µs |
+| `WOSWOAR_IGNORE` regex test | 54 µs † |
 | escaping (command and cwd) | 12 µs |
 | strip the history number | 7 µs |
 | the appending `printf` | 9 µs |
 | `printf -v day '%(%F)T'` | 4 µs |
 | cwd anchoring, timing, dispatch | ~10 µs |
 | each extra `PROMPT_COMMAND` entry | ~8 µs |
+
+† The one row not from the run above. The pattern was broadened in issue #23,
+and re-measuring it on a different machine gave 30 µs for the old pattern and
+54 µs for the new one, against a record path of 288 µs → 324 µs. Treat the ratio
+(**1.8×**, **+12%** end to end) as the finding and the absolutes as
+machine-dependent; the other rows in this table have not been re-measured on
+that machine, so they are not directly comparable.
 
 That last row is why the wiring below keeps its `PROMPT_COMMAND` footprint to
 two entries: the status capture, which has to be there, and `__woswoar_precmd`.
@@ -264,7 +271,16 @@ them, so the user's existing configuration just works.
 
 On top of that, `$WOSWOAR_IGNORE` (an extended regex, overridable) drops
 credential-shaped commands so they never reach a file that will be synced. It
-defaults to things like `…TOKEN=`, `…PASSWORD=`, `--password`, `--token`.
+covers credential-shaped assignments (`AWS_SECRET_ACCESS_KEY=`), long options
+(`--password`, `--token`), credentials in a URL, `Authorization` headers, and
+the few short options that carry a secret. `docs/shell-integration.md` lists
+what it deliberately does not catch.
+
+Its cost is proportional to the pattern's *length*, because `[[ =~ ]]`
+recompiles on every command and bash caches nothing. That is why it carries no
+leading anchor, and why `--([a-z]+-)*` is spelled out rather than `--[a-z-]*`:
+the flat form is quadratic in a run of dashes, and measured 654 ms for a single
+8000-character command. The reasoning for both lives next to the pattern.
 
 ### Known limitation
 

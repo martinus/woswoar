@@ -82,7 +82,45 @@ export WOSWOAR_SESSION
 # HISTCONTROL/HISTIGNORE already apply for free -- anything bash declines to put
 # in history is invisible to us -- so this is only for things you want in your
 # local history but never written to a file that gets synced.
-: "${WOSWOAR_IGNORE=(^|[[:space:]])[A-Za-z_]*(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)=|--password[=[:space:]]|--token[=[:space:]]}"
+#
+# `docs/shell-integration.md` owns the catalogue of what this catches and, more
+# importantly, what it does not. Only what a reader of the regex itself needs is
+# here.
+#
+# KEY, PASS and AUTH are matched only after `_` (`AWS_ACCESS_KEY_ID=`), never
+# bare, or `MONKEY=`, `KEYS=` and `PASSAGE=` would all be dropped. TOKEN,
+# SECRET, PASSW, CREDENTIAL and APIKEY are distinctive enough to match anywhere
+# in the name, which is what catches `PGPASSWORD=` and `AWS_SECRET_ACCESS_KEY=`.
+#
+# Two shapes here are deliberate and easy to "tidy" into a bug:
+#
+# 1. No `(^|[[:space:]])[A-Za-z0-9_]*` in front of the assignment keywords, even
+#    though that is the obvious way to say "this is a variable name". It costs
+#    more than twice as much -- the leading `*` retries at every position -- and
+#    buys nothing, because `[A-Za-z0-9_]*=` cannot cross a space anyway.
+#
+# 2. `--([a-z]+-)*` rather than `--[a-z-]*` before the option keywords. The
+#    flat `[a-z-]*` is quadratic in the length of a `[a-z-]` run: it can start
+#    an attempt at every interior `-`, and each attempt rescans the rest. A
+#    command of 8000 dashes measured 654ms -- on the prompt path, before the
+#    8000-char truncation below. Requiring a letter between dashes makes it
+#    linear: the same input is 0.6ms.
+#
+# `[[ =~ ]]` recompiles on every command (bash caches nothing), so cost tracks
+# the pattern's *length*, not how much of it can match. Measured here: 30us for
+# the four-keyword pattern this replaces, 54us for this one, against a 288us ->
+# 324us record path. Weigh anything added against that.
+: "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:]]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
+
+# Appended, not merged into the default above, so that adding one rule of your
+# own does not pin you to today's default forever. Overriding `WOSWOAR_IGNORE`
+# outright means copying 450 characters into ~/.bashrc and never receiving the
+# next fix to them -- and this very pattern grew because the old one missed
+# `AWS_SECRET_ACCESS_KEY=`. Joined once at startup rather than tested as a
+# second variable on every command, so an unused knob costs nothing.
+if [[ -n ${WOSWOAR_IGNORE_EXTRA:-} ]]; then
+    WOSWOAR_IGNORE=${WOSWOAR_IGNORE:+$WOSWOAR_IGNORE|}$WOSWOAR_IGNORE_EXTRA
+fi
 
 #: Mirrors MAX_CMD_CHARS in woswoar/entry.py.
 __woswoar_max=8000

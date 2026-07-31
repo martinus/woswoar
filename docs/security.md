@@ -259,9 +259,13 @@ Being straight about the limits is part of the security story:
 >   trust` on each machine that will read it. That is the price of an anchor the
 >   remote cannot rewrite.
 > - **Secrets you type are still secrets.** `WOSWOAR_IGNORE` skips
->   credential-shaped commands by default (`*TOKEN=`, `*SECRET=`, `--password`,
->   …), and bash's own `HISTCONTROL`/`HISTIGNORE` are honoured for free — but no
->   pattern catches everything.
+>   credential-shaped commands by default — assignments like
+>   `AWS_SECRET_ACCESS_KEY=`, options like `--password`, credentials inside a
+>   URL, and `Authorization` headers — and bash's own `HISTCONTROL`/`HISTIGNORE`
+>   are honoured for free. But **no pattern catches everything**, and a secret
+>   with no tell (`deploy.sh AKIA…`) is indistinguishable from any other
+>   argument. [What it does and does not catch](shell-integration.md#commands-that-are-never-recorded)
+>   is written down; read it before relying on it.
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run
 >   `woswoar grant` from another machine. If it loses its *signing* key it mints
