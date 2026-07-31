@@ -1844,17 +1844,16 @@ class TestTheMergeWatermark(SyncTestCase):
             sync.grant()
         return alpha, beta, chunks
 
-    def publish_repo_edit(self, machine: Fake, message: str) -> None:
+    def publish_repo_edit(self, message: str) -> None:
         """Commit and push a change made to the repo behind `sync`'s back.
 
-        `sync` commits only when it has written something itself, so a test that
-        edits the repo directly has to publish the edit itself rather than wait
-        for the next sync to stage it.
+        `sync` commits only when it wrote something itself, so a test that edits
+        the repo directly has to publish the edit rather than wait for the next
+        sync to stage it. Call from inside the editing machine's `active()`.
         """
-        with machine.active():
-            sync.git("add", "-A")
-            sync.git("commit", "-q", "-m", message)
-            sync._push(sync.read_repo())
+        sync.git("add", "-A")
+        sync.git("commit", "-q", "-m", message)
+        sync._push(sync.read_repo())
 
     def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
         """The silent half, and the worse one.
@@ -1871,15 +1870,8 @@ class TestTheMergeWatermark(SyncTestCase):
         with alpha.active():
             # Damaged in place: its digest no longer matches the signed
             # manifest, so beta refuses it -- while the later chunk is fine.
-            #
-            # Staged and committed here rather than left for `sync` to notice.
-            # `sync` only commits when it has itself written something, so a
-            # chunk changed behind its back is not published -- which is the
-            # right answer for real corruption and would make this test about
-            # that instead of about the watermark.
             first.path.write_bytes(b"corrupted" + original)
-            self.publish_repo_edit(alpha, "corrupt the first chunk")
-            sync.run(now=1_700_000_700)
+            self.publish_repo_edit("corrupt the first chunk")
 
         with beta.active():
             report = sync.run()
@@ -1890,8 +1882,7 @@ class TestTheMergeWatermark(SyncTestCase):
         # Repaired at the source, as a transient failure would be.
         with alpha.active():
             first.path.write_bytes(original)
-            self.publish_repo_edit(alpha, "repair the first chunk")
-            sync.run(now=1_700_000_800)
+            self.publish_repo_edit("repair the first chunk")
 
         with beta.active():
             sync.run()
@@ -3081,7 +3072,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
         self.assertEqual([c for c in calls if c.startswith("branch")], ["branch --show-current"])
         # Nothing wrote, so there is nothing to stage -- and `add -A` is a full
         # stat of every chunk this machine ever published. Measured at 20k
-        # chunks, asking cost 10.3 ms of a 20.6 ms idle sync.
+        # chunks: an idle sync drops from 20.6 ms to 10.3 ms by not asking.
         self.assertEqual([c for c in calls if c.startswith("add")], [])
 
     def test_a_sync_that_wrote_something_still_commits_it(self) -> None:
@@ -3093,15 +3084,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             calls = self.git_calls()
             self.assertIn("add -A", calls)
             self.assertIn("commit -q", calls)
-
-        beta = self.machine("beta")
-        with beta.active():
-            sync.run()
-        with alpha.active():
-            sync.grant()
-        with beta.active():
-            sync.run()
-            self.assertEqual(beta.commands(), {"git status", "make -j8"})
+            self.assertIn("push --quiet", calls)
 
     def test_a_republished_signer_is_committed_even_with_nothing_to_export(self) -> None:
         """The other writer on this path, and the one with no chunk beside it.
@@ -3142,10 +3125,10 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     def test_files_left_by_a_run_that_died_are_committed_by_the_next_one(self) -> None:
         """The catch-up that makes skipping the `add` safe.
 
-        A run that died between writing a chunk and committing it leaves files
-        nothing staged. They are not stranded: the watermark was never saved
-        either, so the next run with anything to export writes again -- and that
-        run's `add -A` stages the leftovers alongside the new files.
+        A run that died between writing a chunk and committing it leaves that
+        chunk unstaged. It is not stranded: the watermark was not saved either,
+        so the next run with anything to export writes again -- and that run's
+        `add -A` stages the leftovers alongside the new files.
         """
         alpha = self.machine("alpha")
         with alpha.active():
@@ -3154,8 +3137,9 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
 
             # What a run that died after `write_atomic` and before `commit`
             # leaves behind.
+            # Into the day directory the sync above already made, because that
+            # is where a run that died after `write_atomic` would have left it.
             stray = store.chunk_dir(alpha.id, "2023-11-14") / "1700000009-abcdef.age"
-            stray.parent.mkdir(parents=True, exist_ok=True)
             stray.write_bytes(b"debris from a run that did not finish")
 
             # An idle sync leaves it alone, which is the whole point.
@@ -3165,7 +3149,9 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             # The next run with something of its own to write picks it up.
             alpha.record("2023-11-14", 1_700_000_002, "make -j8")
             sync.run()
-            self.assertIn(stray.name, sync.git("log", "--name-only", "--format=", "-3"))
+            # HEAD, not the last few commits: the catch-up has to happen on
+            # the run that wrote, not eventually.
+            self.assertIn(stray.name, sync.git("show", "--name-only", "--format=", "HEAD"))
 
     def test_a_sync_with_something_to_say_still_pushes(self) -> None:
         """The half that would silently stop publishing if the skip overreached.

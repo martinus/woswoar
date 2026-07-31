@@ -1259,9 +1259,11 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # no manifest -- this is a report, not the defence.
         report.foreign |= {f"{day}/{name}" for name in on_disk.get(day, set()) - set(listed)}
 
-    # True even where a day was skipped for size or refused for a missing key:
-    # by here a chunk, a day key or a manifest has all but certainly been
-    # written, and being wrong costs one `git add` rather than a lost commit.
+    # True even on the passes that refused every day they looked at -- an
+    # orphaned day key, a manifest gone missing, one that will not verify. By
+    # here a chunk, a day key or a manifest has all but certainly been written,
+    # and over-reporting costs one `git add` where under-reporting would cost a
+    # commit.
     return True
 
 
@@ -1571,25 +1573,26 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # a machine nobody had granted access to could not tag a chunk either,
         # so its own history piled up locally until someone else acted.
         report.revoked = _this_machine_revoked(known)
-        wrote = False
+        published = False
+        exported = False
         if not report.revoked:
-            # `or` the other way round would short-circuit the export.
-            wrote = publish_signer(known)
-            wrote = export(known, state, report, int(time.time()) if now is None else now) or wrote
+            published = publish_signer(known)
+            exported = export(known, state, report, int(time.time()) if now is None else now)
 
         # `git add -A` is a full stat of the working tree -- every chunk this
-        # machine has ever published, 9.8 ms at 20k files -- and this runs once
-        # a minute. On an idle run there is provably nothing to stage: the only
-        # two things that write into the repo here have just said they wrote
-        # nothing.
+        # machine has ever published -- and this runs once a minute. On an idle
+        # run there is provably nothing to stage, because the only two things
+        # that write into the repo here have just said they wrote nothing.
+        # Measured at 20k chunks: an idle sync drops from 20.6 ms to 10.3 ms,
+        # and stops growing with the size of the history.
         #
-        # A run that died between writing and committing leaves files nothing
-        # staged, and this does not strand them. Its watermark was never saved
-        # either, so the next run with anything to export writes again -- and
-        # `add -A` on *that* run stages the leftovers alongside the new files.
-        # The same catch-up covers a `recipients.txt` edited by hand, which no
-        # amount of asking woswoar's own writers would ever notice.
-        committed = _commit() if wrote else False
+        # A run that died between writing a file and committing it leaves that
+        # file unstaged, and this does not strand it. The watermark was not
+        # saved either, so the next run with anything to export writes again --
+        # and `add -A` on *that* run stages the leftovers alongside the new
+        # files. The same catch-up covers a `recipients.txt` edited by hand,
+        # which no amount of asking woswoar's own writers would ever notice.
+        committed = _commit() if published or exported else False
 
         if remote:
             # `push` contacts the remote even with nothing to send, which is the
@@ -1739,8 +1742,12 @@ def _commit() -> bool:
     # path and nothing at all when the index already matches, so the same
     # command that stages also answers "is there anything to commit". The
     # obvious `status --porcelain` afterwards costs a second full stat of a
-    # working tree that is tens of thousands of chunks after a couple of years,
-    # on a timer that now fires every minute.
+    # working tree that is tens of thousands of chunks after a couple of years.
+    #
+    # `run` no longer reaches here on an idle sync -- it asks its writers first
+    # -- so this is now paid only by runs that did write, and by `grant`,
+    # `revoke` and `init`. That makes it cheaper, not unnecessary: those runs
+    # still have a whole tree to stat, and doing it once beats doing it twice.
     if not git("add", "-A", "--verbose"):
         return False
     git("commit", "-q", "-m", COMMIT_MESSAGE)
