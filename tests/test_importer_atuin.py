@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from woswoar import cache, importer, search, store
-from woswoar.entry import MAX_CMD_CHARS
+from woswoar.entry import MAX_CMD_CHARS, parse_line
 
 from .support import WoswoarTestCase
 
@@ -91,10 +91,24 @@ class TestConversion(AtuinTestCase):
         self.assertEqual(cache.load_entries()[0].exit_code, 130)
 
     def test_commands_with_newlines_and_tabs_survive(self) -> None:
+        """Stored faithfully. What a *reader* gets back is a separate question.
+
+        The log is the copy sync publishes and the copy dedup compares against,
+        so it keeps the command exactly as atuin had it. The cache hands out the
+        display form, where the newline is a visible ``\n`` -- see
+        `entry.make_inert`: a recalled multi-line command that is wrong to run
+        as-is, but obviously wrong, beats one the picker never showed.
+        """
         tricky = "for i in 1 2; do\n\techo $i\ndone"
         db = self.atuin([(BASE, 0, 0, tricky, "/tmp", "s1", "box:someone")])
         importer.run("atuin", db)
-        self.assertEqual(cache.load_entries()[0].cmd, tricky)
+
+        on_disk = next(store.logs_dir().rglob("*.tsv")).read_text(encoding="utf-8")
+        stored = parse_line(on_disk.rstrip("\n"), "h")
+        assert stored is not None
+        self.assertEqual(stored.cmd, tricky)
+
+        self.assertEqual(cache.load_entries()[0].cmd, "for i in 1 2; do\\n\techo $i\\ndone")
 
     def test_session_is_shortened_but_stays_distinct(self) -> None:
         db = self.atuin(
@@ -485,6 +499,20 @@ class TestAtuinImportDropsCredentials(AtuinTestCase):
         self.assertNotIn("ghp_secretvalue", written)
         self.assertNotIn("u:pw@db", written)
         self.assertIn("git status", written)
+
+    def test_a_control_byte_does_not_break_idempotency(self) -> None:
+        """Dedup compares against the log verbatim, so it must stay verbatim.
+
+        `cache` reads the same files with `inert=True`, for everything that
+        displays history. If `store.existing_keys` ever did the same, a row
+        already on disk would stop matching itself. atuin is where that shows:
+        it has no per-source count watermark, so `existing_keys` is consulted
+        for every row on every run.
+        """
+        db = self.atuin([(BASE, SECOND, 0, "ls\x1b[2Kx", "/tmp", "s1", "box:someone")])
+        self.assertEqual(importer.run("atuin", db).imported, 1)
+        self.assertEqual(importer.run("atuin", db).imported, 0, "a control byte broke dedup")
+        self.assertEqual(len(cache.load_entries()), 1)
 
     def test_a_second_import_does_not_resurrect_them(self) -> None:
         db = self.atuin(self.rows())

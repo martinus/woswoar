@@ -89,10 +89,15 @@ def rank(entries: list[Entry], dedup: bool = True) -> list[Entry]:
 
 
 def render(entries: list[Entry], now: int | None = None) -> list[str]:
-    """Format entries as fzf input lines.
+    """Format entries as display lines.
 
     The command is re-escaped so one entry is always exactly one line, even if
-    the recorded command spanned several.
+    the recorded command spanned several, and then made inert.
+
+    Only escaped, not made inert: `cache` has already done that, on the one door
+    every peer-supplied entry comes through. These lines go straight to a
+    terminal from `woswoar list`, and fzf only happens to strip escapes when it
+    is not given `--ansi` -- that is fzf's property, not woswoar's.
     """
     if now is None:
         now = int(time.time())
