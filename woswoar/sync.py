@@ -1600,13 +1600,18 @@ def _fetch_and_rebase(repo: Repo) -> bool:
     with one code path.
 
     HEAD is resolved in the same fork, and a HEAD already equal to the fetched
-    ref skips the rebase -- git would replay nothing, and this is the shape of
-    every idle run of the one-minute timer. Returning that fact also lets the
-    caller skip a push that would contact the remote to send nothing.
+    ref needs no replaying at all -- the shape of every idle run of the
+    one-minute timer. Returning that fact lets the caller skip a push that would
+    contact the remote to send nothing.
 
     The rebase cannot conflict over chunks -- every machine only ever adds files
     below its own host id. ``recipients.txt`` is the single shared file, and
     ``.gitattributes`` marks it ``merge=union`` so both sides' keys survive.
+
+    Do not answer the question with ``merge --ff-only`` succeeding. Merging a ref
+    that is already an *ancestor* of HEAD succeeds too -- it is a no-op -- so a
+    machine holding commits nobody else has would read as level and never
+    publish them. Only where HEAD lands says anything.
     """
     git("fetch", "--quiet", "origin")
     local, upstream = _resolve("HEAD", f"refs/remotes/origin/{repo.branch}")
@@ -1619,7 +1624,12 @@ def _fetch_and_rebase(repo: Repo) -> bool:
     except SyncError:
         git("rebase", "--abort", check=False)
         raise
-    return False
+    # A rebase with nothing of its own to replay lands exactly on the fetched
+    # ref: this machine only received. Worth one fork on the path that just
+    # rebased -- never on the idle path -- because it saves opening a connection
+    # to the remote to send it nothing, on every machine every time any peer
+    # records a command.
+    return _resolve("HEAD")[0] == upstream
 
 
 def _push(repo: Repo) -> None:
@@ -1664,14 +1674,19 @@ def read_repo() -> Repo:
     for line in git("config", "--list", "--local", check=False).splitlines():
         key, _, value = line.partition("=")
         values[key] = value
+    has_remote = any(key.startswith("remote.") and key.endswith(".url") for key in values)
     return Repo(
-        has_remote=any(key.startswith("remote.") and key.endswith(".url") for key in values),
+        has_remote=has_remote,
         name=values.get("user.name", ""),
         email=values.get("user.email", ""),
+        # Only asked for when there is a remote to name it to: every reader of
+        # this field is inside an `if has_remote`, and a local-only install
+        # would otherwise fork once a minute for a string nothing reads.
+        #
         # `branch --show-current` rather than `rev-parse --abbrev-ref HEAD`,
         # which cannot answer on an unborn HEAD -- exactly the state `init` is
         # in when it enrols the first machine.
-        branch=git("branch", "--show-current"),
+        branch=git("branch", "--show-current") if has_remote else "",
     )
 
 

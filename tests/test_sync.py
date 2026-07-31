@@ -2928,6 +2928,51 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             sync.run()
             self.assertEqual(beta.commands(), {"git status", "make -j8"})
 
+    def test_a_sync_that_only_receives_does_not_push(self) -> None:
+        """Adopting a peer's commit leaves nothing of our own to send.
+
+        `push` opens a connection to the remote whether or not it has anything
+        to say, and this fires on every machine every time any peer records a
+        command -- so it is the most frequent needless round trip there is.
+        """
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            calls = self.git_calls()
+            self.assertIn("rebase --autostash", calls)
+            self.assertNotIn("push --quiet", calls)
+            self.assertEqual(beta.commands(), {"git status"})
+
+    def test_a_machine_ahead_of_the_remote_still_pushes(self) -> None:
+        """The trap in deciding "level" from anything but where HEAD lands.
+
+        A commit the remote has not seen makes `origin/<branch>` an *ancestor*
+        of HEAD. Every cheap test for "up to date" -- `merge --ff-only`, "the
+        rebase replayed nothing", "the fetch changed no ref" -- passes in that
+        state, and a machine that believes it would stop publishing silently and
+        for good, because the condition never clears by itself.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            # A commit that never reached the remote -- what a compaction, or a
+            # run that died between committing and pushing, leaves behind.
+            store.recipients_file().write_text(
+                store.recipients_file().read_text(encoding="utf-8") + "\n", "utf-8"
+            )
+            sync.git("commit", "-qam", "unpushed")
+            calls = self.git_calls()
+            self.assertIn("push --quiet", calls)
+            self.assertEqual(
+                sync._resolve("HEAD", "refs/remotes/origin/main")[0],
+                sync._resolve("HEAD", "refs/remotes/origin/main")[1],
+            )
+
     def test_a_sync_behind_the_remote_still_rebases(self) -> None:
         alpha = self.machine("alpha")
         beta = self.machine("beta")
