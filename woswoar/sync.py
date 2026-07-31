@@ -2206,7 +2206,7 @@ def revoke(reader: Reader) -> RevokeReport:
     return RevokeReport(resealed, skipped, pushed=change.remote, still_readable=still_readable)
 
 
-def compact(before: str) -> tuple[int, int, int]:
+def compact(before: str | None = None) -> tuple[int, int, int]:
     """Merge a host's own chunks for completed days into one chunk per day.
 
     Write-once chunks trade bytes for inodes: a 5-minute timer produces roughly
@@ -2220,11 +2220,26 @@ def compact(before: str) -> tuple[int, int, int]:
     `store.new_chunk`'s uniqueness check sound, since that check assumes no
     other process is creating chunks for this host concurrently.
 
+    ``before`` defaults to today, and may not be later than it: compaction is
+    for days that are *finished*. A future one takes in today and every day
+    after it, and those days keep gaining chunks -- so each becomes a day whose
+    local copy every peer rebuilds each time it grows (#69). There is no case
+    where asking for it is what was meant.
+
     Returns (days compacted, chunks replaced, days left alone because merging
     them would exceed `MAX_EXPORT_BYTES`).
     """
     crypto.require()
     crypto.require_signing()
+    # `store.day_for`, so "today" here is the bucket the shell hook records
+    # into rather than a second definition of it.
+    today = store.day_for(int(time.time()))
+    if before is None:
+        before = today
+    elif before > today:
+        raise SyncError(
+            f"--before {before} is in the future; compaction is for days that are finished"
+        )
     known = store.machine()
 
     with lock():
