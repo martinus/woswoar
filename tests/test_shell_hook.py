@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -436,13 +437,21 @@ class TestEscapingThroughAShell(ShellHookTestCase):
 
 @requires_bash5
 class TestFiltering(ShellHookTestCase):
-    def test_ignore_pattern_suppresses_secrets(self) -> None:
-        self.run_shell("export MY_SECRET_TOKEN=abc123\necho safe\n")
-        self.assertEqual(self.commands(), ["echo safe"])
-
     def test_custom_ignore_pattern(self) -> None:
         self.run_shell("echo keep-me\necho drop-me\n", env_extra={"WOSWOAR_IGNORE": "drop-me"})
         self.assertEqual(self.commands(), ["echo keep-me"])
+
+    def test_an_extra_pattern_adds_to_the_default_rather_than_replacing_it(self) -> None:
+        """Otherwise one custom rule silently freezes the built-in protection.
+
+        The default grew because it missed `AWS_SECRET_ACCESS_KEY=`; a user who
+        had pasted the old one into ~/.bashrc to add a rule would never see that.
+        """
+        self.run_shell(
+            "deploy-to-prod\nexport GITHUB_TOKEN=ghp_x\necho safe\n",
+            env_extra={"WOSWOAR_IGNORE_EXTRA": "deploy-to-prod"},
+        )
+        self.assertEqual(self.commands(), ["echo safe"])
 
     def test_histcontrol_ignorespace_is_respected(self) -> None:
         # The hook defers to bash's own history rules rather than reimplementing
@@ -452,6 +461,218 @@ class TestFiltering(ShellHookTestCase):
         )
         self.assertNotIn(" echo hidden", self.commands())
         self.assertIn("echo visible", self.commands())
+
+    def test_an_aws_secret_never_reaches_the_log(self) -> None:
+        """The case from #23, driven all the way through a real bash.
+
+        `AWS_SECRET_ACCESS_KEY=` is the shape everyone assumes is covered, and
+        it was not: the old pattern needed the keyword flush against the `=`.
+        """
+        self.run_shell("export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI\necho safe\n")
+        self.assertEqual(self.commands(), ["echo safe"])
+
+        logs = (Path(os.environ["WOSWOAR_DIR"]) / "logs").rglob("*.tsv")
+        for path in logs:
+            self.assertNotIn("wJalrXUtnFEMI", path.read_text(encoding="utf-8"))
+
+    def test_a_pathological_command_does_not_stall_the_prompt(self) -> None:
+        """A long run of dashes must not make the filter quadratic.
+
+        The first version of this pattern used `--[a-z-]*`, which can start a
+        match attempt at every interior `-` and rescan the rest each time. 8000
+        dashes measured 654ms for a single command -- paid on the prompt, and
+        before the truncation at `__woswoar_max` gets a chance to shorten
+        anything.
+
+        The match itself is timed rather than the whole shell: one bash startup
+        is ~100ms, which would swallow the very regression this guards. Ten
+        iterations cost ~6ms healthy and ~6.5s quadratic, so the bound below has
+        two orders of magnitude of headroom in both directions.
+        """
+        out = self.run_shell(
+            'line=$(printf -- "-%.0s" {1..8000})\n'
+            "t0=${EPOCHREALTIME//[.,]/}\n"
+            "for _ in {1..10}; do [[ $line =~ $WOSWOAR_IGNORE ]]; done\n"
+            "t1=${EPOCHREALTIME//[.,]/}\n"
+            'printf "ELAPSED %s\\n" "$(( t1 - t0 ))"\n'
+        )
+        match = re.search(r"^ELAPSED (\d+)$", out, re.MULTILINE)
+        assert match is not None, f"the shell did not report a timing:\n{out}"
+        micros = int(match.group(1))
+        self.assertLess(micros, 1_000_000, "the ignore pattern went superlinear again")
+
+
+#: Command shapes the default `WOSWOAR_IGNORE` must drop. Most come from #23,
+#: which listed them as *not* caught by the pattern this replaces.
+SECRET_SHAPES = [
+    "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI",
+    "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7",
+    "AWS_SESSION_TOKEN=abc aws s3 ls",
+    "export MY_SECRET_TOKEN=abc123",
+    "export GITHUB_TOKEN=ghp_xxx",
+    "API_KEY=abc",
+    "APIKEY=abc",
+    "PGPASSWORD=hunter2 psql",
+    "export PASSWORD=x",
+    "export SECRET_KEY_BASE=deadbeef",
+    "export DB_PASSWD=x",
+    "export DB_PASS=x",
+    "export MY_AUTH_TOKEN=x",
+    "export STRIPE_API_KEY=sk_live_x",
+    "mysql --password=hunter2",
+    "wget --password hunter2 http://x",
+    "curl --token abc https://x",
+    "gh auth login --with-token",
+    "kubectl create secret generic s --from-literal=password=x",
+    "aws --secret-key x",
+    "helm install --api-key=abc",
+    "s3cmd --access-key AKIAIOSFODNN7",
+    'curl -H "Authorization: Bearer eyJ0eXAi"',
+    'curl -H "authorization: Basic dXNlcg=="',
+    "curl -u user:pass https://api.example.com",
+    'psql "postgres://user:pass@host/db"',
+    "git clone https://user:token@github.com/o/r",
+    "sshpass -p hunter2 ssh host",
+    "htpasswd -b .htpasswd user pass",
+    "openssl passwd -6 hunter2",
+    "mysql -pSECRETpw -u root",
+    "mysql -u root -pSECRETpw",
+    "docker login -p hunter2 -u me",
+    "ssh-keygen -t ed25519 -N hunter2 -f k",
+]
+
+#: Ordinary commands the pattern must leave alone. A filter that eats these is
+#: worse than useless: it deletes history and says nothing.
+INNOCENT_SHAPES = [
+    "git status",
+    "ls -la",
+    "make -j8",
+    "ssh-keygen -t ed25519 -C me@host",
+    "ssh-keygen -lf ~/.ssh/id_ed25519.pub",
+    "ssh-keygen -R oldhost",
+    "git clone https://github.com/martinus/woswoar",
+    'curl -H "Accept: application/json" https://api.example.com',
+    "curl -sSL https://example.com/install.sh | bash",
+    "curl -fsSL -o out.json https://api.example.com/v1/items",
+    "docker run -p 8080:80 nginx",
+    "docker run -u 1000:1000 alpine",
+    "docker compose up -d --build",
+    "mysql --protocol=tcp -u root",
+    "mysql -u root -h db01 mydb",
+    "mysql < dump.sql",
+    "kubectl get secret",
+    "kubectl describe secrets",
+    "vault kv get secret/app",
+    "psql postgres://localhost/mydb",
+    "export EDITOR=vim",
+    "export MONKEY=banana",
+    "export KEYS=3",
+    "export KEYBOARD=us",
+    "export PASSAGE=x",
+    "export PATH=/usr/bin:$PATH",
+    "make KEYS=3",
+    "aws s3 ls",
+    "aws configure list",
+    "openssl req -new -x509",
+    "openssl x509 -in c.pem -text",
+    "grep -r password .",
+    "vim ~/.aws/credentials",
+    "cat /etc/passwd",
+    "git log --oneline -20",
+    "git commit -m 'add auth handler'",
+    "ssh -p 2222 user@host",
+    "npm install --save-dev typescript",
+    "touch a_key_file.txt",
+    "man curl",
+    # A long option that merely *starts* with a keyword. This is what the
+    # `([=[:space:]]|$)` boundary after each keyword is for: without it, `auth`
+    # matches inside `--auth-mode` and a real azure command disappears.
+    "az storage blob list --auth-mode login",
+]
+
+
+#: Shapes the pattern does **not** catch, each one a claim `docs/shell-integration.md`
+#: makes in prose. They are pinned here because an unbacked claim in a security
+#: document is worse than a known gap: a later broadening would falsify the
+#: document with CI green, and nobody would look.
+#:
+#: Not a wish list. Some of these genuinely carry a secret and are recorded
+#: anyway -- `redis-cli -a`, `aws configure set`, `vault kv put`. Chasing them
+#: means an unbounded list of tool names priced per character on every prompt,
+#: so the project documents them instead of pretending otherwise.
+DOCUMENTED_GAPS = [
+    # No secret is on these lines at all -- the tool prompts for it.
+    "mysql -p",
+    "docker login",
+    "gh auth login",
+    # A secret with no tell: nothing distinguishes it from any other argument.
+    "deploy.sh AKIAIOSFODNN7EXAMPLE",
+    # Lower-case assignment. Upper case is the convention and the pattern's cost
+    # is proportional to its length, so both cases are not spelled out.
+    "token=abc",
+    # A tool that takes a secret as a positional argument or a bare flag.
+    "aws configure set aws_secret_access_key wJalr",
+    "vault kv put secret/app value=hunter2",
+    "redis-cli -a hunter2",
+]
+
+
+@requires_bash5
+class TestTheDefaultIgnorePattern(ShellHookTestCase):
+    """What the shipped pattern does and does not catch.
+
+    Evaluated by the same bash that will run it, against the value the hook
+    actually sets -- not against a copy in this file, which could drift from the
+    hook and keep passing. One shell tests the whole corpus, because starting a
+    bash per command would cost more than the rest of the suite.
+    """
+
+    def classify(self, commands: list[str]) -> dict[str, bool]:
+        """Ask a real bash which of `commands` the default pattern matches."""
+        array = " ".join(shlex.quote(command) for command in commands)
+        out = self.run_shell(
+            f"__corpus=({array})\n"
+            'printf "PATTERN %s\\n" "${#WOSWOAR_IGNORE}"\n'
+            'for i in "${!__corpus[@]}"; do\n'
+            '  [[ ${__corpus[i]} =~ $WOSWOAR_IGNORE ]] && printf "MATCH %s\\n" "$i" '
+            '|| printf "KEEP %s\\n" "$i"\n'
+            "done\n"
+        )
+
+        self.assertRegex(out, r"PATTERN [1-9]", "the hook set no default pattern")
+        verdicts = {}
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] in {"MATCH", "KEEP"}:
+                verdicts[commands[int(fields[1])]] = fields[0] == "MATCH"
+        self.assertEqual(len(verdicts), len(commands), "some commands were not classified")
+        return verdicts
+
+    def test_every_credential_shape_is_dropped(self) -> None:
+        verdicts = self.classify(SECRET_SHAPES)
+        missed = [command for command, matched in verdicts.items() if not matched]
+        self.assertEqual(missed, [], f"{len(missed)} secret-bearing commands would be recorded")
+        # Counted, not just "nothing missed": a harness that classified nothing
+        # would satisfy the assertion above while testing the pattern not at all.
+        self.assertEqual(sum(verdicts.values()), len(SECRET_SHAPES))
+
+    def test_the_documented_gaps_really_are_gaps(self) -> None:
+        """Pin the "what it does not catch" section to the pattern's behaviour."""
+        verdicts = self.classify(DOCUMENTED_GAPS)
+        caught = [command for command, matched in verdicts.items() if matched]
+        self.assertEqual(
+            caught,
+            [],
+            "the pattern now catches something docs/shell-integration.md says it does not; "
+            "update the document in the same commit",
+        )
+        self.assertEqual(len(verdicts), len(DOCUMENTED_GAPS))
+
+    def test_no_ordinary_command_is_dropped(self) -> None:
+        verdicts = self.classify(INNOCENT_SHAPES)
+        eaten = [command for command, matched in verdicts.items() if matched]
+        self.assertEqual(eaten, [], f"{len(eaten)} ordinary commands would be silently discarded")
+        self.assertEqual(len(verdicts), len(INNOCENT_SHAPES))
 
 
 @requires_bash5

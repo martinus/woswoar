@@ -192,6 +192,7 @@ truthful. Re-running an import is idempotent.
 |---|---|
 | `WOSWOAR_DIR` | data directory (default `~/.local/share/woswoar`) |
 | `WOSWOAR_IGNORE` | extended regex of commands never to record |
+| `WOSWOAR_IGNORE_EXTRA` | extra regex joined onto the default, instead of replacing it |
 | `WOSWOAR_SCOPE` | default scope for <kbd>Ctrl</kbd>+<kbd>R</kbd> (default `global`) |
 | `WOSWOAR_NO_BIND` | set to skip binding <kbd>Ctrl</kbd>+<kbd>R</kbd> |
 
