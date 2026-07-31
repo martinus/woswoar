@@ -1844,6 +1844,18 @@ class TestTheMergeWatermark(SyncTestCase):
             sync.grant()
         return alpha, beta, chunks
 
+    def publish_repo_edit(self, machine: Fake, message: str) -> None:
+        """Commit and push a change made to the repo behind `sync`'s back.
+
+        `sync` commits only when it has written something itself, so a test that
+        edits the repo directly has to publish the edit itself rather than wait
+        for the next sync to stage it.
+        """
+        with machine.active():
+            sync.git("add", "-A")
+            sync.git("commit", "-q", "-m", message)
+            sync._push(sync.read_repo())
+
     def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
         """The silent half, and the worse one.
 
@@ -1859,7 +1871,14 @@ class TestTheMergeWatermark(SyncTestCase):
         with alpha.active():
             # Damaged in place: its digest no longer matches the signed
             # manifest, so beta refuses it -- while the later chunk is fine.
+            #
+            # Staged and committed here rather than left for `sync` to notice.
+            # `sync` only commits when it has itself written something, so a
+            # chunk changed behind its back is not published -- which is the
+            # right answer for real corruption and would make this test about
+            # that instead of about the watermark.
             first.path.write_bytes(b"corrupted" + original)
+            self.publish_repo_edit(alpha, "corrupt the first chunk")
             sync.run(now=1_700_000_700)
 
         with beta.active():
@@ -1871,6 +1890,7 @@ class TestTheMergeWatermark(SyncTestCase):
         # Repaired at the source, as a transient failure would be.
         with alpha.active():
             first.path.write_bytes(original)
+            self.publish_repo_edit(alpha, "repair the first chunk")
             sync.run(now=1_700_000_800)
 
         with beta.active():

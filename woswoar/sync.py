@@ -1128,7 +1128,7 @@ def unpack(blob: bytes, limit: int = MAX_CHUNK_BYTES) -> bytes:
     return out
 
 
-def export(known: Machine, state: State, report: Report, now: int) -> None:
+def export(known: Machine, state: State, report: Report, now: int) -> bool:
     """Seal each log file's new lines into a fresh chunk, and sign the day's list.
 
     The manifest is built by **extending the one this machine last signed**,
@@ -1163,8 +1163,10 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
                 (log.relpath, data, new_offset)
             )
 
+    # The one exit that has provably written nothing, which is what lets `run`
+    # skip the `git add` that would stat the whole working tree to find that out.
     if not fresh:
-        return
+        return False
 
     # One pass for the whole host, not one per day.
     on_disk: dict[str, set[str]] = {}
@@ -1256,6 +1258,11 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
         # chunk on a quiet day is refused by peers either way, because it is in
         # no manifest -- this is a report, not the defence.
         report.foreign |= {f"{day}/{name}" for name in on_disk.get(day, set()) - set(listed)}
+
+    # True even where a day was skipped for size or refused for a missing key:
+    # by here a chunk, a day key or a manifest has all but certainly been
+    # written, and being wrong costs one `git add` rather than a lost commit.
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1564,11 +1571,25 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # a machine nobody had granted access to could not tag a chunk either,
         # so its own history piled up locally until someone else acted.
         report.revoked = _this_machine_revoked(known)
+        wrote = False
         if not report.revoked:
-            publish_signer(known)
-            export(known, state, report, int(time.time()) if now is None else now)
+            # `or` the other way round would short-circuit the export.
+            wrote = publish_signer(known)
+            wrote = export(known, state, report, int(time.time()) if now is None else now) or wrote
 
-        committed = _commit()
+        # `git add -A` is a full stat of the working tree -- every chunk this
+        # machine has ever published, 9.8 ms at 20k files -- and this runs once
+        # a minute. On an idle run there is provably nothing to stage: the only
+        # two things that write into the repo here have just said they wrote
+        # nothing.
+        #
+        # A run that died between writing and committing leaves files nothing
+        # staged, and this does not strand them. Its watermark was never saved
+        # either, so the next run with anything to export writes again -- and
+        # `add -A` on *that* run stages the leftovers alongside the new files.
+        # The same catch-up covers a `recipients.txt` edited by hand, which no
+        # amount of asking woswoar's own writers would ever notice.
+        committed = _commit() if wrote else False
 
         if remote:
             # `push` contacts the remote even with nothing to send, which is the
