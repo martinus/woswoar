@@ -90,6 +90,10 @@ class Report:
     #: them until the manifest is put right, which beats signing a replacement
     #: that silently disowns everything published earlier that day.
     unsignable: set[str] = field(default_factory=set)
+    #: Days of this machine's own history whose sealed day key has gone while
+    #: chunks sealed to its public half remain. Nothing further is written for
+    #: them, because a new key cannot rescue what the old one sealed.
+    orphaned: set[str] = field(default_factory=set)
     #: "<day>/<name>" chunks sitting under *this* machine's own id that it never
     #: published. Nothing else would ever look at them -- `merge` skips our own
     #: id -- and they are deliberately not swept into a manifest we sign.
@@ -574,18 +578,77 @@ def trust_status(known: Machine) -> IdentityStatus:
     return IdentityStatus(not waiting, detail)
 
 
+def orphaned_day_key(host_id: str, day: str) -> bool:
+    """A public half published with no sealed private half beside it.
+
+    Anything sealed to that public key is unreadable by every machine including
+    the one that wrote it, permanently -- the secret only ever existed inside
+    the `.age` file. So this is the state to notice before writing more, not
+    after.
+
+    It is reachable by a stranger: `keys/` is deliberately rewritable, because
+    `grant` and `revoke` re-seal every file in it, so anyone with push access can
+    delete one and the deletion arrives with the next fetch. `.age` is written
+    before `.pub` below, which keeps woswoar's own crash window on the harmless
+    side of this -- a sealed key with no public half is simply re-minted.
+    """
+    return (
+        store.day_key_public(host_id, day).is_file() and not store.day_key(host_id, day).is_file()
+    )
+
+
+def has_chunks(host_id: str, day: str) -> bool:
+    """Whether anything is already sealed to this host's key for ``day``.
+
+    What turns a half-written key pair from a nuisance into a loss: with no
+    chunks the next `export` simply mints a new pair over it and nothing is
+    ever noticed, so reporting that state would be a false alarm.
+    """
+    directory = store.chunk_dir(host_id, day)
+    return directory.is_dir() and any(directory.iterdir())
+
+
+def orphaned_days() -> list[tuple[str, str]]:
+    """``(host, day)`` for every day key in the repo whose sealed half is gone.
+
+    Cheap -- a listing of `keys/`, no decryption -- and worth doing on demand:
+    the state is silent otherwise, and every sync that passes over such a day
+    without noticing makes it look fine. Reported for *every* host, not just
+    this one, because a machine that can still open the key is the only place a
+    copy can come from.
+
+    Pairs rather than a formatted string, so the caller decides how to show
+    them and a test can assert on the day rather than search for it.
+    """
+    found = []
+    for host_id in store.repo_hosts():
+        sealed, public = store.day_key_days(host_id)
+        for day in sorted(public - sealed):
+            if has_chunks(host_id, day):
+                found.append((host_id, day))
+    return found
+
+
 def day_public_key(known: Machine, day: str) -> str:
     """The public half of this host's key for ``day``, creating it if needed.
 
     One key per host per day. Kept in the clear beside the sealed private half
     so writing a chunk never has to open the sealed key first.
+
+    Both halves are required to reuse a key. Checking only the public one meant
+    a day whose sealed half had gone kept handing out a public key nobody held
+    the secret for, and every chunk written afterwards was lost on the spot.
+    Minting over the top is safe only because `export` refuses first for any day
+    that already has chunks -- those are sealed to the old key, and a new one
+    cannot help them.
     """
     pub_path = store.day_key_public(known.id, day)
-    if pub_path.is_file():
+    if pub_path.is_file() and store.day_key(known.id, day).is_file():
         return pub_path.read_text(encoding="utf-8").strip()
 
     identity = crypto.generate_identity()
     sealed = crypto.encrypt_to_recipients(identity.secret.encode("utf-8"), recipients())
+    # Sealed half first: see `orphaned_day_key`.
     store.write_atomic(store.day_key(known.id, day), sealed)
     store.write_atomic(pub_path, (identity.public + "\n").encode("utf-8"))
     return identity.public
@@ -1021,6 +1084,21 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
         on_disk.setdefault(chunk.day, set()).add(chunk.name)
 
     for day, tails in sorted(fresh.items()):
+        # Before the manifest, not after. Refusing does not advance
+        # `state.exported`, so a refused day comes back on every sync -- and
+        # `read_manifest` forks `ssh-keygen -Y verify`. Checked afterwards, one
+        # orphaned day cost a fork a minute for as long as it stayed that way,
+        # on a path issue #50 is already about. `day in on_disk` first because
+        # it is a dict lookup and the other two are stats.
+        if day in on_disk and orphaned_day_key(known.id, day):
+            # See `orphaned_day_key` for what this state is. A fresh key would
+            # let this sync succeed and say nothing while the day's existing
+            # chunks stayed unreadable, so nothing is written. The lines stay
+            # pending -- `state.exported` is not advanced -- so they are still
+            # in `logs/` and publish once the sealed key is restored.
+            report.orphaned.add(day)
+            continue
+
         # What this machine has already put its name to for this day. Extended,
         # never rebuilt from the directory -- see the docstring.
         listed = read_manifest(known.id, day, verify_key)
@@ -1935,6 +2013,13 @@ def compact(before: str) -> tuple[int, int]:
         replaced = 0
         for day, chunks in sorted(by_day.items()):
             if len(chunks) < 2:
+                continue
+            if orphaned_day_key(known.id, day):
+                # Nothing here can be opened, and one such day used to abort the
+                # whole run -- so a single unreadable day left every later day
+                # uncompacted, reported as a bare path. Skipped instead: `sync`
+                # and `doctor` are where this state is explained, and compaction
+                # has no business being the messenger.
                 continue
             secret = open_day_key(known, known.id, day)
 
