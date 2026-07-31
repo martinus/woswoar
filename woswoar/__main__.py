@@ -736,7 +736,21 @@ def cmd_trust(args: argparse.Namespace) -> int:
 def cmd_compact(args: argparse.Namespace) -> int:
     from . import sync
 
-    days, replaced, skipped = sync.compact(before=args.before or time.strftime("%Y-%m-%d"))
+    today = time.strftime("%Y-%m-%d")
+    before = args.before or today
+    # Compaction is for days that are finished. A `--before` in the future takes
+    # in today and every day after it, and those days keep gaining chunks -- so
+    # each one is a day whose local copy has to be rebuilt on peers every time
+    # it grows. There is no case where asking for it is what was meant.
+    if before > today:
+        print(
+            f"woswoar: --before {before} is in the future; compaction is for days "
+            "that are finished",
+            file=sys.stderr,
+        )
+        return 1
+
+    days, replaced, skipped = sync.compact(before=before)
     if not days:
         print("nothing to compact")
     else:
