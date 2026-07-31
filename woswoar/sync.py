@@ -94,6 +94,10 @@ class Report:
     #: chunks sealed to its public half remain. Nothing further is written for
     #: them, because a new key cannot rescue what the old one sealed.
     orphaned: set[str] = field(default_factory=set)
+    #: Days this machine has published before whose signed manifest has gone.
+    #: Signing a fresh one would list only what this run writes, disowning
+    #: everything published earlier -- so nothing is written for them either.
+    manifest_missing: set[str] = field(default_factory=set)
     #: "<day>/<name>" chunks sitting under *this* machine's own id that it never
     #: published. Nothing else would ever look at them -- `merge` skips our own
     #: id -- and they are deliberately not swept into a manifest we sign.
@@ -629,6 +633,39 @@ def orphaned_days() -> list[tuple[str, str]]:
     return found
 
 
+def manifest_gone(host_id: str, day: str) -> bool:
+    """No signed list for a day, said once so both callers ask it the same way.
+
+    Meaningless on its own -- a day never published has no manifest either --
+    so every caller pairs it with "did this machine publish this day", which is
+    its own export watermark.
+    """
+    return not store.day_manifest(host_id, day).exists()
+
+
+def days_missing_a_manifest() -> list[str]:
+    """Days this machine published and whose signed manifest is no longer there.
+
+    `export` reports the same state, but only for a day that still has lines to
+    publish -- a day that was fully exported before the manifest went is never
+    looked at again, and stays silently unusable by every peer that had not
+    already merged it.
+
+    Keyed on this machine's own export watermark rather than on the presence of
+    chunks, for the reason `export` gives: a chunk under our id proves only that
+    somebody wrote one.
+    """
+    known = store.machine()
+    # Every key here is a day this machine exported: the watermark is written
+    # only after a chunk was sealed for it, so its presence is the claim and
+    # there is no zero to filter out.
+    return [
+        day
+        for day in sorted(store.day_of_log(relpath) for relpath in State.load().exported)
+        if manifest_gone(known.id, day)
+    ]
+
+
 def day_public_key(known: Machine, day: str) -> str:
     """The public half of this host's key for ``day``, creating it if needed.
 
@@ -1099,10 +1136,30 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             report.orphaned.add(day)
             continue
 
+        # A manifest this machine wrote before and that is no longer there.
+        # `read_manifest` returns nothing for "absent" and for "will not verify"
+        # alike, and the branch below only covers the second -- so a deletion
+        # looked exactly like a day never published, and the fresh manifest
+        # signed at the end of this loop listed only what this run wrote.
+        # Everything published earlier that day was dropped out of it, and a
+        # peer refuses a chunk no signed manifest names. The machine that did it
+        # keeps its own copy in `logs/`, and the only thing said out loud was
+        # `foreign`, whose message blames a planted chunk.
+        #
+        # The signal is this machine's own export watermark, not the presence of
+        # chunks: a chunk under our id proves only that *someone* wrote one, so
+        # keying on that would let anyone who can push plant one on a day we
+        # have not published yet and block that day for good.
+        published_before = any(relpath in state.exported for relpath, _, _ in tails)
+        has_manifest = not manifest_gone(known.id, day)
+        if published_before and not has_manifest:
+            report.manifest_missing.add(day)
+            continue
+
         # What this machine has already put its name to for this day. Extended,
         # never rebuilt from the directory -- see the docstring.
         listed = read_manifest(known.id, day, verify_key)
-        if not listed and store.day_manifest(known.id, day).exists():
+        if not listed and has_manifest:
             # There is a manifest for this day and this machine cannot verify
             # it, so it cannot tell what it has already published. Signing a
             # fresh one would silently drop every earlier chunk of that day from
