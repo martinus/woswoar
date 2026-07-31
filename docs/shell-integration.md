@@ -81,18 +81,20 @@ synced. What the default catches:
 ### What it does not catch
 
 This list is the point of this section, and every line of it is pinned by a test
-(`DOCUMENTED_GAPS` in `tests/test_shell_hook.py`) so it cannot quietly stop being
+(`DOCUMENTED_GAPS` in `tests/credential_shapes.py`) so it cannot quietly stop being
 true. **No pattern catches everything**:
 
 - **A secret with no tell.** `deploy.sh AKIAIOSFODNN7EXAMPLE` looks like any
-  other argument. Nothing can find that.
+  other argument to the hook. (`woswoar import` recognises the well-known token
+  formats — see below — but the hook cannot afford to.)
 - **A tool that is not on the list above**, or one that takes its secret as a
   positional argument or a bare flag: `redis-cli -a`, `az login -p`,
   `mongosh -p`, `aws configure set aws_secret_access_key …`,
-  `vault kv put … value=…`, `smbclient -U user%pass`. These *are* secrets and
-  they *are* recorded. Chasing them means an unbounded list of program names,
-  and the filter is priced per character on every prompt — so they are written
-  down here instead of half-covered.
+  `vault kv put … value=…`, `smbclient -U user%pass`, `pscp -pw`. These *are* secrets and
+  the **hook** does record them. Chasing them means an unbounded list of program
+  names, and the hook is priced per character on every prompt — so they are
+  written down here instead of half-covered. `woswoar import` does catch them
+  (see below), because it runs once rather than on every keystroke.
 - **A bare `KEY=` or `PASS=`.** `KEY` and `PASS` are matched only after an
   underscore (`SSH_KEY=`, `DB_PASS=`), because matching them anywhere would eat
   `MONKEY=`, `KEYS=` and `PASSAGE=`. Deleting real history silently is the worse
@@ -109,19 +111,55 @@ It errs the other way once: `docker login --password-stdin` is dropped even
 though the password arrives on stdin. Over-matching a login command costs one
 history entry, so it is not worth another alternative to exclude.
 
+### `woswoar import` filters too, and looks harder
+
+The same rules run over anything `woswoar import` reads. That matters more than
+the hook does on day one: a `~/.bash_history` or an atuin database was recorded
+over years with no filter of any kind, and importing it publishes the lot.
+
+Because an import runs once instead of on every prompt, it can afford what the
+hook cannot, and so it also recognises:
+
+- **token formats on sight** — `AKIA…`, `ghp_…`, `glpat-…`, `xox…`,
+  `sk_live_…`, `AIza…`, a JWT, a `-----BEGIN … PRIVATE KEY-----` block
+- **the tools listed as gaps above**, which is all of them — `aws configure
+  set …secret…`, `vault kv put … value=`, `redis-cli -a`, `mongosh -p`,
+  `az login -p`, `smbclient -U user%pass`, `pscp -pw`
+
+It reports what it dropped rather than doing it quietly:
+
+```console
+$ woswoar import bash
+~/.bash_history: 8213 parsed, imported 8196, 17 skipped as credential-shaped
+```
+
+There is deliberately **no entropy heuristic**. Shell history is full of
+high-entropy strings that are not secrets — git SHAs, checksums, UUIDs, base64
+payloads — and dropping a command is silent and permanent, so precision matters
+more than recall.
+
 ### Adding a rule of your own
 
-`WOSWOAR_IGNORE_EXTRA` is joined onto the default:
+`WOSWOAR_IGNORE_EXTRA` is joined onto the default, and applies to imports as
+well as to the hook:
 
 ```bash
 export WOSWOAR_IGNORE_EXTRA='deploy-to-prod|MYCORP_[A-Z_]*='
 ```
 
-Prefer this to overriding `WOSWOAR_IGNORE`. Replacing the default means copying
-~450 characters into your `.bashrc` and never receiving the next fix to them —
-and the default grew precisely because an earlier version missed
-`AWS_SECRET_ACCESS_KEY=`. Setting `WOSWOAR_IGNORE=` empty disables the filter
-entirely.
+Prefer this to overriding `WOSWOAR_IGNORE`, for two reasons. Replacing the
+default means copying ~450 characters into your `.bashrc` and never receiving
+the next fix to them — and the default grew precisely because an earlier version
+missed `AWS_SECRET_ACCESS_KEY=`.
+
+> [!IMPORTANT]
+> `WOSWOAR_IGNORE` reaches the **hook only**. It is a POSIX extended regex,
+> which Python cannot compile, so `woswoar import` does not read it. A rule you
+> put there filters what you type and *not* what you import. Put it in
+> `WOSWOAR_IGNORE_EXTRA`, which both paths honour.
+
+Setting `WOSWOAR_IGNORE=` empty disables the filter for the hook; the importer's
+built-in rules always apply.
 
 > [!TIP]
 > The filter runs on every command and bash recompiles the regex each time, so

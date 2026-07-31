@@ -13,7 +13,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from . import store
+from . import credentials, store
 from .entry import Entry, truncate
 
 Kind = Literal["bash", "zsh", "atuin"]
@@ -54,6 +54,17 @@ class Result(NamedTuple):
     #: on disk. Reporting them as one made a first-ever import into an empty
     #: store claim entries were "already present".
     collapsed: int = 0
+    #: Dropped because the command looks like it carries a secret. Reported
+    #: rather than silent: a user who expects a command to be there needs to
+    #: know why it is not, and "the filter ate it" is a different answer from
+    #: "your history file did not have it".
+    credentials: int = 0
+    #: The dropped commands themselves, populated only for a dry run. Dropping
+    #: is irreversible and a count alone is unauditable -- "17 skipped" over a
+    #: decade of history gives nobody a way to spot a false positive. Never
+    #: filled on a real import, so a secret cannot reach a caller that stores
+    #: its Result.
+    dropped: tuple[str, ...] = ()
     #: (display name, count) per machine, biggest first. Only atuin carries
     #: more than one host. A tuple rather than a dict because Result is a
     #: NamedTuple, and a mutable default would be shared across instances.
@@ -371,6 +382,9 @@ def run_atuin(
     entries_by_host: dict[str, list[Entry]] = {}
     skipped = 0
     collapsed = 0
+    secrets = 0
+    dropped: list[str] = []
+    extra = credentials.user_pattern()
 
     for host_id, rows in by_host.items():
         days = {store.day_for(r.ts) for r in rows}
@@ -388,6 +402,12 @@ def run_atuin(
                     skipped += 1
                 else:
                     collapsed += 1
+                continue
+            # key[1] is the truncated command -- see the note in `run`.
+            if credentials.looks_like_credential(key[1], extra):
+                secrets += 1
+                if dry_run:
+                    dropped.append(row.cmd)
                 continue
             known.add(key)
             fresh.append(
@@ -423,6 +443,8 @@ def run_atuin(
         imported=imported,
         skipped=skipped,
         collapsed=collapsed,
+        credentials=secrets,
+        dropped=tuple(dropped),
         source=source,
         per_host=tuple(
             sorted(
@@ -473,6 +495,9 @@ def run(
     entries: list[Entry] = []
     skipped = 0
     collapsed = 0
+    secrets = 0
+    dropped: list[str] = []
+    extra = credentials.user_pattern()
     for item in fresh:
         # Not `key`: that name already holds the per-source state key below.
         seen = _dedup_key(item.ts, item.cmd)
@@ -481,6 +506,21 @@ def run(
                 skipped += 1
             else:
                 collapsed += 1
+            continue
+        # Before the dedup bookkeeping is committed but after the cheap checks:
+        # a credential-shaped line must never become an Entry, because from
+        # there it goes to logs/, into an encrypted chunk, into git, and out to
+        # every machine -- and docs/security.md says publication is final.
+        #
+        # `seen[1]`, not `item.cmd`: the truncated text is what would be
+        # published, and several rules scan with `[^|;&]*`, which is quadratic
+        # in the length of the line. A 97 KB pasted script measured 636ms
+        # untruncated and 5ms truncated -- and `_dedup_key` computed the
+        # truncation on the line above regardless, so this is free.
+        if credentials.looks_like_credential(seen[1], extra):
+            secrets += 1
+            if dry_run:
+                dropped.append(item.cmd)
             continue
         known.add(seen)
         entries.append(
@@ -505,5 +545,7 @@ def run(
         imported=len(entries),
         skipped=skipped,
         collapsed=collapsed,
+        credentials=secrets,
+        dropped=tuple(dropped),
         source=source,
     )
