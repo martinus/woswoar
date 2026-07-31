@@ -281,6 +281,31 @@ class TestCoexistence(ShellHookTestCase):
         out = self.run_shell("echo hello\n", before=self.PRIOR + self.SABOTAGE)
         self.assertIn("PREEXEC[echo hello]", out)
 
+    def test_a_prior_trap_survives_an_array_prompt_command(self) -> None:
+        """bash 5.1's array form is a separate branch, and it was untested.
+
+        `__woswoar_boot` is an array *element* there rather than part of a
+        newline-joined string, and #57 moved the trap spec into a command
+        substitution inside it. If an element were evaluated somewhere that
+        cannot see the parent's DEBUG trap, chaining would break for every user
+        of a prompt framework that sets the array -- silently, since every part
+        would still look installed.
+        """
+        array = """
+            _title_preexec() { printf 'PREEXEC[%s]\\n' "$BASH_COMMAND"; }
+            _title_prompt() { printf 'PROMPT[%s]\\n' "$?"; }
+            trap '_title_preexec' DEBUG
+            PROMPT_COMMAND=(_title_prompt)
+        """
+        out = self.run_shell("sleep 0.2\n", before=array)
+        self.assertIn("PREEXEC[sleep 0.2]", out)
+        self.assertIn("PROMPT[0]", out)
+        # A duration, not merely a recorded command: `__woswoar_precmd` captures
+        # from `history 1` and would record the command even if nothing had ever
+        # wired the trap. Only a start time proves `__woswoar_preexec` fired,
+        # which is the half this branch is responsible for installing.
+        self.assertGreaterEqual(self.by_cmd()["sleep 0.2"].duration_ms, 100)
+
     def test_durations_survive_chaining(self) -> None:
         self.run_shell("sleep 0.2\n", before=self.PRIOR)
         by_cmd = self.by_cmd()
