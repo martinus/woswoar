@@ -113,13 +113,16 @@ then `git reset --hard origin/main` — the operation rule 6 is about.
 - Preflight before pushing — the same checks CI runs, in one line:
 
   ```sh
-  ruff check . && ruff format --check . && mypy woswoar tests \
+  ruff check . && ruff format --check . && mypy woswoar tests tools \
     && shellcheck --shell=bash woswoar/shell/woswoar.bash \
-    && python -m unittest discover -s . -t . -p 'test_*.py'
+    && python -m tools.run_tests
   ```
 
+  `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
+  serially, and takes about three times as long.
+
 - Run mutation tests with `python -B` **and** delete `woswoar/__pycache__`
-  between mutations. A `.pyc` is validated against `(mtime_seconds, size)`, so
+  (plus `tools/` and `tests/`) between mutations. A `.pyc` is validated against `(mtime_seconds, size)`, so
   two mutations that change a file by the same number of bytes inside one second
   run each other's cached bytecode — which reports a test as surviving when it
   does not, and has sent a correct test to be rewritten as "decoration".

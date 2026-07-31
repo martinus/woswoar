@@ -21,12 +21,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      # No `cache: pip` here: it was tried and measured, and it made this job
+      # slower -- 13s to 17s. The dev deps are floors rather than pins, so pip
+      # still pays a resolution round-trip on a hit, and the cache only saves
+      # the wheel downloads, which cost less than restoring and saving it.
+      #
       # shellcheck comes from pip rather than apt so the version CI enforces is
       # the same one `pip install -e .[dev]` gives you locally.
       - run: pip install -e .[dev]
       - run: ruff check .
       - run: ruff format --check .
-      - run: mypy woswoar tests
+      - run: mypy woswoar tests tools
       - run: shellcheck --shell=bash woswoar/shell/woswoar.bash
 
   test:
@@ -43,7 +48,14 @@ jobs:
       - name: install age
         # Sync tests skip themselves without it, and a silently skipped suite
         # looks exactly like a passing one.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+        #
+        # `update` only when the direct install misses: refreshing the lists
+        # costs ~10s and the runner image usually already has what age needs,
+        # which on the critical path is most of the job. The fallback keeps it
+        # correct on an image where that stops being true.
+        run: |
+          sudo apt-get install -y -qq age \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
       - name: ssh-keygen is present
         # Signing needs it. Present on ubuntu-latest, asserted rather than
         # assumed for the same reason as bash below: a silently skipped suite
@@ -55,7 +67,13 @@ jobs:
         run: |
           bash -c 'echo "bash ${BASH_VERSION}"'
           bash -c '((BASH_VERSINFO[0] >= 5))' || { echo "bash 5.0+ required"; exit 1; }
-      - run: python -m unittest discover -s . -t . -p 'test_*.py' --verbose
+      # Sharded across processes: the suite is ~88% subprocess wait, so this is
+      # 38s -> ~13s. The runner fails the build if any discovered test did not
+      # report, which a plain `unittest discover` cannot get wrong but a
+      # parallel runner can. No --no-skips here: strace is not installed in this
+      # job, so the fork-scaling tests legitimately skip. The `hook` job is
+      # where they are made fatal.
+      - run: python -m tools.run_tests
 
   hook:
     # Called on every prompt, so the hook gets its own job: the fork-scaling
@@ -68,11 +86,16 @@ jobs:
           python-version: "3.12"
       - name: install strace and locales
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq strace locales
+          sudo apt-get install -y -qq strace locales \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq strace locales; }
           # The comma-decimal test needs a locale where $EPOCHREALTIME uses ","
           sudo locale-gen de_AT.UTF-8
-      - run: python -m unittest tests.test_shell_hook --verbose
+      # --jobs 1 on purpose: this job counts forks under strace, and the whole
+      # point of it is a measurement that concurrent load has no say in. The
+      # runner is used anyway for --no-skips -- strace and bash 5 are installed
+      # here, so a skip means one of them stopped working, not that the test is
+      # inapplicable.
+      - run: python -m tools.run_tests --only tests.test_shell_hook --jobs 1 --no-skips
 
   sync:
     # Two machines exchanging encrypted history through a bare repo, plus the
@@ -83,20 +106,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - run: |
+          sudo apt-get install -y -qq age \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
       - run: age --version && git --version && command -v ssh-keygen
       - name: sync suite
-        run: |
-          set -o pipefail
-          python -m unittest tests.test_sync --verbose 2>&1 | tee sync.log
-          # These tests skip themselves when age or git is absent. A skipped run
-          # is green, which is precisely the failure mode worth guarding.
-          # The summary line, not the bare word: a test *docstring* containing
-          # "skipped" would otherwise redden this build.
-          if grep -qE "^(OK|FAILED) \(.*skipped=" sync.log; then
-            echo "::error::sync tests were skipped - age or git missing"
-            exit 1
-          fi
+        # These tests skip themselves when age or git is absent. A skipped run
+        # is green, which is precisely the failure mode worth guarding, so
+        # --no-skips makes any skip fatal here. It replaces a grep over the
+        # summary line, which had to dodge the word "skipped" appearing in a
+        # test docstring; the runner counts the skips themselves instead.
+        run: python -m tools.run_tests --only tests.test_sync --no-skips
 
   perf:
     runs-on: ubuntu-latest
@@ -109,8 +129,15 @@ jobs:
         env:
           WOSWOAR_BENCH: "1"
         # Prints the measured numbers and fails only on a large regression, so a
-        # noisy shared runner cannot redden the build on its own.
-        run: python -m unittest tests.test_perf --verbose
+        # noisy shared runner cannot redden the build on its own. --jobs 1 for
+        # the same reason: these are latency measurements, and running them
+        # beside each other would be the noise they are trying to survive.
+        #
+        # --no-skips is the point of routing this through the runner: these
+        # tests skip themselves unless WOSWOAR_BENCH is set, so if the env block
+        # above ever stopped taking effect this job would go green having
+        # measured nothing at all.
+        run: python -m tools.run_tests --only tests.test_perf --jobs 1 --no-skips
 
   install:
     # Proves the packaging works and the documented first-run flow succeeds on a
@@ -154,7 +181,8 @@ jobs:
       - name: two machines sync through a bare repo, from the installed wheel
         run: |
           set -euxo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          sudo apt-get install -y -qq age \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
           BASE="$(mktemp -d)"
           git init --quiet --bare "$BASE/origin.git"
 
