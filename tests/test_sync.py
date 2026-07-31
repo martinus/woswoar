@@ -3065,13 +3065,13 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             sync.run()
         return seen
 
-    def test_an_idle_sync_forks_git_five_times(self) -> None:
+    def test_an_idle_sync_forks_git_four_times(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
             calls = self.git_calls()
-        self.assertLessEqual(len(calls), 5, calls)
+        self.assertLessEqual(len(calls), 4, calls)
         # The identity and the remote come from one config read, not three.
         self.assertEqual([c for c in calls if c.startswith("config")], ["config --list"])
         self.assertEqual([c for c in calls if c.startswith("remote")], [])
@@ -3079,6 +3079,57 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
         self.assertEqual([c for c in calls if c.startswith(("rebase", "push"))], [])
         # The branch cannot change mid-run, so it is asked for once.
         self.assertEqual([c for c in calls if c.startswith("branch")], ["branch --show-current"])
+        # Nothing wrote, so there is nothing to stage -- and `add -A` is a full
+        # stat of every chunk this machine ever published. Measured at 20k
+        # chunks, asking cost 10.3 ms of a 20.6 ms idle sync.
+        self.assertEqual([c for c in calls if c.startswith("add")], [])
+
+    def test_a_sync_that_wrote_something_still_commits_it(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+            calls = self.git_calls()
+            self.assertIn("add -A", calls)
+            self.assertIn("commit -q", calls)
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status", "make -j8"})
+
+    def test_files_left_by_a_run_that_died_are_committed_by_the_next_one(self) -> None:
+        """The catch-up that makes skipping the `add` safe.
+
+        A run that died between writing a chunk and committing it leaves files
+        nothing staged. They are not stranded: the watermark was never saved
+        either, so the next run with anything to export writes again -- and that
+        run's `add -A` stages the leftovers alongside the new files.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+            # What a run that died after `write_atomic` and before `commit`
+            # leaves behind.
+            stray = store.chunk_dir(alpha.id, "2023-11-14") / "1700000009-abcdef.age"
+            stray.parent.mkdir(parents=True, exist_ok=True)
+            stray.write_bytes(b"debris from a run that did not finish")
+
+            # An idle sync leaves it alone, which is the whole point.
+            sync.run()
+            self.assertNotIn(stray.name, sync.git("show", "--name-only", "--format=", "HEAD"))
+
+            # The next run with something of its own to write picks it up.
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+            sync.run()
+            self.assertIn(stray.name, sync.git("log", "--name-only", "--format=", "-3"))
 
     def test_a_sync_with_something_to_say_still_pushes(self) -> None:
         """The half that would silently stop publishing if the skip overreached.
