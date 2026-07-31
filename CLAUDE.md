@@ -103,6 +103,32 @@ single largest waste of a session so far, twice over.
 Not after. Undoing a commit that landed on `main` means branching at `HEAD` and
 then `git reset --hard origin/main` — the operation rule 6 is about.
 
+## 8. Write no migration code: nothing is deployed yet
+
+woswoar has no users. Nobody has installed it, so there is no history in the
+field and no repository built by an older version.
+
+Change the record format, the repo layout, `state.json`, the cache, the day-key
+scheme — outright. Do **not** write an upgrade path, a version field two code
+paths branch on, an "if this is the old shape" fallback, or a deprecation
+period. A clean cut is the norm here, not something to argue for.
+
+Two things this does not license:
+
+- **Say so in the PR body, with the rebuild command**, in case the maintainer's
+  own machine is on the old shape:
+  `rm -rf ~/.local/share/woswoar/history ~/.local/share/woswoar/state.json`,
+  then `woswoar init <url>` and `woswoar grant`.
+- `logs/` is the plaintext history and the primary copy; `history/` is derived
+  from it and can always be rebuilt. Discarding the derived tree is cheap;
+  discarding `logs/` loses data. That distinction outlives this rule.
+
+**This expires the moment woswoar is published and someone installs it.** Delete
+the rule then, rather than reasoning about who might be affected. Both errors
+cost: assuming a user base that does not exist wastes work — issue #54 was filed
+at P1 and closed for exactly that — and assuming forever that there is none
+corrupts somebody's history.
+
 ## Repository conventions worth matching
 
 - Comments explain **why**, especially why an obvious alternative was rejected.
