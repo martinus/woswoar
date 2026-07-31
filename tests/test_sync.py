@@ -1251,7 +1251,7 @@ class TestCompact(SyncTestCase):
             before = len(list(store.iter_chunks(alpha.id)))
             self.assertEqual(before, 5)
 
-            days, replaced = sync.compact(before="2023-11-15")
+            days, replaced, _ = sync.compact(before="2023-11-15")
             self.assertEqual((days, replaced), (1, 5))
             self.assertEqual(len(list(store.iter_chunks(alpha.id))), 1)
 
@@ -1858,7 +1858,7 @@ class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
             # this reproduced about half the time -- which is a coin flip, not a
             # regression test.
             with mock.patch("woswoar.store.secrets.token_hex", return_value="ffffff"):
-                days, replaced = sync.compact(before="2023-11-15")
+                days, replaced, _ = sync.compact(before="2023-11-15")
             self.assertEqual((days, replaced), (1, 3))
             sync.run(now=1_700_000_900)
 
@@ -2440,7 +2440,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
                     sync.run()
             store.day_key(alpha.id, "2023-11-14").unlink()
 
-            days, replaced = sync.compact(before="2023-12-01")
+            days, replaced, _ = sync.compact(before="2023-12-01")
 
             self.assertEqual(days, 1, "the healthy day was not compacted")
             self.assertGreater(replaced, 0)
@@ -2598,6 +2598,160 @@ class TestADeletedManifest(SyncTestCase):
             self.assertEqual(code, 1)
             self.assertIn("[FAIL] manifests", text)
             self.assertIn("2023-11-14", text)
+
+
+class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
+    """Issue #45: the reader's bound was never enforced on the writer.
+
+    `unpack` refuses a chunk that decompresses past `MAX_CHUNK_BYTES`, but
+    `read_tail` is bounded by "everything since the last export", not by size.
+    A machine that imported a decade of history in one go could seal a chunk
+    every peer then refused -- for good, because `state.exported` had already
+    moved past those bytes and its own copy in `logs/` looked fine.
+    """
+
+    def test_a_tail_over_the_budget_becomes_several_chunks_none_too_big(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(200):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
+            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                report = sync.run()
+
+            self.assertGreater(report.chunks_written, 1, "the tail was not split")
+            self.assertEqual(report.lines_exported, 200)
+
+            secret = sync.open_day_key(store.machine(), alpha.id, "2023-11-14")
+            for chunk in store.iter_chunks(alpha.id):
+                plain = sync.unpack(crypto.decrypt_with_secret(chunk.path.read_bytes(), secret))
+                self.assertLessEqual(len(plain), 512, f"{chunk.name} is over the budget")
+
+    def test_a_peer_gets_every_line(self) -> None:
+        """The point of the whole thing: nothing is lost by splitting."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            for i in range(200):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
+            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                sync.run()
+
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        self.accept_everyone(beta)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 200)
+            self.assertEqual(sorted(beta.commands()), sorted(alpha.commands()))
+
+    def test_compaction_leaves_an_over_budget_day_alone(self) -> None:
+        """The other producer, bound by the same budget.
+
+        Merging a whole day unbounded would rebuild the very chunk the split
+        prevents, and unlink the smaller ones that were fine. Skipped rather
+        than merged in batches: partial compaction leaves some of a day's
+        chunks unmerged, and a peer rebuilding a compacted day drops what it
+        had already merged (#67).
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(400):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
+                if i % 40 == 39:
+                    with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                        sync.run()
+
+            before = {c.name for c in store.iter_chunks(alpha.id)}
+            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                days, replaced, skipped = sync.compact(before="2023-12-01")
+
+            self.assertEqual((days, replaced), (0, 0), "an over-budget day was merged")
+            self.assertEqual(skipped, 1)
+            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+
+    def test_a_day_within_the_budget_still_compacts(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(4):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
+                sync.run()
+            days, replaced, skipped = sync.compact(before="2023-12-01")
+            self.assertEqual((days, skipped), (1, 0))
+            self.assertEqual(replaced, 4)
+
+    def test_a_crash_part_way_through_loses_no_lines(self) -> None:
+        """Splitting means more write points, so more chances to die mid-tail.
+
+        The watermark is only saved by a run that finishes, so the next one
+        re-reads the whole tail. What must not happen is a line going missing
+        or arriving at a peer twice.
+        """
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            for i in range(200):
+                alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
+
+            real = store.write_atomic
+            writes: list[Path] = []
+
+            def die_after_two(path: Path, data: bytes) -> None:
+                if path.suffix == ".age" and path.parent.name != "keys":
+                    writes.append(path)
+                    if len(writes) > 2:
+                        raise OSError("interrupted part way through the tail")
+                real(path, data)
+
+            with (
+                mock.patch.object(sync, "MAX_EXPORT_BYTES", 512),
+                mock.patch.object(store, "write_atomic", die_after_two),
+                self.assertRaises(OSError),
+            ):
+                sync.run()
+
+            self.assertEqual(sync.State.load().exported, {}, "a dead run saved a watermark")
+            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                sync.run()
+
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        self.accept_everyone(beta)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 200)
+            self.assertEqual(len(set(beta.commands())), 200, "a line arrived twice")
+
+
+class TestSplitForExport(unittest.TestCase):
+    """The splitter on its own, where the edges are cheap to state."""
+
+    def test_it_is_lossless_and_line_aligned(self) -> None:
+        data = b"".join(b"line %d\n" % i for i in range(50))
+        for limit in (1, 7, 8, 20, 1000):
+            with self.subTest(limit=limit):
+                pieces = list(sync.split_for_export(data, limit))
+                self.assertEqual(b"".join(pieces), data)
+                for piece in pieces:
+                    self.assertTrue(piece.endswith(b"\n"))
+
+    def test_a_tail_that_fits_is_one_piece(self) -> None:
+        data = b"one\ntwo\n"
+        self.assertEqual(list(sync.split_for_export(data, 1000)), [data])
+
+    def test_a_line_longer_than_the_budget_is_kept_whole(self) -> None:
+        """Splitting a record would drop it from every reader, not just one."""
+        long_line = b"y" * 100 + b"\n"
+        pieces = list(sync.split_for_export(long_line + b"short\n", 10))
+        self.assertEqual(pieces[0], long_line)
+        self.assertEqual(b"".join(pieces), long_line + b"short\n")
+
+    def test_the_budget_is_under_what_a_reader_accepts(self) -> None:
+        """The invariant the whole change exists for, stated once."""
+        self.assertLess(sync.MAX_EXPORT_BYTES, sync.MAX_CHUNK_BYTES)
 
 
 if __name__ == "__main__":

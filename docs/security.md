@@ -230,6 +230,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
 | A day whose signed list is gone is refused, not re-signed | deleting a manifest and syncing publishes nothing further for that day, rather than signing a replacement that names only the newest chunk and disowns every earlier one |
 | A day whose sealed key is gone is refused, not written over | deleting one and syncing publishes nothing further for that day and says so, rather than adding chunks no machine could ever read |
+| This machine never writes a chunk its peers would refuse | a tail past the export budget is split into several chunks and a peer merges every line of it; compaction, the other producer, leaves a day alone rather than merging it past the same budget |
 | A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
 | A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
 | Nor under another machine's name | the same, written into a peer's host directory, where that peer never looks |
