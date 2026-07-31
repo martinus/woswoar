@@ -2754,5 +2754,113 @@ class TestSplitForExport(unittest.TestCase):
         self.assertLess(sync.MAX_EXPORT_BYTES, sync.MAX_CHUNK_BYTES)
 
 
+class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
+    """Issue #67: a rewrite must rebuild the day from everything, not what is new.
+
+    A compacted chunk keeps its `subsumes` list in the manifest for good, so
+    `_Day.open` sees a rewrite on every later pass too. Skipping the chunks
+    already in `state.merged` first meant the day was rebuilt from only the
+    chunks that happened to be new -- and everything before them was gone from
+    the peer's log, silently.
+
+    Reached by `compact` and then `import`, which writes into past days by
+    construction.
+    """
+
+    def merged_pair(self) -> tuple[Fake, Fake]:
+        """alpha with one day of four chunks, and a beta that has merged them."""
+        alpha, beta = self.history_across_days(days=1, per_day=4)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 4)
+        return alpha, beta
+
+    def test_a_later_chunk_does_not_discard_the_day(self) -> None:
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            days, _, _ = sync.compact(before="2023-12-01")
+            self.assertEqual(days, 1)
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 4, "compaction alone lost history")
+
+        # The trigger: one more line on a day already compacted and merged.
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_100, "later")
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(
+                sorted(beta.commands()),
+                [f"day 0 command {i}" for i in range(4)] + ["later"],
+                "the rewrite dropped what had already been merged",
+            )
+
+    def test_a_re_read_chunk_is_not_counted_as_newly_merged(self) -> None:
+        """Two passes, so the second genuinely re-reads the compacted chunk."""
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            sync.compact(before="2023-12-01")
+            sync.run()
+        with beta.active():
+            sync.run()  # merges the compacted chunk
+
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_100, "later")
+            sync.run()
+        with beta.active():
+            report = sync.run()
+            # The compacted chunk is read again to rebuild the day, but only
+            # `later` is new. Counting the re-read would tell the user history
+            # arrived that they already had.
+            self.assertEqual(report.chunks_merged, 1, "a re-read chunk was counted as new")
+            self.assertEqual(len(set(beta.commands())), 5)
+
+    def test_an_ordinary_day_stays_incremental(self) -> None:
+        """Only a rewrite re-reads. Otherwise every sync would redo the day.
+
+        A day with no compacted chunk gains a line: exactly one chunk should be
+        decrypted, not every chunk the day holds.
+        """
+        alpha, beta = self.merged_pair()
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_100, "later")
+            sync.run()
+
+        with beta.active():
+            opened: list[str] = []
+            real = sync.open_chunk
+
+            def counted(path: Path, digest: str) -> bytes:
+                opened.append(path.name)
+                return real(path, digest)
+
+            with mock.patch.object(sync, "open_chunk", counted):
+                sync.run()
+            self.assertEqual(len(opened), 1, f"the whole day was re-read: {opened}")
+            self.assertEqual(len(beta.commands()), 5)
+
+    def test_a_day_with_nothing_new_reads_no_manifest(self) -> None:
+        """The laziness that makes signatures affordable, kept.
+
+        A manifest costs an `ssh-keygen -Y verify`, and sync runs on a
+        one-minute timer. Grouping by day must not turn that into one fork per
+        day of history per run.
+        """
+        _, beta = self.merged_pair()
+        with beta.active():
+            reads: list[str] = []
+            real = sync.read_manifest
+
+            def counted(host_id: str, day: str, verify_key: str) -> dict[str, sync.Entry]:
+                reads.append(day)
+                return real(host_id, day, verify_key)
+
+            with mock.patch.object(sync, "read_manifest", counted):
+                sync.run()
+            self.assertEqual(reads, [], "a day with nothing new still read its manifest")
+
+
 if __name__ == "__main__":
     unittest.main()
