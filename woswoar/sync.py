@@ -2028,6 +2028,17 @@ def initialise(
     crypto.require()
     crypto.require_signing()
 
+    if remote is not None and remote.startswith("-"):
+        # Refused here rather than only guarded with `--` at the git calls, so
+        # the user gets a sentence instead of git's own error, and so the rule
+        # is stated once where it can be tested. `--` is still passed below:
+        # this is the message, that is the defence.
+        raise SyncError(
+            f"a remote may not start with '-': {remote!r}\n"
+            "That is an option to git, not an address -- 'git clone' takes\n"
+            "'--upload-pack=<command>' and runs it."
+        )
+
     chosen = choose_identity(new_identity=new_identity, explicit=identity)
     known = store.machine()._replace(identity=str(chosen))
     store.save_machine(known)
@@ -2036,12 +2047,17 @@ def initialise(
     if not is_repo():
         store.private_dir(history.parent)
         if remote and not any(history.glob("*")):
-            git("clone", "--quiet", remote, str(history), cwd=history.parent)
+            # `--` before anything the user supplied. `git clone` takes
+            # `--upload-pack=<cmd>` and runs it, so a "remote" beginning with a
+            # dash is a command, not an address -- and argparse hands one
+            # through happily, because `--` ends *woswoar's* option parsing and
+            # makes the rest a positional.
+            git("clone", "--quiet", "--", remote, str(history), cwd=history.parent)
         else:
             history.mkdir(parents=True, exist_ok=True)
             git("init", "--quiet", "-b", "main")
     if remote and not has_remote():
-        git("remote", "add", "origin", remote)
+        git("remote", "add", "origin", "--", remote)
 
     # After the remote is added, not before: that is what decides `has_remote`.
     repo = read_repo()

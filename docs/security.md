@@ -245,6 +245,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
 | The hook's scratch file is never in a directory another user can write | `TMPDIR` and `/tmp` are never consulted; an `XDG_RUNTIME_DIR` this user cannot write falls back to woswoar's own `0700` tree instead of switching recording off |
+| A remote is an address, never an option to git | `woswoar init -- --upload-pack=<command>` is refused, and both git calls that are handed the remote pass `--` first; the command never runs |
 | The cache cannot execute | a pickle that would run code on load is written to the cache path; it is refused and a witness file never appears |
 | Search stays fast | latency measured on 52,000 entries |
 
