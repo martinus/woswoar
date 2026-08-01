@@ -3114,6 +3114,21 @@ class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
             everyone = {log.host_id for log in store.iter_log_files()}
             self.assertEqual(everyone, {alpha.id, beta.id})
 
+            listed: list[str] = []
+            real = store.iter_log_files
+
+            def counted(host_id: str | None = None) -> Iterator[store.LogFile]:
+                for log in real(host_id):
+                    listed.append(log.host_id)
+                    yield log
+
+            with mock.patch.object(store, "iter_log_files", counted):
+                sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_900)
+            # Peers' directories are not walked at all, rather than walked and
+            # then discarded: at three machines that was two thirds of the
+            # listing done to be thrown away, once a minute.
+            self.assertEqual(set(listed), {alpha.id}, "another host's logs were listed")
+
             ours = list(store.iter_log_files(alpha.id))
             self.assertEqual({log.host_id for log in ours}, {alpha.id})
             # The same files the caller would have kept after filtering, so
