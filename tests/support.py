@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import NamedTuple
 
 from woswoar import crypto, store
+from woswoar.__main__ import main
 from woswoar.entry import Entry
 
 MACHINE_ID = "0123456789abcdef"
@@ -20,6 +24,31 @@ requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
 requires_bash = unittest.skipUnless(shutil.which("bash"), "bash required")
+
+
+class Ran(NamedTuple):
+    """What one CLI invocation did."""
+
+    code: int
+    out: str
+    err: str
+
+
+def run_cli(*argv: str) -> Ran:
+    """Drive the real CLI in process, capturing both streams.
+
+    Both, because several commands put the thing a test cares about on stderr --
+    `sync`'s warning that a day could not be authenticated, `grant`'s refusal to
+    act without a terminal. Four modules used to spell this out separately and
+    every one of them captured stdout alone, so a test meaning "it warned" could
+    only check the exit code, and would have passed had the warning been
+    deleted. That is the failure mode `CLAUDE.md` rule 3 is about, and it was
+    invisible at each individual call site.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = main(list(argv))
+    return Ran(code, out.getvalue(), err.getvalue())
 
 
 def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -> Entry:

@@ -8,15 +8,13 @@ would think to run it.
 
 from __future__ import annotations
 
-import io
 import os
 import stat
 import unittest
-from contextlib import redirect_stdout
 
 from woswoar import crypto
-from woswoar.__main__ import main
 
+from . import support
 from .support import WoswoarTestCase, requires_age
 
 
@@ -46,26 +44,23 @@ class TestDoctorWithABrokenAge(WoswoarTestCase):
         os.environ["PATH"] = f"{fake}{os.pathsep}{self._path}"
         self.addCleanup(lambda: os.environ.__setitem__("PATH", self._path))
 
-    def doctor(self) -> tuple[int, str]:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            code = main(["doctor"])
-        return code, buffer.getvalue()
+    def doctor(self) -> support.Ran:
+        return support.run_cli("doctor")
 
     def test_selftest_reports_what_age_said(self) -> None:
         failure = crypto.selftest()
         self.assertIn("permission denied", failure)
 
     def test_doctor_fails_and_shows_the_reason(self) -> None:
-        code, out = self.doctor()
-        self.assertNotEqual(code, 0, out)
-        self.assertRegex(out, r"\[FAIL\] age", out)
-        self.assertIn("permission denied", out)
+        ran = self.doctor()
+        self.assertNotEqual(ran.code, 0, ran.out)
+        self.assertRegex(ran.out, r"\[FAIL\] age", ran.out)
+        self.assertIn("permission denied", ran.out)
 
     def test_doctor_does_not_need_a_repo_to_notice(self) -> None:
         """The whole point. This used to be gated behind `sync.is_repo()`, so
         the machine where `init` had just failed got a clean bill of health."""
-        _, out = self.doctor()
+        out = self.doctor().out
         self.assertIn("no history repo", out, "precondition: no repo in this sandbox")
         self.assertRegex(out, r"\[FAIL\] age")
 

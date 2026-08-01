@@ -13,6 +13,7 @@ from pathlib import Path
 from woswoar import deps
 from woswoar.__main__ import main
 
+from . import support
 from .support import WoswoarTestCase
 
 
@@ -99,16 +100,14 @@ class TestInstallWarnsAboutMissingTools(WoswoarTestCase):
             os.environ["HOME"] = self._home
 
     def test_install_still_succeeds_but_says_what_is_missing(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = main(["install", "--rcfile", str(self.home / ".bashrc")])
+        ran = support.run_cli("install", "--rcfile", str(self.home / ".bashrc"))
 
         # Recording works without any of them, so this is a warning, not a
         # failure -- the hook really was installed.
-        self.assertEqual(code, 0)
-        self.assertIn("woswoar.bash", out.getvalue())
+        self.assertEqual(ran.code, 0)
+        self.assertIn("woswoar.bash", ran.out)
         for tool in ("fzf", "age", "git", "ssh-keygen"):
-            self.assertIn(tool, err.getvalue())
+            self.assertIn(tool, ran.err)
 
     def test_a_complete_machine_says_nothing(self) -> None:
         # Put the tools back so `missing()` finds them.
