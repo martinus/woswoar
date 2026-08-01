@@ -2537,6 +2537,48 @@ class TestADecompressionBomb(SyncTestCase):
         self.assertEqual(len({e.cmd for e in entries}), before)
 
 
+class TestTheRepoExplainsItself(SyncTestCase):
+    """A history repository is opaque by design, which makes it unreadable in
+    the other sense too: a stranger who finds it, or its owner three years on,
+    sees directories of random hex and encrypted blobs and no way to tell what
+    it is or what touching it would break."""
+
+    def test_init_commits_a_readme(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            committed = sync.git("ls-files").splitlines()
+            self.assertIn(store.README, committed, "the README was not committed")
+            text = (store.history_dir() / store.README).read_text(encoding="utf-8")
+        self.assertIn("github.com/martinus/woswoar", text, "no link to the project")
+        self.assertIn("Do not edit", text)
+
+    def test_a_peer_receives_it(self) -> None:
+        """It is in the repo, so it arrives with the clone rather than per machine."""
+        self.machine("alpha")
+        beta = self.machine("beta")
+        with beta.active():
+            self.assertTrue((store.history_dir() / store.README).is_file())
+
+    def test_it_is_written_once_and_then_left_alone(self) -> None:
+        """A machine on another version must not rewrite a peer's wording.
+
+        `.gitattributes` *is* compared and rewritten, because `merge=union` on
+        `recipients.txt` is what keeps two machines enrolling at once
+        conflict-free. Prose earns no such thing: rewriting it would mean two
+        versions putting it back at each other every time anyone ran `init`.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            readme = store.history_dir() / store.README
+            readme.write_text("written by another version\n", encoding="utf-8")
+            sync._commit()
+
+            # `init` again is the path that could rewrite it -- `sync` never
+            # touches repo metadata at all.
+            sync.initialise(remote=str(self.origin))
+            self.assertEqual(readme.read_text(encoding="utf-8"), "written by another version\n")
+
+
 class TestRecipientsPublishNoNames(SyncTestCase):
     """#22: the one plaintext file in the repo named every machine.
 
@@ -2626,7 +2668,12 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         `docs/security.md` says the repo does not publish machine names. This is
         what makes that a guarantee instead of a sentence.
         """
-        alpha = self.machine("alpha", display="martinus@secret-box")
+        # A user name that cannot occur in the repo for any other reason. The
+        # earlier fixture used "martinus", which is also the owner of the
+        # project URL in `store.README_CONTENT` -- so this failed on a string
+        # that names no machine, and would have kept failing for every user
+        # whose account happens to match a word in a committed file.
+        alpha = self.machine("alpha", display="zqoperator@secret-box")
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
@@ -2638,7 +2685,14 @@ class TestRecipientsPublishNoNames(SyncTestCase):
                 path.read_bytes() for path in store.history_dir().rglob("*") if path.is_file()
             )
         self.assertNotIn(b"secret-box", committed)
-        self.assertNotIn(b"martinus", committed)
+        self.assertNotIn(b"zqoperator", committed)
+
+        # And the one plaintext file a machine name could most easily creep
+        # into is exactly what the constant says, so nothing can ever be
+        # interpolated into it.
+        with alpha.active():
+            readme = (store.history_dir() / store.README).read_text(encoding="utf-8")
+        self.assertEqual(readme, store.README_CONTENT)
 
     def test_no_name_is_written_into_recipients_at_all(self) -> None:
         """#22: the label used to be `$USER@$(uname -n)`, in cleartext.
