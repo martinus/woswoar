@@ -46,8 +46,17 @@ _SHARED = (
     r"--(?:[a-z]+-)*(?:(?:passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)"
     r"(?:[=\s]|$)",
     r"--from-literal=",
-    # Credentials inside a URL.
+    # Credentials inside a URL. Two shapes: a `user:pass@` prefix, and a token
+    # that *is* a path component -- a webhook URL, where holding the address is
+    # holding the credential. Anchored on the known hosts rather than on
+    # "looks random", for the reason the module docstring gives.
+    #
+    # The whole host, not a path under it. Measured against real history, the
+    # one that turned up was `hooks.slack.com/triggers/...`, not the
+    # `/services/...` an incoming webhook uses -- and every path on that host
+    # carries a trigger a holder can fire.
     r"://[^/\s]+:[^/@\s]+@",
+    r"://(?:hooks\.slack\.com|discord(?:app)?\.com/api/webhooks)/\S",
     r"[Aa]uthorization:\s*[A-Za-z]",
     # The three tools that exist to take a password on the command line.
     r"(?:sshpass|htpasswd|openssl passwd)\s",

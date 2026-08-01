@@ -202,12 +202,14 @@ HOOK = Path(__file__).resolve().parent.parent / "woswoar" / "shell" / "woswoar.b
 def as_posix_ere(pattern: str) -> str:
     r"""Rewrite one Python pattern into the POSIX ERE dialect bash `[[ =~ ]]` uses.
 
-    Only the two constructs `_SHARED` actually uses need translating: ERE has no
-    non-capturing group, and no `\s`. Inside a bracket expression the class is
-    spelled `[:space:]`; outside one it needs its own brackets.
+    Only the constructs `_SHARED` actually uses need translating: ERE has no
+    non-capturing group, and no `\s` or `\S`. Inside a bracket expression the
+    class is spelled `[:space:]`; outside one it needs its own brackets, and the
+    negated form needs the negated bracket.
     """
     pattern = pattern.replace("(?:", "(")
     pattern = re.sub(r"\[([^]]*?)\\s([^]]*?)\]", r"[\1[:space:]\2]", pattern)
+    pattern = pattern.replace(r"\S", "[^[:space:]]")
     return pattern.replace(r"\s", "[[:space:]]")
 
 

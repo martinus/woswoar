@@ -282,6 +282,13 @@ Being straight about the limits is part of the security story:
 >   token formats, which is where the risk is concentrated. But **no pattern
 >   catches everything**. [What it does and does not catch](shell-integration.md#commands-that-are-never-recorded)
 >   is written down; read it before relying on it.
+>
+>   For a sense of scale rather than a promise: measured against one
+>   maintainer's real atuin history of **55,017 commands**, the rules skipped 32
+>   and missed **one** shape -- a Slack webhook URL, where the address *is* the
+>   credential. That rule now exists, and the shape is in the corpus. One
+>   history is not a survey, and the number that matters for you is the one from
+>   your own; `woswoar import --dry-run` prints what it would skip.
 > - **Lose your key, lose your access.** There is no recovery service, because
 >   there is no service. If a machine loses its identity, re-enrol it and run
 >   `woswoar grant` from another machine. If it loses its *signing* key it mints

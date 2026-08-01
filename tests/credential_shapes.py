@@ -11,6 +11,26 @@ from __future__ import annotations
 #: Command shapes the default `WOSWOAR_IGNORE` must drop. Most come from #23,
 #: which listed them as *not* caught by the pattern this replaces.
 SECRET_SHAPES = [
+    # A credential that is a *path component* of a URL rather than a
+    # `user:pass@` prefix. Measured against 55,017 commands of one maintainer's
+    # real history, this was the only shape the rules missed -- twice, in `curl`
+    # calls to a Slack webhook. Anyone holding the URL can fire that integration,
+    # so it is a credential in the ordinary sense.
+    #
+    # The tokens here are deliberately too short and too obviously fake to match
+    # a vendor's own shape. A corpus of credential examples is a file full of
+    # things that look like credentials, and GitHub's push protection rejected
+    # an earlier draft of it: a 24-character token after `/services/` is exactly
+    # what its Slack rule matches. woswoar's rule needs only the host and one
+    # character of path, so nothing is lost by staying well clear.
+    'curl -X POST -d \'{"text":"hi"}\' https://hooks.slack.com/services/EXAMPLE-NOT-REAL',
+    # The one that actually turned up: a workflow *trigger*, not an incoming
+    # webhook. Anchoring the rule on `/services/` -- the shape that comes to
+    # mind -- would have missed the only real instance in 55,017 commands, which
+    # is why the rule names the host and not a path under it.
+    "curl -X POST https://hooks.slack.com/triggers/EXAMPLE-NOT-REAL",
+    "curl -H 'Content-type: application/json' https://discord.com/api/webhooks/EXAMPLE-NOT-REAL",
+    "curl -d @body.json https://discordapp.com/api/webhooks/EXAMPLE-NOT-REAL",
     "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI",
     "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7",
     "AWS_SESSION_TOKEN=abc aws s3 ls",
