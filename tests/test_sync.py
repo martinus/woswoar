@@ -3096,6 +3096,10 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         self.assertEqual([self.verifications(beta) for _ in range(3)], [0, 0, 0])
         with beta.active():
             self.assertEqual(len(beta.commands()), 2, "the day's own history was lost")
+        # And the stray is not recorded as merged. It never was -- and a name
+        # remembered as merged is one that would be skipped if a manifest ever
+        # did list it, taking its lines with it.
+        self.assertNotIn("1700000000-dead.age", self.remembered(beta, alpha))
 
     def test_compaction_shrinks_what_is_remembered(self) -> None:
         """#86: `state.json` is read and compared every sync, and only grew."""
