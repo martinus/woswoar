@@ -3101,6 +3101,32 @@ class TestWalkingAPeersChunks(SyncTestCase):
         self.assertTrue(all(name.endswith(".age") for name in names), names)
         self.assertEqual(len(names), 2)
 
+    def test_a_directory_holding_no_chunk_is_not_a_day(self) -> None:
+        """Empty and "nothing new" are different answers, told apart here.
+
+        A day directory can exist with nothing in it -- a `compact` that removed
+        the last chunk, a partial write cleaned up -- and every caller would
+        otherwise have to ask. `has_chunks` in particular decides whether an
+        orphaned day key is a loss or a harmless nuisance, so a directory with
+        only a stray file in it must read as empty there too.
+        """
+        alpha, _beta = self.stocked()
+        with alpha.active():
+            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow.mkdir(parents=True, exist_ok=True)
+
+            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertFalse(sync.has_chunks(alpha.id, "2023-11-20"))
+
+            (hollow / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
+            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertFalse(
+                sync.has_chunks(alpha.id, "2023-11-20"), "a stray file counted as a chunk"
+            )
+
+            # And a day that does hold one still says so.
+            self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
+
     def test_keys_and_manifests_are_not_mistaken_for_days(self) -> None:
         """They sit in the same host directory, and neither holds chunks."""
         alpha, _beta = self.stocked()
