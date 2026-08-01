@@ -33,7 +33,6 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1371,10 +1370,11 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     #: instead of hundreds, on precisely the first sync a new machine runs.
     day_keys: dict[str, str | None] = {}
 
-    # Grouped by day rather than streamed chunk by chunk, because whether a day
-    # is being *rewritten* has to be known before deciding which of its chunks
-    # to read -- and that answer is in the manifest. `iter_chunks` yields a
-    # day's chunks contiguously, which is what makes one group one day.
+    # A day at a time rather than a chunk at a time, because whether a day is
+    # being *rewritten* has to be known before deciding which of its chunks to
+    # read -- and that answer is in the manifest. `iter_chunk_days` hands over
+    # one day's names together, which used to be a `groupby` over a flat stream
+    # relying on that stream keeping a day contiguous.
     #
     # A rewrite replaces the day's log file outright, so it has to be rebuilt
     # from every chunk the manifest lists, not from the ones this run happens to
@@ -1386,8 +1386,12 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # Laziness is kept where it pays: a day with nothing new never reads its
     # manifest, and a manifest costs a subprocess. Over a year of three machines
     # that is the difference between ~3.6s and nearly two minutes.
-    for chunk_day, group in groupby(store.iter_chunks(host_id), key=lambda c: c.day):
-        chunks = list(group)
+    # Names, not `Chunk` objects: the decision below is made from the name
+    # alone, and on an idle sync it is "already merged" for every one of them.
+    # Building a `Path` and a `Chunk` per file first is what made this walk cost
+    # 88 ms per peer at 20k chunks rather than 3 -- once a minute, growing with
+    # the archive. Objects are built only for the chunks actually read.
+    for chunk_day, names in store.iter_chunk_days(host_id):
         key = f"{host_id}/{chunk_day}"
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
@@ -1396,16 +1400,17 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # merged below, and aliasing it made "was this already merged" answer
         # yes for a chunk this very run had just added.
         already = frozenset(state.merged.get(key, ()))
-        fresh = [chunk for chunk in chunks if chunk.name not in already]
+        fresh = [name for name in names if name not in already]
         if not fresh:
             continue
 
         listed = read_manifest(host_id, chunk_day, verify_key)
         day = _Day(host_id, chunk_day, listed, already)
-        pending = chunks if day.rewrite else fresh
+        pending = names if day.rewrite else fresh
+        directory = store.chunk_dir(host_id, chunk_day)
 
-        for chunk in pending:
-            if chunk.name not in day.listed:
+        for name in pending:
+            if name not in day.listed:
                 # No signed statement that this host wrote this. Covers a
                 # missing, unsigned, mis-signed or mis-addressed manifest as
                 # well as a chunk simply absent from a good one -- see
@@ -1432,7 +1437,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # and the parser only ever see bytes one of this user's own machines
             # wrote.
             try:
-                blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
+                blob = open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
                 report.unauthenticated.add(key)
                 continue
@@ -1450,8 +1455,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 continue
 
             day.add(plaintext, report)
-            state.merged.setdefault(key, set()).add(chunk.name)
-            if chunk.name not in already:
+            state.merged.setdefault(key, set()).add(name)
+            if name not in already:
                 report.chunks_merged += 1
 
         day.flush(report)
