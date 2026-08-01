@@ -2537,6 +2537,53 @@ class TestADecompressionBomb(SyncTestCase):
         self.assertEqual(len({e.cmd for e in entries}), before)
 
 
+class TestCloningDoesNotShareObjectsWithTheOrigin(SyncTestCase):
+    """Issue #79: `git clone` of a *local path* hardlinks objects from it.
+
+    A bare repo on a NAS or a shared filesystem is an ordinary woswoar remote,
+    and a fleet syncing to it means the source is being written while a joining
+    machine clones. Git notices and refuses -- `fatal: hardlink different from
+    source` -- which is how this surfaced, on CI, on a pull request that changed
+    a version string.
+    """
+
+    def test_the_clone_shares_no_object_file_with_its_source(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        beta = self.machine("beta")
+        with beta.active():
+            objects = list((store.history_dir() / ".git" / "objects").rglob("*"))
+            files = [p for p in objects if p.is_file()]
+            self.assertTrue(files, "precondition: the clone has object files")
+
+            # A hardlink is the same inode as the origin's copy. Linked objects
+            # mean a `git gc` or a corruption on either side reaches the other,
+            # quite apart from the clone failing under a concurrent writer.
+            origin_inodes = {p.stat().st_ino for p in Path(self.origin).rglob("*") if p.is_file()}
+            shared = [p for p in files if p.stat().st_ino in origin_inodes]
+            self.assertEqual(shared, [], "objects are hardlinked to the origin")
+
+    def test_a_joining_machine_still_gets_the_history(self) -> None:
+        """The copy has to be a real one, not merely an unlinked one."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        # Enrol first, then grant: `grant` seals to the recipients as they are
+        # at that moment, so the other order widens access to a list beta is
+        # not yet in.
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status"})
+
+
 class TestInitLeavesNothingReadable(SyncTestCase):
     """The first thing a new machine does must not fail its own check.
 

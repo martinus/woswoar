@@ -2109,7 +2109,28 @@ def initialise(
             # dash is a command, not an address -- and argparse hands one
             # through happily, because `--` ends *woswoar's* option parsing and
             # makes the rest a positional.
-            git("clone", "--quiet", "--", remote, str(history), cwd=history.parent)
+            # `--no-hardlinks` because a local-path remote is an ordinary
+            # woswoar setup -- a bare repo on a NAS or a shared filesystem --
+            # and `git clone` links objects from such a source instead of
+            # copying them. Two things follow, and both have happened here:
+            #
+            # - The clone fails outright if another machine writes the source
+            #   while it runs, which is exactly what a fleet syncing to that
+            #   repo does: `fatal: hardlink different from source`.
+            # - The new clone's object files *are* the origin's, so a `git gc`
+            #   or a corruption on either side reaches the other.
+            #
+            # The cost is copying the objects rather than linking them, once,
+            # at `init`. A clone over ssh or https never linked anything.
+            git(
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                "--",
+                remote,
+                str(history),
+                cwd=history.parent,
+            )
         else:
             history.mkdir(parents=True, exist_ok=True)
             git("init", "--quiet", "-b", "main")
