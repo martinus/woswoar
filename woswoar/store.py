@@ -32,6 +32,39 @@ _NAME_FILE = ".name"
 
 RECIPIENTS = "recipients.txt"
 GITATTRIBUTES = ".gitattributes"
+README = "README.md"
+
+#: What a stranger finding the repository sees first, and what its owner sees in
+#: three years having forgotten what it was. Deliberately says nothing about
+#: whose it is: the host directories are opaque hex precisely so the archive does
+#: not name machines, and a README that undid that would be worse than none.
+#:
+#: Written only when absent, unlike `.gitattributes`, which is compared and
+#: rewritten to match. Both are written by `init` rather than by `sync`, so the
+#: cost of getting this wrong is bounded -- but a machine on a newer version
+#: would still rewrite a peer's wording the next time anyone ran `init`, and the
+#: older one would put it back. `.gitattributes` earns that because its content
+#: is load-bearing: `merge=union` on `recipients.txt` is what makes two machines
+#: enrolling at once conflict-free. Prose does not.
+README_CONTENT = """# woswoar history
+
+Encrypted shell history, written by [woswoar](https://github.com/martinus/woswoar).
+
+Every `.age` file here is ciphertext. There is nothing readable in this
+repository, including the directory names -- they are random hex so that an
+archive of it does not publish which machines exist.
+
+## Do not edit this by hand
+
+Chunks are written once and never rewritten, and each machine signs a list of
+what it published each day. A file that no signed list accounts for is refused
+by every other machine and reported. Editing or deleting one here does not
+remove history -- other machines keep their own copies -- and will make them
+report the repository as tampered with.
+
+To take a machine's access away, run `woswoar revoke` from another one. To see
+what state this repository is in, run `woswoar doctor`.
+"""
 
 #: `recipients.txt` is the one file every machine appends to, so it is also the
 #: only place a merge conflict could arise. A union merge resolves it: the file

@@ -268,6 +268,68 @@ sense. Dropping `grant` entirely would be perfectly safe — a new machine would
 simply never read history recorded before it enrolled. What is unsafe is keeping
 the capability and removing the person.
 
+## 🌐 Can I use a public repository?
+
+You can, and the encryption holds — a public repository is still a pile of
+unreadable blobs, and because "public" on a git host means *readable*, not
+writable, push access is unchanged and so is everything the signatures
+guarantee.
+
+**Use a private one anyway.** Three things change, and two of them cannot be
+undone afterwards.
+
+### Your SSH public key names you
+
+By default the recipient woswoar enrols is your existing **SSH public key** —
+preferred because it means no new secret exists to lose. GitHub publishes every
+user's SSH public keys at `github.com/<username>.keys`, and GitLab does the
+same. So a public history repository can be matched to your account, and to
+every other place that key is used, by anyone who cares to look.
+
+The opaque host directories exist so that an archive does not publish which
+machines you have. This would hand over who you are instead.
+
+`woswoar init --new-identity` avoids it: a dedicated age key that exists nowhere
+else, and is therefore not a handle to anything.
+
+### Harvest now, decrypt later
+
+Against a private repository an attacker needs access **and** a key. Public
+removes the first requirement permanently and retroactively: anyone can take a
+copy today and keep it. If a key is ever compromised, or age's primitives are
+ever broken, everything published becomes readable back to the first commit.
+
+And there is no taking it back. Forks, mirrors and archives mean "I will make it
+private later" does not undo a day of it being public.
+
+### The metadata becomes a continuous public record
+
+Encryption covers file contents. It does not cover file *names*, and those carry:
+
+```
+hosts/6941894815e14751/2023-11-14/1700000500-f400be.age
+                       ^ which days   ^ the sync time, to the second
+```
+
+Which days you worked, how many chunks each day, and the second at which every
+sync ran — plus a commit timestamp beside it. Over months that is working hours,
+timezone, sleep, and holidays, published continuously. *What is not protected*
+below already lists metadata as something the design does not hide; a public
+repository turns it from *what a leak would reveal* into *a feed*.
+
+### And one that compounds
+
+The credential filter is best-effort by design, and says so. In a private
+repository a command that slips past it still has both encryption and access
+control in front of it. Public removes one of those, and combines with
+harvest-now-decrypt-later above.
+
+### If you want a public one anyway
+
+For a demonstration repository — showing what the format looks like, say — use a
+throwaway with `--new-identity` and history you do not mind publishing. That is
+a different thing from syncing the machines you actually work on.
+
 ## 📦 Minimal supply chain
 
 No on-disk format woswoar reads can execute code. The parse cache under

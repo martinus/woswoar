@@ -2164,6 +2164,13 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
         store.write_atomic(attrs, store.GITATTRIBUTES_CONTENT.encode("utf-8"))
         changed = True
 
+    # Only when absent -- see `store.README_CONTENT` for why it is not compared
+    # and rewritten the way `.gitattributes` is.
+    readme = store.history_dir() / store.README
+    if not readme.is_file():
+        store.write_atomic(readme, store.README_CONTENT.encode("utf-8"))
+        changed = True
+
     recipient = crypto.recipient_for(identity).strip()
     if add_recipient(recipient):
         changed = True

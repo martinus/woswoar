@@ -196,6 +196,53 @@ truthful. Re-running an import is idempotent.
 | `WOSWOAR_SCOPE` | default scope for <kbd>Ctrl</kbd>+<kbd>R</kbd> (default `global`) |
 | `WOSWOAR_NO_BIND` | set to skip binding <kbd>Ctrl</kbd>+<kbd>R</kbd> |
 
+## Uninstalling
+
+There is no `woswoar uninstall`, because every step is one you should see. In
+order, and each is independent:
+
+```sh
+# 1. Stop the timer, if you installed one.
+systemctl --user disable --now woswoar-sync.timer
+rm -f ~/.config/systemd/user/woswoar-sync.{service,timer}
+
+# 2. Remove the hook from your shell. `woswoar install` wrote a marked block;
+#    delete the three lines between the markers, or:
+sed -i '/# >>> woswoar >>>/,/# <<< woswoar <<</d' ~/.bashrc
+
+# 3. Remove the program.
+pipx uninstall woswoar
+
+# 4. Remove its data. THIS DELETES YOUR RECORDED HISTORY -- see below first.
+rm -rf ~/.local/share/woswoar ~/.config/woswoar ~/.cache/woswoar
+```
+
+Open a new shell afterwards; the current one still has the hook loaded.
+
+### Before you run step 4
+
+`~/.local/share/woswoar/logs/` is the **only** plaintext copy of what this
+machine recorded. `history/` beside it is the encrypted git checkout, and
+`~/.config/woswoar/` holds this machine's identity and its signing key.
+
+- **Keeping the history?** Copy `logs/` somewhere first. It is TSV, one command
+  per line, readable without woswoar.
+- **Other machines still syncing?** Deleting local files does not remove this
+  machine from the shared repository, and it does not stop peers accepting what
+  it published. Run `woswoar revoke <fingerprint>` from **another** machine,
+  otherwise its key stays in `recipients.txt` as a machine that can still read
+  everything. `woswoar grant` on that other machine lists every enrolled
+  machine by fingerprint and name, which is where that value comes from — it
+  asks before changing anything, and does nothing at all if nothing is new.
+- **Reinstalling later?** Deleting `~/.config/woswoar/` discards the identity.
+  The machine can rejoin with `woswoar init <url>`, but it enrols as a *new*
+  machine: someone must run `woswoar grant` again, and every other machine must
+  `woswoar trust` it. Keep that directory if you only meant to move the data.
+
+The remote repository is untouched by all of this. Delete it separately if you
+want it gone, remembering that other machines still hold their own copies of
+everything in it.
+
 ## How it works
 
 ```
