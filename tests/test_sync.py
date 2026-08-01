@@ -3015,9 +3015,17 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         A manifest costs an `ssh-keygen -Y verify`, and sync runs on a
         one-minute timer. Grouping by day must not turn that into one fork per
         day of history per run.
+
+        The day's directory is disturbed first, so the mtime stamp of #85 does
+        not skip it before `read_manifest` is ever reached. Without that this
+        test passes whether or not the laziness it is named for still exists.
         """
-        _, beta = self.merged_pair()
+        alpha, beta = self.merged_pair()
         with beta.active():
+            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray.write_bytes(b"disturb the day's stamp")
+            stray.unlink()
+
             reads: list[str] = []
             real = sync.read_manifest
 
@@ -3028,6 +3036,193 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             with mock.patch.object(sync, "read_manifest", counted):
                 sync.run()
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
+
+
+class TestSkippingAnUnchangedDay(SyncTestCase):
+    """Issue #85: listing a peer's archive is what an idle merge costs.
+
+    A day directory's mtime moves when a chunk lands in it, so a day whose stamp
+    is unchanged since it was merged has nothing new -- and needs no listing. At
+    20k chunks over 40 days that is 0.18 ms of stats against 4.96 ms of listing,
+    once a minute, per peer.
+    """
+
+    #: The days `history_across_days` writes.
+    DAYS: ClassVar[tuple[str, ...]] = ("2023-11-14", "2023-11-15")
+
+    def listed(self, machine: Fake) -> list[str]:
+        """The days one sync actually lists the chunks of."""
+        days: list[str] = []
+        real = store.chunk_names
+
+        def counted(machine_id: str, day: str) -> list[str]:
+            days.append(day)
+            return real(machine_id, day)
+
+        with machine.active(), mock.patch.object(store, "chunk_names", counted):
+            sync.run()
+        return days
+
+    def settle(self, machine: Fake, host: Fake, *days: str) -> None:
+        """Age a day directory past `RACY_WINDOW_NS`, as a minute of real time does.
+
+        A day written moments ago is deliberately not stamped: its mtime cannot
+        yet rule out another write landing in the same filesystem tick. Every
+        real day reaches that state within seconds; a test would otherwise have
+        to sleep through it.
+        """
+        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
+        with machine.active():
+            for day in days:
+                os.utime(store.chunk_dir(host.id, day), (aged, aged))
+
+    def pair(self) -> tuple[Fake, Fake]:
+        """alpha with two days of one chunk, and a beta that has merged both."""
+        alpha, beta = self.history_across_days(days=2, per_day=1)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 2)
+        # Settled, then one more pass so the stamps are recorded.
+        self.settle(beta, alpha, *self.DAYS)
+        with beta.active():
+            sync.run()
+        return alpha, beta
+
+    def test_a_merged_day_is_not_listed_again(self) -> None:
+        _alpha, beta = self.pair()
+        self.assertEqual(self.listed(beta), [], "an unchanged day was listed")
+        # ...and the history is still there, which is the point of not looking.
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 2)
+
+    def test_a_day_that_gains_a_chunk_is_listed_and_merged(self) -> None:
+        """The half that would silently stop merging if the skip overreached."""
+        alpha, beta = self.pair()
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_000_002, "a later line")
+            sync.run()
+
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        with beta.active():
+            self.assertIn("a later line", beta.commands())
+
+        # And once the day has been still long enough to be trusted, it settles
+        # rather than re-listing for ever. Until then it is looked at again --
+        # deliberately, since its mtime cannot yet rule out another write.
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        self.settle(beta, alpha, "2023-11-15")
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        self.assertEqual(self.listed(beta), [])
+
+    def test_a_day_left_short_is_looked_at_again(self) -> None:
+        """A stamp must mean "merged", not "looked at".
+
+        A chunk that would not open leaves the day incomplete. Stamping it would
+        say the day is finished, and nothing would ever read that chunk again --
+        the same trap #69 hit by recording a rebuild that had failed.
+        """
+        alpha, beta = self.pair()
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_000_002, "a later line")
+            sync.run()
+
+        def refuse(path: Path, expected: str) -> bytes:
+            raise ValueError(f"{path.name} is not the chunk its manifest names")
+
+        # Twice, with a settle between. The first pass is what *fetches* the
+        # chunk, so it leaves the directory freshly written and the racy window
+        # would keep the day being read again whatever the completeness rule
+        # said. The second runs against a day that is settled and still short --
+        # the only state in which the rule is the thing being tested.
+        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+            sync.run()
+        self.settle(beta, alpha, "2023-11-15")
+        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+            report = sync.run()
+        self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
+
+        # Nothing changed on disk, so only an unstamped day gets a second look.
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        with beta.active():
+            self.assertIn("a later line", beta.commands())
+
+    def test_a_day_whose_directory_changed_is_listed_again(self) -> None:
+        """The stamp is the whole test, so a moved stamp must be believed.
+
+        And then re-recorded. A day that is looked at, found to hold nothing
+        new, and left unstamped would be listed again on every sync for ever --
+        which is what a single stray file in a peer's directory would cost.
+        """
+        alpha, beta = self.pair()
+        with beta.active():
+            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray.write_bytes(b"something landed in the directory")
+        self.assertEqual(self.listed(beta), ["2023-11-14"])
+        self.settle(beta, alpha, "2023-11-14")
+        self.assertEqual(self.listed(beta), ["2023-11-14"])
+        self.assertEqual(self.listed(beta), [], "a stray file re-listed the day for ever")
+
+    def test_a_chunk_arriving_mid_listing_is_not_stamped_over(self) -> None:
+        """Why the stamp is read *before* the listing, not after.
+
+        Read after, a chunk that lands between the two is missing from the names
+        but covered by the stamp -- so the day looks finished, is skipped from
+        then on, and those commands are never merged. Read before, the same
+        chunk is either in the listing or under a stamp that no longer matches.
+
+        The arrival is forced here rather than raced for: `chunk_names` drops a
+        real chunk into the directory the instant after it has listed it, which
+        is the one interleaving that matters.
+        """
+        alpha, beta = self.pair()
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_100_002, "arrived mid-listing")
+            sync.run()
+            source = store.chunk_dir(alpha.id, "2023-11-15")
+            late = max(store.chunk_names(alpha.id, "2023-11-15"))
+            payload = (source / late).read_bytes()
+
+        real = store.chunk_names
+        dropped = False
+
+        def racing(machine_id: str, day: str) -> list[str]:
+            nonlocal dropped
+            names = real(machine_id, day)
+            if day == "2023-11-15" and not dropped:
+                dropped = True
+                names = [name for name in names if name != late]
+                (store.chunk_dir(machine_id, day) / late).write_bytes(payload)
+            return names
+
+        with beta.active(), mock.patch.object(store, "chunk_names", racing):
+            sync.run()
+        self.assertTrue(dropped, "the race was never reached")
+
+        # The chunk was invisible to that pass. It must not have been stamped
+        # over: the next sync has to look again and take it.
+        self.settle(beta, alpha, "2023-11-15")
+        with beta.active():
+            sync.run()
+            self.assertIn("arrived mid-listing", beta.commands())
+
+    def test_a_day_shaped_directory_holding_nothing_is_not_stamped(self) -> None:
+        """`state.json` is read and compared every sync, so what goes in it lasts.
+
+        A directory named like a day but holding no chunk is not a day (see
+        `store.iter_chunk_days`). Stamping one would leave a permanent entry for
+        something that was never there -- and this file already only grows.
+        """
+        alpha, beta = self.pair()
+        with beta.active():
+            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow.mkdir(parents=True, exist_ok=True)
+        # Old enough that the racy window is not what is keeping it unstamped.
+        self.settle(beta, alpha, "2023-11-20")
+        with beta.active():
+            sync.run()
+            self.assertNotIn(f"{alpha.id}/2023-11-20", sync.State.load().merged_at)
+            # The days that *are* days still are.
+            self.assertIn(f"{alpha.id}/2023-11-14", sync.State.load().merged_at)
 
 
 class TestWalkingAPeersChunks(SyncTestCase):

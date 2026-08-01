@@ -562,6 +562,10 @@ def chunk_names(machine_id: str, day: str) -> list[str]:
     host -- `has_chunks` did, and turned a 0.09 ms question into a 4.6 ms one on
     an archive of 20k chunks, once per orphaned day.
 
+    Listing is what walking an archive costs now that nothing builds a `Path`
+    per file: 4.96 ms for one peer's 20k chunks, against 0.18 ms to stat its 40
+    day directories, which is why `day_stamp` exists.
+
     `os.scandir` swallows the same errors `Path.glob` did: a day directory that
     has gone away, or that cannot be read, has no chunks to offer.
     """
@@ -572,33 +576,46 @@ def chunk_names(machine_id: str, day: str) -> list[str]:
         return []
 
 
-def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
-    """``(day, chunk filenames)`` for one host: days in order, names sorted.
+def chunk_days(machine_id: str) -> list[str]:
+    """The day directories one host publishes into, in order.
 
-    Each day appears exactly once, with all of its chunks. `sync._merge_host`
-    relies on that: it holds one day at a time to bound memory, and `_Day`
-    *replaces* the log file it writes, so a day arriving in two pieces would
-    have the second overwrite what the first had just written.
-
-    Names, not `Chunk` objects, because the caller that runs every minute
-    decides from the *name* alone whether it has already merged a chunk, and on
-    an idle sync the answer is yes for every one of them. Building a `Path` and
-    a `Chunk` per file first was the whole cost of that walk: one peer with 20k
-    chunks took 88 ms to list against 5 ms to name, once a minute, growing with
-    the archive forever.
-
-    `os.scandir` rather than `Path.glob` for the same reason, and it is free:
-    scandir already knows whether an entry is a directory, so `_is_day` decides
-    on a name that has been read once. The order is unchanged -- chunk names are
-    fixed-width, so sorting them as strings sorts them as `Path`s did.
+    One `scandir` of the host, and no listing of the days themselves -- which is
+    what lets a caller decide *per day* whether it needs the names at all.
     """
     try:
         with os.scandir(repo_host_dir(machine_id)) as entries:
-            days = sorted(e.name for e in entries if e.is_dir() and _is_day(e.name))
+            return sorted(e.name for e in entries if e.is_dir() and _is_day(e.name))
     except OSError:
-        return
+        return []
 
-    for day in days:
+
+def day_stamp(machine_id: str, day: str) -> int | None:
+    """When this day directory last gained or lost a file. ``None`` if absent.
+
+    A directory's mtime moves when an entry is added to or removed from it,
+    which is exactly what a fetch bringing in a chunk does -- so a day whose
+    stamp is unchanged since it was last merged has nothing new in it, without
+    listing it -- see `chunk_names` for what that saves.
+
+    Nanoseconds, and compared for equality rather than order: a directory
+    restored from a backup can be older than the stamp that was recorded, and
+    "older" still means "different, look again".
+    """
+    try:
+        return os.stat(chunk_dir(machine_id, day)).st_mtime_ns
+    except OSError:
+        return None
+
+
+def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
+    """``(day, chunk filenames)`` for one host: days in order, names sorted.
+
+    Each day appears exactly once, with all of its chunks, and days with none at
+    all are not days. `sync._merge_host` reaches the same two halves separately
+    -- `chunk_days` then, per day it has to look at, `chunk_names` -- because it
+    can decide from the day alone that it needs no names.
+    """
+    for day in chunk_days(machine_id):
         # A day directory with nothing in it is not a day with no new chunks --
         # it is not a day at all, and saying so keeps every caller from having
         # to ask.
