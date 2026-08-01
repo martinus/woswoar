@@ -380,7 +380,10 @@ class State:
 
     #: log relpath -> plaintext bytes already sealed into a chunk.
     exported: dict[str, int] = field(default_factory=dict)
-    #: "<host>/<day>" -> the chunk filenames already merged into logs/.
+    #: "<host>/<day>" -> the chunk filenames of that day already merged into
+    #: logs/. Pruned to the day's *signed manifest* once every name in it has
+    #: been merged, so this shrinks when a peer compacts -- it is a record of
+    #: what the host says the day holds, not of every file ever seen.
     #:
     #: A set, not a high-water mark. A single "highest name seen" cannot say
     #: "all of these except that one", and chunk names are only loosely ordered:
@@ -406,8 +409,8 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
-    #: "<host>/<day>" -> the day directory's mtime when every chunk it held had
-    #: been merged. A day whose stamp still matches has gained nothing since, so
+    #: "<host>/<day>" -> the day directory's mtime when every chunk its signed
+    #: manifest listed had been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
     #: costs on a timer that fires every minute. See `store.day_stamp`.
     #:
@@ -1458,11 +1461,22 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # merged from elsewhere. Recording it here is what stops the next
             # run listing that day too, and for ever.
             #
-            # The same condition as the write below the merge, reached earlier:
-            # `not fresh` means every name is in `already`, which *is*
-            # `state.merged[key]`. `names` because an empty directory is not a
-            # day (see `store.iter_chunk_days`), and stamping one would put a
-            # permanent entry in `state.json` for something that is not there.
+            # Judged on the directory here, and on the manifest below the
+            # merge. Deliberately, and the two do not have to agree: `not fresh`
+            # means every name on disk is already merged, so the only thing a
+            # manifest could add is a name with no file behind it -- which
+            # nothing can merge now, and whose arrival would move the day's
+            # mtime and bring it back here anyway.
+            #
+            # This branch has no manifest to judge against, because reading one
+            # is the `ssh-keygen` fork that #87 exists to stop paying. That also
+            # means it cannot prune: a day settling here keeps whatever
+            # `state.merged` already held, and is pruned on the next pass that
+            # has a reason to read the manifest.
+            #
+            # `names` because an empty directory is not a day (see
+            # `store.iter_chunk_days`), and stamping one would put a permanent
+            # entry in `state.json` for something that is not there.
             _stamp(state, key, stamp, settled=bool(names))
             continue
 
@@ -1523,10 +1537,31 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
 
         day.flush(report)
 
-        # Only a day with nothing left over. A chunk that failed to open, or one
-        # in no signed manifest, is not in `merged` -- so the day is unfinished
-        # and must be read again, stamp or no stamp.
-        _stamp(state, key, stamp, settled=not set(names) - state.merged.get(key, set()))
+        # Judged against what the host *signed*, not against what is in the
+        # directory. A name the manifest does not list is not part of the day --
+        # it is debris from an interrupted write, or something a stranger
+        # dropped in -- and nothing will ever merge it, so waiting for it means
+        # the day is re-listed and its manifest re-verified, one `ssh-keygen`
+        # fork, on every sync for ever (#87).
+        #
+        # An empty `listed` is not "a day holding nothing": `read_manifest`
+        # answers that way for a manifest that is missing, unsigned, or will not
+        # verify. Settling on it would stamp a day whose every chunk is still
+        # being refused, and pruning on it would forget the whole day and merge
+        # it again from scratch, duplicating its lines.
+        signed = set(day.listed)
+        settled = bool(signed) and signed <= state.merged.get(key, set())
+        if settled:
+            # Pruned to the same statement. Compaction *removes* the names it
+            # subsumed from the manifest, so this is what stops `state.merged`
+            # growing with every chunk that ever existed -- including while the
+            # archive it describes is getting smaller (#86).
+            #
+            # To the manifest and never to the directory: a chunk missing from
+            # this checkout for a moment would otherwise be forgotten and then
+            # merged again when it came back, and `_Day` appends.
+            state.merged[key] = signed
+        _stamp(state, key, stamp, settled=settled)
 
 
 class _Day:
@@ -1565,7 +1600,19 @@ class _Day:
         # `state.merged` on a pass that rewrote the file. So a rewrite cut short
         # by an unopenable day key is still owed on the next pass, with no
         # second record of what was rebuilt to keep in step with this one.
-        self.rewrite = bool(self.compacted - already)
+        # Or when the manifest has lost a name this machine merged. A name only
+        # enters `merged` while the manifest lists it, so in ordinary growth
+        # this is empty; it is not empty when the manifest went *backwards* --
+        # a working tree rolled back to before a compaction, a half-applied
+        # restore. Appending then would write the day's lines a second time,
+        # because `merged` was pruned to the compaction and no longer remembers
+        # the chunks it replaced. Rebuilding from what the manifest now lists is
+        # right either way.
+        #
+        # An unverifiable manifest lands here too, with nothing listed -- and
+        # nothing then merges, so `flush` has no blocks and leaves the day
+        # alone rather than replacing it with nothing.
+        self.rewrite = bool(self.compacted - already) or bool(already - set(listed))
         self._blocks: list[bytes] = []
         self._bytes = 0
 

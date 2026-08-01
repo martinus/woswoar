@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import os
 import secrets
+import shutil
 import subprocess
 import tempfile
 import time
@@ -199,6 +200,19 @@ class SyncTestCase(unittest.TestCase):
         """
         with fake.active():
             sync.trust(sync.trust_candidates())
+
+    def settle(self, machine: Fake, host: Fake, *days: str) -> None:
+        """Age a day directory past `RACY_WINDOW_NS`, as a minute of real time does.
+
+        A day written moments ago is deliberately not stamped: its mtime cannot
+        yet rule out another write landing in the same filesystem tick. Every
+        real day reaches that state within seconds; a test would otherwise have
+        to sleep through it.
+        """
+        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
+        with machine.active():
+            for day in days:
+                os.utime(store.chunk_dir(host.id, day), (aged, aged))
 
     def run_cli(self, fake: Fake, *argv: str) -> tuple[int, str]:
         """Drive the real CLI as ``fake``, returning ``(exit code, stdout)``.
@@ -3038,6 +3052,173 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestADayIsWhatItsManifestSays(SyncTestCase):
+    """Issues #86 and #87: the signed manifest is the statement of a day.
+
+    Judging a day by what is *in its directory* gets both wrong. A name the
+    manifest does not list is not part of the day, so waiting for it to be
+    merged waits for ever; and a name the manifest no longer lists is a chunk
+    compaction replaced, so remembering it for ever makes `state.json` grow
+    while the archive it describes shrinks.
+    """
+
+    DAY = "2023-11-14"
+
+    def verifications(self, machine: Fake) -> int:
+        """Manifest signature checks one sync makes -- an `ssh-keygen` fork each."""
+        seen = 0
+        real = crypto.verify
+
+        def counted(*args: object, **kwargs: object) -> bool:
+            nonlocal seen
+            seen += 1
+            return real(*args, **kwargs)  # type: ignore[arg-type]
+
+        with machine.active(), mock.patch.object(crypto, "verify", counted):
+            sync.run()
+        return seen
+
+    def remembered(self, machine: Fake, host: Fake) -> set[str]:
+        with machine.active():
+            return set(sync.State.load().merged.get(f"{host.id}/{self.DAY}", set()))
+
+    def test_a_stray_file_is_reported_once_and_then_settles(self) -> None:
+        """#87: an unlistable name must not hold the day open for ever.
+
+        Before, the day was never complete, so every sync re-listed it *and*
+        re-verified its manifest -- a fork a minute, which anyone with push
+        access could turn on with one byte.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+        self.settle(beta, alpha, self.DAY)
+
+        # Said once, because the day did change -- and that pass is the one
+        # that pays for the manifest.
+        with beta.active():
+            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().unauthenticated)
+        # Then never again while the directory is untouched. Settling here would
+        # move the mtime and legitimately earn another look.
+        self.assertEqual([self.verifications(beta) for _ in range(3)], [0, 0, 0])
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 2, "the day's own history was lost")
+        # And the stray is not recorded as merged. It never was -- and a name
+        # remembered as merged is one that would be skipped if a manifest ever
+        # did list it, taking its lines with it.
+        self.assertNotIn("1700000000-dead.age", self.remembered(beta, alpha))
+
+    def test_compaction_shrinks_what_is_remembered(self) -> None:
+        """#86: `state.json` is read and compared every sync, and only grew."""
+        alpha, beta = self.history_across_days(days=1, per_day=6)
+        with beta.active():
+            sync.run()
+        self.assertEqual(len(self.remembered(beta, alpha)), 6)
+
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        with alpha.active():
+            live = set(store.chunk_names(alpha.id, self.DAY))
+        self.assertEqual(self.remembered(beta, alpha), live, "names of chunks that are gone")
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 6, "compaction lost history")
+
+    def test_a_day_whose_manifest_went_backwards_is_rebuilt(self) -> None:
+        """What pruning gives up, and how it is paid for.
+
+        Before the prune, `state.merged` remembered every chunk this machine had
+        ever merged, so a working tree rolled back to before a compaction simply
+        found them all already merged. Pruned, it remembers only the compacted
+        chunk -- and the old manifest's chunks look new, so appending them writes
+        the day's lines a second time.
+
+        The signal is the manifest having *lost* a name this machine merged,
+        which cannot happen while a day only grows. Rebuilding from what it now
+        lists is right whether the rollback is a restore, a half-applied backup,
+        or a `git checkout` of an older commit over the working tree.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=4)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 4)
+            backup = store.history_dir().with_name("history.backup")
+            shutil.copytree(store.history_dir(), backup, symlinks=True)
+
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(self.remembered(beta, alpha)), 1, "the prune did not happen")
+
+            # The working tree only: HEAD stays where it is, so the next fetch
+            # finds nothing to bring forward and the rollback sticks.
+            live = store.history_dir()
+            for entry in live.iterdir():
+                if entry.name != ".git":
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+            for entry in backup.iterdir():
+                if entry.name != ".git":
+                    if entry.is_dir():
+                        shutil.copytree(entry, live / entry.name, symlinks=True)
+                    else:
+                        shutil.copy2(entry, live / entry.name)
+
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 4, "the day was written twice over")
+            self.assertEqual(beta.commands(), {f"day 0 command {i}" for i in range(4)})
+
+    def test_a_manifest_that_will_not_verify_settles_nothing(self) -> None:
+        """The hazard both halves share, and the one that loses history.
+
+        `read_manifest` answers with *nothing* for a manifest that is missing,
+        unsigned or mis-signed -- not because the day is empty. Treating that as
+        "every signed chunk is merged" would stamp a day whose chunks are all
+        still being refused, and would prune the day's record to nothing. The
+        day would then be merged again from scratch, and `_Day` appends: every
+        line twice.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+        before = self.remembered(beta, alpha)
+        self.assertEqual(len(before), 2)
+
+        # A chunk arrives *and* the manifest stops verifying, so the day has to
+        # be looked at and then cannot be trusted. Wrecking it alone would leave
+        # the day settled and never consulted, which is its own right answer.
+        with alpha.active():
+            alpha.record(self.DAY, 1_700_000_003, "a third line")
+            sync.run()
+            store.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
+            sync._commit()
+            sync._push(sync.read_repo())
+
+        with beta.active():
+            sync.run()
+            self.assertEqual(
+                self.remembered(beta, alpha),
+                before,
+                "an unverifiable manifest emptied the day's record",
+            )
+            # Not stamped *as it now stands*. An older stamp from the last
+            # good sync may still be recorded; what matters is that it does not
+            # match, so the day keeps being looked at.
+            self.assertNotEqual(
+                sync.State.load().merged_at.get(f"{alpha.id}/{self.DAY}"),
+                store.day_stamp(alpha.id, self.DAY),
+                "an unverifiable manifest settled the day",
+            )
+            # And nothing was written twice.
+            self.assertEqual(len(beta.entries()), 2)
+
+
 class TestSkippingAnUnchangedDay(SyncTestCase):
     """Issue #85: listing a peer's archive is what an idle merge costs.
 
@@ -3062,19 +3243,6 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         with machine.active(), mock.patch.object(store, "chunk_names", counted):
             sync.run()
         return days
-
-    def settle(self, machine: Fake, host: Fake, *days: str) -> None:
-        """Age a day directory past `RACY_WINDOW_NS`, as a minute of real time does.
-
-        A day written moments ago is deliberately not stamped: its mtime cannot
-        yet rule out another write landing in the same filesystem tick. Every
-        real day reaches that state within seconds; a test would otherwise have
-        to sleep through it.
-        """
-        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
-        with machine.active():
-            for day in days:
-                os.utime(store.chunk_dir(host.id, day), (aged, aged))
 
     def pair(self) -> tuple[Fake, Fake]:
         """alpha with two days of one chunk, and a beta that has merged both."""
