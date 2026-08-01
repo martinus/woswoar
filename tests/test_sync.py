@@ -3129,6 +3129,14 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         def refuse(path: Path, expected: str) -> bytes:
             raise ValueError(f"{path.name} is not the chunk its manifest names")
 
+        # Twice, with a settle between. The first pass is what *fetches* the
+        # chunk, so it leaves the directory freshly written and the racy window
+        # would keep the day being read again whatever the completeness rule
+        # said. The second runs against a day that is settled and still short --
+        # the only state in which the rule is the thing being tested.
+        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+            sync.run()
+        self.settle(beta, alpha, "2023-11-15")
         with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
             report = sync.run()
         self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
@@ -3208,6 +3216,9 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         with beta.active():
             hollow = store.chunk_dir(alpha.id, "2023-11-20")
             hollow.mkdir(parents=True, exist_ok=True)
+        # Old enough that the racy window is not what is keeping it unstamped.
+        self.settle(beta, alpha, "2023-11-20")
+        with beta.active():
             sync.run()
             self.assertNotIn(f"{alpha.id}/2023-11-20", sync.State.load().merged_at)
             # The days that *are* days still are.
