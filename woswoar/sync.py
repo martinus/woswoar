@@ -63,6 +63,10 @@ class Report:
     #: that was already level with the remote and committed nothing sets it
     #: without sending anything, because there was nothing to send.
     pushed: bool = False
+    #: "<host>/<day>" left exactly as it was, because rebuilding it would have
+    #: needed a chunk this machine could not read. Stale rather than short: the
+    #: day keeps every line it already had, and the next sync tries again.
+    stale: set[str] = field(default_factory=set)
     hosts_seen: set[str] = field(default_factory=set)
     #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
     #: error: it is what a freshly joined machine sees until someone runs
@@ -1484,6 +1488,9 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
         directory = store.chunk_dir(host_id, chunk_day)
+        #: Chunks whose plaintext reached `day`, and whether any was skipped.
+        taken: list[str] = []
+        missed = False
 
         for name in pending:
             if name not in day.listed:
@@ -1492,6 +1499,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # well as a chunk simply absent from a good one -- see
                 # `Report.unauthenticated`.
                 report.unauthenticated.add(key)
+                missed = True
                 continue
 
             if chunk_day not in day_keys:
@@ -1507,6 +1515,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             secret = day_keys[chunk_day]
             if secret is None:
                 report.unreadable.add(key)
+                missed = True
                 continue
 
             # Authenticated before it is decrypted or decompressed, so age, zlib
@@ -1516,6 +1525,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 blob = open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
                 report.unauthenticated.add(key)
+                missed = True
                 continue
 
             try:
@@ -1528,14 +1538,32 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # and every other host's readable chunks, on this run and every
                 # run after it.
                 report.unreadable.add(key)
+                missed = True
                 continue
 
             day.add(plaintext, report)
-            state.merged.setdefault(key, set()).add(name)
-            if name not in already:
-                report.chunks_merged += 1
+            taken.append(name)
 
-        day.flush(report)
+        # A rewrite *replaces* the day's file, so it must not run on a partial
+        # read: it would drop lines this machine already had in exchange for
+        # the ones it could get. Measured before this guard, on a day of five
+        # commands whose compacted chunk would not open: the day was rewritten
+        # to one line, and stayed at one for as long as the chunk stayed
+        # damaged. The lines it lost were in that chunk and nowhere else.
+        #
+        # Appending is safe partially, by contrast, and `add` may already have
+        # flushed some of it -- which is why only the rewrite is refused.
+        if day.rewrite and missed:
+            report.stale.add(key)
+        else:
+            day.flush(report)
+            # Recorded only once the bytes are on disk. A refused rewrite that
+            # had marked its chunks merged would never read them again, and
+            # would have lost exactly what it was trying not to lose.
+            for name in taken:
+                if name not in already:
+                    report.chunks_merged += 1
+                state.merged.setdefault(key, set()).add(name)
 
         # Judged against what the host *signed*, not against what is in the
         # directory. A name the manifest does not list is not part of the day --

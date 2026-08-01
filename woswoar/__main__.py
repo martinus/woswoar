@@ -428,6 +428,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    if report.stale:
+        print(
+            f"\n{len(report.stale)} day(s) could not be rebuilt: a chunk they are made of\n"
+            "would not open, so each was left exactly as it was rather than rewritten\n"
+            "from the part that did. Nothing was lost. If it persists, the chunk is\n"
+            "damaged in this checkout - 'woswoar doctor' has the detail.",
+            file=sys.stderr,
+        )
+
     if report.untrusted:
         print(
             f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
