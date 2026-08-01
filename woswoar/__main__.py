@@ -528,9 +528,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     if report.foreign:
         print(
-            f"\nWARNING: {len(report.foreign)} chunk(s) sit under this machine's own id\n"
-            "that it never published. They were not signed and will not be offered to\n"
-            "anyone, but someone else can write into this repository.",
+            f"\n{len(report.foreign)} chunk(s) sit under this machine's own id that it\n"
+            "never signed. They are inert: no machine will read them, including this\n"
+            "one, and nothing was lost -- whatever was in them has been published again\n"
+            "under a chunk that is signed.\n"
+            "Two things look like this and cannot be told apart from here: a run of\n"
+            "this machine that was killed between writing a chunk and signing for it,\n"
+            "and someone else writing into the repository. A power cut is the ordinary\n"
+            "explanation. 'woswoar doctor' lists them under 'chunks'.",
             file=sys.stderr,
         )
 
