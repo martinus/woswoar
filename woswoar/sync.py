@@ -1548,12 +1548,25 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         #
         # Appending is safe partially, by contrast, and `add` may already have
         # flushed some of it -- which is why only the rewrite is refused.
-        # Measured against what the manifest lists, so a stray file in the
-        # directory cannot hold a day back: it is not part of the day, and
-        # counting it would leave that day stale for ever (which is #87 by
-        # another route).
-        refused = day.rewrite and bool(
-            {name for name in pending if name in day.listed} - set(taken)
+        # Against the manifest, and against the whole of it -- not against the
+        # names that happened to be on disk. A chunk the manifest lists but that
+        # is *absent* never reaches the loop at all, so measuring the directory
+        # counted it as nothing to miss and rewrote the day without it: five
+        # commands became one, with nothing reported. A machine with push access
+        # can delete a chunk; woswoar itself never does.
+        #
+        # A stray file is excluded for free, because it is not in the manifest:
+        # it is not part of the day, and counting it would leave that day stale
+        # for ever, which is #87 by another route.
+        #
+        # Not when the day key will not open, though. Then nothing decrypted,
+        # there is nothing partial to write, and `unreadable` already names that
+        # day with the remedy -- it is the ordinary state of a machine that has
+        # not been granted access yet, and calling it damage would be a lie.
+        refused = (
+            day.rewrite
+            and day_keys.get(chunk_day) is not None
+            and bool(set(day.listed) - set(taken))
         )
         if refused:
             report.stale.add(key)

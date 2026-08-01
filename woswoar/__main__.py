@@ -435,8 +435,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
             "they were rather than rewritten from the part that could be read:\n"
             f"{stale}\n"
             "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
-            "checkout; 'git -C ~/.local/share/woswoar/history log --diff-filter=M' finds\n"
-            "who changed it, because woswoar itself never rewrites one.",
+            "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
+            "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
+            "did.",
             file=sys.stderr,
         )
 
