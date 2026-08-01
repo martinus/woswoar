@@ -3029,6 +3029,95 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestWalkingAPeersChunks(SyncTestCase):
+    """Issue #82: `merge` walks every peer's whole tree on every sync.
+
+    Its idle answer is "nothing new", decided from chunk *names*, so building a
+    `Path` and a `Chunk` per file first was the entire cost: 71.5 ms against
+    8.5 ms for one peer with 20k chunks, once a minute, growing with the archive.
+    """
+
+    def stocked(self) -> tuple[Fake, Fake]:
+        """alpha, and a beta whose history alpha has merged."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "on alpha")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            for day in ("2023-11-14", "2023-11-15"):
+                for i in range(2):
+                    beta.record(day, 1_700_000_100 + i, f"{day} number {i}")
+                    sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+        return alpha, beta
+
+    def test_the_names_are_the_ones_the_chunk_walk_yields(self) -> None:
+        """The two views of the same tree must not drift.
+
+        `iter_chunks` is built on `iter_chunk_days`, and everything that reads a
+        chunk still goes through it -- so a difference here would mean `merge`
+        and `compact` disagreeing about what a host published.
+        """
+        _alpha, beta = self.stocked()
+        with beta.active():
+            by_day = list(store.iter_chunk_days(beta.id))
+            flat = [(chunk.day, chunk.name) for chunk in store.iter_chunks(beta.id)]
+
+        self.assertEqual(
+            [(day, name) for day, names in by_day for name in names],
+            flat,
+            "the name walk and the chunk walk disagree",
+        )
+        self.assertEqual([day for day, _ in by_day], sorted(day for day, _ in by_day))
+        for _day, names in by_day:
+            self.assertEqual(names, sorted(names))
+            self.assertTrue(names, "an empty day was yielded")
+
+    def test_a_day_is_never_split_across_two_groups(self) -> None:
+        """The contract `_merge_host` leans on, and the one that loses history.
+
+        `_Day` replaces the log file it writes, so a day appearing twice would
+        have the second group overwrite what the first had just written.
+        """
+        _alpha, beta = self.stocked()
+        with beta.active():
+            days = [day for day, _ in store.iter_chunk_days(beta.id)]
+        self.assertEqual(len(days), len(set(days)), f"a day was yielded twice: {days}")
+
+    def test_keys_and_manifests_are_not_mistaken_for_days(self) -> None:
+        """They sit in the same host directory, and neither holds chunks."""
+        _alpha, beta = self.stocked()
+        with beta.active():
+            siblings = {p.name for p in store.repo_host_dir(beta.id).iterdir() if p.is_dir()}
+            self.assertTrue({"keys", "manifests"} <= siblings, siblings)
+            days = {day for day, _ in store.iter_chunk_days(beta.id)}
+        self.assertEqual(days, {"2023-11-14", "2023-11-15"})
+
+    def test_an_idle_merge_builds_nothing_per_chunk(self) -> None:
+        """The saving itself, asserted where a future change would undo it.
+
+        Nothing is new, so `merge` has no reason to construct a `Chunk` -- and
+        constructing one per file is what made this walk cost 8x what reading
+        the names does.
+        """
+        alpha, _beta = self.stocked()
+        real = store.iter_chunks
+        used = []
+
+        def spy(machine_id: str) -> Iterator[store.Chunk]:
+            used.append(machine_id)
+            return real(machine_id)
+
+        with alpha.active(), mock.patch.object(store, "iter_chunks", spy):
+            report = sync.run()
+        self.assertEqual(report.chunks_merged, 0)
+        self.assertEqual(used, [], "merge built Chunk objects for an idle sync")
+
+
 class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
     """Issue #80: the early exit is the shape of every idle sync.
 
