@@ -3220,6 +3220,50 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         self.assertIn("could not be rebuilt", said)
         self.assertIn(f"{alpha.id}/{self.DAY}", said, "it did not say which day")
 
+    def test_a_chunk_deleted_from_the_repo_does_not_truncate_the_day(self) -> None:
+        """The route with no mock in it, and the one that said nothing.
+
+        A chunk the manifest lists but that is *absent* never reaches the merge
+        loop, so measuring what was missed against the directory counted it as
+        nothing to miss: the day was rewritten without it, five commands became
+        one, and neither `stale` nor `unauthenticated` fired. Anyone with push
+        access can delete a chunk; woswoar itself never does.
+        """
+        alpha, beta, compacted = self.compacted_and_growing()
+        with alpha.active():
+            (store.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
+            sync._commit()
+            sync._push(sync.read_repo())
+
+        with beta.active():
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 5, "the day was rewritten without it")
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+    def test_a_machine_awaiting_grant_is_not_told_its_history_is_damaged(self) -> None:
+        """An unopenable day key skips every chunk, which is not damage.
+
+        It is the ordinary state of a machine between `init` and someone running
+        `grant`, which the rest of the output goes out of its way to describe as
+        expected. Nothing decrypted, so there was never a partial rewrite to
+        refuse -- and `unreadable` already names the day with the right remedy.
+        """
+        alpha, _beta = self.history_across_days(days=1, per_day=3)
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+
+        gamma = self.machine("gamma")  # enrolled, never granted
+        errors = io.StringIO()
+        with gamma.active(), redirect_stderr(errors), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["sync"]), 0)
+        said = errors.getvalue()
+        self.assertIn(_GRANT_REMEDY.splitlines()[0], said)
+        self.assertNotIn("could not be rebuilt", said, "an ungranted machine was accused")
+
     def test_appending_is_still_allowed_to_be_partial(self) -> None:
         """Only a rewrite is all-or-nothing.
 
