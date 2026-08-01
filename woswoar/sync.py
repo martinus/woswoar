@@ -1523,10 +1523,31 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
 
         day.flush(report)
 
-        # Only a day with nothing left over. A chunk that failed to open, or one
-        # in no signed manifest, is not in `merged` -- so the day is unfinished
-        # and must be read again, stamp or no stamp.
-        _stamp(state, key, stamp, settled=not set(names) - state.merged.get(key, set()))
+        # Judged against what the host *signed*, not against what is in the
+        # directory. A name the manifest does not list is not part of the day --
+        # it is debris from an interrupted write, or something a stranger
+        # dropped in -- and nothing will ever merge it, so waiting for it means
+        # the day is re-listed and its manifest re-verified, one `ssh-keygen`
+        # fork, on every sync for ever (#87).
+        #
+        # An empty `listed` is not "a day holding nothing": `read_manifest`
+        # answers that way for a manifest that is missing, unsigned, or will not
+        # verify. Settling on it would stamp a day whose every chunk is still
+        # being refused, and pruning on it would forget the whole day and merge
+        # it again from scratch, duplicating its lines.
+        signed = set(day.listed)
+        settled = bool(signed) and signed <= state.merged.get(key, set())
+        if settled:
+            # Pruned to the same statement. Compaction *removes* the names it
+            # subsumed from the manifest, so this is what stops `state.merged`
+            # growing with every chunk that ever existed -- including while the
+            # archive it describes is getting smaller (#86).
+            #
+            # To the manifest and never to the directory: a chunk missing from
+            # this checkout for a moment would otherwise be forgotten and then
+            # merged again when it came back, and `_Day` appends.
+            state.merged[key] = signed
+        _stamp(state, key, stamp, settled=settled)
 
 
 class _Day:
