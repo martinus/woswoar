@@ -611,7 +611,12 @@ def cmd_grant(args: argparse.Namespace) -> int:
         return 1
 
     report = sync.grant(approved=[reader.key for reader in readers])
-    print(f"\nre-sealed {report.resealed} key file(s)")
+    if report.resealed or report.skipped:
+        print(f"\nre-sealed {report.resealed} key file(s)")
+    else:
+        # Not "re-sealed 0", which reads as a failure. Every key file is already
+        # sealed to exactly these machines, so there was nothing to do.
+        print("\nnothing to do: every key is already sealed to these machines")
     if report.pushed:
         print("published to the remote")
         print("\nOn each machine that was waiting, run:  woswoar sync")

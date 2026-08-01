@@ -407,6 +407,11 @@ class State:
     #: answer, and a record kept in the repo could be edited by exactly the
     #: attacker the confirmation exists to catch.
     granted: list[str] = field(default_factory=list)
+    #: Whether the grant that recorded `granted` sealed *every* key file. A
+    #: partial one -- this machine could not open some of them -- leaves key
+    #: files that are not sealed to everyone, so "the recipient list has not
+    #: changed" is not enough on its own to skip the work.
+    granted_complete: bool = False
     #: host id -> the signing key this machine accepts history from that host
     #: under. *The* trust anchor, and local for the reason the rest of this class
     #: is: everything in the repo can be rewritten by anyone who can push,
@@ -432,6 +437,7 @@ class State:
         exported = raw.get("exported", {})
         merged = raw.get("merged", {})
         granted = raw.get("granted", [])
+        granted_complete = raw.get("granted_complete", False)
         signers = raw.get("signers", {})
         merged_at = raw.get("merged_at", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
@@ -450,6 +456,9 @@ class State:
             # A malformed list costs the prompt its memory, which shows every
             # machine as new -- the safe direction to be wrong in.
             granted=[str(k) for k in granted] if isinstance(granted, list) else [],
+            # Anything but a true boolean means "assume it was partial", which
+            # costs one full re-seal rather than leaving a key file behind.
+            granted_complete=granted_complete is True,
             # And a malformed map costs every pin, which refuses every host until
             # a human re-runs `trust` -- also the safe direction, and loud,
             # because `sync` reports the untrusted hosts rather than skipping on.
@@ -476,6 +485,7 @@ class State:
             "exported": dict(self.exported),
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
+            "granted_complete": self.granted_complete,
             "signers": dict(self.signers),
             "merged_at": dict(self.merged_at),
         }
@@ -2322,7 +2332,21 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
                 "run 'woswoar grant' again to see the current list"
             )
 
-        resealed, skipped = _reseal(change.identity, keys)
+        # Nothing new, and nothing left behind last time: every key file is
+        # already sealed to exactly these recipients, and re-sealing would fork
+        # `age` twice per file to produce different ciphertext of identical
+        # plaintext. On three hosts with a year of history that is ~1000 files
+        # and ~2000 subprocesses.
+        #
+        # Both halves are needed. "The list has not changed" alone is not
+        # enough, because a *partial* grant leaves key files this machine could
+        # not open, and those are still sealed to the older, smaller list.
+        #
+        # Key files created since are already right: `export` seals a new day to
+        # whatever `recipients.txt` said, and by this branch it has not changed.
+        state = State.load()
+        settled = state.granted_complete and sorted(state.granted) == sorted(keys)
+        resealed, skipped = (0, 0) if settled else _reseal(change.identity, keys)
 
         if approved is not None:
             # Recorded rather than counted: what the next confirmation subtracts
@@ -2330,8 +2354,8 @@ def grant(approved: list[str] | None = None) -> ReencryptReport:
             # re-sealable from here. A machine that could open nothing still
             # approved these, and a grant with no approved list behind it -- an
             # unattended one -- must not silence the next prompt.
-            state = State.load()
             state.granted = keys
+            state.granted_complete = skipped == 0 or settled
             state.save()
 
     return ReencryptReport(resealed, skipped, pushed=change.remote)
