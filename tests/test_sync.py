@@ -2537,6 +2537,49 @@ class TestADecompressionBomb(SyncTestCase):
         self.assertEqual(len({e.cmd for e in entries}), before)
 
 
+class TestInitLeavesNothingReadable(SyncTestCase):
+    """The first thing a new machine does must not fail its own check.
+
+    `woswoar install` walks these paths and re-tightens them, and `doctor`
+    reports any that another account could read. But `init` can run first, and
+    it creates the signing key -- so before this, the very first `doctor` on a
+    fresh machine said `[FAIL] private` about a file woswoar had just written,
+    with the user having done nothing wrong.
+    """
+
+    def test_a_stock_umask_cannot_loosen_what_init_writes(self) -> None:
+        # 022 is the default nearly everywhere, and is what left the public half
+        # 0644: ssh-keygen honours it. Pinned rather than inherited, so this
+        # cannot pass vacuously on a strict runner.
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+
+        alpha = self.machine("alpha")
+        with alpha.active():
+            # The harness makes WOSWOAR_DIR with a plain mkdir, so it arrives
+            # 0755. A real one is created by woswoar at 0700 -- and a directory
+            # woswoar *found* is deliberately not re-permissioned, since a
+            # user-chosen WOSWOAR_DIR is not its to clamp. Set it to what a real
+            # install has, so what is asserted below is what woswoar wrote.
+            store.data_dir().chmod(0o700)
+
+            self.assertEqual(support.loose_paths(), [])
+            # And the helper the code uses agrees, which is what `doctor` reads.
+            self.assertEqual(store.readable_by_others(), [])
+
+    def test_the_signing_key_is_owner_only_on_both_halves(self) -> None:
+        """A public key exposes nothing; the guarantee is what it would break."""
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+
+        alpha = self.machine("alpha")
+        with alpha.active():
+            private = store.signing_key_file()
+            for half in (private, crypto.public_half(private)):
+                self.assertTrue(half.is_file(), half)
+                self.assertEqual(half.stat().st_mode & 0o777, 0o600, f"{half} is loose")
+
+
 class TestTheRepoExplainsItself(SyncTestCase):
     """A history repository is opaque by design, which makes it unreadable in
     the other sense too: a stranger who finds it, or its owner three years on,

@@ -7,6 +7,7 @@ the incident that established it.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -192,6 +193,37 @@ NS = "woswoar-test"
 
 
 @requires_ssh_keygen
+@requires_ssh_keygen
+class TestTheSigningKeyIsOwnerOnly(unittest.TestCase):
+    """`generate_signing_key` creates two files and a directory, so it owns the
+    modes of all three -- rather than depending on some earlier caller having
+    made the directory, which is what made this worth pinning."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+
+    def test_it_creates_its_directory_owner_only(self) -> None:
+        """The directory does not exist here, which is the case that was never
+        reached in practice: every caller happens to make it first. Depending on
+        that is the fragile part."""
+        key = Path(self._tmp.name) / "fresh" / "signing_key"
+        crypto.generate_signing_key(key)
+        self.assertEqual(key.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_both_halves_are_owner_only(self) -> None:
+        """A public key exposes nothing. What a loose one breaks is the
+        guarantee that every path woswoar creates is owner-only, which `doctor`
+        enforces by walking them -- so it reported a failure on the first run of
+        a fresh machine, about a file woswoar had just written."""
+        key = Path(self._tmp.name) / "signing_key"
+        crypto.generate_signing_key(key)
+        for half in (key, crypto.public_half(key)):
+            self.assertEqual(half.stat().st_mode & 0o777, 0o600, f"{half} is loose")
+
+
 class TestSigning(unittest.TestCase):
     """Authorship, which age cannot answer and a shared secret cannot either."""
 

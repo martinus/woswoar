@@ -51,6 +51,24 @@ def run_cli(*argv: str) -> Ran:
     return Ran(code, out.getvalue(), err.getvalue())
 
 
+def loose_paths() -> list[str]:
+    """Paths another account could read, walked independently of the code.
+
+    Deliberately not `store.readable_by_others()`: asking the helper about
+    itself could not catch it forgetting a path, which is the failure this
+    guards against. `history/` is excluded -- it is ciphertext arriving from
+    `git clone`, and the directory above it is owner-only.
+    """
+    roots = [store.data_dir(), store.config_dir(), store.cache_dir()]
+    seen = [r for r in roots if r.is_dir()]
+    seen += [p for r in list(seen) for p in r.rglob("*")]
+    return sorted(
+        f"{p} is {oct(p.stat().st_mode & 0o777)}"
+        for p in seen
+        if p.stat().st_mode & 0o077 and store.history_dir() not in [p, *p.parents]
+    )
+
+
 def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -> Entry:
     """An Entry with plausible defaults, so fixture fields live in one place."""
     return Entry(ts=ts, host=host, session=session, cwd="/tmp", exit_code=0, duration_ms=1, cmd=cmd)

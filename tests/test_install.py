@@ -118,22 +118,6 @@ class TestPrivateByDefault(WoswoarTestCase):
     downgrade on any box with a group- or world-readable home.
     """
 
-    def loose(self) -> list[str]:
-        """Paths another account could read, walked independently of the code.
-
-        Deliberately not `store.readable_by_others()`: asking the helper about
-        itself could not catch it forgetting a path, which is the failure this
-        is guarding against.
-        """
-        roots = [store.data_dir(), store.config_dir(), store.cache_dir()]
-        seen = [r for r in roots if r.is_dir()]
-        seen += [p for r in list(seen) for p in r.rglob("*")]
-        return sorted(
-            f"{p} is {oct(p.stat().st_mode & 0o777)}"
-            for p in seen
-            if p.stat().st_mode & 0o077 and store.history_dir() not in [p, *p.parents]
-        )
-
     def as_if_never_installed(self) -> None:
         """Drop the config directory the shared harness pre-creates.
 
@@ -156,16 +140,16 @@ class TestPrivateByDefault(WoswoarTestCase):
         previous = os.umask(0o022)
         self.addCleanup(os.umask, previous)
         self.first_run()
-        self.assertEqual(self.loose(), [])
+        self.assertEqual(support.loose_paths(), [])
 
     def test_an_older_install_is_retightened(self) -> None:
         self.first_run()
         for path in (store.data_dir(), store.logs_dir(), *store.logs_dir().rglob("*")):
             path.chmod(0o755 if path.is_dir() else 0o644)
-        self.assertTrue(self.loose(), "the fixture is not actually loose")
+        self.assertTrue(support.loose_paths(), "the fixture is not actually loose")
 
         store.harden()
-        self.assertEqual(self.loose(), [])
+        self.assertEqual(support.loose_paths(), [])
 
     def test_creating_a_file_does_not_repermission_a_directory_it_found(self) -> None:
         """`write_atomic` is a durability primitive, not a permissions one.
