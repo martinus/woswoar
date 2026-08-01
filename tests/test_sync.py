@@ -3052,6 +3052,244 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestARewriteIsAllOrNothing(SyncTestCase):
+    """Issue #89: a rewrite replaces the day, so a partial one destroys history.
+
+    The chunks a compaction subsumed are unlinked, so their lines exist only
+    inside the compacted chunk. A rewrite that cannot open it, but can open
+    something else in the day, used to write the day out as that something
+    else -- trading lines this machine already had for the ones it could get.
+    """
+
+    DAY = "2023-11-14"
+
+    def compacted_and_growing(self) -> tuple[Fake, Fake, str]:
+        """A day compacted into one chunk, plus a later one the rewrite can read."""
+        alpha, beta = self.history_across_days(days=1, per_day=5)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            verify_key = sync.signing_public()
+            listed = sync.read_manifest(alpha.id, self.DAY, verify_key)
+            compacted = next(name for name, entry in listed.items() if entry.subsumes)
+            alpha.record(self.DAY, 1_700_000_600, "and another")
+            sync.run()
+        return alpha, beta, compacted
+
+    def damaged(self, name: str) -> Callable[[Path, str], bytes]:
+        real = sync.open_chunk
+
+        def refuse(path: Path, expected: str) -> bytes:
+            if path.name == name:
+                raise ValueError(f"{path.name} is not the chunk its manifest names")
+            return real(path, expected)
+
+        return refuse
+
+    def test_a_day_keeps_what_it_had_when_a_chunk_will_not_open(self) -> None:
+        alpha, beta, compacted = self.compacted_and_growing()
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 5, "the day was rewritten from a partial read")
+
+            # And it stays whole for as long as the chunk stays damaged.
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+    def test_the_chunks_it_did_read_are_not_recorded_as_merged(self) -> None:
+        """Otherwise the refusal is worse than the truncation it prevents.
+
+        A refused rewrite discards the plaintext it had collected. Marking those
+        chunks merged would mean never reading them again -- losing exactly the
+        lines the refusal exists to protect.
+        """
+        alpha, beta, compacted = self.compacted_and_growing()
+        with alpha.active():
+            readable = next(
+                name for name in store.chunk_names(alpha.id, self.DAY) if name != compacted
+            )
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            sync.run()
+            remembered = sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())
+        # Not the one that failed, and -- the point -- not the one that read
+        # either: its plaintext was discarded with the refused rewrite.
+        self.assertNotIn(compacted, remembered)
+        self.assertNotIn(readable, remembered, "a discarded chunk was recorded as merged")
+
+        # Once the chunk reads, the day is rebuilt whole: the five it had, plus
+        # the one that arrived while it could not be.
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 6)
+            self.assertIn("and another", beta.commands())
+
+    def test_a_stray_file_does_not_hold_a_rewrite_back(self) -> None:
+        """A name the manifest does not list is not part of the day.
+
+        Counting it as a chunk the rewrite failed to get would leave the day
+        stale for ever, which is #87 reached by another route -- and anyone with
+        push access could arrange it with one byte.
+        """
+        alpha, beta, _compacted = self.compacted_and_growing()
+        with beta.active():
+            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.unauthenticated)
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 6, "the stray blocked the rebuild")
+
+    def test_a_refused_rewrite_is_never_treated_as_finished(self) -> None:
+        """The settle rule reads `state.merged`, which a refusal does not write.
+
+        A rewrite owed because the manifest went *backwards* can leave every
+        name it lists already merged -- so "every signed chunk is merged" is
+        true while the file was deliberately not rebuilt. Stamping that would
+        prune the day and skip it from then on, leaving a log that is wrong and
+        never looked at again.
+        """
+        # Three things at once, which is why the guard is easy to miss: a
+        # manifest rolled back to one listing *fewer* chunks (so every name it
+        # lists is already merged, and a rebuild is owed because this machine
+        # merged one more), something unmerged in the directory (so the day is
+        # looked at at all), and one listed chunk that will not open (so the
+        # rebuild is refused). Without the guard the day is then pruned and
+        # stamped as finished, with a log that was deliberately not rebuilt.
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        key = f"{alpha.id}/{self.DAY}"
+        with alpha.active():
+            for i in range(4):
+                alpha.record(self.DAY, 1_700_000_001 + i, f"early {i}")
+                sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 4)
+            backup = store.history_dir().with_name("history.backup")
+            shutil.copytree(store.history_dir(), backup, symlinks=True)
+            first = min(store.chunk_names(alpha.id, self.DAY))
+
+        with alpha.active():
+            alpha.record(self.DAY, 1_700_000_009, "the fifth")
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+            # Working tree only, so HEAD stays put and the rollback sticks.
+            live = store.history_dir()
+            for entry in live.iterdir():
+                if entry.name != ".git":
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+            for entry in backup.iterdir():
+                if entry.name != ".git":
+                    if entry.is_dir():
+                        shutil.copytree(entry, live / entry.name, symlinks=True)
+                    else:
+                        shutil.copy2(entry, live / entry.name)
+
+            # ...and something unmerged in the directory, or the day has
+            # nothing fresh and is skipped before any of this is reached.
+            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+
+        self.settle(beta, alpha, self.DAY)
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(first)):
+            self.assertIn(key, sync.run().stale)
+            self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
+            self.assertEqual(len(beta.entries()), 5, "the day was rebuilt from a partial read")
+
+    def test_sync_says_which_day_it_left_alone(self) -> None:
+        """New user-facing behaviour, so it is pinned like its neighbours."""
+        alpha, beta, compacted = self.compacted_and_growing()
+        errors = io.StringIO()
+        with (
+            beta.active(),
+            mock.patch.object(sync, "open_chunk", self.damaged(compacted)),
+            redirect_stderr(errors),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(["sync"]), 0)
+        said = errors.getvalue()
+        self.assertIn("could not be rebuilt", said)
+        self.assertIn(f"{alpha.id}/{self.DAY}", said, "it did not say which day")
+
+    def test_a_chunk_deleted_from_the_repo_does_not_truncate_the_day(self) -> None:
+        """The route with no mock in it, and the one that said nothing.
+
+        A chunk the manifest lists but that is *absent* never reaches the merge
+        loop, so measuring what was missed against the directory counted it as
+        nothing to miss: the day was rewritten without it, five commands became
+        one, and neither `stale` nor `unauthenticated` fired. Anyone with push
+        access can delete a chunk; woswoar itself never does.
+        """
+        alpha, beta, compacted = self.compacted_and_growing()
+        with alpha.active():
+            (store.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
+            sync._commit()
+            sync._push(sync.read_repo())
+
+        with beta.active():
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 5, "the day was rewritten without it")
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+    def test_a_machine_awaiting_grant_is_not_told_its_history_is_damaged(self) -> None:
+        """An unopenable day key skips every chunk, which is not damage.
+
+        It is the ordinary state of a machine between `init` and someone running
+        `grant`, which the rest of the output goes out of its way to describe as
+        expected. Nothing decrypted, so there was never a partial rewrite to
+        refuse -- and `unreadable` already names the day with the right remedy.
+        """
+        alpha, _beta = self.history_across_days(days=1, per_day=3)
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+
+        gamma = self.machine("gamma")  # enrolled, never granted
+        errors = io.StringIO()
+        with gamma.active(), redirect_stderr(errors), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["sync"]), 0)
+        said = errors.getvalue()
+        self.assertIn(_GRANT_REMEDY.splitlines()[0], said)
+        self.assertNotIn("could not be rebuilt", said, "an ungranted machine was accused")
+
+    def test_appending_is_still_allowed_to_be_partial(self) -> None:
+        """Only a rewrite is all-or-nothing.
+
+        An append adds to what is there, and `_Day.add` may already have flushed
+        part of it, so refusing the whole pass would strand chunks that are
+        already on disk -- and gains nothing, since nothing was replaced.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            for i in range(2):
+                alpha.record(self.DAY, 1_700_000_700 + i, f"later {i}")
+                sync.run()
+            names = store.chunk_names(alpha.id, self.DAY)
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(names[-1])):
+            report = sync.run()
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            # The one that read was kept, rather than held back with the other.
+            self.assertEqual(len(beta.entries()), 3)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 4)
+
+
 class TestADayIsWhatItsManifestSays(SyncTestCase):
     """Issues #86 and #87: the signed manifest is the statement of a day.
 

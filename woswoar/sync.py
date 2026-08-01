@@ -63,6 +63,10 @@ class Report:
     #: that was already level with the remote and committed nothing sets it
     #: without sending anything, because there was nothing to send.
     pushed: bool = False
+    #: "<host>/<day>" left exactly as it was, because rebuilding it would have
+    #: needed a chunk this machine could not read. Stale rather than short: the
+    #: day keeps every line it already had, and the next sync tries again.
+    stale: set[str] = field(default_factory=set)
     hosts_seen: set[str] = field(default_factory=set)
     #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
     #: error: it is what a freshly joined machine sees until someone runs
@@ -1484,6 +1488,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
         directory = store.chunk_dir(host_id, chunk_day)
+        #: Chunk names whose plaintext reached `day`.
+        taken: list[str] = []
 
         for name in pending:
             if name not in day.listed:
@@ -1531,11 +1537,48 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 continue
 
             day.add(plaintext, report)
-            state.merged.setdefault(key, set()).add(name)
-            if name not in already:
-                report.chunks_merged += 1
+            taken.append(name)
 
-        day.flush(report)
+        # A rewrite *replaces* the day's file, so it must not run on a partial
+        # read: it would drop lines this machine already had in exchange for
+        # the ones it could get. Measured before this guard, on a day of five
+        # commands whose compacted chunk would not open: the day was rewritten
+        # to one line, and stayed at one for as long as the chunk stayed
+        # damaged. The lines it lost were in that chunk and nowhere else.
+        #
+        # Appending is safe partially, by contrast, and `add` may already have
+        # flushed some of it -- which is why only the rewrite is refused.
+        # Against the manifest, and against the whole of it -- not against the
+        # names that happened to be on disk. A chunk the manifest lists but that
+        # is *absent* never reaches the loop at all, so measuring the directory
+        # counted it as nothing to miss and rewrote the day without it: five
+        # commands became one, with nothing reported. A machine with push access
+        # can delete a chunk; woswoar itself never does.
+        #
+        # A stray file is excluded for free, because it is not in the manifest:
+        # it is not part of the day, and counting it would leave that day stale
+        # for ever, which is #87 by another route.
+        #
+        # Not when the day key will not open, though. Then nothing decrypted,
+        # there is nothing partial to write, and `unreadable` already names that
+        # day with the remedy -- it is the ordinary state of a machine that has
+        # not been granted access yet, and calling it damage would be a lie.
+        refused = (
+            day.rewrite
+            and day_keys.get(chunk_day) is not None
+            and bool(set(day.listed) - set(taken))
+        )
+        if refused:
+            report.stale.add(key)
+        else:
+            day.flush(report)
+            # Recorded only once the bytes are on disk. A refused rewrite that
+            # had marked its chunks merged would never read them again, and
+            # would have lost exactly what it was trying not to lose.
+            for name in taken:
+                if name not in already:
+                    report.chunks_merged += 1
+                state.merged.setdefault(key, set()).add(name)
 
         # Judged against what the host *signed*, not against what is in the
         # directory. A name the manifest does not list is not part of the day --
@@ -1549,8 +1592,13 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # verify. Settling on it would stamp a day whose every chunk is still
         # being refused, and pruning on it would forget the whole day and merge
         # it again from scratch, duplicating its lines.
+        # Never on a pass that refused to rebuild. A rewrite owed because the
+        # manifest went *backwards* can leave every listed name already merged,
+        # so this would otherwise read as complete -- and stamp and prune a day
+        # whose file was deliberately not rebuilt, which is a day left wrong and
+        # then never looked at again.
         signed = set(day.listed)
-        settled = bool(signed) and signed <= state.merged.get(key, set())
+        settled = not refused and bool(signed) and signed <= state.merged.get(key, set())
         if settled:
             # Pruned to the same statement. Compaction *removes* the names it
             # subsumed from the manifest, so this is what stops `state.merged`

@@ -428,6 +428,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    if report.stale:
+        stale = ", ".join(sorted(report.stale))
+        print(
+            f"\n{len(report.stale)} day(s) could not be rebuilt, and were left exactly as\n"
+            "they were rather than rewritten from the part that could be read:\n"
+            f"{stale}\n"
+            "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
+            "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
+            "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
+            "did.",
+            file=sys.stderr,
+        )
+
     if report.untrusted:
         print(
             f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
