@@ -3052,6 +3052,102 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestARewriteIsAllOrNothing(SyncTestCase):
+    """Issue #89: a rewrite replaces the day, so a partial one destroys history.
+
+    The chunks a compaction subsumed are unlinked, so their lines exist only
+    inside the compacted chunk. A rewrite that cannot open it, but can open
+    something else in the day, used to write the day out as that something
+    else -- trading lines this machine already had for the ones it could get.
+    """
+
+    DAY = "2023-11-14"
+
+    def compacted_and_growing(self) -> tuple[Fake, Fake, str]:
+        """A day compacted into one chunk, plus a later one the rewrite can read."""
+        alpha, beta = self.history_across_days(days=1, per_day=5)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            verify_key = sync.signing_public()
+            listed = sync.read_manifest(alpha.id, self.DAY, verify_key)
+            compacted = next(name for name, entry in listed.items() if entry.subsumes)
+            alpha.record(self.DAY, 1_700_000_600, "and another")
+            sync.run()
+        return alpha, beta, compacted
+
+    def damaged(self, name: str) -> Callable[[Path, str], bytes]:
+        real = sync.open_chunk
+
+        def refuse(path: Path, expected: str) -> bytes:
+            if path.name == name:
+                raise ValueError(f"{path.name} is not the chunk its manifest names")
+            return real(path, expected)
+
+        return refuse
+
+    def test_a_day_keeps_what_it_had_when_a_chunk_will_not_open(self) -> None:
+        alpha, beta, compacted = self.compacted_and_growing()
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 5, "the day was rewritten from a partial read")
+
+            # And it stays whole for as long as the chunk stays damaged.
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+    def test_the_chunks_it_did_read_are_not_recorded_as_merged(self) -> None:
+        """Otherwise the refusal is worse than the truncation it prevents.
+
+        A refused rewrite discards the plaintext it had collected. Marking those
+        chunks merged would mean never reading them again -- losing exactly the
+        lines the refusal exists to protect.
+        """
+        alpha, beta, compacted = self.compacted_and_growing()
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            sync.run()
+            self.assertNotIn(
+                compacted, sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())
+            )
+
+        # Once the chunk reads, the day is rebuilt whole: the five it had, plus
+        # the one that arrived while it could not be.
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 6)
+            self.assertIn("and another", beta.commands())
+
+    def test_appending_is_still_allowed_to_be_partial(self) -> None:
+        """Only a rewrite is all-or-nothing.
+
+        An append adds to what is there, and `_Day.add` may already have flushed
+        part of it, so refusing the whole pass would strand chunks that are
+        already on disk -- and gains nothing, since nothing was replaced.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            for i in range(2):
+                alpha.record(self.DAY, 1_700_000_700 + i, f"later {i}")
+                sync.run()
+            names = store.chunk_names(alpha.id, self.DAY)
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(names[-1])):
+            report = sync.run()
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            # The one that read was kept, rather than held back with the other.
+            self.assertEqual(len(beta.entries()), 3)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 4)
+
+
 class TestADayIsWhatItsManifestSays(SyncTestCase):
     """Issues #86 and #87: the signed manifest is the statement of a day.
 
