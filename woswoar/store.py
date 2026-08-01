@@ -261,6 +261,11 @@ def read_tail(path: Path, offset: int) -> tuple[bytes, int]:
     cache, and sync's export. They must agree on where a file "ends", and for
     sync the stakes are higher -- a half-sealed record would be committed to an
     append-only repo where it could never be fixed.
+
+    An ``offset`` at or past the end returns ``(b"", offset)``, and `export`
+    leans on that: it stats first and skips this call entirely when the file
+    cannot have grown. Anything that made reading past the end mean something
+    else -- returning the partial final line, say -- has to change that too.
     """
     try:
         with path.open("rb") as handle:
@@ -395,13 +400,17 @@ class LogFile(NamedTuple):
     path: Path
 
 
-def iter_log_files() -> Iterator[LogFile]:
-    """Yield every plaintext log file, sorted for reproducible cache builds."""
+def iter_log_files(host_id: str | None = None) -> Iterator[LogFile]:
+    """Yield plaintext log files, sorted for reproducible cache builds.
+
+    ``host_id`` lists that host's directory alone; without it, every host's.
+    """
     root = logs_dir() / _HOSTS
     if not root.is_dir():
         return
 
-    for host in sorted(root.iterdir()):
+    hosts = [root / host_id] if host_id is not None else sorted(root.iterdir())
+    for host in hosts:
         if not host.is_dir():
             continue
         for path in sorted(host.glob(f"*{_LOG_SUFFIX}")):

@@ -3029,6 +3029,101 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
+    """Issue #80: the early exit is the shape of every idle sync.
+
+    Getting to it used to cost work proportional to the whole history -- every
+    host's log directory listed, and every one of this machine's own day files
+    opened, seeked, read and closed to discover it had not grown.
+    """
+
+    def read_tails(self, machine: Fake) -> list[str]:
+        """Which log files one `export` actually opens."""
+        opened: list[str] = []
+        real = store.read_tail
+
+        def counted(path: Path, offset: int) -> tuple[bytes, int]:
+            opened.append(path.name)
+            return real(path, offset)
+
+        with machine.active(), mock.patch.object(store, "read_tail", counted):
+            self.export_once()
+        return opened
+
+    def export_once(self) -> None:
+        """One `export` as `run` would call it. Caller holds `active()`."""
+        sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_900)
+
+    def test_a_log_that_cannot_have_grown_is_not_opened(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for day in ("2023-11-14", "2023-11-15", "2023-11-16"):
+                alpha.record(day, 1_700_000_001, f"on {day}")
+                sync.run()
+
+        self.assertEqual(self.read_tails(alpha), [], "an unchanged log was read")
+
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_000_002, "a later line")
+        # Only the day that grew, not the three that exist.
+        self.assertEqual(self.read_tails(alpha), ["2023-11-15.tsv"])
+
+    def test_a_log_that_shrank_is_not_read_either(self) -> None:
+        """A truncated log reads as nothing new, exactly as it did before.
+
+        `read_tail` seeking past the end returns no data, so skipping the open
+        gives the same answer -- which is what makes the comparison `<=` and not
+        `==`. Pinned because it is the one case where the two differ in reads
+        but must not differ in outcome.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            store.log_file(alpha.id, "2023-11-14").write_text("", encoding="utf-8")
+
+        self.assertEqual(self.read_tails(alpha), [])
+        with alpha.active():
+            self.assertEqual(sync.run().lines_exported, 0)
+
+    def test_only_our_own_host_directory_is_listed(self) -> None:
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            beta.record("2023-11-14", 1_700_000_002, "make -j8")
+            sync.run()
+        # alpha cloned before beta existed, so it has to be told beta is real.
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()  # alpha now holds a decrypted copy of beta's log
+
+            everyone = {log.host_id for log in store.iter_log_files()}
+            self.assertEqual(everyone, {alpha.id, beta.id})
+
+            listed: list[str] = []
+            real = store.iter_log_files
+
+            def counted(host_id: str | None = None) -> Iterator[store.LogFile]:
+                for log in real(host_id):
+                    listed.append(log.host_id)
+                    yield log
+
+            with mock.patch.object(store, "iter_log_files", counted):
+                self.export_once()
+            self.assertEqual(set(listed), {alpha.id}, "another host's logs were listed")
+
+            # And narrowing cannot change *what* is exported: the same files the
+            # caller would have kept after filtering, in the same order.
+            self.assertEqual(
+                [log.relpath for log in store.iter_log_files(alpha.id)],
+                [log.relpath for log in store.iter_log_files() if log.host_id == alpha.id],
+            )
+
+
 class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     """`sync` runs from a one-minute timer, so each fork is a recurring cost.
 

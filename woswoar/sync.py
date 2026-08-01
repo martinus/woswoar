@@ -1154,10 +1154,31 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
     # that turned a no-op sync from 0.04 s into nearly 3 s and grew with the
     # archive forever.
     fresh: dict[str, list[tuple[str, bytes, int]]] = {}
-    for log in store.iter_log_files():
-        if log.host_id != known.id:
-            continue  # other hosts' logs arrived decrypted; never re-export them
-        data, new_offset = store.read_tail(log.path, state.exported.get(log.relpath, 0))
+    # Only this machine's own logs: other hosts' arrived decrypted and are never
+    # re-exported. Asked for by host rather than listed and then filtered, which
+    # at three machines walked two thirds of a tree to throw it away.
+    for log in store.iter_log_files(known.id):
+        exported = state.exported.get(log.relpath, 0)
+
+        # One stat instead of an open, a seek, a read and a close, on a file
+        # that is almost always exactly as long as it was a minute ago. Reading
+        # from at or past the end returns nothing anyway, so this is the same
+        # answer for a fraction of the syscalls -- which is why the comparison
+        # is `<=` and not `==`: a *truncated* log also has no tail to take.
+        #
+        # Together with the line above, `export`'s early exit -- the shape of
+        # every idle sync -- goes from 5.50 ms to 1.85 ms at three years of
+        # three machines, and stops growing with how many machines there are.
+        try:
+            size = log.path.stat().st_size
+        except OSError:
+            # As `read_tail` treats one: a file that went away between being
+            # listed and being looked at has no tail to export.
+            continue
+        if size <= exported:
+            continue
+
+        data, new_offset = store.read_tail(log.path, exported)
         if data:
             fresh.setdefault(store.day_of_log(log.relpath), []).append(
                 (log.relpath, data, new_offset)
@@ -2191,9 +2212,7 @@ def find_reader(fingerprint: str) -> Reader:
 def _still_readable(host_id: str) -> list[str]:
     """Days this host has both a key for and a log it may still append to."""
     keyed = {store.day_of_key(path) for path in store.iter_day_keys(host_id)}
-    logged = {
-        store.day_of_log(log.relpath) for log in store.iter_log_files() if log.host_id == host_id
-    }
+    logged = {store.day_of_log(log.relpath) for log in store.iter_log_files(host_id)}
     return sorted(keyed & logged)
 
 
