@@ -3030,6 +3030,96 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
 
+class TestSkippingAnUnchangedDay(SyncTestCase):
+    """Issue #85: listing a peer's archive is what an idle merge costs.
+
+    A day directory's mtime moves when a chunk lands in it, so a day whose stamp
+    is unchanged since it was merged has nothing new -- and needs no listing. At
+    20k chunks over 40 days that is 0.18 ms of stats against 4.96 ms of listing,
+    once a minute, per peer.
+    """
+
+    def listed(self, machine: Fake) -> list[str]:
+        """The days one sync actually lists the chunks of."""
+        days: list[str] = []
+        real = store.chunk_names
+
+        def counted(machine_id: str, day: str) -> list[str]:
+            days.append(day)
+            return real(machine_id, day)
+
+        with machine.active(), mock.patch.object(store, "chunk_names", counted):
+            sync.run()
+        return days
+
+    def pair(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            for day in ("2023-11-14", "2023-11-15"):
+                alpha.record(day, 1_700_000_001, f"on {day}")
+                sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 2)
+        return alpha, beta
+
+    def test_a_merged_day_is_not_listed_again(self) -> None:
+        alpha, beta = self.pair()
+        self.assertEqual(self.listed(beta), [], "an unchanged day was listed")
+        # ...and the history is still there, which is the point of not looking.
+        with beta.active():
+            self.assertEqual(len(beta.commands()), 2)
+        del alpha
+
+    def test_a_day_that_gains_a_chunk_is_listed_and_merged(self) -> None:
+        """The half that would silently stop merging if the skip overreached."""
+        alpha, beta = self.pair()
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_000_002, "a later line")
+            sync.run()
+
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        with beta.active():
+            self.assertIn("a later line", beta.commands())
+
+        # And it settles again rather than re-listing for ever.
+        self.assertEqual(self.listed(beta), [])
+
+    def test_a_day_left_short_is_looked_at_again(self) -> None:
+        """A stamp must mean "merged", not "looked at".
+
+        A chunk that would not open leaves the day incomplete. Stamping it would
+        say the day is finished, and nothing would ever read that chunk again --
+        the same trap #69 hit by recording a rebuild that had failed.
+        """
+        alpha, beta = self.pair()
+        with alpha.active():
+            alpha.record("2023-11-15", 1_700_000_002, "a later line")
+            sync.run()
+
+        def refuse(path: Path, expected: str) -> bytes:
+            raise ValueError(f"{path.name} is not the chunk its manifest names")
+
+        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+            report = sync.run()
+        self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
+
+        # Nothing changed on disk, so only an unstamped day gets a second look.
+        self.assertEqual(self.listed(beta), ["2023-11-15"])
+        with beta.active():
+            self.assertIn("a later line", beta.commands())
+
+    def test_a_day_whose_directory_changed_is_listed_again(self) -> None:
+        """The stamp is the whole test, so a moved stamp must be believed."""
+        alpha, beta = self.pair()
+        with beta.active():
+            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray.write_bytes(b"something landed in the directory")
+        self.assertEqual(self.listed(beta), ["2023-11-14"])
+
+
 class TestWalkingAPeersChunks(SyncTestCase):
     """Issue #82: `merge` walks every peer's whole tree on every sync.
 
