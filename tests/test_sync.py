@@ -1107,6 +1107,89 @@ class TestRevokeConfirmation(SyncTestCase):
             self.assertNotIn(gone, sync.recipients())
 
 
+class TestGrantDoesNotRepeatItself(SyncTestCase):
+    """Issue #35: re-sealing a key file that is already sealed to everyone.
+
+    `grant` opens and re-seals every day key of every host, two `age` forks
+    apiece, to produce different ciphertext of identical plaintext for an
+    identical recipient list. On 120 days across two machines that is 255
+    subprocesses and 575 ms; it grows with the history, and the command is run
+    by hand.
+    """
+
+    def granting_pair(self) -> tuple[Fake, Fake]:
+        alpha, beta = self.history_across_days(days=3, per_day=1)
+        with beta.active():
+            sync.run()
+        return alpha, beta
+
+    def sealed(self, machine: Fake) -> int:
+        """Key files one `grant` actually rewrites."""
+        with machine.active():
+            return sync.grant(approved=[reader.key for reader in sync.readers()]).resealed
+
+    def test_a_second_grant_with_nothing_new_seals_nothing(self) -> None:
+        alpha, beta = self.granting_pair()
+        self.assertGreater(self.sealed(alpha), 0, "precondition: the first grant did work")
+        self.assertEqual(self.sealed(alpha), 0, "it re-sealed an unchanged list")
+
+        # And access is unchanged, which is the only thing that matters about
+        # skipping the work.
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.commands()), 3)
+
+    def test_a_machine_that_enrols_later_is_still_sealed_to(self) -> None:
+        """The half that would silently stop granting if the skip overreached."""
+        alpha, _beta = self.granting_pair()
+        self.sealed(alpha)
+        self.assertEqual(self.sealed(alpha), 0)
+
+        gamma = self.machine("gamma")  # enrols, so the recipient list changes
+        self.assertGreater(self.sealed(alpha), 0, "a new machine was not sealed to")
+        with gamma.active():
+            sync.run()
+            self.assertEqual(len(gamma.commands()), 3)
+
+    def test_a_partial_grant_is_not_remembered_as_complete(self) -> None:
+        """The subtlety that makes "nothing new" insufficient on its own.
+
+        A machine that cannot open a key file leaves it sealed to the older,
+        smaller list. The recipient list is unchanged either way, so a gate that
+        looked only at that would skip for ever and those files would never be
+        re-sealed -- and the machines they were missing would never read those
+        days.
+        """
+        alpha, _beta = self.granting_pair()
+        gamma = self.machine("gamma")
+
+        # gamma has never been granted, so it can open none of the keys.
+        with gamma.active():
+            partial = sync.grant(approved=[reader.key for reader in sync.readers()])
+            # Its own key it can open; every other host's it cannot.
+            self.assertGreater(partial.skipped, 0, "precondition: gamma was left work undone")
+            self.assertFalse(sync.State.load().granted_complete)
+
+        # Now gamma is granted by a machine that can, and gamma tries again. The
+        # recipient list has not moved, but the last pass left files behind.
+        self.assertGreater(self.sealed(alpha), 0)
+        with gamma.active():
+            sync.run()
+            self.assertGreater(
+                sync.grant(approved=[reader.key for reader in sync.readers()]).resealed,
+                0,
+                "a partial grant was remembered as complete",
+            )
+
+    def test_it_says_nothing_to_do_rather_than_re_sealed_zero(self) -> None:
+        alpha, _beta = self.granting_pair()
+        self.sealed(alpha)
+        ran = self.run_cli(alpha, "grant", "--yes")
+        self.assertEqual(ran.code, 0)
+        self.assertIn("nothing to do", ran.out)
+        self.assertNotIn("re-sealed 0", ran.out)
+
+
 class TestGrantConfirmsAdditions(SyncTestCase):
     """A confirmation listing everything makes the one new line easy to miss."""
 
