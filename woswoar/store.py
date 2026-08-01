@@ -553,20 +553,68 @@ class Chunk(NamedTuple):
     path: Path
 
 
+def chunk_names(machine_id: str, day: str) -> list[str]:
+    """The chunk filenames in one host-day, sorted. Empty if there are none.
+
+    The unit the layout is actually asked about: what counts as a chunk is
+    decided here, so a partial write or an editor's leftover in a day directory
+    is not one. Callers that want a single day must not reach it by walking the
+    host -- `has_chunks` did, and turned a 0.09 ms question into a 4.6 ms one on
+    an archive of 20k chunks, once per orphaned day.
+
+    `os.scandir` swallows the same errors `Path.glob` did: a day directory that
+    has gone away, or that cannot be read, has no chunks to offer.
+    """
+    try:
+        with os.scandir(chunk_dir(machine_id, day)) as entries:
+            return sorted(e.name for e in entries if e.is_file() and e.name.endswith(_CHUNK_SUFFIX))
+    except OSError:
+        return []
+
+
+def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
+    """``(day, chunk filenames)`` for one host: days in order, names sorted.
+
+    Each day appears exactly once, with all of its chunks. `sync._merge_host`
+    relies on that: it holds one day at a time to bound memory, and `_Day`
+    *replaces* the log file it writes, so a day arriving in two pieces would
+    have the second overwrite what the first had just written.
+
+    Names, not `Chunk` objects, because the caller that runs every minute
+    decides from the *name* alone whether it has already merged a chunk, and on
+    an idle sync the answer is yes for every one of them. Building a `Path` and
+    a `Chunk` per file first was the whole cost of that walk: one peer with 20k
+    chunks took 88 ms to list against 5 ms to name, once a minute, growing with
+    the archive forever.
+
+    `os.scandir` rather than `Path.glob` for the same reason, and it is free:
+    scandir already knows whether an entry is a directory, so `_is_day` decides
+    on a name that has been read once. The order is unchanged -- chunk names are
+    fixed-width, so sorting them as strings sorts them as `Path`s did.
+    """
+    try:
+        with os.scandir(repo_host_dir(machine_id)) as entries:
+            days = sorted(e.name for e in entries if e.is_dir() and _is_day(e.name))
+    except OSError:
+        return
+
+    for day in days:
+        # A day directory with nothing in it is not a day with no new chunks --
+        # it is not a day at all, and saying so keeps every caller from having
+        # to ask.
+        if names := chunk_names(machine_id, day):
+            yield day, names
+
+
 def iter_chunks(machine_id: str) -> Iterator[Chunk]:
     """Every sealed chunk belonging to one host, oldest first.
 
-    A day's chunks are contiguous, and days come in order: the outer loop walks
-    one day directory at a time. `sync._merge_host` groups on that -- it holds
-    one day at a time to bound memory, and a day appearing twice would make the
-    second group overwrite the log file the first had just written.
+    The flat view of `iter_chunk_days`, for the callers that want the paths.
     """
     root = repo_host_dir(machine_id)
-    if not root.is_dir():
-        return
-    for day_dir in sorted(p for p in root.iterdir() if p.is_dir() and _is_day(p.name)):
-        for path in sorted(day_dir.glob(f"*{_CHUNK_SUFFIX}")):
-            yield Chunk(day=day_dir.name, name=path.name, path=path)
+    for day, names in iter_chunk_days(machine_id):
+        for name in names:
+            yield Chunk(day=day, name=name, path=root / day / name)
 
 
 def _is_day(name: str) -> bool:

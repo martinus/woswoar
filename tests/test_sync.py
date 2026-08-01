@@ -19,6 +19,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 from woswoar import cache, crypto, search, store, sync
@@ -3027,6 +3028,160 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             with mock.patch.object(sync, "read_manifest", counted):
                 sync.run()
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
+
+
+class TestWalkingAPeersChunks(SyncTestCase):
+    """Issue #82: `merge` walks every peer's whole tree on every sync.
+
+    Its idle answer is "nothing new", decided from chunk *names*, so building a
+    `Path` and a `Chunk` per file first was the entire cost: 71.5 ms against
+    8.5 ms for one peer with 20k chunks, once a minute, growing with the archive.
+    """
+
+    #: Recorded newest-day-first, deliberately. Two days cannot tell a sorted
+    #: walk from a reversed one, and creation order is not incidental: on btrfs
+    #: -- the filesystem this is developed on -- `readdir` returns entries in
+    #: the order they were made, so an unsorted walk comes back wrong here and
+    #: would pass on the tmpfs the suite's temporary directories land in.
+    DAYS: ClassVar[tuple[str, ...]] = ("2023-11-16", "2023-11-14", "2023-11-15")
+
+    def stocked(self) -> tuple[Fake, Fake]:
+        """alpha with three days of two chunks each, and a beta that merged them."""
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        with alpha.active():
+            for day in self.DAYS:
+                for i in range(2):
+                    alpha.record(day, 1_700_000_100 + i, f"{day} number {i}")
+                    sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()
+        return alpha, beta
+
+    def test_the_names_are_the_ones_the_chunk_walk_yields(self) -> None:
+        """The two views of the same tree must not drift.
+
+        `iter_chunks` is built on `iter_chunk_days`, and everything that reads a
+        chunk still goes through it -- so a difference here would mean `merge`
+        and `compact` disagreeing about what a host published.
+        """
+        alpha, _beta = self.stocked()
+        with alpha.active():
+            by_day = list(store.iter_chunk_days(alpha.id))
+            flat = [(chunk.day, chunk.name) for chunk in store.iter_chunks(alpha.id)]
+
+        self.assertEqual(
+            [(day, name) for day, names in by_day for name in names],
+            flat,
+            "the name walk and the chunk walk disagree",
+        )
+        # Sorted, and each day exactly once. `_Day` *replaces* the log file it
+        # writes, so a day arriving in two pieces would have the second
+        # overwrite what the first had just written.
+        self.assertEqual([day for day, _ in by_day], sorted(self.DAYS))
+        for _day, names in by_day:
+            self.assertEqual(names, sorted(names))
+            self.assertTrue(names, "an empty day was yielded")
+
+    def test_only_chunks_are_yielded(self) -> None:
+        """A day directory is not guaranteed to hold nothing else.
+
+        A partial write, an editor's backup, a `.orig` left by a merge tool: the
+        walk names what it is looking for rather than taking whatever is there,
+        because everything downstream treats a name as a chunk to authenticate.
+        """
+        alpha, _beta = self.stocked()
+        with alpha.active():
+            directory = store.chunk_dir(alpha.id, "2023-11-14")
+            (directory / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
+            (directory / "notes.txt").write_text("not a chunk", encoding="utf-8")
+
+            names = dict(store.iter_chunk_days(alpha.id))["2023-11-14"]
+        self.assertTrue(all(name.endswith(".age") for name in names), names)
+        self.assertEqual(len(names), 2)
+
+    def test_a_directory_holding_no_chunk_is_not_a_day(self) -> None:
+        """Empty and "nothing new" are different answers, told apart here.
+
+        A day directory can exist with nothing in it -- a `compact` that removed
+        the last chunk, a partial write cleaned up -- and every caller would
+        otherwise have to ask. `has_chunks` in particular decides whether an
+        orphaned day key is a loss or a harmless nuisance, so a directory with
+        only a stray file in it must read as empty there too.
+        """
+        alpha, _beta = self.stocked()
+        with alpha.active():
+            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow.mkdir(parents=True, exist_ok=True)
+
+            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertFalse(sync.has_chunks(alpha.id, "2023-11-20"))
+
+            (hollow / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
+            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertFalse(
+                sync.has_chunks(alpha.id, "2023-11-20"), "a stray file counted as a chunk"
+            )
+
+            # And a day that does hold one still says so.
+            self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
+
+    def test_one_day_is_not_answered_by_walking_the_host(self) -> None:
+        """`orphaned_days` asks once per orphaned day, so the cost compounds.
+
+        Answering from a whole-host walk made a 0.12 ms question 5 ms, and
+        `orphaned_days` 5 ms to 184 ms with 40 orphaned days over 20k chunks --
+        quadratic in the archive, in exactly the state `doctor` exists to find
+        and that a stranger with push access can create.
+        """
+        alpha, _beta = self.stocked()
+        walked: list[str] = []
+        real = store.iter_chunk_days
+
+        def spy(machine_id: str) -> Iterator[tuple[str, list[str]]]:
+            walked.append(machine_id)
+            return real(machine_id)
+
+        with alpha.active(), mock.patch.object(store, "iter_chunk_days", spy):
+            self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
+            sync.orphaned_days()
+
+            # `export` asks the same question, per day it is sealing, on every
+            # sync that records anything.
+            alpha.record("2023-11-14", 1_700_000_900, "one more")
+            self.assertTrue(
+                sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_901)
+            )
+        self.assertEqual(walked, [], "a one-day question walked the whole host")
+
+    def test_keys_and_manifests_are_not_mistaken_for_days(self) -> None:
+        """They sit in the same host directory, and neither holds chunks."""
+        alpha, _beta = self.stocked()
+        with alpha.active():
+            siblings = {p.name for p in store.repo_host_dir(alpha.id).iterdir() if p.is_dir()}
+            self.assertTrue({"keys", "manifests"} <= siblings, siblings)
+            self.assertEqual({day for day, _ in store.iter_chunk_days(alpha.id)}, set(self.DAYS))
+
+    def test_an_idle_merge_builds_nothing_per_chunk(self) -> None:
+        """The saving itself, asserted where a future change would undo it.
+
+        Nothing is new, so `merge` has no reason to construct a `Chunk` -- and
+        constructing one per file is what made this walk cost 8x what reading
+        the names does.
+        """
+        _alpha, beta = self.stocked()
+        real = store.iter_chunks
+        used = []
+
+        def spy(machine_id: str) -> Iterator[store.Chunk]:
+            used.append(machine_id)
+            return real(machine_id)
+
+        with beta.active(), mock.patch.object(store, "iter_chunks", spy):
+            report = sync.run()
+        self.assertEqual(report.chunks_merged, 0)
+        self.assertEqual(used, [], "merge built Chunk objects for an idle sync")
 
 
 class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):

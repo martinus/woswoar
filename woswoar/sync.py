@@ -33,7 +33,6 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -612,9 +611,18 @@ def has_chunks(host_id: str, day: str) -> bool:
     What turns a half-written key pair from a nuisance into a loss: with no
     chunks the next `export` simply mints a new pair over it and nothing is
     ever noticed, so reporting that state would be a false alarm.
+
+    Through the same listing that decides what a chunk *is*, so a day directory
+    holding only a partial write or an editor's leftover reads as empty here
+    too. "Anything at all is in the directory" said the opposite, which would
+    have turned a stray file into a reported loss.
+
+    One day, asked directly: `orphaned_days` calls this once per orphaned day,
+    so answering by walking the whole host would be quadratic in the archive --
+    186 ms rather than 3.8 ms for 40 orphaned days at 20k chunks, in exactly the
+    state `doctor` exists to find.
     """
-    directory = store.chunk_dir(host_id, day)
-    return directory.is_dir() and any(directory.iterdir())
+    return bool(store.chunk_names(host_id, day))
 
 
 def orphaned_days() -> list[tuple[str, str]]:
@@ -1192,9 +1200,6 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         return wrote
 
     # One pass for the whole host, not one per day.
-    on_disk: dict[str, set[str]] = {}
-    for chunk in store.iter_chunks(known.id):
-        on_disk.setdefault(chunk.day, set()).add(chunk.name)
 
     for day, tails in sorted(fresh.items()):
         # Before the manifest, not after. Refusing does not advance
@@ -1203,7 +1208,8 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # orphaned day cost a fork a minute for as long as it stayed that way,
         # on a path issue #50 is already about. `day in on_disk` first because
         # it is a dict lookup and the other two are stats.
-        if day in on_disk and orphaned_day_key(known.id, day):
+        on_disk = set(store.chunk_names(known.id, day))
+        if on_disk and orphaned_day_key(known.id, day):
             # See `orphaned_day_key` for what this state is. A fresh key would
             # let this sync succeed and say nothing while the day's existing
             # chunks stayed unreadable, so nothing is written. The lines stay
@@ -1281,7 +1287,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # every manifest, which is the cost this loop exists to avoid. A planted
         # chunk on a quiet day is refused by peers either way, because it is in
         # no manifest -- this is a report, not the defence.
-        report.foreign |= {f"{day}/{name}" for name in on_disk.get(day, set()) - set(listed)}
+        report.foreign |= {f"{day}/{name}" for name in on_disk - set(listed)}
 
     # Set at the manifest rather than approximated by "we got past the guards".
     # A day can be refused for an orphaned key, a missing manifest or one that
@@ -1371,10 +1377,9 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     #: instead of hundreds, on precisely the first sync a new machine runs.
     day_keys: dict[str, str | None] = {}
 
-    # Grouped by day rather than streamed chunk by chunk, because whether a day
-    # is being *rewritten* has to be known before deciding which of its chunks
-    # to read -- and that answer is in the manifest. `iter_chunks` yields a
-    # day's chunks contiguously, which is what makes one group one day.
+    # A day at a time rather than a chunk at a time, because whether a day is
+    # being *rewritten* has to be known before deciding which of its chunks to
+    # read -- and that answer is in the manifest.
     #
     # A rewrite replaces the day's log file outright, so it has to be rebuilt
     # from every chunk the manifest lists, not from the ones this run happens to
@@ -1386,8 +1391,9 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # Laziness is kept where it pays: a day with nothing new never reads its
     # manifest, and a manifest costs a subprocess. Over a year of three machines
     # that is the difference between ~3.6s and nearly two minutes.
-    for chunk_day, group in groupby(store.iter_chunks(host_id), key=lambda c: c.day):
-        chunks = list(group)
+    # Names rather than `Chunk` objects, and paths built only for the chunks
+    # actually read -- see `store.iter_chunk_days` for what that is worth here.
+    for chunk_day, names in store.iter_chunk_days(host_id):
         key = f"{host_id}/{chunk_day}"
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
@@ -1396,16 +1402,17 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # merged below, and aliasing it made "was this already merged" answer
         # yes for a chunk this very run had just added.
         already = frozenset(state.merged.get(key, ()))
-        fresh = [chunk for chunk in chunks if chunk.name not in already]
+        fresh = [name for name in names if name not in already]
         if not fresh:
             continue
 
         listed = read_manifest(host_id, chunk_day, verify_key)
         day = _Day(host_id, chunk_day, listed, already)
-        pending = chunks if day.rewrite else fresh
+        pending = names if day.rewrite else fresh
+        directory = store.chunk_dir(host_id, chunk_day)
 
-        for chunk in pending:
-            if chunk.name not in day.listed:
+        for name in pending:
+            if name not in day.listed:
                 # No signed statement that this host wrote this. Covers a
                 # missing, unsigned, mis-signed or mis-addressed manifest as
                 # well as a chunk simply absent from a good one -- see
@@ -1432,7 +1439,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # and the parser only ever see bytes one of this user's own machines
             # wrote.
             try:
-                blob = open_chunk(chunk.path, day.listed[chunk.name].digest)
+                blob = open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
                 report.unauthenticated.add(key)
                 continue
@@ -1450,8 +1457,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 continue
 
             day.add(plaintext, report)
-            state.merged.setdefault(key, set()).add(chunk.name)
-            if chunk.name not in already:
+            state.merged.setdefault(key, set()).add(name)
+            if name not in already:
                 report.chunks_merged += 1
 
         day.flush(report)
