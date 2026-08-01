@@ -141,13 +141,14 @@ The remaining sealed keys are then re-sealed without it, so a copy of the repo
 taken afterwards cannot be opened with that key at all, and every day key minted
 from then on excludes it.
 
-What it does **not** do, all three said on screen before you confirm:
+What it does **not** do, both said on screen before you confirm:
 
 - **It does not un-publish anything.** History already in the repo stays
   readable by that key if it kept a copy.
 - **It does not revoke git access.** If the key got in through a stolen token or
   a mis-scoped deploy key, that credential needs rotating too, or it can simply
   fetch again.
+
 What it **does** do, and this is what #38 added: from that moment nothing that
 machine publishes is accepted by any of your machines, under its own name or
 anyone else's. It keeps its signing key — nobody can take that back — but every
@@ -197,6 +198,76 @@ with `--identity <path>` or `--new-identity`.
 
 </details>
 
+## 🧭 `grant` and `trust` answer different questions
+
+Two commands, both asking a human, and it is easy to assume one could replace
+the other. They are on different axes and neither can absorb the other.
+
+| | `woswoar grant` | `woswoar trust` |
+|---|---|---|
+| The question | who may **read** what already exists? | whose new history do I **believe**? |
+| Acts on | age recipients — the per-day keys are re-sealed | one Ed25519 verify key, pinned |
+| Runs | **once**, on a machine that can already decrypt | on **each** machine that will read the new one |
+| Touches the repo | yes: it rewrites and pushes the key files | no, ever |
+| If you skip it | the new machine sees only history from its enrolment on | the new machine's history is refused, and said so |
+
+Reading and writing are separate because the cryptography separates them.
+Chunks are sealed to a day key, and the day key is sealed to the recipient list
+— so **reading** is a question about age recipients. Nothing about age says who
+*wrote* a chunk, so each machine signs a manifest — and **believing** is a
+question about signing keys. A machine can be able to read everything and be
+believed by nobody, or the reverse.
+
+### Why each one has to ask a person
+
+`recipients.txt` is plaintext and `merge=union`, and `hosts/<id>/signer.pub` is
+an ordinary committed file. **Anyone who can push can add a line to either.**
+That is the assumption the whole design is built on, and it is what makes both
+confirmations load-bearing rather than ceremonial:
+
+- If re-sealing happened **automatically** whenever the recipient list changed,
+  then appending one key would be enough: the next sync on any enrolled machine
+  would re-seal every day key to include the attacker, who could then decrypt the
+  entire archive. No signature is forged and nothing looks wrong. The
+  confirmation in `grant` *is* the defence.
+- If a published `signer.pub` were **believed on sight**, anyone who can push
+  could have history accepted under any machine's name. Hence the local pin, and
+  hence the rule above: **repo state may only ever remove trust, never add
+  it.**
+
+### Why `grant` cannot quietly do `trust` as well
+
+The tempting simplification is that granting a machine could pin it at the same
+time — one confirmation instead of two. It cannot, for two reasons, and the
+second is the sharp one.
+
+The dull reason: `grant` runs once, anywhere; the pin is needed on *every* other
+machine. Pinning at grant time would fix only the machine you happened to run it
+on.
+
+The sharp reason: **at grant time the human is checking a different key.** The
+prompt shows an *age recipient* fingerprint. What links that recipient to a
+signing key is `signer.pub`, a file in the repo. So someone with push access
+could point their own host directory at the recipient you are about to approve —
+they still could not decrypt anything, because they do not hold that private
+key, but their *verify key* would be pinned as that host's signer and you would
+accept history they published. Disclosure would be prevented and injection
+introduced. `trust` avoids it by showing the verify key's own fingerprint, which
+is the thing being decided.
+
+### What that costs, and what it does not
+
+Adding a laptop is `grant` once, and `trust` on the machines that will read it —
+`trust` offers every unpinned machine at once, so it is one command per machine,
+not one per newcomer. That cost is the price of an anchor the remote cannot
+rewrite, and it is listed under *What is not protected* rather than
+hidden.
+
+What it is *not* is a choice between security and convenience in the usual
+sense. Dropping `grant` entirely would be perfectly safe — a new machine would
+simply never read history recorded before it enrolled. What is unsafe is keeping
+the capability and removing the person.
+
 ## 📦 Minimal supply chain
 
 No on-disk format woswoar reads can execute code. The parse cache under
@@ -217,37 +288,64 @@ install from your distribution.
 
 Claims rot. The ones that matter are asserted in CI on every push:
 
+**Nobody else can put history in yours**
+
 | Claim | How it is enforced |
 |---|---|
-| The hook forks nothing | recording runs under `strace`; the clone/fork/execve count must be **0** |
-| Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
-| History is never rewritten | `git log --diff-filter=MD` over chunk files must be **empty** |
-| A compacted day survives gaining more history | a chunk written for a day after it was compacted leaves every peer holding that day's earlier commands as well, not only the new one |
-| Compaction does not duplicate history | a peer that already merged a day, and one that merged only part of it, both end up holding each command exactly once |
-| A failed chunk is retried, not dropped | an earlier chunk that fails while a later one succeeds is merged once it is repaired |
-| age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
 | Forged history is refused | a chunk sealed to a host's published day key, but absent from that host's signed manifest, is rejected and reported |
-| The repo names no machine | every committed byte is searched for the username and hostname; a leaked archive says how many machines there are, not which |
 | Tampering is refused | flipping one byte of a real chunk fails authentication, not merely decryption |
-| A day whose signed list is gone is refused, not re-signed | deleting a manifest and syncing publishes nothing further for that day, rather than signing a replacement that names only the newest chunk and disowns every earlier one |
-| A day whose sealed key is gone is refused, not written over | deleting one and syncing publishes nothing further for that day and says so, rather than adding chunks no machine could ever read |
-| This machine never writes a chunk its peers would refuse | a tail past the export budget is split into several chunks and a peer merges every line of it; compaction, the other producer, leaves a day alone rather than merging it past the same budget |
-| A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
-| A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
-| Nor under another machine's name | the same, written into a peer's host directory, where that peer never looks |
 | A manifest cannot be moved | a real, correctly signed manifest copied to another day is refused; host and day are inside the signed bytes |
 | A machine never signs what it did not write | a chunk planted under a machine's own id stays out of the manifest it signs, and is reported |
 | A changed signing key is never waved through | the peer refuses, keeps the old pin, and says so |
+| A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
+
+**A revoked machine stays revoked**
+
+| Claim | How it is enforced |
+|---|---|
+| A revoked machine cannot publish | it keeps its signing key and its old manifests, signs a chunk with them, pushes -- and a third machine accepts none of it |
+| Nor under another machine's name | the same, written into a peer's host directory, where that peer never looks |
 | A revoked machine stops receiving history | two real machines through a bare repo: after `revoke`, the revoked one still has what came before and never gets what comes after |
 | A revocation cannot be undone by pushing | re-adding the key, by command or by appending the line, leaves it subtracted |
+
+**A leaked repository says as little as possible**
+
+| Claim | How it is enforced |
+|---|---|
+| The repo names no machine | every committed byte is searched for the username and hostname; a leaked archive says how many machines there are, not which |
+| age is never given a file path | every age invocation is inspected; no argument may be an existing path outside `/dev/fd` |
+| A remote is an address, never an option to git | `woswoar init -- --upload-pack=<command>` is refused, and both git calls that are handed the remote pass `--` first; the command never runs |
+
+**Your own history is not quietly lost or doubled**
+
+| Claim | How it is enforced |
+|---|---|
+| History is never rewritten | `git log --diff-filter=MD` over chunk files must be **empty** |
+| A failed chunk is retried, not dropped | an earlier chunk that fails while a later one succeeds is merged once it is repaired |
+| A compacted day survives gaining more history | a chunk written for a day after it was compacted leaves every peer holding that day's earlier commands as well, not only the new one |
+| Compaction does not duplicate history | a peer that already merged a day, and one that merged only part of it, both end up holding each command exactly once |
+| A day whose signed list is gone is refused, not re-signed | deleting a manifest and syncing publishes nothing further for that day, rather than signing a replacement that names only the newest chunk and disowns every earlier one |
+| A day whose sealed key is gone is refused, not written over | deleting one and syncing publishes nothing further for that day and says so, rather than adding chunks no machine could ever read |
+| This machine never writes a chunk its peers would refuse | a tail past the export budget is split into several chunks and a peer merges every line of it; compaction, the other producer, leaves a day alone rather than merging it past the same budget |
+
+**Nothing woswoar reads can run**
+
+| Claim | How it is enforced |
+|---|---|
+| The cache cannot execute | a pickle that would run code on load is written to the cache path; it is refused and a witness file never appears |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
 | Nothing woswoar prints can drive your terminal | no C0 byte reaches the terminal raw from `list`, `search`, `stats` or `import` -- a peer's command is made inert as it leaves the cache, a peer's machine name where it is read |
-| The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
+| Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
+
+**It stays yours, and stays fast**
+
+| Claim | How it is enforced |
+|---|---|
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
 | The hook's scratch file is never in a directory another user can write | `TMPDIR` and `/tmp` are never consulted; an `XDG_RUNTIME_DIR` this user cannot write falls back to woswoar's own `0700` tree instead of switching recording off |
-| A remote is an address, never an option to git | `woswoar init -- --upload-pack=<command>` is refused, and both git calls that are handed the remote pass `--` first; the command never runs |
-| The cache cannot execute | a pickle that would run code on load is written to the cache path; it is refused and a witness file never appears |
+| The hook forks nothing | recording runs under `strace`; the clone/fork/execve count must be **0** |
 | Search stays fast | latency measured on 52,000 entries |
+| The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 
 ## ⚠️ What is *not* protected
 
