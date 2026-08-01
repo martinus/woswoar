@@ -409,7 +409,7 @@ class State:
     #: "<host>/<day>" -> the day directory's mtime when every chunk it held had
     #: been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
-    #: costs on a timer that fires every minute.
+    #: costs on a timer that fires every minute. See `store.day_stamp`.
     #:
     #: Recorded only for a day merged *completely*. One left short by an
     #: unopenable key or a chunk that would not authenticate has to be looked at
@@ -1408,7 +1408,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # manifest, and a manifest costs a subprocess. Over a year of three machines
     # that is the difference between ~3.6s and nearly two minutes.
     # Names rather than `Chunk` objects, and paths built only for the chunks
-    # actually read -- see `store.iter_chunk_days` for what that is worth here.
+    # actually read -- see `store.chunk_names` for what that is worth here.
     for chunk_day in store.chunk_days(host_id):
         key = f"{host_id}/{chunk_day}"
 
@@ -1430,8 +1430,15 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         fresh = [name for name in names if name not in already]
         if not fresh:
             # Nothing new, but the stamp moved -- a chunk added and removed
-            # again, or a first sight of a day already merged from elsewhere.
-            # Recording it here is what stops the next run listing it too.
+            # again, a stray file dropped in, or a first sight of a day already
+            # merged from elsewhere. Recording it here is what stops the next
+            # run listing that day too, and for ever.
+            #
+            # The same condition as the write below the merge, reached earlier:
+            # `not fresh` means every name is in `already`, which *is*
+            # `state.merged[key]`. `names` because an empty directory is not a
+            # day (see `store.iter_chunk_days`), and stamping one would put a
+            # permanent entry in `state.json` for something that is not there.
             if stamp is not None and names:
                 state.scanned[key] = stamp
             continue

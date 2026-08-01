@@ -3015,9 +3015,17 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         A manifest costs an `ssh-keygen -Y verify`, and sync runs on a
         one-minute timer. Grouping by day must not turn that into one fork per
         day of history per run.
+
+        The day's directory is disturbed first, so the mtime stamp of #85 does
+        not skip it before `read_manifest` is ever reached. Without that this
+        test passes whether or not the laziness it is named for still exists.
         """
-        _, beta = self.merged_pair()
+        alpha, beta = self.merged_pair()
         with beta.active():
+            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray.write_bytes(b"disturb the day's stamp")
+            stray.unlink()
+
             reads: list[str] = []
             real = sync.read_manifest
 
@@ -3053,25 +3061,19 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         return days
 
     def pair(self) -> tuple[Fake, Fake]:
-        alpha = self.machine("alpha")
-        beta = self.machine("beta")
-        with alpha.active():
-            for day in ("2023-11-14", "2023-11-15"):
-                alpha.record(day, 1_700_000_001, f"on {day}")
-                sync.run()
-            sync.grant()
+        """alpha with two days of one chunk, and a beta that has merged both."""
+        alpha, beta = self.history_across_days(days=2, per_day=1)
         with beta.active():
             sync.run()
             self.assertEqual(len(beta.commands()), 2)
         return alpha, beta
 
     def test_a_merged_day_is_not_listed_again(self) -> None:
-        alpha, beta = self.pair()
+        _alpha, beta = self.pair()
         self.assertEqual(self.listed(beta), [], "an unchanged day was listed")
         # ...and the history is still there, which is the point of not looking.
         with beta.active():
             self.assertEqual(len(beta.commands()), 2)
-        del alpha
 
     def test_a_day_that_gains_a_chunk_is_listed_and_merged(self) -> None:
         """The half that would silently stop merging if the skip overreached."""
@@ -3112,12 +3114,18 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
             self.assertIn("a later line", beta.commands())
 
     def test_a_day_whose_directory_changed_is_listed_again(self) -> None:
-        """The stamp is the whole test, so a moved stamp must be believed."""
+        """The stamp is the whole test, so a moved stamp must be believed.
+
+        And then re-recorded. A day that is looked at, found to hold nothing
+        new, and left unstamped would be listed again on every sync for ever --
+        which is what a single stray file in a peer's directory would cost.
+        """
         alpha, beta = self.pair()
         with beta.active():
             stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
             stray.write_bytes(b"something landed in the directory")
         self.assertEqual(self.listed(beta), ["2023-11-14"])
+        self.assertEqual(self.listed(beta), [], "a stray file re-listed the day for ever")
 
 
 class TestWalkingAPeersChunks(SyncTestCase):

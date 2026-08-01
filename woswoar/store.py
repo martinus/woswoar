@@ -562,6 +562,10 @@ def chunk_names(machine_id: str, day: str) -> list[str]:
     host -- `has_chunks` did, and turned a 0.09 ms question into a 4.6 ms one on
     an archive of 20k chunks, once per orphaned day.
 
+    Listing is what walking an archive costs now that nothing builds a `Path`
+    per file: 4.96 ms for one peer's 20k chunks, against 0.18 ms to stat its 40
+    day directories, which is why `day_stamp` exists.
+
     `os.scandir` swallows the same errors `Path.glob` did: a day directory that
     has gone away, or that cannot be read, has no chunks to offer.
     """
@@ -591,8 +595,7 @@ def day_stamp(machine_id: str, day: str) -> int | None:
     A directory's mtime moves when an entry is added to or removed from it,
     which is exactly what a fetch bringing in a chunk does -- so a day whose
     stamp is unchanged since it was last merged has nothing new in it, without
-    listing it. At 20k chunks over 40 days, stamping is 0.18 ms against 4.96 ms
-    to list.
+    listing it -- see `chunk_names` for what that saves.
 
     Nanoseconds, and compared for equality rather than order: a directory
     restored from a backup can be older than the stamp that was recorded, and
@@ -607,22 +610,10 @@ def day_stamp(machine_id: str, day: str) -> int | None:
 def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
     """``(day, chunk filenames)`` for one host: days in order, names sorted.
 
-    Each day appears exactly once, with all of its chunks. `sync._merge_host`
-    relies on that: it holds one day at a time to bound memory, and `_Day`
-    *replaces* the log file it writes, so a day arriving in two pieces would
-    have the second overwrite what the first had just written.
-
-    Names, not `Chunk` objects, because the caller that runs every minute
-    decides from the *name* alone whether it has already merged a chunk, and on
-    an idle sync the answer is yes for every one of them. Building a `Path` and
-    a `Chunk` per file first was the whole cost of that walk: one peer with 20k
-    chunks took 88 ms to list against 5 ms to name, once a minute, growing with
-    the archive forever.
-
-    `os.scandir` rather than `Path.glob` for the same reason, and it is free:
-    scandir already knows whether an entry is a directory, so `_is_day` decides
-    on a name that has been read once. The order is unchanged -- chunk names are
-    fixed-width, so sorting them as strings sorts them as `Path`s did.
+    Each day appears exactly once, with all of its chunks, and days with none at
+    all are not days. `sync._merge_host` reaches the same two halves separately
+    -- `chunk_days` then, per day it has to look at, `chunk_names` -- because it
+    can decide from the day alone that it needs no names.
     """
     for day in chunk_days(machine_id):
         # A day directory with nothing in it is not a day with no new chunks --
