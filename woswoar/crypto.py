@@ -325,12 +325,26 @@ def generate_signing_key(path: Path) -> str:
     useful copy of, because nobody else ever needed it to verify.
     """
     require_signing()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # 0700 on the leaf. This module deliberately does not import `store`, so
+    # `private_dir` is out of reach -- but the directory it makes here is
+    # woswoar's own, and inheriting a 022 umask would leave it 0755.
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # ssh-keygen refuses to overwrite, and would prompt about it on a terminal.
     path.unlink(missing_ok=True)
     public_half(path).unlink(missing_ok=True)
     _run_signer([SSH_KEYGEN, "-t", "ed25519", "-N", "", "-C", "woswoar", "-q", "-f", str(path)])
+    # Both halves, not just the secret one. ssh-keygen writes the private key
+    # 0600 and the public key at the umask -- 0644 on a stock install. Nothing
+    # is exposed by a public key being readable; what breaks is the guarantee
+    # that *every* path woswoar creates is owner-only, which `doctor` enforces
+    # by walking them. It reported `[FAIL] private` on the first run of a fresh
+    # machine, before the user had done anything wrong.
+    # The private half is belt and braces: ssh-keygen writes a private key 0600
+    # whatever the umask, so removing this line changes nothing observable and
+    # no test can catch it. Kept anyway, because the mode of a file woswoar
+    # creates should not depend on another tool's habits.
     path.chmod(0o600)
+    public_half(path).chmod(0o600)
     return signing_public(path)
 
 
