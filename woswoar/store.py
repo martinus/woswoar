@@ -261,6 +261,11 @@ def read_tail(path: Path, offset: int) -> tuple[bytes, int]:
     cache, and sync's export. They must agree on where a file "ends", and for
     sync the stakes are higher -- a half-sealed record would be committed to an
     append-only repo where it could never be fixed.
+
+    An ``offset`` at or past the end returns ``(b"", offset)``, and `export`
+    leans on that: it stats first and skips this call entirely when the file
+    cannot have grown. Anything that made reading past the end mean something
+    else -- returning the partial final line, say -- has to change that too.
     """
     try:
         with path.open("rb") as handle:
