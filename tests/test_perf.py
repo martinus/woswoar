@@ -31,6 +31,20 @@ DAYS = 730
 #: Targets from the plan. CI fails at 3x to stay honest on a shared runner
 #: while still catching a real regression -- a change that makes loading twice
 #: as slow will not slip through, but a noisy neighbour will not fail the build.
+
+#: The full parse of every log file, with no cache to start from -- paid on the
+#: first Ctrl-R after an install, an import, or a cache the user deleted. It had
+#: no bound at all: `warm < cold` holds however slow the cold path becomes.
+#:
+#: What this catches is a gross regression, at 3x like everything else here. It
+#: would *not* have caught the one that prompted it -- #25 cost 22% of cold
+#: build, 75 ms to 92 ms -- and no wall-clock bound safe on a shared runner
+#: would: cold build reads ~750 files, and five consecutive local runs on an
+#: otherwise idle machine spread 80-94 ms by themselves. A ratio against the
+#: warm load in the same run is no steadier (2.24-2.66 over those five). So this
+#: is a floor under "somebody made it several times slower", and a 20% one still
+#: needs a person measuring, as #25's did.
+COLD_BUILD_TARGET_MS = 150.0
 CACHE_LOAD_TARGET_MS = 50.0
 LIST_TARGET_MS = 100.0
 #: The whole process, not just the functions. About double LIST_TARGET_MS,
@@ -177,8 +191,17 @@ class TestPerformance(WoswoarTestCase):
     def test_warm_load_beats_cold_build(self) -> None:
         cold_ms, _ = self.timed(cache.load_entries)
         warm_ms, _ = self.timed(cache.load_entries)
+        print(f"\n  cold build    {cold_ms:8.1f} ms  (target {COLD_BUILD_TARGET_MS:.0f} ms)")
+
         # If this ever fails, the incremental path is not being taken at all.
         self.assertLess(warm_ms, cold_ms)
+        # And a bound on the cold path itself, which the comparison above cannot
+        # give: it stays true however slow both become.
+        self.assertLess(
+            cold_ms,
+            COLD_BUILD_TARGET_MS * TOLERANCE,
+            f"cold cache build regressed: {cold_ms:.1f} ms",
+        )
 
 
 if __name__ == "__main__":
