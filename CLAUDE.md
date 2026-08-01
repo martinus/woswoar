@@ -147,31 +147,34 @@ single largest waste of a session so far, twice over.
 Not after. Undoing a commit that landed on `main` means branching at `HEAD` and
 then `git reset --hard origin/main` — the operation rule 6 is about.
 
-## 8. Write no migration code: nothing is deployed yet
+## 8. There is a user now: changing a format means moving what exists
 
-woswoar has no users. Nobody has installed it, so there is no history in the
-field and no repository built by an older version.
+woswoar is installed and recording. Until v0.2.0 this rule said the opposite —
+change any format outright, write no upgrade path — because nothing was
+deployed. It said to delete itself the moment someone installed, rather than
+reason about who might be affected. This is that deletion.
 
-Change the record format, the repo layout, `state.json`, the cache, the day-key
-scheme — outright. Do **not** write an upgrade path, a version field two code
-paths branch on, an "if this is the old shape" fallback, or a deprecation
-period. A clean cut is the norm here, not something to argue for.
+So: a change to the record format, the repo layout, `state.json`, the cache or
+the day-key scheme now needs a way for an existing installation to arrive at the
+new shape. Not necessarily *code* — a one-line note in the release saying
+"delete the cache, it rebuilds" is an upgrade path, and a good one where the
+thing is derived. What is no longer acceptable is a change that leaves a running
+machine silently wrong.
 
-Two things this does not license:
+The distinction that decides how much care a change needs:
 
-- **Say so in the PR body, with the rebuild command**, in case the maintainer's
-  own machine is on the old shape:
-  `rm -rf ~/.local/share/woswoar/history ~/.local/share/woswoar/state.json`,
-  then `woswoar init <url>` and `woswoar grant`.
-- `logs/` is the plaintext history and the primary copy; `history/` is derived
-  from it and can always be rebuilt. Discarding the derived tree is cheap;
-  discarding `logs/` loses data. That distinction outlives this rule.
+- `logs/` is the plaintext history and the **primary copy**. Losing it loses
+  data. Nothing may require it to be discarded.
+- `history/` is the encrypted git tree, derived from `logs/` and rebuildable.
+  `cache.txt` likewise. Telling someone to delete either is cheap.
+- `state.json` is progress, not history: losing it costs a re-merge and a
+  re-export, never a command. Fields there may be added freely, and `State.load`
+  already degrades an unreadable value to a safe default — that is the pattern
+  to follow rather than a version field two code paths branch on.
 
-**This expires the moment woswoar is published and someone installs it.** Delete
-the rule then, rather than reasoning about who might be affected. Both errors
-cost: assuming a user base that does not exist wastes work — issue #54 was filed
-at P1 and closed for exactly that — and assuming forever that there is none
-corrupts somebody's history.
+Nothing in the repo records which version wrote it, so a change to the *repo*
+format has no marker to hang an upgrade on. That is worth fixing before the
+first such change, not during one.
 
 ## Repository conventions worth matching
 
