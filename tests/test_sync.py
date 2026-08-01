@@ -7,6 +7,7 @@ are enough, and that is only meaningful if it is actually demonstrated.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import secrets
@@ -1105,6 +1106,70 @@ class TestRevokeConfirmation(SyncTestCase):
         self.assertIn("nothing that machine publishes is accepted", out)
         with alpha.active():
             self.assertNotIn(gone, sync.recipients())
+
+
+class TestCrashDebrisIsNotCalledAnIntruder(SyncTestCase):
+    """Issue #66: the same evidence has two explanations, and one is ordinary.
+
+    `export` writes a chunk and then signs the day's list. Killed between the
+    two, it leaves a chunk in no manifest -- and `state.save()` never ran, so the
+    next sync republishes those lines under a chunk that *is* signed. Nothing is
+    lost and nothing is duplicated; the abandoned one is inert for ever.
+
+    It used to be reported as "someone else can write into this repository",
+    which sends a user hunting an intruder after a power cut.
+    """
+
+    def debris(self) -> tuple[Fake, str]:
+        """One chunk left behind by a run that died before signing."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "one")
+            sync.run()
+            before = set(store.chunk_names(alpha.id, "2023-11-14"))
+
+            alpha.record("2023-11-14", 1_700_000_002, "two")
+
+            def die(*args: object, **kwargs: object) -> None:
+                raise KeyboardInterrupt("power cut")
+
+            with (
+                contextlib.suppress(KeyboardInterrupt),
+                mock.patch.object(sync, "write_manifest", die),
+            ):
+                sync.run()
+            left = set(store.chunk_names(alpha.id, "2023-11-14")) - before
+        self.assertEqual(len(left), 1, "precondition: a chunk was left unsigned")
+        return alpha, left.pop()
+
+    def test_nothing_is_lost_and_nothing_is_duplicated(self) -> None:
+        """The claim the message makes, checked rather than asserted in prose."""
+        alpha, _stray = self.debris()
+        with alpha.active():
+            self.assertTrue(sync.run().foreign)
+            self.assertEqual(alpha.commands(), {"one", "two"})
+            self.assertEqual(len(alpha.entries()), 2, "a line was published twice")
+
+    def test_it_does_not_accuse_anyone(self) -> None:
+        alpha, _stray = self.debris()
+        said = self.run_cli(alpha, "sync").err
+        self.assertIn("never signed", said)
+        self.assertIn("killed between writing a chunk and signing", said)
+        self.assertNotIn("someone else can write into this repository", said)
+
+    def test_doctor_lists_it(self) -> None:
+        """The message points there, so the pointer has to be true.
+
+        `unlisted_chunks` reports every host, including this one, which is what
+        makes it the right place to send someone -- `sync` says it once and then
+        the day settles.
+        """
+        alpha, stray = self.debris()
+        with alpha.active():
+            sync.run()
+            self.assertEqual(sync.unlisted_chunks(), [(alpha.id, "2023-11-14", 1)])
+        self.assertRegex(self.run_cli(alpha, "doctor").out, r"\[FAIL\] chunks .*no signed list")
+        del stray
 
 
 class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
