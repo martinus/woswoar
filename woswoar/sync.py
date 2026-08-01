@@ -611,9 +611,13 @@ def has_chunks(host_id: str, day: str) -> bool:
     What turns a half-written key pair from a nuisance into a loss: with no
     chunks the next `export` simply mints a new pair over it and nothing is
     ever noticed, so reporting that state would be a false alarm.
+
+    Through the same walk that decides what a chunk *is*, so a day directory
+    holding only a partial write or an editor's leftover reads as empty here
+    too. "Anything at all is in the directory" said the opposite, which would
+    have turned a stray file into a reported loss.
     """
-    directory = store.chunk_dir(host_id, day)
-    return directory.is_dir() and any(directory.iterdir())
+    return bool(dict(store.iter_chunk_days(host_id)).get(day))
 
 
 def orphaned_days() -> list[tuple[str, str]]:
@@ -1191,9 +1195,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         return wrote
 
     # One pass for the whole host, not one per day.
-    on_disk: dict[str, set[str]] = {}
-    for chunk in store.iter_chunks(known.id):
-        on_disk.setdefault(chunk.day, set()).add(chunk.name)
+    on_disk = {day: set(names) for day, names in store.iter_chunk_days(known.id)}
 
     for day, tails in sorted(fresh.items()):
         # Before the manifest, not after. Refusing does not advance
@@ -1372,9 +1374,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
 
     # A day at a time rather than a chunk at a time, because whether a day is
     # being *rewritten* has to be known before deciding which of its chunks to
-    # read -- and that answer is in the manifest. `iter_chunk_days` hands over
-    # one day's names together, which used to be a `groupby` over a flat stream
-    # relying on that stream keeping a day contiguous.
+    # read -- and that answer is in the manifest.
     #
     # A rewrite replaces the day's log file outright, so it has to be rebuilt
     # from every chunk the manifest lists, not from the ones this run happens to
@@ -1386,11 +1386,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # Laziness is kept where it pays: a day with nothing new never reads its
     # manifest, and a manifest costs a subprocess. Over a year of three machines
     # that is the difference between ~3.6s and nearly two minutes.
-    # Names, not `Chunk` objects: the decision below is made from the name
-    # alone, and on an idle sync it is "already merged" for every one of them.
-    # Building a `Path` and a `Chunk` per file first is what made this walk cost
-    # 88 ms per peer at 20k chunks rather than 3 -- once a minute, growing with
-    # the archive. Objects are built only for the chunks actually read.
+    # Names rather than `Chunk` objects, and paths built only for the chunks
+    # actually read -- see `store.iter_chunk_days` for what that is worth here.
     for chunk_day, names in store.iter_chunk_days(host_id):
         key = f"{host_id}/{chunk_day}"
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
