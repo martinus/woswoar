@@ -3,15 +3,29 @@
 Rules for AI agents working in this repository. They apply to every task unless
 the maintainer says otherwise in the moment.
 
-## 1. Run `/simplify` before opening a pull request
+## 1. Review before opening a pull request, in proportion to the risk
 
-When the work is complete and the tests pass, invoke the `simplify` skill,
-**apply** what it finds, and re-run the suite. Only then open the PR.
+When the work is complete and the tests pass, review it, **apply** what you
+find, and re-run the suite. Only then open the PR — not afterwards, because a
+review that lands on an open PR means the maintainer has already read code that
+was about to change.
 
-Not afterwards: a review that lands on an open PR means the maintainer has
-already read code that was about to change. Its findings routinely include real
-defects, not just style — treat "this is only a quality pass" as an assumption
-to check, never as a reason to skip it.
+How much review depends on what the change can get wrong:
+
+| The change | Review |
+|---|---|
+| Forgets, prunes, rewrites or replaces stored data; changes a security claim; caches a fact about the world | Full `/simplify`, all four angles. This is where it pays: the prune in #91 introduced a P1 regression, caught before the PR opened and not by its author. |
+| Changes behaviour on a path a user reaches | One agent, aimed at the specific hazard — or a careful read of the diff against the issue's own "constraint that makes the obvious fix wrong". |
+| Mechanical, with a measured before and after and no new state | Re-read the diff yourself. No agents. |
+
+Four agents asked "what is wrong with this" will always return something. That
+rate is a function of how many you run, not of how bad the code is, and it is
+how a backlog fills with polish nobody will ever do. Pick the row honestly: a
+change that *looks* mechanical but alters what reaches disk is the top row.
+
+Treat "this is only a quality pass" as an assumption to check. Findings here
+have included real defects, twice including a regression introduced by the
+change under review.
 
 If a finding is wrong or its fix would exceed the task's scope, say so
 explicitly in the PR description rather than silently dropping it.
@@ -42,13 +56,40 @@ Prefer driving the real thing over asserting on a mock. This repository already
 tests the shell hook by running a real `bash`, and sync by running real `age`
 and `git`; follow that.
 
-## 4. File an issue for anything you find outside the current scope
+The other failure mode is a fixture too weak to tell the two answers apart, and
+it is invisible in the test's own text. All of these were written here, passed
+review, and guarded nothing:
 
-While working you will notice bugs, performance problems, missing tests, or
-worthwhile improvements that do not belong in the change at hand. Do not silently
-fix them, and do not drop them on the floor. File a GitHub issue.
+- two day directories cannot distinguish a sorted walk from a reversed one
+- a directory holding only `.age` files cannot test a suffix filter
+- a day written moments ago is skipped by the racy-timestamp rule regardless, so
+  a test about *why else* it might be skipped asserts nothing
+- a marker asserted in a shell's stdout also appears in the harness's echo of
+  the line that was typed
 
-Each issue should carry enough for someone to act on it cold:
+So when a mutation survives, suspect the fixture before you suspect the
+mutation.
+
+## 4. File an issue only for what someone would actually do
+
+While working you will notice bugs, performance problems, missing tests, and
+improvements that do not belong in the change at hand. There are three answers,
+and filing is not the default:
+
+- **Fix it here**, if it is small and in code the diff already touches. Say so
+  in the PR body.
+- **File it**, if it is P2 or above by rule 5 — or if it is a security item, a
+  guard that would catch a future regression, or a symptom that actively
+  misleads a user. Those three earn a P3.
+- **Say it in the task summary and let it go** otherwise.
+
+A backlog of things nobody will do is worse than no record, because it hides the
+two items that matter. One triage pass closed six issues unworked — a
+millisecond here, an unreproducible flake, some tidiness — and every one had
+been dutifully filed under an earlier reading of this rule. Do not silently fix
+what you should have filed; do not file what you would close.
+
+Each issue you do file should carry enough for someone to act on it cold:
 
 - what is wrong, and the concrete consequence
 - `file:line` for the relevant code
@@ -154,3 +195,10 @@ corrupts somebody's history.
   does not, and has sent a correct test to be rewritten as "decoration".
 - Before blaming your branch for a CI failure, measure the same job on `main`,
   enough times to see a one-in-forty flake. Two runs of green proves nothing.
+- **Commit before comparing two revisions.** `git checkout main` carries
+  uncommitted changes across, so a before-and-after benchmark run that way
+  measures the same tree twice and reports no difference. That has twice nearly
+  buried a correct change here as "no measurable effect".
+- An optimisation sequence converges. When the term you are about to remove is a
+  small share of what is left — a millisecond of fifteen — stop and say so,
+  rather than filing the next one.
