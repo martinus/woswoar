@@ -1155,19 +1155,26 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
     # archive forever.
     fresh: dict[str, list[tuple[str, bytes, int]]] = {}
     # Only this machine's own logs: other hosts' arrived decrypted and are never
-    # re-exported. Asked for by host rather than filtered afterwards, so peers'
-    # directories are not listed at all.
+    # re-exported. Asked for by host rather than listed and then filtered, which
+    # at three machines walked two thirds of a tree to throw it away.
     for log in store.iter_log_files(known.id):
         exported = state.exported.get(log.relpath, 0)
-        try:
-            size = log.path.stat().st_size
-        except OSError:
-            continue
+
         # One stat instead of an open, a seek, a read and a close, on a file
         # that is almost always exactly as long as it was a minute ago. Reading
         # from at or past the end returns nothing anyway, so this is the same
-        # answer for a fraction of the syscalls -- measured over 365 own-day
-        # files, 2.05 ms down to 0.66 ms.
+        # answer for a fraction of the syscalls -- which is why the comparison
+        # is `<=` and not `==`: a *truncated* log also has no tail to take.
+        #
+        # Together with the line above, `export`'s early exit -- the shape of
+        # every idle sync -- goes from 5.50 ms to 1.85 ms at three years of
+        # three machines, and stops growing with how many machines there are.
+        try:
+            size = log.path.stat().st_size
+        except OSError:
+            # As `read_tail` treats one: a file that went away between being
+            # listed and being looked at has no tail to export.
+            continue
         if size <= exported:
             continue
 

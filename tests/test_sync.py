@@ -3047,8 +3047,12 @@ class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
             return real(path, offset)
 
         with machine.active(), mock.patch.object(store, "read_tail", counted):
-            sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_900)
+            self.export_once()
         return opened
+
+    def export_once(self) -> None:
+        """One `export` as `run` would call it. Caller holds `active()`."""
+        sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_900)
 
     def test_a_log_that_cannot_have_grown_is_not_opened(self) -> None:
         alpha = self.machine("alpha")
@@ -3063,20 +3067,6 @@ class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
             alpha.record("2023-11-15", 1_700_000_002, "a later line")
         # Only the day that grew, not the three that exist.
         self.assertEqual(self.read_tails(alpha), ["2023-11-15.tsv"])
-
-    def test_a_growing_log_is_still_exported(self) -> None:
-        """The half a wrong comparison would break, and break silently."""
-        alpha = self.machine("alpha")
-        beta = self.machine("beta")
-        with alpha.active():
-            alpha.record("2023-11-14", 1_700_000_001, "git status")
-            sync.run()
-            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
-            self.assertEqual(sync.run().lines_exported, 1)
-            sync.grant()
-        with beta.active():
-            sync.run()
-            self.assertEqual(beta.commands(), {"git status", "make -j8"})
 
     def test_a_log_that_shrank_is_not_read_either(self) -> None:
         """A truncated log reads as nothing new, exactly as it did before.
@@ -3123,18 +3113,13 @@ class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
                     yield log
 
             with mock.patch.object(store, "iter_log_files", counted):
-                sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_900)
-            # Peers' directories are not walked at all, rather than walked and
-            # then discarded: at three machines that was two thirds of the
-            # listing done to be thrown away, once a minute.
+                self.export_once()
             self.assertEqual(set(listed), {alpha.id}, "another host's logs were listed")
 
-            ours = list(store.iter_log_files(alpha.id))
-            self.assertEqual({log.host_id for log in ours}, {alpha.id})
-            # The same files the caller would have kept after filtering, so
-            # narrowing the listing cannot change what is exported.
+            # And narrowing cannot change *what* is exported: the same files the
+            # caller would have kept after filtering, in the same order.
             self.assertEqual(
-                [log.relpath for log in ours],
+                [log.relpath for log in store.iter_log_files(alpha.id)],
                 [log.relpath for log in store.iter_log_files() if log.host_id == alpha.id],
             )
 

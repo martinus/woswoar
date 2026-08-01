@@ -398,10 +398,7 @@ class LogFile(NamedTuple):
 def iter_log_files(host_id: str | None = None) -> Iterator[LogFile]:
     """Yield plaintext log files, sorted for reproducible cache builds.
 
-    ``host_id`` narrows it to one host's directory instead of listing every
-    host's and letting the caller throw the rest away. `export` wants only this
-    machine's own logs and runs once a minute, so at three machines that was two
-    thirds of the listing done to be discarded.
+    ``host_id`` lists that host's directory alone; without it, every host's.
     """
     root = logs_dir() / _HOSTS
     if not root.is_dir():
