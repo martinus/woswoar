@@ -2109,23 +2109,38 @@ def initialise(
             # dash is a command, not an address -- and argparse hands one
             # through happily, because `--` ends *woswoar's* option parsing and
             # makes the rest a positional.
-            # `--no-hardlinks` because a local-path remote is an ordinary
-            # woswoar setup -- a bare repo on a NAS or a shared filesystem --
-            # and `git clone` links objects from such a source instead of
-            # copying them. Two things follow, and both have happened here:
+            # `--no-local` because a local-path remote is an ordinary woswoar
+            # setup -- a bare repo on a NAS or a shared filesystem -- and for
+            # one of those `git clone` skips the transport entirely: it walks
+            # the origin's `objects/` and hardlinks, or copies, what the
+            # directory listing showed. That listing is not a snapshot, and the
+            # object store underneath it has writers:
             #
-            # - The clone fails outright if another machine writes the source
-            #   while it runs, which is exactly what a fleet syncing to that
-            #   repo does: `fatal: hardlink different from source`.
-            # - The new clone's object files *are* the origin's, so a `git gc`
-            #   or a corruption on either side reaches the other.
+            # - another machine pushing, whose `receive-pack` migrates its
+            #   incoming objects out of a quarantine directory;
+            # - git's own `gc --auto`, which the push before this one detached
+            #   into the background and which is still pruning loose objects
+            #   that are now packed.
             #
-            # The cost is copying the objects rather than linking them, once,
-            # at `init`. A clone over ssh or https never linked anything.
+            # Either way an object named by the listing is gone by the time
+            # clone opens it, and the clone dies -- `fatal: failed to copy file
+            # to ...`, or in the hardlink spelling of the same defect (#79)
+            # `fatal: hardlink different from source`. Those are one bug, not
+            # two: when `link()` fails git silently falls back to copying, so
+            # both spellings end in the same unguarded read.
+            #
+            # `--no-local` asks `upload-pack` for a pack instead -- the path
+            # every clone over ssh or https already took, against servers that
+            # repack constantly. It also settles #79's other half for free: a
+            # received pack is this machine's own file, so a `git gc` here
+            # cannot reach the origin's objects.
+            #
+            # git ignores the option for a remote that is not a local path, so
+            # it costs an ssh clone nothing.
             git(
                 "clone",
                 "--quiet",
-                "--no-hardlinks",
+                "--no-local",
                 "--",
                 remote,
                 str(history),
