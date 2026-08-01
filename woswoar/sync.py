@@ -1600,7 +1600,19 @@ class _Day:
         # `state.merged` on a pass that rewrote the file. So a rewrite cut short
         # by an unopenable day key is still owed on the next pass, with no
         # second record of what was rebuilt to keep in step with this one.
-        self.rewrite = bool(self.compacted - already)
+        # Or when the manifest has lost a name this machine merged. A name only
+        # enters `merged` while the manifest lists it, so in ordinary growth
+        # this is empty; it is not empty when the manifest went *backwards* --
+        # a working tree rolled back to before a compaction, a half-applied
+        # restore. Appending then would write the day's lines a second time,
+        # because `merged` was pruned to the compaction and no longer remembers
+        # the chunks it replaced. Rebuilding from what the manifest now lists is
+        # right either way.
+        #
+        # An unverifiable manifest lands here too, with nothing listed -- and
+        # nothing then merges, so `flush` has no blocks and leaves the day
+        # alone rather than replacing it with nothing.
+        self.rewrite = bool(self.compacted - already) or bool(already - set(listed))
         self._blocks: list[bytes] = []
         self._bytes = 0
 

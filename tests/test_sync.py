@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import os
 import secrets
+import shutil
 import subprocess
 import tempfile
 import time
@@ -3126,6 +3127,52 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         self.assertEqual(self.remembered(beta, alpha), live, "names of chunks that are gone")
         with beta.active():
             self.assertEqual(len(beta.commands()), 6, "compaction lost history")
+
+    def test_a_day_whose_manifest_went_backwards_is_rebuilt(self) -> None:
+        """What pruning gives up, and how it is paid for.
+
+        Before the prune, `state.merged` remembered every chunk this machine had
+        ever merged, so a working tree rolled back to before a compaction simply
+        found them all already merged. Pruned, it remembers only the compacted
+        chunk -- and the old manifest's chunks look new, so appending them writes
+        the day's lines a second time.
+
+        The signal is the manifest having *lost* a name this machine merged,
+        which cannot happen while a day only grows. Rebuilding from what it now
+        lists is right whether the rollback is a restore, a half-applied backup,
+        or a `git checkout` of an older commit over the working tree.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=4)
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 4)
+            backup = store.history_dir().with_name("history.backup")
+            shutil.copytree(store.history_dir(), backup, symlinks=True)
+
+        with alpha.active():
+            self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(self.remembered(beta, alpha)), 1, "the prune did not happen")
+
+            # The working tree only: HEAD stays where it is, so the next fetch
+            # finds nothing to bring forward and the rollback sticks.
+            live = store.history_dir()
+            for entry in live.iterdir():
+                if entry.name != ".git":
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+            for entry in backup.iterdir():
+                if entry.name != ".git":
+                    if entry.is_dir():
+                        shutil.copytree(entry, live / entry.name, symlinks=True)
+                    else:
+                        shutil.copy2(entry, live / entry.name)
+
+            for _ in range(3):
+                sync.run()
+            self.assertEqual(len(beta.entries()), 4, "the day was written twice over")
+            self.assertEqual(beta.commands(), {f"day 0 command {i}" for i in range(4)})
 
     def test_a_manifest_that_will_not_verify_settles_nothing(self) -> None:
         """The hazard both halves share, and the one that loses history.
