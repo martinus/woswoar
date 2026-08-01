@@ -406,6 +406,15 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
+    #: "<host>/<day>" -> the day directory's mtime when every chunk it held had
+    #: been merged. A day whose stamp still matches has gained nothing since, so
+    #: it needs no listing at all -- and listing is what a peer's whole archive
+    #: costs on a timer that fires every minute.
+    #:
+    #: Recorded only for a day merged *completely*. One left short by an
+    #: unopenable key or a chunk that would not authenticate has to be looked at
+    #: again, and a stamp would say it did not.
+    scanned: dict[str, int] = field(default_factory=dict)
     #: What was on disk when this was loaded, so `save` can tell whether there
     #: is anything to write. Not part of the state itself.
     _loaded: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
@@ -417,6 +426,7 @@ class State:
         merged = raw.get("merged", {})
         granted = raw.get("granted", [])
         signers = raw.get("signers", {})
+        scanned = raw.get("scanned", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         state = cls(
@@ -439,6 +449,11 @@ class State:
             signers={str(k): str(v) for k, v in signers.items()}
             if isinstance(signers, dict)
             else {},
+            # A malformed stamp costs one listing of that day, which is what
+            # every run did before it existed.
+            scanned={str(k): int(v) for k, v in scanned.items() if isinstance(v, int)}
+            if isinstance(scanned, dict)
+            else {},
         )
         state._loaded = state.as_json()
         return state
@@ -455,6 +470,7 @@ class State:
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
             "signers": dict(self.signers),
+            "scanned": dict(self.scanned),
         }
 
     def save(self) -> None:
@@ -1393,8 +1409,17 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # that is the difference between ~3.6s and nearly two minutes.
     # Names rather than `Chunk` objects, and paths built only for the chunks
     # actually read -- see `store.iter_chunk_days` for what that is worth here.
-    for chunk_day, names in store.iter_chunk_days(host_id):
+    for chunk_day in store.chunk_days(host_id):
         key = f"{host_id}/{chunk_day}"
+
+        # Read before the listing, not after: a chunk arriving between the two
+        # would otherwise be covered by a stamp taken after it landed, and not
+        # looked at until something else changed the directory.
+        stamp = store.day_stamp(host_id, chunk_day)
+        if stamp is not None and state.scanned.get(key) == stamp:
+            continue
+
+        names = store.chunk_names(host_id, chunk_day)
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
         # empty record that is then written out on every sync forever.
@@ -1404,6 +1429,11 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         already = frozenset(state.merged.get(key, ()))
         fresh = [name for name in names if name not in already]
         if not fresh:
+            # Nothing new, but the stamp moved -- a chunk added and removed
+            # again, or a first sight of a day already merged from elsewhere.
+            # Recording it here is what stops the next run listing it too.
+            if stamp is not None and names:
+                state.scanned[key] = stamp
             continue
 
         listed = read_manifest(host_id, chunk_day, verify_key)
@@ -1462,6 +1492,12 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 report.chunks_merged += 1
 
         day.flush(report)
+
+        # Only a day with nothing left over. A chunk that failed to open, or one
+        # in no signed manifest, is not in `merged` -- so the day is unfinished
+        # and must be looked at again, stamp or no stamp.
+        if stamp is not None and not set(names) - state.merged.get(key, set()):
+            state.scanned[key] = stamp
 
 
 class _Day:
