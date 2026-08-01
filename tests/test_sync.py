@@ -18,7 +18,7 @@ import tracemalloc
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -214,17 +214,10 @@ class SyncTestCase(unittest.TestCase):
             for day in days:
                 os.utime(store.chunk_dir(host.id, day), (aged, aged))
 
-    def run_cli(self, fake: Fake, *argv: str) -> tuple[int, str]:
-        """Drive the real CLI as ``fake``, returning ``(exit code, stdout)``.
-
-        Only stdout: several commands put their warnings on stderr, and a test
-        that means "it warned" has to say which stream it is asserting on. The
-        two that need stderr capture it themselves.
-        """
-        buffer = io.StringIO()
-        with fake.active(), redirect_stdout(buffer):
-            code = main(list(argv))
-        return code, buffer.getvalue()
+    def run_cli(self, fake: Fake, *argv: str) -> support.Ran:
+        """Drive the real CLI as ``fake``. Both streams -- see `support.run_cli`."""
+        with fake.active():
+            return support.run_cli(*argv)
 
 
 class TestSingleMachine(SyncTestCase):
@@ -1092,7 +1085,7 @@ class TestRevokeConfirmation(SyncTestCase):
         with alpha.active():
             gone = alpha.append_recipient(name="old-laptop")
 
-        code, _ = self.run_cli(alpha, "revoke", crypto.fingerprint(gone))
+        code, _, _ = self.run_cli(alpha, "revoke", crypto.fingerprint(gone))
         self.assertEqual(code, 1)
         with alpha.active():
             self.assertIn(gone, sync.recipients())
@@ -1105,7 +1098,7 @@ class TestRevokeConfirmation(SyncTestCase):
         with alpha.active():
             gone = alpha.append_recipient(name="old-laptop")
 
-        code, out = self.run_cli(alpha, "revoke", crypto.fingerprint(gone), "--yes")
+        code, out, _ = self.run_cli(alpha, "revoke", crypto.fingerprint(gone), "--yes")
         self.assertEqual(code, 0)
         self.assertIn("does not un-publish", out)
         self.assertIn("does not revoke git access", out)
@@ -1124,7 +1117,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
 
     def test_granting_remembers_who_was_approved(self) -> None:
         alpha = self.machine("alpha")
-        code, _ = self.run_cli(alpha, "grant", "--yes")
+        code, _, _ = self.run_cli(alpha, "grant", "--yes")
         self.assertEqual(code, 0)
         with alpha.active():
             self.assertFalse(any(reader.is_new for reader in sync.readers()))
@@ -1155,7 +1148,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         with alpha.active():
             alpha.append_recipient(name="martin@laptop")
 
-        code, out = self.run_cli(alpha, "grant", "--yes")
+        code, out, _ = self.run_cli(alpha, "grant", "--yes")
         self.assertEqual(code, 0)
         self.assertIn("1 machine(s) NOT yet granted", out)
         self.assertIn("SAME NAME AS ANOTHER KEY", out)
@@ -1175,7 +1168,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         with alpha.active():
             alpha.append_recipient(name=hostile)
 
-        _, out = self.run_cli(alpha, "grant", "--yes")
+        _, out, _ = self.run_cli(alpha, "grant", "--yes")
         self.assertIn("martin@desktop", out)
         self.assertNotIn(hostile, out)
         self.assertNotIn("\u202e", out)
@@ -1190,7 +1183,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         alpha = self.machine("alpha")
         self.run_cli(alpha, "grant", "--yes")
 
-        code, out = self.run_cli(alpha, "grant")
+        code, out, _ = self.run_cli(alpha, "grant")
         self.assertEqual(code, 0)
         self.assertIn("No machine is new", out)
 
@@ -1200,7 +1193,7 @@ class TestGrantConfirmsAdditions(SyncTestCase):
         with alpha.active():
             alpha.append_recipient(name="martin@desktop")
 
-        code, _ = self.run_cli(alpha, "grant")
+        code, _, _ = self.run_cli(alpha, "grant")
         self.assertEqual(code, 1)
         with alpha.active():
             self.assertTrue(any(reader.is_new for reader in sync.readers()))
@@ -1477,7 +1470,7 @@ class TestASigningKeyThatChanges(SyncTestCase):
 
         with beta.active():
             sync.run()
-            code, _ = self.run_cli(beta, "trust", "--replace", "--yes")
+            code, _, _ = self.run_cli(beta, "trust", "--replace", "--yes")
             self.assertEqual(code, 0)
             sync.run()
             self.assertIn("after-the-key-changed", beta.commands())
@@ -2484,11 +2477,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             store.day_key(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "after")
 
-            errors = io.StringIO()
-            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
-                main(["sync"])
-
-        said = errors.getvalue()
+        said = self.run_cli(alpha, "sync").err
         self.assertIn("2023-11-14", said)
         self.assertIn("cannot be published", said)
         # The recovery it offers has to be the one that works: the deleted key
@@ -2513,7 +2502,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             pub.write_text(crypto.generate_identity().public + "\n", encoding="utf-8")
 
             self.assertEqual(sync.orphaned_days(), [])
-            _, text = self.run_cli(alpha, "doctor")
+            _, text, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] day keys", text)
 
     def test_compact_skips_the_day_rather_than_aborting(self) -> None:
@@ -2543,13 +2532,13 @@ class TestAnOrphanedDayKey(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "ours")
             sync.run()
             self.assertEqual(sync.orphaned_days(), [])
-            code, healthy = self.run_cli(alpha, "doctor")
+            code, healthy, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] day keys", healthy)
 
             store.day_key(alpha.id, "2023-11-14").unlink()
             self.assertEqual(sync.orphaned_days(), [(alpha.id, "2023-11-14")])
 
-            code, text = self.run_cli(alpha, "doctor")
+            code, text, _ = self.run_cli(alpha, "doctor")
             self.assertEqual(code, 1, "doctor stayed green with an unreadable day")
             self.assertIn("[FAIL] day keys", text)
             self.assertIn("2023-11-14", text)
@@ -2648,11 +2637,8 @@ class TestADeletedManifest(SyncTestCase):
         with alpha.active():
             store.day_manifest(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "second")
-            errors = io.StringIO()
-            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
-                main(["sync"])
 
-        said = errors.getvalue()
+        said = self.run_cli(alpha, "sync").err
         self.assertIn("2023-11-14", said)
         self.assertIn("--diff-filter=D", said)
 
@@ -2667,20 +2653,20 @@ class TestADeletedManifest(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-20", 1_700_500_000, "not yet published")
             self.assertEqual(sync.days_missing_a_manifest(), [])
-            _, text = self.run_cli(alpha, "doctor")
+            _, text, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] manifests", text)
 
     def test_doctor_finds_a_quiet_day_sync_never_looks_at(self) -> None:
         """A day fully exported before the deletion never returns to `export`."""
         alpha = self.published_day()
         with alpha.active():
-            _, healthy = self.run_cli(alpha, "doctor")
+            _, healthy, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] manifests", healthy)
 
             store.day_manifest(alpha.id, "2023-11-14").unlink()
             self.assertEqual(sync.days_missing_a_manifest(), ["2023-11-14"])
 
-            code, text = self.run_cli(alpha, "doctor")
+            code, text, _ = self.run_cli(alpha, "doctor")
             self.assertEqual(code, 1)
             self.assertIn("[FAIL] manifests", text)
             self.assertIn("2023-11-14", text)
@@ -3208,15 +3194,10 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
     def test_sync_says_which_day_it_left_alone(self) -> None:
         """New user-facing behaviour, so it is pinned like its neighbours."""
         alpha, beta, compacted = self.compacted_and_growing()
-        errors = io.StringIO()
-        with (
-            beta.active(),
-            mock.patch.object(sync, "open_chunk", self.damaged(compacted)),
-            redirect_stderr(errors),
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(main(["sync"]), 0)
-        said = errors.getvalue()
+        with mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            ran = self.run_cli(beta, "sync")
+        self.assertEqual(ran.code, 0)
+        said = ran.err
         self.assertIn("could not be rebuilt", said)
         self.assertIn(f"{alpha.id}/{self.DAY}", said, "it did not say which day")
 
@@ -3257,10 +3238,9 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             sync.run()
 
         gamma = self.machine("gamma")  # enrolled, never granted
-        errors = io.StringIO()
-        with gamma.active(), redirect_stderr(errors), redirect_stdout(io.StringIO()):
-            self.assertEqual(main(["sync"]), 0)
-        said = errors.getvalue()
+        ran = self.run_cli(gamma, "sync")
+        self.assertEqual(ran.code, 0)
+        said = ran.err
         self.assertIn(_GRANT_REMEDY.splitlines()[0], said)
         self.assertNotIn("could not be rebuilt", said, "an ungranted machine was accused")
 

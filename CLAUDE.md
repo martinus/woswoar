@@ -48,6 +48,9 @@ reverted**. Verify that, do not assume it:
 2. Run the suite and confirm the new test fails.
 3. Restore the fix and confirm it passes.
 
+`tools/mutate.py` is that loop: write the table of edits, run
+`python -m tools.mutate <spec>.py`, paste the output into the PR.
+
 A test that passes either way is decoration, and reading it will not tell you
 which kind you have written. Tests have been added here that looked correct and
 never executed the line they claimed to guard.
@@ -188,11 +191,14 @@ corrupts somebody's history.
   `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
   serially, and takes about three times as long.
 
-- Run mutation tests with `python -B` **and** delete `woswoar/__pycache__`
-  (plus `tools/` and `tests/`) between mutations. A `.pyc` is validated against `(mtime_seconds, size)`, so
-  two mutations that change a file by the same number of bytes inside one second
-  run each other's cached bytecode — which reports a test as surviving when it
-  does not, and has sent a correct test to be rewritten as "decoration".
+- Mutation-test through `tools/mutate.py` rather than writing the loop again. It
+  runs `-B`, clears every `__pycache__` between mutations, refuses an edit that
+  matches other than exactly once, checks the baseline is green, and restores
+  the tree even when interrupted. The trap it exists for: a `.pyc` is validated
+  against `(mtime_seconds, size)`, so two mutations that change a file by the
+  same number of bytes inside one second run each other's cached bytecode —
+  which reported a *correct* test as decoration here, and nearly got it
+  rewritten.
 - Before blaming your branch for a CI failure, measure the same job on `main`,
   enough times to see a one-in-forty flake. Two runs of green proves nothing.
 - **Commit before comparing two revisions.** `git checkout main` carries

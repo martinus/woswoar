@@ -7,17 +7,16 @@ which differs the moment two machines disagree about the username.
 
 from __future__ import annotations
 
-import io
 import os
 import shutil
 import subprocess
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from woswoar import store
 from woswoar.__main__ import main, portable_hook_path
 
+from . import support
 from .support import MACHINE_ID, WoswoarTestCase, make_entry, requires_bash
 
 
@@ -186,10 +185,7 @@ class TestPrivateByDefault(WoswoarTestCase):
     def test_doctor_reports_an_exposed_history(self) -> None:
         self.first_run()
         store.logs_dir().chmod(0o755)
-        out = io.StringIO()
-        with redirect_stdout(out), redirect_stderr(io.StringIO()):
-            main(["doctor"])
-        self.assertRegex(out.getvalue(), r"\[FAIL\] private")
+        self.assertRegex(support.run_cli("doctor").out, r"\[FAIL\] private")
 
 
 if __name__ == "__main__":
