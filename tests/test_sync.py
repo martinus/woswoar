@@ -3127,6 +3127,22 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         self.assertEqual(self.listed(beta), ["2023-11-14"])
         self.assertEqual(self.listed(beta), [], "a stray file re-listed the day for ever")
 
+    def test_a_day_shaped_directory_holding_nothing_is_not_stamped(self) -> None:
+        """`state.json` is read and compared every sync, so what goes in it lasts.
+
+        A directory named like a day but holding no chunk is not a day (see
+        `store.iter_chunk_days`). Stamping one would leave a permanent entry for
+        something that was never there -- and this file already only grows.
+        """
+        alpha, beta = self.pair()
+        with beta.active():
+            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow.mkdir(parents=True, exist_ok=True)
+            sync.run()
+            self.assertNotIn(f"{alpha.id}/2023-11-20", sync.State.load().scanned)
+            # The days that *are* days still are.
+            self.assertIn(f"{alpha.id}/2023-11-14", sync.State.load().scanned)
+
 
 class TestWalkingAPeersChunks(SyncTestCase):
     """Issue #82: `merge` walks every peer's whole tree on every sync.
