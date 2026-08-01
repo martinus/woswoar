@@ -1107,6 +1107,78 @@ class TestRevokeConfirmation(SyncTestCase):
             self.assertNotIn(gone, sync.recipients())
 
 
+class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
+    """Issue #26: `git clone --upload-pack=<cmd>` runs <cmd>.
+
+    `woswoar init -- --upload-pack=...` reaches argparse as a positional,
+    because `--` ends *woswoar's* option parsing and hands the rest through. It
+    is the user's own URL, so this is low severity -- until the URL comes from a
+    README, a chat message, or a provisioning script that wraps `init`.
+    """
+
+    def test_a_remote_that_would_run_a_command_does_not(self) -> None:
+        """The attack, not the message: a witness file must never appear."""
+        witness = self.root / "OWNED"
+        hostile = f"--upload-pack=touch {witness}"
+
+        alpha = self.machine("alpha")
+        with alpha.active(), self.assertRaises(sync.SyncError) as refused:
+            sync.initialise(remote=hostile)
+        self.assertIn("may not start with", str(refused.exception))
+        self.assertFalse(witness.exists(), "the remote was executed")
+
+    def test_git_is_told_where_the_options_end(self) -> None:
+        """The guard behind the message, so one is not the only defence.
+
+        A remote reaching `git clone` unseparated is an option to git whatever
+        woswoar checked first, and the check is a string comparison that a later
+        edit could narrow.
+        """
+        seen: list[tuple[str, ...]] = []
+        real = sync.git
+
+        def spy(*args: str, **kwargs: object) -> str:
+            seen.append(args)
+            return real(*args, **kwargs)  # type: ignore[arg-type]
+
+        # A machine that has never been set up, because those are the only two
+        # calls that are ever handed a remote -- an already-initialised one
+        # clones nothing and this would watch an empty list.
+        with mock.patch.object(sync, "git", spy):
+            alpha = self.machine("alpha")
+
+        # `remote add` is only reached when the repo was *not* cloned -- a clone
+        # sets origin itself. That is `woswoar init` with no remote, and a
+        # remote given later; without it this watches the clone alone.
+        with alpha.active():
+            sync.git("remote", "remove", "origin")
+            with mock.patch.object(sync, "git", spy):
+                sync.initialise(remote=str(self.origin))
+
+        handed = [call for call in seen if call[:1] == ("clone",) or call[:2] == ("remote", "add")]
+        self.assertTrue(handed, "precondition: no call was handed the remote")
+        for call in handed:
+            self.assertIn("--", call, f"no separator before the remote: {call}")
+            self.assertLess(
+                call.index("--"),
+                call.index(str(self.origin)),
+                f"the separator comes after the remote: {call}",
+            )
+
+    def test_an_ordinary_remote_still_works(self) -> None:
+        """`--` must not break the thing it guards."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            self.assertTrue(sync.run().pushed)
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(beta.commands(), {"git status"})
+
+
 class TestGrantDoesNotRepeatItself(SyncTestCase):
     """Issue #35: re-sealing a key file that is already sealed to everyone.
 
