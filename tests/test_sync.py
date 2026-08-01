@@ -20,7 +20,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest import mock
 
 from woswoar import cache, crypto, search, store, sync
@@ -1105,6 +1105,108 @@ class TestRevokeConfirmation(SyncTestCase):
         self.assertIn("nothing that machine publishes is accepted", out)
         with alpha.active():
             self.assertNotIn(gone, sync.recipients())
+
+
+class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
+    """Issue #90: `sync` says it once, then the day settles and it stops.
+
+    Right for a one-minute timer -- #87 -- and no use to somebody asking
+    afterwards, especially as that one report most likely went to a journal.
+    """
+
+    DAY = "2023-11-14"
+
+    def planted(self, machine: Fake, host: Fake, name: str = "1700000000-dead.age") -> None:
+        with machine.active():
+            (store.chunk_dir(host.id, self.DAY) / name).write_bytes(b"not a chunk anyone signed")
+
+    def test_it_is_found_after_sync_has_stopped_saying_so(self) -> None:
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+        self.planted(beta, alpha)
+
+        with beta.active():
+            # Said once...
+            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().unauthenticated)
+        # Settling moves the mtime, so one more pass records the stamp; the one
+        # after it is the quiet steady state this exists for.
+        self.settle(beta, alpha, self.DAY)
+        with beta.active():
+            sync.run()
+            self.assertEqual(sync.run().unauthenticated, set(), "precondition: it settled")
+
+            # ...and still answerable.
+            self.assertEqual(sync.unlisted_chunks(), [(alpha.id, self.DAY, 1)])
+        # The line, not just the exit code: this fixture has other findings, so
+        # a non-zero exit would be true whether or not the check existed.
+        self.assertRegex(self.run_cli(beta, "doctor").out, r"\[FAIL\] chunks .*no signed list")
+
+    def test_a_clean_repo_says_so_and_forks_nothing(self) -> None:
+        """The design: a signature check only where there is something to check.
+
+        Verifying every day's manifest would be an `ssh-keygen` fork per
+        host-day -- thousands on a real archive -- to answer "nothing here" in
+        the case that is always true.
+        """
+        _alpha, beta = self.history_across_days(days=3, per_day=1)
+        with beta.active():
+            sync.run()
+
+            spawns = 0
+            real = subprocess.run
+
+            def counted(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+                nonlocal spawns
+                spawns += 1
+                return real(argv, *args, **kwargs)
+
+            with mock.patch.object(subprocess, "run", counted):
+                self.assertEqual(sync.unlisted_chunks(), [])
+            self.assertEqual(spawns, 0, "a clean repo paid for signature checks")
+
+        self.assertIn("all accounted for", self.run_cli(beta, "doctor").out)
+
+    def test_a_manifest_that_will_not_verify_is_not_reported_as_planted(self) -> None:
+        """Otherwise one broken signature reads as every chunk being forged.
+
+        That state has its own name -- `sync` reports the day unauthenticated
+        and every peer refuses all of it -- and calling it "somebody planted
+        three chunks" would point at the wrong thing entirely.
+        """
+        alpha, beta = self.history_across_days(days=1, per_day=2)
+        with beta.active():
+            sync.run()
+            store.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
+            self.assertEqual(sync.unlisted_chunks(), [])
+
+    def test_a_host_this_machine_has_not_pinned_is_not_even_checked(self) -> None:
+        """Nothing to check its manifests against, so there is nothing to learn.
+
+        Reporting is unaffected either way -- an unverifiable manifest accounts
+        for nothing, and the guard against *that* already suppresses it. What
+        the skip buys is the `ssh-keygen` per day that asking anyway would cost,
+        on precisely the host where the answer is known in advance.
+        """
+        alpha, _beta = self.history_across_days(days=1, per_day=2)
+        gamma = self.machine("gamma")  # cloned after alpha, so alpha *is* pinned
+        self.planted(gamma, alpha)
+        with gamma.active():
+            state = sync.State.load()
+            del state.signers[alpha.id]
+            state.save()
+
+            spawns = 0
+            real = subprocess.run
+
+            def counted(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+                nonlocal spawns
+                spawns += 1
+                return real(argv, *args, **kwargs)
+
+            with mock.patch.object(subprocess, "run", counted):
+                self.assertEqual(sync.unlisted_chunks(), [])
+            self.assertEqual(spawns, 0, "an unpinned host was checked anyway")
 
 
 class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
