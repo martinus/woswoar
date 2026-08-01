@@ -3145,6 +3145,42 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
             self.assertEqual(len(beta.entries()), 6, "the stray blocked the rebuild")
 
+    def test_a_refused_rewrite_is_never_treated_as_finished(self) -> None:
+        """The settle rule reads `state.merged`, which a refusal does not write.
+
+        A rewrite owed because the manifest went *backwards* can leave every
+        name it lists already merged -- so "every signed chunk is merged" is
+        true while the file was deliberately not rebuilt. Stamping that would
+        prune the day and skip it from then on, leaving a log that is wrong and
+        never looked at again.
+        """
+        alpha, beta, compacted = self.compacted_and_growing()
+        key = f"{alpha.id}/{self.DAY}"
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+            sync.run()
+            self.assertIn(key, sync.run().stale)
+            self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
+
+        # So it is still owed, and taken as soon as the chunk reads.
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 6)
+
+    def test_sync_says_which_day_it_left_alone(self) -> None:
+        """New user-facing behaviour, so it is pinned like its neighbours."""
+        alpha, beta, compacted = self.compacted_and_growing()
+        errors = io.StringIO()
+        with (
+            beta.active(),
+            mock.patch.object(sync, "open_chunk", self.damaged(compacted)),
+            redirect_stderr(errors),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(["sync"]), 0)
+        said = errors.getvalue()
+        self.assertIn("could not be rebuilt", said)
+        self.assertIn(f"{alpha.id}/{self.DAY}", said, "it did not say which day")
+
     def test_appending_is_still_allowed_to_be_partial(self) -> None:
         """Only a rewrite is all-or-nothing.
 

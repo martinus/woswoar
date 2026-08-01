@@ -1552,8 +1552,10 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # directory cannot hold a day back: it is not part of the day, and
         # counting it would leave that day stale for ever (which is #87 by
         # another route).
-        wanted = {name for name in pending if name in day.listed}
-        if day.rewrite and wanted - set(taken):
+        refused = day.rewrite and bool(
+            {name for name in pending if name in day.listed} - set(taken)
+        )
+        if refused:
             report.stale.add(key)
         else:
             day.flush(report)
@@ -1577,8 +1579,13 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # verify. Settling on it would stamp a day whose every chunk is still
         # being refused, and pruning on it would forget the whole day and merge
         # it again from scratch, duplicating its lines.
+        # Never on a pass that refused to rebuild. A rewrite owed because the
+        # manifest went *backwards* can leave every listed name already merged,
+        # so this would otherwise read as complete -- and stamp and prune a day
+        # whose file was deliberately not rebuilt, which is a day left wrong and
+        # then never looked at again.
         signed = set(day.listed)
-        settled = bool(signed) and signed <= state.merged.get(key, set())
+        settled = not refused and bool(signed) and signed <= state.merged.get(key, set())
         if settled:
             # Pruned to the same statement. Compaction *removes* the names it
             # subsumed from the manifest, so this is what stops `state.merged`

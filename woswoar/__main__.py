@@ -429,11 +429,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         )
 
     if report.stale:
+        stale = ", ".join(sorted(report.stale))
         print(
-            f"\n{len(report.stale)} day(s) could not be rebuilt: a chunk they are made of\n"
-            "would not open, so each was left exactly as it was rather than rewritten\n"
-            "from the part that did. Nothing was lost. If it persists, the chunk is\n"
-            "damaged in this checkout - 'woswoar doctor' has the detail.",
+            f"\n{len(report.stale)} day(s) could not be rebuilt, and were left exactly as\n"
+            "they were rather than rewritten from the part that could be read:\n"
+            f"{stale}\n"
+            "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
+            "checkout; 'git -C ~/.local/share/woswoar/history log --diff-filter=M' finds\n"
+            "who changed it, because woswoar itself never rewrites one.",
             file=sys.stderr,
         )
 
