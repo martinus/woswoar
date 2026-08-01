@@ -1488,9 +1488,8 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
         directory = store.chunk_dir(host_id, chunk_day)
-        #: Chunks whose plaintext reached `day`, and whether any was skipped.
+        #: Chunk names whose plaintext reached `day`.
         taken: list[str] = []
-        missed = False
 
         for name in pending:
             if name not in day.listed:
@@ -1499,7 +1498,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # well as a chunk simply absent from a good one -- see
                 # `Report.unauthenticated`.
                 report.unauthenticated.add(key)
-                missed = True
                 continue
 
             if chunk_day not in day_keys:
@@ -1515,7 +1513,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             secret = day_keys[chunk_day]
             if secret is None:
                 report.unreadable.add(key)
-                missed = True
                 continue
 
             # Authenticated before it is decrypted or decompressed, so age, zlib
@@ -1525,7 +1522,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 blob = open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
                 report.unauthenticated.add(key)
-                missed = True
                 continue
 
             try:
@@ -1538,7 +1534,6 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # and every other host's readable chunks, on this run and every
                 # run after it.
                 report.unreadable.add(key)
-                missed = True
                 continue
 
             day.add(plaintext, report)
@@ -1553,7 +1548,12 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         #
         # Appending is safe partially, by contrast, and `add` may already have
         # flushed some of it -- which is why only the rewrite is refused.
-        if day.rewrite and missed:
+        # Measured against what the manifest lists, so a stray file in the
+        # directory cannot hold a day back: it is not part of the day, and
+        # counting it would leave that day stale for ever (which is #87 by
+        # another route).
+        wanted = {name for name in pending if name in day.listed}
+        if day.rewrite and wanted - set(taken):
             report.stale.add(key)
         else:
             day.flush(report)

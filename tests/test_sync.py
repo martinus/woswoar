@@ -3109,11 +3109,18 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         lines the refusal exists to protect.
         """
         alpha, beta, compacted = self.compacted_and_growing()
+        with alpha.active():
+            readable = next(
+                name for name in store.chunk_names(alpha.id, self.DAY) if name != compacted
+            )
+
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
             sync.run()
-            self.assertNotIn(
-                compacted, sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())
-            )
+            remembered = sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())
+        # Not the one that failed, and -- the point -- not the one that read
+        # either: its plaintext was discarded with the refused rewrite.
+        self.assertNotIn(compacted, remembered)
+        self.assertNotIn(readable, remembered, "a discarded chunk was recorded as merged")
 
         # Once the chunk reads, the day is rebuilt whole: the five it had, plus
         # the one that arrived while it could not be.
@@ -3121,6 +3128,22 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             sync.run()
             self.assertEqual(len(beta.entries()), 6)
             self.assertIn("and another", beta.commands())
+
+    def test_a_stray_file_does_not_hold_a_rewrite_back(self) -> None:
+        """A name the manifest does not list is not part of the day.
+
+        Counting it as a chunk the rewrite failed to get would leave the day
+        stale for ever, which is #87 reached by another route -- and anyone with
+        push access could arrange it with one byte.
+        """
+        alpha, beta, _compacted = self.compacted_and_growing()
+        with beta.active():
+            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+
+            report = sync.run()
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.unauthenticated)
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertEqual(len(beta.entries()), 6, "the stray blocked the rebuild")
 
     def test_appending_is_still_allowed_to_be_partial(self) -> None:
         """Only a rewrite is all-or-nothing.
