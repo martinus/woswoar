@@ -330,6 +330,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             detail = "all sealed"
         check("day keys", not orphaned, detail)
+
+        # `sync` says this once, on the pass that first sees the file, and then
+        # the day settles and it stops -- which is right for a one-minute timer
+        # and no use to somebody asking afterwards. Costs no subprocess unless
+        # there is something to find; see `unlisted_chunks`.
+        planted = sync.unlisted_chunks()
+        if planted:
+            host, day, count = planted[0]
+            detail = (
+                f"{sum(n for _, _, n in planted)} chunk(s) in no signed list, e.g."
+                f" {count} under {host[:8]}/{day} - no machine will read them,"
+                " and this one did not write them"
+            )
+        else:
+            detail = "all accounted for"
+        check("chunks", not planted, detail)
     else:
         info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
 

@@ -689,6 +689,63 @@ def manifest_gone(host_id: str, day: str) -> bool:
     return not store.day_manifest(host_id, day).exists()
 
 
+def unlisted_chunks() -> list[tuple[str, str, int]]:
+    """``(host, day, how many)`` for chunks no signed manifest accounts for.
+
+    A chunk in no manifest is one somebody wrote into the repository that the
+    host it sits under never vouched for. Every peer refuses it -- that is what
+    the signature is for -- so nothing is at risk, and `sync` says so the first
+    time it sees one. But since #87 a day settles once its *listed* chunks are
+    merged, so `sync` says it once and then not again, most likely into a
+    journal from the timer rather than to a person. This is where the question
+    can be asked afterwards.
+
+    Cheap in the case that matters. The manifest body is read without verifying
+    it first, which needs no subprocess; only a day that appears to hold an
+    unaccounted-for name pays the `ssh-keygen -Y verify` to be sure. On a
+    repository where nothing is planted -- every repository, almost always --
+    that is a listing and a file read per day and no forks at all.
+
+    Skips a host this machine has not pinned. There is no key to check its
+    manifests against, so every chunk would read as unlisted; `sync` reports
+    that host as untrusted, which is the more useful sentence.
+    """
+    state = State.load()
+    found: list[tuple[str, str, int]] = []
+    for host_id in store.repo_hosts():
+        verify_key = state.signers.get(host_id)
+        if verify_key is None:
+            continue
+        for day, names in store.iter_chunk_days(host_id):
+            claimed = _manifest_names(host_id, day)
+            if not set(names) - claimed:
+                continue
+            # Only now is it worth a signature check: an unverifiable manifest
+            # accounts for nothing, and would make every chunk of the day look
+            # planted when the manifest is what is wrong.
+            listed = read_manifest(host_id, day, verify_key)
+            strays = set(names) - set(listed)
+            if strays and listed:
+                found.append((host_id, day, len(strays)))
+    return found
+
+
+def _manifest_names(host_id: str, day: str) -> set[str]:
+    """The names a day's manifest claims, *without* checking who signed it.
+
+    Only ever used to decide whether a signature check is worth doing. A forged
+    manifest can make a chunk look accounted for here, and that is fine: the
+    same forgery makes every peer refuse the whole day, which `sync` reports as
+    unauthenticated rather than as a stray file.
+    """
+    try:
+        blob = store.day_manifest(host_id, day).read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    _, _, body = blob.partition(_MANIFEST_SEPARATOR)
+    return {line.partition(" ")[0] for line in body.splitlines()[1:]}
+
+
 def days_missing_a_manifest() -> list[str]:
     """Days this machine published and whose signed manifest is no longer there.
 
