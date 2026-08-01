@@ -1128,7 +1128,7 @@ def unpack(blob: bytes, limit: int = MAX_CHUNK_BYTES) -> bytes:
     return out
 
 
-def export(known: Machine, state: State, report: Report, now: int) -> None:
+def export(known: Machine, state: State, report: Report, now: int) -> bool:
     """Seal each log file's new lines into a fresh chunk, and sign the day's list.
 
     The manifest is built by **extending the one this machine last signed**,
@@ -1163,8 +1163,12 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
                 (log.relpath, data, new_offset)
             )
 
+    # Whether anything reached the repo. What lets `run` skip the `git add` that
+    # would otherwise stat the whole working tree to find that out.
+    wrote = False
+
     if not fresh:
-        return
+        return wrote
 
     # One pass for the whole host, not one per day.
     on_disk: dict[str, set[str]] = {}
@@ -1244,6 +1248,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
             state.exported[relpath] = new_offset
 
         write_manifest(known, day, listed)
+        wrote = True
 
         # A chunk under this host's own id that this host never wrote. `merge`
         # skips our own id, so nothing else would ever look at it, and peers
@@ -1256,6 +1261,19 @@ def export(known: Machine, state: State, report: Report, now: int) -> None:
         # chunk on a quiet day is refused by peers either way, because it is in
         # no manifest -- this is a report, not the defence.
         report.foreign |= {f"{day}/{name}" for name in on_disk.get(day, set()) - set(listed)}
+
+    # Set at the manifest rather than approximated by "we got past the guards".
+    # A day can be refused for an orphaned key, a missing manifest or one that
+    # will not verify, and a refused day never advances `state.exported` -- so
+    # its tail is fresh again next run, and every run after that. Answering
+    # "probably wrote" there would mean a full stat of the working tree once a
+    # minute for the life of that machine, in precisely the stuck state this
+    # exists to relieve.
+    #
+    # The manifest is the right place to set it: every repo write in the loop
+    # above -- minting a day key, sealing a chunk -- happens in the same
+    # iteration, ahead of it.
+    return wrote
 
 
 # ---------------------------------------------------------------------------
@@ -1564,11 +1582,34 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # a machine nobody had granted access to could not tag a chunk either,
         # so its own history piled up locally until someone else acted.
         report.revoked = _this_machine_revoked(known)
+        published = False
+        exported = False
         if not report.revoked:
-            publish_signer(known)
-            export(known, state, report, int(time.time()) if now is None else now)
+            published = publish_signer(known)
+            exported = export(known, state, report, int(time.time()) if now is None else now)
 
-        committed = _commit()
+        # `git add -A` is a full stat of the working tree -- every chunk this
+        # machine has ever published -- and this runs once a minute. On an idle
+        # run there is provably nothing to stage, because the only two things
+        # that write into the repo here have just said they wrote nothing.
+        # Measured at 20k chunks: an idle sync drops from 20.6 ms to 10.3 ms,
+        # and stops growing with the size of the history.
+        #
+        # A run that died between writing a chunk and committing it leaves that
+        # chunk unstaged, and this does not strand it: the watermark was not
+        # saved either, so the next run with anything to export writes the same
+        # lines again, and `add -A` on *that* run stages the leftovers too.
+        #
+        # That argument is about `export`, whose write and whose watermark are
+        # one all-or-nothing unit. It does not carry to `publish_signer`, whose
+        # write *is* its own watermark: the file survives the crash, so the next
+        # run reads it back, agrees with it, and reports writing nothing. The
+        # file then waits for an unrelated export. Benign -- a machine in that
+        # state publishes nothing, so peers keep seeing the old key beside the
+        # old chunks it signed -- and `grant`, `revoke` and `init` still sweep
+        # the tree unconditionally, which is also what catches a
+        # `recipients.txt` edited by hand.
+        committed = _commit() if published or exported else False
 
         if remote:
             # `push` contacts the remote even with nothing to send, which is the
@@ -1718,8 +1759,12 @@ def _commit() -> bool:
     # path and nothing at all when the index already matches, so the same
     # command that stages also answers "is there anything to commit". The
     # obvious `status --porcelain` afterwards costs a second full stat of a
-    # working tree that is tens of thousands of chunks after a couple of years,
-    # on a timer that now fires every minute.
+    # working tree that is tens of thousands of chunks after a couple of years.
+    #
+    # `run` no longer reaches here on an idle sync -- it asks its writers first
+    # -- so this is now paid only by runs that did write, and by `grant`,
+    # `revoke` and `init`. That makes it cheaper, not unnecessary: those runs
+    # still have a whole tree to stat, and doing it once beats doing it twice.
     if not git("add", "-A", "--verbose"):
         return False
     git("commit", "-q", "-m", COMMIT_MESSAGE)
