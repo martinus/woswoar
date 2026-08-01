@@ -1138,9 +1138,9 @@ class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
 
             # ...and still answerable.
             self.assertEqual(sync.unlisted_chunks(), [(alpha.id, self.DAY, 1)])
-        ran = self.run_cli(beta, "doctor")
-        self.assertIn("in no signed list", ran.out)
-        self.assertNotEqual(ran.code, 0, "doctor passed with a planted chunk")
+        # The line, not just the exit code: this fixture has other findings, so
+        # a non-zero exit would be true whether or not the check existed.
+        self.assertRegex(self.run_cli(beta, "doctor").out, r"\[FAIL\] chunks .*no signed list")
 
     def test_a_clean_repo_says_so_and_forks_nothing(self) -> None:
         """The design: a signature check only where there is something to check.
@@ -1180,16 +1180,33 @@ class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
             store.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
             self.assertEqual(sync.unlisted_chunks(), [])
 
-    def test_a_host_this_machine_has_not_pinned_is_left_alone(self) -> None:
-        """No key to check against, so every chunk would read as unlisted."""
+    def test_a_host_this_machine_has_not_pinned_is_not_even_checked(self) -> None:
+        """Nothing to check its manifests against, so there is nothing to learn.
+
+        Reporting is unaffected either way -- an unverifiable manifest accounts
+        for nothing, and the guard against *that* already suppresses it. What
+        the skip buys is the `ssh-keygen` per day that asking anyway would cost,
+        on precisely the host where the answer is known in advance.
+        """
         alpha, _beta = self.history_across_days(days=1, per_day=2)
         gamma = self.machine("gamma")  # cloned after alpha, so alpha *is* pinned
+        self.planted(gamma, alpha)
         with gamma.active():
-            sync.run()
             state = sync.State.load()
             del state.signers[alpha.id]
             state.save()
-            self.assertEqual(sync.unlisted_chunks(), [])
+
+            spawns = 0
+            real = subprocess.run
+
+            def counted(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+                nonlocal spawns
+                spawns += 1
+                return real(argv, *args, **kwargs)
+
+            with mock.patch.object(subprocess, "run", counted):
+                self.assertEqual(sync.unlisted_chunks(), [])
+            self.assertEqual(spawns, 0, "an unpinned host was checked anyway")
 
 
 class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
