@@ -3154,17 +3154,56 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         prune the day and skip it from then on, leaving a log that is wrong and
         never looked at again.
         """
-        alpha, beta, compacted = self.compacted_and_growing()
+        # Three things at once, which is why the guard is easy to miss: a
+        # manifest rolled back to one listing *fewer* chunks (so every name it
+        # lists is already merged, and a rebuild is owed because this machine
+        # merged one more), something unmerged in the directory (so the day is
+        # looked at at all), and one listed chunk that will not open (so the
+        # rebuild is refused). Without the guard the day is then pruned and
+        # stamped as finished, with a log that was deliberately not rebuilt.
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
         key = f"{alpha.id}/{self.DAY}"
-        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
-            sync.run()
-            self.assertIn(key, sync.run().stale)
-            self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
-
-        # So it is still owed, and taken as soon as the chunk reads.
+        with alpha.active():
+            for i in range(4):
+                alpha.record(self.DAY, 1_700_000_001 + i, f"early {i}")
+                sync.run()
+            sync.grant()
         with beta.active():
             sync.run()
-            self.assertEqual(len(beta.entries()), 6)
+            self.assertEqual(len(beta.entries()), 4)
+            backup = store.history_dir().with_name("history.backup")
+            shutil.copytree(store.history_dir(), backup, symlinks=True)
+            first = min(store.chunk_names(alpha.id, self.DAY))
+
+        with alpha.active():
+            alpha.record(self.DAY, 1_700_000_009, "the fifth")
+            sync.run()
+        with beta.active():
+            sync.run()
+            self.assertEqual(len(beta.entries()), 5)
+
+            # Working tree only, so HEAD stays put and the rollback sticks.
+            live = store.history_dir()
+            for entry in live.iterdir():
+                if entry.name != ".git":
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+            for entry in backup.iterdir():
+                if entry.name != ".git":
+                    if entry.is_dir():
+                        shutil.copytree(entry, live / entry.name, symlinks=True)
+                    else:
+                        shutil.copy2(entry, live / entry.name)
+
+            # ...and something unmerged in the directory, or the day has
+            # nothing fresh and is skipped before any of this is reached.
+            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+
+        self.settle(beta, alpha, self.DAY)
+        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(first)):
+            self.assertIn(key, sync.run().stale)
+            self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
+            self.assertEqual(len(beta.entries()), 5, "the day was rebuilt from a partial read")
 
     def test_sync_says_which_day_it_left_alone(self) -> None:
         """New user-facing behaviour, so it is pinned like its neighbours."""
