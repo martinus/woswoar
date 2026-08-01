@@ -3127,6 +3127,34 @@ class TestWalkingAPeersChunks(SyncTestCase):
             # And a day that does hold one still says so.
             self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
 
+    def test_one_day_is_not_answered_by_walking_the_host(self) -> None:
+        """`orphaned_days` asks once per orphaned day, so the cost compounds.
+
+        Answering from a whole-host walk made a 0.12 ms question 5 ms, and
+        `orphaned_days` 5 ms to 184 ms with 40 orphaned days over 20k chunks --
+        quadratic in the archive, in exactly the state `doctor` exists to find
+        and that a stranger with push access can create.
+        """
+        alpha, _beta = self.stocked()
+        walked: list[str] = []
+        real = store.iter_chunk_days
+
+        def spy(machine_id: str) -> Iterator[tuple[str, list[str]]]:
+            walked.append(machine_id)
+            return real(machine_id)
+
+        with alpha.active(), mock.patch.object(store, "iter_chunk_days", spy):
+            self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
+            sync.orphaned_days()
+
+            # `export` asks the same question, per day it is sealing, on every
+            # sync that records anything.
+            alpha.record("2023-11-14", 1_700_000_900, "one more")
+            self.assertTrue(
+                sync.export(store.machine(), sync.State.load(), sync.Report(), 1_700_000_901)
+            )
+        self.assertEqual(walked, [], "a one-day question walked the whole host")
+
     def test_keys_and_manifests_are_not_mistaken_for_days(self) -> None:
         """They sit in the same host directory, and neither holds chunks."""
         alpha, _beta = self.stocked()

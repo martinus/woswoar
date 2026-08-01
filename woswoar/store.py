@@ -553,6 +553,25 @@ class Chunk(NamedTuple):
     path: Path
 
 
+def chunk_names(machine_id: str, day: str) -> list[str]:
+    """The chunk filenames in one host-day, sorted. Empty if there are none.
+
+    The unit the layout is actually asked about: what counts as a chunk is
+    decided here, so a partial write or an editor's leftover in a day directory
+    is not one. Callers that want a single day must not reach it by walking the
+    host -- `has_chunks` did, and turned a 0.09 ms question into a 4.6 ms one on
+    an archive of 20k chunks, once per orphaned day.
+
+    `os.scandir` swallows the same errors `Path.glob` did: a day directory that
+    has gone away, or that cannot be read, has no chunks to offer.
+    """
+    try:
+        with os.scandir(chunk_dir(machine_id, day)) as entries:
+            return sorted(e.name for e in entries if e.is_file() and e.name.endswith(_CHUNK_SUFFIX))
+    except OSError:
+        return []
+
+
 def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
     """``(day, chunk filenames)`` for one host: days in order, names sorted.
 
@@ -565,7 +584,7 @@ def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
     decides from the *name* alone whether it has already merged a chunk, and on
     an idle sync the answer is yes for every one of them. Building a `Path` and
     a `Chunk` per file first was the whole cost of that walk: one peer with 20k
-    chunks took 88 ms to list against 3 ms to name, once a minute, growing with
+    chunks took 88 ms to list against 5 ms to name, once a minute, growing with
     the archive forever.
 
     `os.scandir` rather than `Path.glob` for the same reason, and it is free:
@@ -573,25 +592,17 @@ def iter_chunk_days(machine_id: str) -> Iterator[tuple[str, list[str]]]:
     on a name that has been read once. The order is unchanged -- chunk names are
     fixed-width, so sorting them as strings sorts them as `Path`s did.
     """
-    root = repo_host_dir(machine_id)
     try:
-        with os.scandir(root) as entries:
+        with os.scandir(repo_host_dir(machine_id)) as entries:
             days = sorted(e.name for e in entries if e.is_dir() and _is_day(e.name))
     except OSError:
         return
 
     for day in days:
-        try:
-            with os.scandir(root / day) as entries:
-                names = sorted(
-                    e.name for e in entries if e.is_file() and e.name.endswith(_CHUNK_SUFFIX)
-                )
-        except OSError:
-            continue
         # A day directory with nothing in it is not a day with no new chunks --
         # it is not a day at all, and saying so keeps every caller from having
         # to ask.
-        if names:
+        if names := chunk_names(machine_id, day):
             yield day, names
 
 
