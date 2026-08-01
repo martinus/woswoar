@@ -380,7 +380,10 @@ class State:
 
     #: log relpath -> plaintext bytes already sealed into a chunk.
     exported: dict[str, int] = field(default_factory=dict)
-    #: "<host>/<day>" -> the chunk filenames already merged into logs/.
+    #: "<host>/<day>" -> the chunk filenames of that day already merged into
+    #: logs/. Pruned to the day's *signed manifest* once every name in it has
+    #: been merged, so this shrinks when a peer compacts -- it is a record of
+    #: what the host says the day holds, not of every file ever seen.
     #:
     #: A set, not a high-water mark. A single "highest name seen" cannot say
     #: "all of these except that one", and chunk names are only loosely ordered:
@@ -406,8 +409,8 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
-    #: "<host>/<day>" -> the day directory's mtime when every chunk it held had
-    #: been merged. A day whose stamp still matches has gained nothing since, so
+    #: "<host>/<day>" -> the day directory's mtime when every chunk its signed
+    #: manifest listed had been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
     #: costs on a timer that fires every minute. See `store.day_stamp`.
     #:
@@ -1458,11 +1461,22 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # merged from elsewhere. Recording it here is what stops the next
             # run listing that day too, and for ever.
             #
-            # The same condition as the write below the merge, reached earlier:
-            # `not fresh` means every name is in `already`, which *is*
-            # `state.merged[key]`. `names` because an empty directory is not a
-            # day (see `store.iter_chunk_days`), and stamping one would put a
-            # permanent entry in `state.json` for something that is not there.
+            # Judged on the directory here, and on the manifest below the
+            # merge. Deliberately, and the two do not have to agree: `not fresh`
+            # means every name on disk is already merged, so the only thing a
+            # manifest could add is a name with no file behind it -- which
+            # nothing can merge now, and whose arrival would move the day's
+            # mtime and bring it back here anyway.
+            #
+            # This branch has no manifest to judge against, because reading one
+            # is the `ssh-keygen` fork that #87 exists to stop paying. That also
+            # means it cannot prune: a day settling here keeps whatever
+            # `state.merged` already held, and is pruned on the next pass that
+            # has a reason to read the manifest.
+            #
+            # `names` because an empty directory is not a day (see
+            # `store.iter_chunk_days`), and stamping one would put a permanent
+            # entry in `state.json` for something that is not there.
             _stamp(state, key, stamp, settled=bool(names))
             continue
 

@@ -200,6 +200,19 @@ class SyncTestCase(unittest.TestCase):
         with fake.active():
             sync.trust(sync.trust_candidates())
 
+    def settle(self, machine: Fake, host: Fake, *days: str) -> None:
+        """Age a day directory past `RACY_WINDOW_NS`, as a minute of real time does.
+
+        A day written moments ago is deliberately not stamped: its mtime cannot
+        yet rule out another write landing in the same filesystem tick. Every
+        real day reaches that state within seconds; a test would otherwise have
+        to sleep through it.
+        """
+        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
+        with machine.active():
+            for day in days:
+                os.utime(store.chunk_dir(host.id, day), (aged, aged))
+
     def run_cli(self, fake: Fake, *argv: str) -> tuple[int, str]:
         """Drive the real CLI as ``fake``, returning ``(exit code, stdout)``.
 
@@ -3050,12 +3063,6 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
 
     DAY = "2023-11-14"
 
-    def settle(self, machine: Fake, host: Fake) -> None:
-        """Age the day past `RACY_WINDOW_NS`, as a minute of real time does."""
-        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
-        with machine.active():
-            os.utime(store.chunk_dir(host.id, self.DAY), (aged, aged))
-
     def verifications(self, machine: Fake) -> int:
         """Manifest signature checks one sync makes -- an `ssh-keygen` fork each."""
         seen = 0
@@ -3085,7 +3092,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         with beta.active():
             sync.run()
             (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
-        self.settle(beta, alpha)
+        self.settle(beta, alpha, self.DAY)
 
         # Said once, because the day did change -- and that pass is the one
         # that pays for the manifest.
@@ -3149,7 +3156,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         with beta.active():
             sync.run()
             self.assertEqual(
-                set(sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())),
+                self.remembered(beta, alpha),
                 before,
                 "an unverifiable manifest emptied the day's record",
             )
@@ -3189,19 +3196,6 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         with machine.active(), mock.patch.object(store, "chunk_names", counted):
             sync.run()
         return days
-
-    def settle(self, machine: Fake, host: Fake, *days: str) -> None:
-        """Age a day directory past `RACY_WINDOW_NS`, as a minute of real time does.
-
-        A day written moments ago is deliberately not stamped: its mtime cannot
-        yet rule out another write landing in the same filesystem tick. Every
-        real day reaches that state within seconds; a test would otherwise have
-        to sleep through it.
-        """
-        aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
-        with machine.active():
-            for day in days:
-                os.utime(store.chunk_dir(host.id, day), (aged, aged))
 
     def pair(self) -> tuple[Fake, Fake]:
         """alpha with two days of one chunk, and a beta that has merged both."""
