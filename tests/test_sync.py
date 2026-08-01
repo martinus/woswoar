@@ -3046,7 +3046,10 @@ class TestWalkingAPeersChunks(SyncTestCase):
             sync.run()
             sync.grant()
         with beta.active():
-            for day in ("2023-11-14", "2023-11-15"):
+            # Three days, recorded newest first: two cannot tell a sorted walk
+            # from a reversed one, and readdir order is not the creation order
+            # in any case.
+            for day in ("2023-11-16", "2023-11-14", "2023-11-15"):
                 for i in range(2):
                     beta.record(day, 1_700_000_100 + i, f"{day} number {i}")
                     sync.run()
@@ -3072,10 +3075,27 @@ class TestWalkingAPeersChunks(SyncTestCase):
             flat,
             "the name walk and the chunk walk disagree",
         )
-        self.assertEqual([day for day, _ in by_day], sorted(day for day, _ in by_day))
+        self.assertEqual([day for day, _ in by_day], ["2023-11-14", "2023-11-15", "2023-11-16"])
         for _day, names in by_day:
             self.assertEqual(names, sorted(names))
             self.assertTrue(names, "an empty day was yielded")
+
+    def test_only_chunks_are_yielded(self) -> None:
+        """A day directory is not guaranteed to hold nothing else.
+
+        A partial write, an editor's backup, a `.orig` left by a merge tool: the
+        walk names what it is looking for rather than taking whatever is there,
+        because everything downstream treats a name as a chunk to authenticate.
+        """
+        _alpha, beta = self.stocked()
+        with beta.active():
+            directory = store.chunk_dir(beta.id, "2023-11-14")
+            (directory / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
+            (directory / "notes.txt").write_text("not a chunk", encoding="utf-8")
+
+            names = dict(store.iter_chunk_days(beta.id))["2023-11-14"]
+        self.assertTrue(all(name.endswith(".age") for name in names), names)
+        self.assertEqual(len(names), 2)
 
     def test_a_day_is_never_split_across_two_groups(self) -> None:
         """The contract `_merge_host` leans on, and the one that loses history.
@@ -3095,7 +3115,7 @@ class TestWalkingAPeersChunks(SyncTestCase):
             siblings = {p.name for p in store.repo_host_dir(beta.id).iterdir() if p.is_dir()}
             self.assertTrue({"keys", "manifests"} <= siblings, siblings)
             days = {day for day, _ in store.iter_chunk_days(beta.id)}
-        self.assertEqual(days, {"2023-11-14", "2023-11-15"})
+        self.assertEqual(days, {"2023-11-14", "2023-11-15", "2023-11-16"})
 
     def test_an_idle_merge_builds_nothing_per_chunk(self) -> None:
         """The saving itself, asserted where a future change would undo it.
