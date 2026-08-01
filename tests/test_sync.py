@@ -35,6 +35,25 @@ from .support import requires_age, requires_git, requires_ssh_keygen
 #: One authoritative list, plus HOME which only these tests need to redirect.
 _ENV = (*support.ENV_KEYS, "HOME")
 
+#: `gc --auto` runs after a commit and after a push, and `gc.autoDetach` sends
+#: it to the background -- so it is still repacking while the *next* git command
+#: runs. A real installation wants exactly that. These tests want a repo that
+#: changes only when they change it, and every one of the five red mains before
+#: this came of not having one, in three different disguises:
+#:
+#: - a clone dying on a loose object the background prune had already removed,
+#:   twice, in two unrelated tests;
+#: - `git gc` in a test colliding with the repack already running there:
+#:   "failed to run repack", "could not find pack '.tmp-...'";
+#: - teardown finding the directory not empty, which `ignore_cleanup_errors`
+#:   did not absorb on 3.12.
+#:
+#: None of those is the hazard under test, and a suite that reddens somewhere
+#: new each time teaches people to re-run it rather than read it. What makes the
+#: *clone* safe is `--no-local`, which has its own test; this only stops git's
+#: housekeeping showing up as whichever test was unlucky.
+QUIET_MAINTENANCE = "[gc]\n\tauto = 0\n\tautoDetach = false\n[receive]\n\tautogc = false\n"
+
 
 class Fake:
     """One simulated machine with its own config, logs, and clone."""
@@ -45,6 +64,8 @@ class Fake:
         self._id: str | None = None
         for sub in ("data", "conf", "cache"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
+        # This machine's HOME, so its clone inherits it.
+        (self.root / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
 
     @property
     def env(self) -> dict[str, str]:
@@ -136,20 +157,17 @@ class Fake:
 @requires_git
 class SyncTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        # `ignore_cleanup_errors` because git may still be finishing
-        # background maintenance in the repo when the directory goes: it
-        # creates a file under `.git` between the walk and the rmdir, and
-        # `rmtree` fails with "Directory not empty". Measured at about one
-        # run in forty, on this change and on main alike, so it is a
-        # teardown race rather than anything under test -- and a suite that
-        # reddens at random teaches people to re-run it rather than read it.
         # `ignore_cleanup_errors` because git may still be finishing background
         # maintenance in the repo when the directory goes: it creates a file
         # under `.git` between the walk and the rmdir, and `rmtree` fails with
         # "Directory not empty". Measured at about one run in forty, on this
         # branch and on main alike, so it is a teardown race rather than
         # anything under test -- and a suite that reddens at random teaches
-        # people to re-run it rather than read it.
+        # people to re-run it rather than read it. It did not always absorb it:
+        # main went red on 3.12 with "Directory not empty" here regardless.
+        # QUIET_MAINTENANCE removes the writer that loses the race, which is the
+        # better fix; the tolerance stays because it costs nothing and proving
+        # the absence of a one-in-forty event does not.
         self._tmp = tempfile.TemporaryDirectory(prefix="woswoar-sync-", ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
@@ -157,6 +175,13 @@ class SyncTestCase(unittest.TestCase):
         self.origin = self.root / "origin.git"
         subprocess.run(
             ["git", "init", "--quiet", "--bare", str(self.origin)], check=True, timeout=60
+        )
+        # In the repo itself, not just in a HOME: a push's `receive-pack` runs
+        # here with the *pushing* machine's environment, and the origin outlives
+        # any one of them.
+        (self.origin / "config").write_text(
+            (self.origin / "config").read_text(encoding="utf-8") + QUIET_MAINTENANCE,
+            encoding="utf-8",
         )
 
     def machine(self, name: str, enrol: bool = True, display: str | None = None) -> Fake:
@@ -2565,6 +2590,47 @@ class TestCloningDoesNotShareObjectsWithTheOrigin(SyncTestCase):
             origin_inodes = {p.stat().st_ino for p in Path(self.origin).rglob("*") if p.is_file()}
             shared = [p for p in files if p.stat().st_ino in origin_inodes]
             self.assertEqual(shared, [], "objects are hardlinked to the origin")
+
+    def test_the_clone_reads_no_object_file_out_of_the_origin(self) -> None:
+        """The stronger claim, and the one that keeps main green.
+
+        Not sharing an inode is not enough. `--no-hardlinks` still walks the
+        origin's `objects/` and copies whatever the directory listing named,
+        and that listing is not a snapshot: a concurrent push migrating its
+        quarantine, or a `gc --auto` the last push detached into the
+        background, removes a loose object between the listing and the open.
+        The clone then dies with `fatal: failed to copy file to ...`, which is
+        how main went red at v0.3.0 -- and in the hardlink spelling it is #79
+        itself, because a failed `link()` falls back to this same copy.
+
+        `--no-local` asks `upload-pack` for a pack. So every object the origin
+        holds *loose* has to arrive here *packed*: that is the difference
+        between reading someone else's live object store and being sent one.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        def loose(objects: Path) -> set[str]:
+            """Object ids stored as individual files, as `objects/ab/cdef...`."""
+            return {p.parent.name + p.name for p in objects.glob("??/*") if p.is_file()}
+
+        # Without this the test is vacuous: a fully packed origin has nothing
+        # for the local path to copy, so both spellings would pass. A push
+        # small enough for `transfer.unpackLimit` is exploded into loose
+        # objects on arrival, which is every push woswoar makes.
+        from_origin = loose(Path(self.origin) / "objects")
+        self.assertTrue(from_origin, "precondition: the origin holds loose objects")
+
+        beta = self.machine("beta")
+        with beta.active():
+            objects = store.history_dir() / ".git" / "objects"
+            self.assertTrue(list((objects / "pack").glob("*.pack")), "the clone received no pack")
+            # beta has committed its own enrolment by now, so it has loose
+            # objects of its own -- they are simply not the origin's.
+            copied = sorted(from_origin & loose(objects))
+            self.assertEqual(copied, [], "the clone copied the origin's loose objects")
 
     def test_a_joining_machine_still_gets_the_history(self) -> None:
         """The copy has to be a real one, not merely an unlinked one."""

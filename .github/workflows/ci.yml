@@ -221,7 +221,11 @@ jobs:
           # build -- and it is a perfectly well-formed chunk. What the attacker
           # cannot do is get it into a manifest alpha signed.
           ATTACK="$BASE/attacker"
-          git clone --quiet "$BASE/origin.git" "$ATTACK"
+          # --no-local for the same reason `init` uses it: a local clone reads
+          # the origin's object store through a directory listing that nothing
+          # holds still. How the attacker got its copy is beside the point of
+          # this test, and a flake here would look like a security failure.
+          git clone --quiet --no-local "$BASE/origin.git" "$ATTACK"
           DAY_PUB=$(cat "$ATTACK/hosts/$ALPHA_ID/keys/2023-11-14.pub")
           printf '1700000009\ts1\t~\t0\t5\tforged-marker-command\n' \
             | python3 -c 'import sys; from woswoar import sync; sys.stdout.buffer.write(sync.pack(sys.stdin.buffer.read()))' \
