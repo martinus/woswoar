@@ -144,8 +144,19 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool) -> list[str]:
         # Match against the command only. Without this, typing "3d" would match
         # the relative-time column and surface unrelated entries.
         "--nth=2..",
-        # Preserve our newest-first order when match scores tie.
-        "--tiebreak=begin,index",
+        # Preserve our newest-first order when match scores tie. `begin` used to
+        # come first here, and it did not preserve anything: for a query like
+        # "sync" every candidate scores the same, so `begin` -- not recency --
+        # decided the whole list, ranking a year-old `sudo sync; echo 3 > ...`
+        # above a three-minute-old `woswoar sync` purely because its match
+        # starts three characters earlier in the line.
+        #
+        # It also leaked the time column into the ranking. fzf scores `begin` as
+        # (match offset - leading whitespace), and the column is right-aligned,
+        # so a two-character age is padded with one more space than a
+        # three-character one: `1y  atuin sync -h` outranked `10h  atuin sync`
+        # with the offsets otherwise identical. `index` is what the intent was.
+        "--tiebreak=index",
         f"--query={query}",
         f"--prompt=woswoar ({scope}) ",
         "--header=ctrl-g global | ctrl-h host | ctrl-s session",

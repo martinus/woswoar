@@ -45,17 +45,18 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: install age
-        # Sync tests skip themselves without it, and a silently skipped suite
-        # looks exactly like a passing one.
+      - name: install age and fzf
+        # Sync tests skip themselves without age, the ranking tests without
+        # fzf, and a silently skipped suite looks exactly like a passing one.
+        # One apt-get for both: the round trip is what costs, not the packages.
         #
         # `update` only when the direct install misses: refreshing the lists
         # costs ~10s and the runner image usually already has what age needs,
         # which on the critical path is most of the job. The fallback keeps it
         # correct on an image where that stops being true.
         run: |
-          sudo apt-get install -y -qq age \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
+          sudo apt-get install -y -qq age fzf \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq age fzf; }
       - name: ssh-keygen is present
         # Signing needs it. Present on ubuntu-latest, asserted rather than
         # assumed for the same reason as bash below: a silently skipped suite
@@ -74,6 +75,12 @@ jobs:
       # job, so the fork-scaling tests legitimately skip. The `hook` job is
       # where they are made fatal.
       - run: python -m tools.run_tests
+      # The ranking tests are the one part of the suite whose subject is fzf's
+      # behaviour rather than woswoar's, so they cannot be asserted against a
+      # stand-in and they skip themselves when fzf is missing. fzf is installed
+      # above, so here a skip means the install stopped working -- and a green
+      # run that ranked nothing at all is exactly the failure worth catching.
+      - run: python -m tools.run_tests --only tests.test_search --no-skips
 
   hook:
     # Called on every prompt, so the hook gets its own job: the fork-scaling
