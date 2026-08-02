@@ -895,9 +895,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import progress
+
     args = build_parser().parse_args(argv)
     try:
-        result: int = args.func(args)
+        # Around every command, not only the slow ones. What a command costs
+        # depends on how much history is behind it, and the reporter shows
+        # nothing until a wait has already gone on too long -- so the ones that
+        # are fast today stay silent, without anyone having to predict which
+        # those are.
+        with progress.to_terminal():
+            result: int = args.func(args)
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:
