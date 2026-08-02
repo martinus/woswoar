@@ -68,8 +68,6 @@ class TestDoctorWithABrokenAge(WoswoarTestCase):
         self.assertRegex(out, r"\[FAIL\] age")
 
 
-
-
 @requires_age
 class TestDoctorWithASlowAge(WoswoarTestCase):
     """The failure that is hardest to diagnose, because nothing is broken.
@@ -131,6 +129,8 @@ class TestAFastAgeIsNotFlagged(WoswoarTestCase):
         self.assertLess(crypto.startup_ms(), crypto.SLOW_MS)
         self.assertIn("[ok] age", support.run_cli("doctor").out)
         self.assertNotIn("ms to start. woswoar runs it", support.run_cli("doctor").out)
+
+
 class TestDoctorsMarkers(WoswoarTestCase):
     """A tick for a person, the old text for everything else.
 
