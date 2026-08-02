@@ -7,11 +7,15 @@ select).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
 from operator import attrgetter
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from typing import IO
 
 from . import cache, store
 from .entry import Entry, escape, make_inert, unescape
@@ -169,19 +173,58 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
         print("\nMeanwhile 'woswoar list' prints the same history as plain text.", file=sys.stderr)
         return None
 
-    lines = lines_for(scope, dedup=dedup)
-    if not lines:
+    # Nothing recorded at all -- a fresh install before the first command. The
+    # check is two stats on a machine that *has* history, because the cache is
+    # the first thing it finds, and it is what keeps "Ctrl-R does nothing yet"
+    # from becoming "Ctrl-R opens an empty picker you have to escape out of".
+    if not store.cache_file().exists() and not any(store.iter_log_files()):
         return None
 
-    result = subprocess.run(
+    # fzf is started *before* the history is built, which is the whole point:
+    # it paints its frame and prompt in about two milliseconds, and then reads
+    # stdin as it arrives -- exactly how `find | fzf` behaves. Building the
+    # lines first meant the screen stayed empty for the entire load-parse-sort-
+    # render, measured at 125 ms on a real 55k-command history. The work is the
+    # same either way; what changes is that you are looking at the picker while
+    # it happens instead of at nothing.
+    process = subprocess.Popen(
         _fzf_argv(scope, query, dedup),
-        input="\n".join(lines),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
-        check=False,
     )
+    assert process.stdin is not None and process.stdout is not None
+
+    try:
+        _feed(process.stdin, lines_for(scope, dedup=dedup))
+    finally:
+        # Both closes can raise the same way, and neither is a failure: it only
+        # means fzf is already gone. Selecting the first line the moment it
+        # appears, or pressing Esc, does exactly that.
+        with contextlib.suppress(BrokenPipeError, OSError):
+            process.stdin.close()
+
+    selected = process.stdout.read()
+    process.stdout.close()
+    returncode = process.wait()
+
     # 1 = no match, 130 = interrupted with Esc or Ctrl-C. Both are ordinary
     # outcomes, not failures.
-    if result.returncode != 0 or not result.stdout.strip():
+    if returncode != 0 or not selected.strip():
         return None
-    return command_from_line(result.stdout.rstrip("\n"))
+    return command_from_line(selected.rstrip("\n"))
+
+
+#: Lines per write into fzf. Large enough that the write syscalls are not the
+#: cost, small enough that a `BrokenPipeError` from an early selection is
+#: noticed rather than buffered behind a megabyte.
+_CHUNK = 2000
+
+
+def _feed(stream: IO[str], lines: list[str]) -> None:
+    """Write the display lines into fzf, tolerating it leaving early."""
+    with contextlib.suppress(BrokenPipeError):
+        for start in range(0, len(lines), _CHUNK):
+            stream.write("\n".join(lines[start : start + _CHUNK]))
+            stream.write("\n")
+        stream.flush()

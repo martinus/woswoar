@@ -5,8 +5,11 @@ from __future__ import annotations
 import io
 import os
 import sqlite3
+import subprocess
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
 
 from woswoar import search, store
 from woswoar.__main__ import main
@@ -237,3 +240,130 @@ class TestNoCommandPrintsControlBytes(WoswoarTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
+    """fzf is started first, and fed afterwards.
+
+    Measured on a real 55,000-command atuin history: the picker used to appear
+    after 121 ms, because nothing was spawned until every line had been loaded,
+    sorted, deduplicated and rendered. Starting fzf first puts it on screen at
+    41 ms -- the work is identical, but you spend it looking at the picker
+    instead of at nothing.
+    """
+
+    def fake_fzf(self, script: str) -> None:
+        """Put a stand-in for fzf first on PATH.
+
+        A real fzf needs a terminal, and CI has neither. What is under test is
+        woswoar's half of the conversation -- when the process is started, what
+        is written to it, and what happens when it leaves early -- so the stand
+        -in is the real subprocess boundary with a scripted other end.
+        """
+        binary = Path(self.root) / "bin" / "fzf"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text(f"#!/usr/bin/env python3\n{script}")
+        binary.chmod(0o755)
+        os.environ["PATH"] = f"{binary.parent}{os.pathsep}{os.environ['PATH']}"
+
+    def some_history(self) -> None:
+        with store.private_append(store.log_file(MACHINE_ID, "2023-11-14")) as handle:
+            for i in range(5):
+                handle.write(format_line(Entry(NOW - i, MACHINE_ID, "s1", "~", 0, 1, f"cmd {i}")))
+                handle.write("\n")
+
+    def test_fzf_is_running_before_the_lines_exist(self) -> None:
+        """The whole change, stated as an order of events.
+
+        The stand-in is installed even though `Popen` is mocked: `interactive`
+        looks fzf up on PATH first and returns early if it is missing, so
+        without this the test asserts nothing on any machine that lacks fzf --
+        which is every CI runner here, and is exactly how it first went red.
+        """
+        self.fake_fzf("import sys\n")
+        self.some_history()
+        order: list[str] = []
+
+        class Spawned:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                order.append("picker")
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO("")
+
+            def wait(self) -> int:
+                return 130  # as Esc does
+
+        def slow_lines(*args: object, **kwargs: object) -> list[str]:
+            order.append("history")
+            return ["  1s  cmd 0"]
+
+        with (
+            mock.patch("subprocess.Popen", Spawned),
+            mock.patch.object(search, "lines_for", slow_lines),
+        ):
+            search.interactive("global")
+
+        self.assertEqual(order, ["picker", "history"], "the picker waited for the history")
+
+    def test_the_lines_reach_fzf(self) -> None:
+        self.some_history()
+        self.fake_fzf("import sys\nprint(sys.stdin.read().splitlines()[0])\n")
+        with redirect_stdout(io.StringIO()):
+            chosen = search.interactive("global")
+        self.assertEqual(chosen, "cmd 0", "the newest entry did not survive the round trip")
+
+    def test_fzf_leaving_early_is_not_an_error(self) -> None:
+        """Selecting the first line the instant it appears closes the pipe
+        under us, and the write has to tolerate that at any point.
+
+        The history has to be bigger than a pipe buffer -- 64 KiB on Linux --
+        or the write lands in the buffer and returns happily even though
+        nothing will ever read it, and this passes with the handling removed.
+        Five short lines did exactly that.
+        """
+        with store.private_append(store.log_file(MACHINE_ID, "2023-11-14")) as handle:
+            for i in range(2000):
+                padded = f"cmd {i} " + "x" * 200
+                handle.write(format_line(Entry(NOW - i, MACHINE_ID, "s1", "~", 0, 1, padded)))
+                handle.write("\n")
+        self.assertGreater(
+            sum(len(line) for line in search.lines_for("global")),
+            1 << 16,
+            "precondition: more than one pipe buffer of history",
+        )
+        # Exits without reading stdin at all -- the harshest version.
+        self.fake_fzf("import sys\nsys.exit(130)\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertIsNone(search.interactive("global"))
+
+    def test_a_machine_with_no_history_opens_no_picker(self) -> None:
+        """Ctrl-R on a fresh install did nothing, and must keep doing nothing
+        rather than opening an empty picker to escape out of.
+
+        The marker is written by the stand-in itself, so this fails if fzf is
+        started at all -- asserting on a file nothing ever creates would pass
+        either way, which is what the first version of this test did.
+        """
+        started = Path(self.root) / "fzf-was-started"
+        self.fake_fzf(f"import pathlib\npathlib.Path({str(started)!r}).write_text('yes')\n")
+
+        # The stand-in really does write it when it runs, or the test below is
+        # asserting the absence of something that never appears anyway.
+        subprocess.run([str(Path(self.root) / "bin" / "fzf")], check=True)
+        self.assertTrue(started.exists(), "precondition: the marker works")
+        started.unlink()
+
+        with redirect_stdout(io.StringIO()):
+            self.assertIsNone(search.interactive("global"))
+        self.assertFalse(started.exists(), "an empty history opened a picker")
+
+    def test_many_lines_survive_the_chunking(self) -> None:
+        """More than one chunk, so the loop runs more than once."""
+        with store.private_append(store.log_file(MACHINE_ID, "2023-11-14")) as handle:
+            for i in range(search._CHUNK * 2 + 7):
+                handle.write(format_line(Entry(NOW - i, MACHINE_ID, "s1", "~", 0, 1, f"cmd {i}")))
+                handle.write("\n")
+        self.fake_fzf("import sys\nseen = sys.stdin.read().splitlines()\nprint(seen[-1])\n")
+        with redirect_stdout(io.StringIO()):
+            chosen = search.interactive("global")
+        self.assertEqual(chosen, f"cmd {search._CHUNK * 2 + 6}", "a chunk went missing")
