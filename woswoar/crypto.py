@@ -505,6 +505,44 @@ def selftest() -> str:
     return ""
 
 
+#: A per-call cost above which woswoar is not usable at scale rather than
+#: merely slower. It runs `age` about twice per day of history, so 50 ms means
+#: 100 ms a day: a year takes 36 s to grant, two years over a minute. A
+#: distribution binary measures 2 ms on the machine this was written on, so
+#: anything near this threshold is a packaging problem, not a fast/slow machine.
+SLOW_MS = 50.0
+
+#: Runs to time. `age --version` does no cryptography, so this measures process
+#: start alone -- which is the whole of the difference: what a sandbox charges
+#: is the same however little the program then does.
+_TIMED_RUNS = 5
+
+
+def startup_ms() -> float:
+    """How long `age` takes to start, in milliseconds. ``-1.0`` if it will not run.
+
+    The number that decides whether woswoar is pleasant or unusable, and it has
+    nothing to do with woswoar: a snap-packaged age sets up a mount namespace
+    and a sandbox on every invocation, and woswoar invokes it once per day-key.
+    Reported from a real Ubuntu install as "about half a second per day", which
+    is 100x the same operation against the same history on the same network.
+    """
+    import statistics
+    import time
+
+    timings = []
+    for _ in range(_TIMED_RUNS):
+        started = time.perf_counter()
+        try:
+            _run([AGE, "--version"], b"")
+        except (AgeError, OSError):
+            return -1.0
+        timings.append((time.perf_counter() - started) * 1000)
+    # The median, not the mean: the first run pays for a cold page cache and
+    # would otherwise decide the answer on a machine that is merely busy.
+    return statistics.median(timings)
+
+
 def why_unusable(identity: Path) -> str:
     """``""`` if this identity can decrypt unattended, else why not.
 

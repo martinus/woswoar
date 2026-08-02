@@ -9,6 +9,7 @@ would think to run it.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import unittest
 
@@ -67,3 +68,66 @@ class TestDoctorWithABrokenAge(WoswoarTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_age
+class TestDoctorWithASlowAge(WoswoarTestCase):
+    """The failure that is hardest to diagnose, because nothing is broken.
+
+    Reported from a real Ubuntu install where `age` came from a snap: `sync` and
+    `accept` took "about half a second per day" of history, roughly 100x the
+    same work on the same history with a distribution binary. woswoar spawns
+    `age` about twice per day-key, so a per-call cost that is invisible at 2 ms
+    turns a three-second grant into a six-minute one -- and every check passed.
+    """
+
+    #: Comfortably over `crypto.SLOW_MS` without making the suite crawl: five
+    #: timed runs at this cost is a third of a second.
+    DELAY_MS = 70
+
+    def setUp(self) -> None:
+        super().setUp()
+        real = shutil.which("age")
+        assert real is not None  # @requires_age
+        fake = self.root / "bin"
+        fake.mkdir()
+        script = fake / "age"
+        # Delegates to the real age after sleeping, so it is genuinely working
+        # and genuinely slow -- which is the combination under test. A stub that
+        # only slept would be caught by `selftest` instead, and prove nothing.
+        script.write_text(f'#!/bin/sh\nsleep {self.DELAY_MS / 1000}\nexec {real} "$@"\n')
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+
+        self._path = os.environ["PATH"]
+        os.environ["PATH"] = f"{fake}{os.pathsep}{self._path}"
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", self._path))
+
+    def test_the_cost_is_measured(self) -> None:
+        self.assertGreaterEqual(crypto.startup_ms(), self.DELAY_MS)
+
+    def test_doctor_fails_and_says_what_it_will_cost(self) -> None:
+        ran = support.run_cli("doctor")
+        # The age *line*, not the exit code: doctor in a bare temp home already
+        # fails on `hook` and `private`, so the exit code is non-zero either way
+        # and asserting on it tested nothing about age at all.
+        self.assertIn("[FAIL] age", ran.out)
+        self.assertNotEqual(ran.code, 0)
+        self.assertIn("ms to start", ran.out)
+        # Matched either side of the wrap rather than across it: the message is
+        # hard-wrapped, so a phrase that spans a line break matches nothing.
+        self.assertIn("woswoar runs it about twice per", ran.out)
+        self.assertIn("day of recorded history", ran.out)
+        self.assertIn("A distribution binary starts", ran.out)
+
+    def test_a_working_age_is_still_the_thing_being_measured(self) -> None:
+        """The stand-in really does work, so the FAIL is about speed alone."""
+        self.assertEqual(crypto.selftest(), "")
+
+
+@requires_age
+class TestAFastAgeIsNotFlagged(WoswoarTestCase):
+    def test_the_real_age_passes(self) -> None:
+        """Guards the threshold from being set somewhere that fails everyone."""
+        self.assertLess(crypto.startup_ms(), crypto.SLOW_MS)
+        self.assertIn("[ok] age", support.run_cli("doctor").out)
+        self.assertNotIn("ms to start. woswoar runs it", support.run_cli("doctor").out)
