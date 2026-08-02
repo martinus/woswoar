@@ -193,9 +193,12 @@ class TestHostAttribution(AtuinTestCase):
             ]
         )
         importer.run("atuin", db)
-        entries = cache.load_entries()
-        self.assertEqual(len(search.filter_scope(entries, "global")), 2)
-        self.assertEqual([e.cmd for e in search.filter_scope(entries, "host")], ["mine"])
+
+        def recall(scope: search.Scope) -> list[str]:
+            return [search.command_from_line(line) for line in search.lines_for(scope)]
+
+        self.assertEqual(len(recall("global")), 2)
+        self.assertEqual(recall("host"), ["mine"])
 
     def test_own_paths_are_stored_home_relative(self) -> None:
         home = str(Path.home())

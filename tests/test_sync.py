@@ -447,9 +447,12 @@ class TestTwoMachines(SyncTestCase):
         with beta.active():
             beta.record("2023-11-14", 1_700_000_050, "from beta")
             sync.run()
-            entries = cache.load_entries()
-            self.assertEqual(len(search.filter_scope(entries, "global")), 2)
-            self.assertEqual([e.cmd for e in search.filter_scope(entries, "host")], ["from beta"])
+
+            def recall(scope: search.Scope) -> list[str]:
+                return [search.command_from_line(line) for line in search.lines_for(scope)]
+
+            self.assertEqual(len(recall("global")), 2)
+            self.assertEqual(recall("host"), ["from beta"])
 
 
 class TestImmutability(SyncTestCase):

