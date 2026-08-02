@@ -432,7 +432,12 @@ multi-line command would appear as several unrelated candidates.
 
 - `--nth=2..` — match against the command only. Without it, typing `3d` matches
   the relative-time column and surfaces unrelated entries.
-- `--tiebreak=begin,index` — preserve newest-first when match scores tie.
+- `--tiebreak=index` — preserve newest-first when match scores tie, which for a
+  one-word query is nearly all of them. `begin,index` was tried first and does
+  the opposite: it ranks by where in the line the match starts, so a year-old
+  `sudo sync; …` sat above a three-minute-old `woswoar sync`. It also let the
+  right-aligned age column rank things, since fzf scores `begin` net of leading
+  whitespace and `1y` is padded one space wider than `10h`.
 - `--bind=ctrl-g/ctrl-h/ctrl-s:reload(woswoar list --scope …)` — switch scope
   without leaving the picker. This is why `list` exists as its own subcommand.
 

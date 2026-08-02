@@ -15,7 +15,7 @@ from woswoar import search, store
 from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
 
-from .support import MACHINE_ID, WoswoarTestCase
+from .support import MACHINE_ID, WoswoarTestCase, requires_fzf
 
 NOW = 1_800_000_000
 
@@ -150,6 +150,102 @@ class TestFzfArgv(unittest.TestCase):
     def test_no_dedup_propagates_into_the_reload_command(self) -> None:
         argv = search._fzf_argv("global", "", False)
         self.assertIn("--no-dedup", " ".join(a for a in argv if a.startswith("--bind=")))
+
+
+MINUTE, HOUR, DAY = 60, 3600, 86400
+
+#: The history from the report that #115 came out of, newest first -- which is
+#: the order `rank_rows` hands to fzf, so any deviation in the output below is
+#: fzf's ranking and nothing else. Every one of these matches "sync" equally
+#: well as far as fzf's score is concerned, which is the whole point: with the
+#: scores tied, the tiebreak decides the entire list.
+SYNC_HISTORY = [
+    (3 * MINUTE, "woswoar sync"),
+    (15 * MINUTE, "time woswoar sync"),
+    (10 * HOUR, "sync"),
+    (10 * HOUR, "synci"),
+    (10 * HOUR, "atuin sync"),
+    (10 * HOUR, "chmod a+x sync_claude_skills.py"),
+    (11 * DAY, "sync; echo 3 | sudo tee /proc/sys/vm/drop_caches"),
+    (2 * 30 * DAY, "sync_claude_skills.py"),
+    (2 * 30 * DAY, "atuin sync -f"),
+    (3 * 30 * DAY, "aimgr repo sync"),
+    (365 * DAY, "sudo sync; echo 3 > /proc/sys/vm/drop_caches"),
+    (365 * DAY, "atuin sync -h"),
+    (365 * DAY, "chezmoi sync"),
+    (365 * DAY, "time m clean && time m && time sync"),
+]
+
+
+@requires_fzf
+class TestRealFzfRanking(unittest.TestCase):
+    """The order fzf actually produces, out of the real binary.
+
+    `--filter` does the same match-and-sort without needing a terminal, so this
+    drives the argv Ctrl-R uses rather than a copy of it: a change to `--nth` or
+    `--tiebreak` reaches this test. Nothing here can be asserted against a
+    stand-in -- the behaviour under test is fzf's, not woswoar's.
+    """
+
+    def ordered(self, query: str) -> list[str]:
+        lines = search.render_rows([(NOW - age, cmd) for age, cmd in SYNC_HISTORY], now=NOW)
+        completed = subprocess.run(
+            [*search._fzf_argv("global", "", True), f"--filter={query}"],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [search.command_from_line(line) for line in completed.stdout.splitlines()]
+
+    def test_the_newest_match_comes_first(self) -> None:
+        self.assertEqual(self.ordered("sync")[0], "woswoar sync")
+
+    def test_an_old_command_does_not_outrank_a_recent_one_for_starting_sooner(self) -> None:
+        """The report: a year-old entry above the command actually wanted.
+
+        The pair is chosen so that only the tiebreak can separate them. The
+        year-old one matches *earlier* in its line -- offset 5 in `sudo sync`
+        against 8 in `woswoar sync` -- so under `begin` it wins however recent
+        the other is, and under `index` it cannot.
+        """
+        order = self.ordered("sync")
+        self.assertLess(
+            order.index("woswoar sync"),
+            order.index("sudo sync; echo 3 > /proc/sys/vm/drop_caches"),
+            "a year-old command outranked one from three minutes ago",
+        )
+
+    def test_the_width_of_the_time_column_does_not_rank(self) -> None:
+        """`atuin sync` and `atuin sync -h` match at the same offset.
+
+        What differs is the column in front: "1y" is right-aligned into four
+        characters and so carries one more leading space than "10h". fzf scores
+        `begin` as (match offset - leading whitespace), which turned that
+        padding into a ranking signal and put the year-old line first.
+        """
+        order = self.ordered("atuin sync")
+        self.assertLess(
+            order.index("atuin sync"),
+            order.index("atuin sync -h"),
+            "the padding of the age column decided the order",
+        )
+
+    def test_the_time_column_is_still_not_matched_against(self) -> None:
+        """The reason `--nth=2..` is there, asserted through fzf itself.
+
+        `TestFzfArgv` checks the flag is passed; this checks what it buys. "10h"
+        is the age of five entries in the fixture and a substring of no command
+        in it, so without the flag this query returns them and with it nothing.
+        """
+        completed = subprocess.run(
+            [*search._fzf_argv("global", "", True), "--filter=10h"],
+            input="\n".join(search.render_rows([(NOW - age, c) for age, c in SYNC_HISTORY], NOW))
+            + "\n",
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.stdout, "", "the relative-time column was matched against")
 
 
 class TestRecalledCommandIsInert(unittest.TestCase):
