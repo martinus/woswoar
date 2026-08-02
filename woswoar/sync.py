@@ -30,13 +30,13 @@ import subprocess
 import time
 import zlib
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import crypto, store
+from . import crypto, progress, store
 from .entry import make_inert
 from .errors import WoswoarError
 from .store import Machine
@@ -365,6 +365,29 @@ def name_for(host_id: str | None) -> Name:
         return Name(UNNAMED, known=False)
     name = store.host_name(host_id)
     return Name(make_inert(name), known=True) if name else Name(UNNAMED, known=False)
+
+
+def learn_names(known: Machine, host_ids: Iterable[str]) -> None:
+    """Open any `name.age` this machine has not read yet.
+
+    `name_for` reads the mirror `_merge_name` fills during a *merge*, which is
+    the right trade everywhere except the two places it matters most. `grant`
+    and `trust` are both asked about a machine that just enrolled, and a machine
+    that just enrolled is precisely one whose history has never been merged --
+    so the confirmation that widens access showed `(unnamed)`, and the name
+    turned up a sync later, once nobody was looking at it.
+
+    The sealed name is already in the tree by then: both callers fetch first,
+    and it is sealed to the recipients, this machine among them. So this is a
+    decrypt of something already present, once per machine ever, not a fetch.
+
+    It cannot fail loudly: `_merge_name` swallows a name it cannot open, which
+    is the correct answer for a machine that enrolled before this one and has
+    not granted since. `(unnamed)` beside a fingerprint is still true, and the
+    fingerprint was always the part being consented to.
+    """
+    for host_id in host_ids:
+        _merge_name(known, host_id)
 
 
 def is_repo() -> bool:
@@ -915,6 +938,10 @@ def trust_candidates() -> list[Candidate]:
         state = State.load()
         live = set(recipients())
 
+        # Every host, before the loop: `trust` is *always* about a machine this
+        # one has never merged, so without this it never had a name to show.
+        learn_names(known, store.repo_hosts())
+
         out: list[Candidate] = []
         for host_id in store.repo_hosts():
             if host_id == known.id:
@@ -1291,7 +1318,12 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
 
     # One pass for the whole host, not one per day.
 
-    for day, tails in sorted(fresh.items()):
+    # The first sync after an import is the long one: a day-key minted, sealed
+    # and signed per day, which at two years of history is where six of its six
+    # and a half seconds go.
+    progress.phase("sealing this machine's history")
+    for done, (day, tails) in enumerate(sorted(fresh.items())):
+        progress.tick(done, len(fresh), "days")
         # Before the manifest, not after. Refusing does not advance
         # `state.exported`, so a refused day comes back on every sync -- and
         # `read_manifest` forks `ssh-keygen -Y verify`. Checked afterwards, one
@@ -1400,9 +1432,12 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
 
 def merge(known: Machine, state: State, report: Report) -> None:
     """Decrypt every chunk from other hosts that we have not merged yet."""
-    for host_id in store.repo_hosts():
-        if host_id == known.id:
-            continue  # our own plaintext is already the source of truth
+    # Our own plaintext is already the source of truth, so it is dropped here
+    # rather than skipped in the loop: the phase names the machine being read,
+    # and `_merge_host` counts that machine's days underneath it.
+    others = [host for host in store.repo_hosts() if host != known.id]
+    for host_id in others:
+        progress.phase(f"reading history from {name_for(host_id).text}")
         report.hosts_seen.add(host_id)
         _merge_host(known, host_id, state, report)
         _merge_name(known, host_id)
@@ -1507,7 +1542,13 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # that is the difference between ~3.6s and nearly two minutes.
     # Names rather than `Chunk` objects, and paths built only for the chunks
     # actually read -- see `store.chunk_names` for what that is worth here.
-    for chunk_day in store.chunk_days(host_id):
+    #
+    # Materialised for its length alone, so the counter can say how far along a
+    # first sync is. An idle sync skips every one of these on the stamp check
+    # below, and never gets far enough into the wait for anything to be shown.
+    days = list(store.chunk_days(host_id))
+    for done, chunk_day in enumerate(days):
+        progress.tick(done, len(days), "days")
         key = f"{host_id}/{chunk_day}"
 
         # Read before the listing, not after: a chunk arriving between the two
@@ -1904,6 +1945,10 @@ def _resolve(*refs: str) -> list[str]:
 def _fetch_and_rebase(repo: Repo) -> bool:
     """Adopt the remote's history under ours; say whether we now match it.
 
+    Announced rather than counted: this is one `git fetch` over the network, so
+    there is nothing to be a fraction of, and a slow one here is a slow remote
+    rather than anything woswoar is doing.
+
     Fetch-then-rebase rather than ``git pull --rebase`` because the tracking ref
     may legitimately not exist: cloning an *empty* remote configures a branch
     pointing at nothing, which is the normal state for the first machine to
@@ -1924,6 +1969,7 @@ def _fetch_and_rebase(repo: Repo) -> bool:
     machine holding commits nobody else has would read as level and never
     publish them. Only where HEAD lands says anything.
     """
+    progress.phase("fetching from the remote")
     git("fetch", "--quiet", "origin")
     local, upstream = _resolve("HEAD", f"refs/remotes/origin/{repo.branch}")
     if not upstream:
@@ -1945,6 +1991,7 @@ def _fetch_and_rebase(repo: Repo) -> bool:
 
 def _push(repo: Repo) -> None:
     """Publish, retrying once if someone else pushed while we worked."""
+    progress.phase("publishing to the remote")
     try:
         git("push", "--quiet", "-u", "origin", repo.branch)
     except SyncError:
@@ -2302,6 +2349,7 @@ def readers() -> list[Reader]:
         except (WoswoarError, OSError):
             mine = ""
 
+        learn_names(store.machine(), {host for host in owners.values() if host})
         labelled = [(key, name_for(owners.get(key))) for key in enrolled]
         names = Counter(name.text for _, name in labelled if name.known)
         return [
@@ -2385,7 +2433,12 @@ def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
         sealed.append(store.name_seal(host_id))
 
     resealed = skipped = 0
-    for path in sealed:
+    # Two `age` invocations per file that is ours -- open, then seal to the new
+    # list -- and one file per day per machine. At two years that is where
+    # `grant`'s three seconds go, all of it after the last thing it printed.
+    progress.phase("re-sealing the day keys")
+    for done, path in enumerate(sealed):
+        progress.tick(done, len(sealed), "keys")
         if not path.is_file():
             continue
         try:

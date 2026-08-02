@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from woswoar import cache, crypto, search, store, sync
+from woswoar import cache, crypto, progress, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, main
 from woswoar.entry import Entry, format_line
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
@@ -589,6 +589,52 @@ class TestGrantConfirmation(SyncTestCase):
         with alpha.active():
             labels = {reader.label for reader in sync.readers()}
         self.assertIn("martinus@box", labels)
+
+    def test_a_machine_that_just_enrolled_is_named_before_it_has_synced(self) -> None:
+        """The name has to be there at the prompt, not one sync later.
+
+        `name_for` reads the mirror a *merge* fills, and a machine you are being
+        asked to grant is by definition one whose history you have never merged.
+        So the confirmation that widens access to everything showed `(unnamed)`,
+        and the name appeared afterwards, when nobody was being asked anything.
+        Reported from a real two-machine setup.
+
+        The sealed name is in the tree by now -- `readers` fetches -- so this is
+        a decrypt of something already present.
+        """
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        # Enrols, pushes its name, and merges nothing. Exactly the state a
+        # newcomer is in when someone turns to the old machine and runs `grant`.
+        self.machine("beta", display="martin@laptop")
+
+        with alpha.active():
+            labels = {reader.label for reader in sync.readers()}
+        self.assertIn("martin@laptop", labels, f"the newcomer is unnamed: {labels}")
+        self.assertNotIn(sync.UNNAMED, labels)
+
+    def test_trust_names_the_machine_it_is_asking_about(self) -> None:
+        """`trust` had it worse: it is *only* ever asked about an unmerged host.
+
+        Every candidate it listed was therefore `(unnamed)`, while README.md
+        showed a name in that very prompt.
+        """
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+
+        beta = self.machine("beta", display="martin@laptop")
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "cargo build")
+            sync.run()
+
+        with alpha.active():
+            labels = {c.label for c in sync.trust_candidates()}
+        self.assertEqual(labels, {"martin@laptop"})
 
     def test_a_key_with_no_name_yet_is_not_named_after_itself(self) -> None:
         """The fallback label used to be an abbreviation of the key.
@@ -4697,6 +4743,82 @@ class TestTheCommitIdentityIsStillPinned(SyncTestCase):
             report = sync.run()
             self.assertEqual(report.chunks_written, 1)
             self.assertFalse(report.pushed)
+
+
+class TestLongCommandsSayWhatTheyAreDoing(SyncTestCase):
+    """Reported from a real setup: "some commands take a long time and do not
+    print anything, so I don't know if they are doing something or hanging".
+
+    Measured at two years of history: a first sync is 6.5 s and a grant 3.2 s,
+    and neither wrote a character until it was finished. What a terminal shows
+    is `tests/test_progress.py`; this is about the calls being *made*, from the
+    loops where the time actually goes.
+    """
+
+    def days_of_history(self, alpha: Fake, days: int) -> None:
+        for day in range(days):
+            stamp = f"2024-{day // 28 + 1:02d}-{day % 28 + 1:02d}"
+            alpha.record(stamp, 1_700_000_000 + day * 86400, f"command on day {day}")
+
+    def test_a_first_sync_counts_the_days_it_is_sealing(self) -> None:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            self.days_of_history(alpha, 40)
+            with progress.recording() as said:
+                sync.run()
+
+        self.assertIn("phase:sealing this machine's history", said)
+        # The count has to move, or it is a spinner: a bar stuck at 0/40 says
+        # exactly as little as no bar at all.
+        ticks = [line for line in said if line.startswith("tick:")]
+        self.assertIn("tick:0/40 days", ticks)
+        self.assertIn("tick:39/40 days", ticks)
+
+    def test_merging_names_the_machine_it_is_reading(self) -> None:
+        """ "reading history from 'martin@laptop'" -- not "host 3f2a...".
+
+        The same fix that put a name in `grant`'s prompt puts one here, and this
+        is the one place a name is worth more than a fingerprint: nobody is
+        authorising anything, they are waiting.
+        """
+        alpha = self.machine("alpha", display="martin@desktop")
+        beta = self.machine("beta", display="martin@laptop")
+        with alpha.active():
+            self.days_of_history(alpha, 30)
+            sync.run()
+            sync.grant()
+        self.accept_everyone(beta)
+
+        with beta.active(), progress.recording() as said:
+            sync.run()
+
+        # beta is reading alpha, so it is alpha's name that has to appear.
+        self.assertIn("phase:reading history from martin@desktop", said)
+        self.assertIn("tick:0/30 days", said)
+
+    def test_grant_counts_the_keys_it_re_seals(self) -> None:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            self.days_of_history(alpha, 25)
+            sync.run()
+            with progress.recording() as said:
+                sync.grant()
+
+        self.assertIn("phase:re-sealing the day keys", said)
+        # 25 day keys plus this machine's sealed name.
+        self.assertIn("tick:0/26 keys", said)
+        self.assertIn("tick:25/26 keys", said)
+
+    def test_an_idle_sync_still_has_nothing_to_count(self) -> None:
+        """The timer runs this every minute; the loops must stay skipped."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            self.days_of_history(alpha, 5)
+            sync.run()
+            with progress.recording() as said:
+                sync.run()
+
+        self.assertEqual([line for line in said if line.startswith("tick:")], [])
 
 
 if __name__ == "__main__":
