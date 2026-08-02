@@ -219,6 +219,38 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+#: What `doctor` puts at the front of each line, plain and coloured.
+#:
+#: The plain forms are byte-for-byte what this printed before there was a
+#: coloured one, and they are what everything that is not a person sees: the
+#: suite asserts on `[FAIL] day keys`, and `woswoar doctor | grep FAIL` is a
+#: reasonable thing to have in a script. A tick that only a terminal renders
+#: must not become the thing those depend on.
+#:
+#: The coloured forms are one column wide rather than four or six, so the labels
+#: line up -- which the plain `[ok]`/`[FAIL]` never have.
+_PLAIN_MARKERS = {"ok": "[ok]", "fail": "[FAIL]", "info": "[--]"}
+_COLOUR_MARKERS = {
+    "ok": "\x1b[32m\u2714\x1b[0m",
+    "fail": "\x1b[31m\u2718\x1b[0m",
+    "info": "\x1b[2m\u00b7\x1b[0m",
+}
+
+
+def _markers(stream: object | None = None) -> dict[str, str]:
+    """Coloured markers for a terminal, the plain ones for anything else.
+
+    `NO_COLOR` is honoured because it costs one condition and someone always
+    has a reason -- a terminal that renders neither colour nor the glyphs, a log
+    being captured through a pty, a screen reader.
+    """
+    out = sys.stdout if stream is None else stream
+    watched = bool(getattr(out, "isatty", lambda: False)())
+    if watched and not os.environ.get("NO_COLOR"):
+        return _COLOUR_MARKERS
+    return _PLAIN_MARKERS
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
@@ -226,16 +258,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from . import crypto, deps, sync
 
     ok = True
+    marker = _markers()
 
     def check(label: str, good: bool, detail: str) -> None:
         """A pass/fail condition: failing means something needs fixing."""
         nonlocal ok
         ok = ok and good
-        print(f"[{'ok' if good else 'FAIL'}] {label:<12} {detail}")
+        print(f"{marker['ok' if good else 'fail']} {label:<12} {detail}")
 
     def info(label: str, detail: str) -> None:
         """Context that cannot fail, kept visually distinct from a real check."""
-        print(f"[--] {label:<12} {detail}")
+        print(f"{marker['info']} {label:<12} {detail}")
 
     bash = shutil.which("bash")
     version = ""

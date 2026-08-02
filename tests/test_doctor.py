@@ -8,11 +8,13 @@ would think to run it.
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import stat
 import unittest
 
+from woswoar import __main__ as main_module
 from woswoar import crypto
 
 from . import support
@@ -66,8 +68,6 @@ class TestDoctorWithABrokenAge(WoswoarTestCase):
         self.assertRegex(out, r"\[FAIL\] age")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 @requires_age
@@ -131,3 +131,57 @@ class TestAFastAgeIsNotFlagged(WoswoarTestCase):
         self.assertLess(crypto.startup_ms(), crypto.SLOW_MS)
         self.assertIn("[ok] age", support.run_cli("doctor").out)
         self.assertNotIn("ms to start. woswoar runs it", support.run_cli("doctor").out)
+class TestDoctorsMarkers(WoswoarTestCase):
+    """A tick for a person, the old text for everything else.
+
+    `[ok]`/`[FAIL]` is what the suite asserts on in a dozen places and what
+    `woswoar doctor | grep FAIL` in somebody's script depends on. A glyph only a
+    terminal renders must not become the thing those rest on, so the plain form
+    is unchanged and the coloured one appears only on a tty.
+    """
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    def test_a_pipe_gets_the_plain_markers(self) -> None:
+        self.assertEqual(main_module._markers(io.StringIO()), main_module._PLAIN_MARKERS)
+
+    def test_a_terminal_gets_a_green_tick_and_a_red_cross(self) -> None:
+        markers = main_module._markers(self.Tty())
+        self.assertEqual(markers, main_module._COLOUR_MARKERS)
+        self.assertIn("\u2714", markers["ok"])
+        self.assertIn("\u2718", markers["fail"])
+        self.assertTrue(markers["ok"].startswith("\x1b[32m"), "the tick is not green")
+        self.assertTrue(markers["fail"].startswith("\x1b[31m"), "the cross is not red")
+        self.assertTrue(all(value.endswith("\x1b[0m") for value in markers.values()))
+
+    def test_no_color_is_honoured_on_a_terminal(self) -> None:
+        os.environ["NO_COLOR"] = "1"
+        self.addCleanup(lambda: os.environ.pop("NO_COLOR", None))
+        self.assertEqual(main_module._markers(self.Tty()), main_module._PLAIN_MARKERS)
+
+    def test_the_run_that_tests_and_scripts_see_is_unchanged(self) -> None:
+        """Captured output is not a tty, so this is the real regression guard."""
+        out = support.run_cli("doctor").out
+        self.assertIn("[ok] ", out)
+        self.assertNotIn("\x1b[", out)
+        self.assertNotIn("\u2714", out)
+
+    def test_the_coloured_markers_are_one_column_wide(self) -> None:
+        """Which is why the labels line up, and `[ok]` versus `[FAIL]` never
+        did -- four characters against six."""
+        widths = {
+            len(
+                value.replace("\x1b[32m", "")
+                .replace("\x1b[31m", "")
+                .replace("\x1b[2m", "")
+                .replace("\x1b[0m", "")
+            )
+            for value in main_module._COLOUR_MARKERS.values()
+        }
+        self.assertEqual(widths, {1})
+
+
+if __name__ == "__main__":
+    unittest.main()
