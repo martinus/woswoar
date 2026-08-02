@@ -44,7 +44,6 @@ gives about 8ms of it back.
 from __future__ import annotations
 
 import hashlib
-from itertools import chain
 from pathlib import Path
 from typing import NamedTuple
 
@@ -99,6 +98,11 @@ class FileMeta(NamedTuple):
     #: lines are ever consumed.
     offset: int
     head: bytes
+    #: Which machine's log this is. One per *file*, which is what it always was
+    #: -- the header has carried it since the format existed, and `loads` used
+    #: to copy it onto all 54,000 entries so that `entries()` could hand it back
+    #: unchanged.
+    host: str = ""
 
 
 class Cache:
@@ -115,7 +119,13 @@ class Cache:
         #: where it is checked before anything is built. Carrying it on the
         #: object as well meant a stale cache could be constructed and only
         #: then rejected, and left two things to keep in step.
-        self.files: dict[str, list[Entry]] = {}
+        #: relpath -> the entry fields of that file, flat, `_FIELDS_PER_ENTRY`
+        #: to a row and in the order `dumps` writes them. Not `Entry` objects:
+        #: building 54,804 seven-field namedtuples cost 25 ms of the 39 ms it
+        #: took to read a real history's cache, and Ctrl-R displays two of the
+        #: seven fields. `entries()` still builds them for whoever wants them;
+        #: `stamps_and_commands` gets the picker what it needs from two slices.
+        self.files: dict[str, list[str]] = {}
         self.meta: dict[str, FileMeta] = {}
         #: Entries parsed since the last write. Not persisted as a live count --
         #: :func:`save` zeroes it -- so it measures exactly the work that would
@@ -123,7 +133,63 @@ class Cache:
         self.unsaved = 0
 
     def entries(self) -> list[Entry]:
-        return list(chain.from_iterable(self.files.values()))
+        """Every entry as an `Entry`. Pays the full construction cost.
+
+        `session` and `cwd` repeat enormously -- a few dozen sessions and a
+        handful of directories across a whole history -- so equal values are
+        shared rather than allocated per entry. Measured on 52,000 entries: no
+        difference in time, and 30% less memory retained. One table for the
+        whole cache, because the same values recur across days.
+        """
+        shared: dict[str, str] = {}
+        share = shared.setdefault
+        out: list[Entry] = []
+        for relpath, flat in self.files.items():
+            if not flat:
+                continue
+            host = self.meta[relpath].host
+            count = len(flat) // _FIELDS_PER_ENTRY
+            out.extend(
+                map(
+                    tuple.__new__,
+                    (Entry,) * count,
+                    zip(
+                        map(int, flat[0::6]),
+                        (host,) * count,
+                        map(share, flat[1::6], flat[1::6]),
+                        map(share, flat[2::6], flat[2::6]),
+                        map(int, flat[3::6]),
+                        map(int, flat[4::6]),
+                        flat[5::6],
+                        strict=True,
+                    ),
+                )
+            )
+        return out
+
+    def stamps_and_commands(self, hosts: set[str] | None = None) -> tuple[list[str], list[str]]:
+        """The two columns the picker shows, without building anything else.
+
+        Returned as parallel lists of *strings*: the timestamp is converted once,
+        by the caller that sorts on it, rather than for every entry of a history
+        that is mostly not going to be looked at.
+
+        ``hosts`` narrows to those machines, which is free -- the host is a
+        property of the file, so it is one dict lookup per file rather than a
+        test per entry.
+        """
+        stamps: list[str] = []
+        commands: list[str] = []
+        for relpath, flat in self.files.items():
+            if hosts is not None and self.meta[relpath].host not in hosts:
+                continue
+            stamps += flat[0::6]
+            commands += flat[5::6]
+        return stamps, commands
+
+    def sessions(self) -> list[str]:
+        """The session column, in the same order as `stamps_and_commands`."""
+        return [value for flat in self.files.values() for value in flat[1::6]]
 
 
 def _fingerprint(path: Path) -> bytes:
@@ -134,8 +200,25 @@ def _fingerprint(path: Path) -> bytes:
         return b""
 
 
-def _read_from(path: Path, host: str, offset: int) -> tuple[list[Entry], int]:
-    """Parse whole lines starting at ``offset``.
+def fields_of(entry: Entry) -> tuple[str, ...]:
+    """One entry as the field strings the cache stores, in `dumps`'s order.
+
+    `host` is not among them: it is one value per *file* and lives in the
+    header, which is why the cache no longer carries a copy of it on every one
+    of a hundred thousand rows.
+    """
+    return (
+        str(entry.ts),
+        entry.session,
+        entry.cwd,
+        str(entry.exit_code),
+        str(entry.duration_ms),
+        entry.cmd,
+    )
+
+
+def _read_from(path: Path, host: str, offset: int) -> tuple[list[str], int]:
+    """Parse whole lines starting at ``offset``, as flat entry fields.
 
     The byte-level "read the tail, stop at the last complete line" step lives in
     store, shared with sync's export -- both read these same files and must
@@ -161,26 +244,36 @@ def _read_from(path: Path, host: str, offset: int) -> tuple[list[Entry], int]:
     #
     # Only newly-read lines pay for it -- the cache holds the inert form -- so
     # the steady-state cost on the Ctrl-R path is zero.
-    entries = [
-        e
-        for e in (parse_line(line, host, inert=True) for line in text.splitlines())
-        if e is not None
-    ]
-    return entries, new_offset
+    flat: list[str] = []
+    for line in text.splitlines():
+        entry = parse_line(line, host, inert=True)
+        if entry is not None:
+            # Flattened straight away: the cache holds columns, and only
+            # newly-read lines come through here, so this is off the Ctrl-R
+            # path in the steady state.
+            flat += fields_of(entry)
+    return flat, new_offset
 
 
 def dumps(cache: Cache) -> bytes:
     """Serialise `cache`. See the module docstring for the format."""
     parts = [_MAGIC]
-    for relpath, entries in cache.files.items():
+    for relpath, flat in cache.files.items():
         meta = cache.meta[relpath]
-        host = entries[0].host if entries else ""
+        count = len(flat) // _FIELDS_PER_ENTRY
         rows = [
-            _FIELD.join((str(e.ts), e.session, e.cwd, str(e.exit_code), str(e.duration_ms), e.cmd))
-            for e in entries
+            _FIELD.join(flat[i : i + _FIELDS_PER_ENTRY])
+            for i in range(0, len(flat), _FIELDS_PER_ENTRY)
         ]
         header = _FIELD.join(
-            (relpath, host, str(meta.size), str(meta.mtime_ns), str(meta.offset), meta.head.hex())
+            (
+                relpath,
+                meta.host,
+                str(meta.size),
+                str(meta.mtime_ns),
+                str(meta.offset),
+                meta.head.hex(),
+            )
         )
         chunk = _RECORD.join([header, *rows])
 
@@ -195,10 +288,10 @@ def dumps(cache: Cache) -> bytes:
         # must never change what you see. Omitted, the file is simply re-parsed
         # every run -- correct, self-healing, and costing one file's parse on a
         # history that should never contain one.
-        expected_fields = (len(entries) + 1) * (_FIELDS_PER_ENTRY - 1)
+        expected_fields = (count + 1) * (_FIELDS_PER_ENTRY - 1)
         if (
             chunk.count(_FIELD) != expected_fields
-            or chunk.count(_RECORD) != len(entries)
+            or chunk.count(_RECORD) != count
             or _FILE in chunk
         ):
             continue
@@ -213,54 +306,42 @@ def loads(blob: bytes) -> Cache:
     number, invalid UTF-8 -- comes out as an exception. Nothing here can execute
     what it reads.
 
-    The shape of the loop is load-bearing, not style. Splitting each file's
-    body once and striding the flat list, then building entries with
-    ``tuple.__new__`` through ``zip``, keeps the whole thing in C: it measured
-    29ms against 37ms for the obvious per-row list comprehension, which is the
-    difference between matching pickle and losing to it.
+    What it does *not* do is build `Entry` objects. Each file's body becomes one
+    flat list of field strings, which is a single `str.split` in C. Measured on
+    a real 54,804-command history: 39 ms to build the namedtuples here, 14 ms to
+    stop at the columns. `Cache.entries` still builds them for callers that want
+    them, and `Cache.stamps_and_commands` skips them for the caller that does
+    not -- which is Ctrl-R, the reason this file exists.
+
+    The numeric fields are left as strings too. They are validated on the way
+    *out*, by whichever accessor converts them; a field that is not a number
+    therefore surfaces as a rebuild rather than a traceback, which is what every
+    other kind of damage to this file already does.
     """
     chunks = blob.decode("utf-8").split(_FILE)
     if chunks[0] != _MAGIC:
         raise ValueError("not a woswoar cache of this version")
 
     cache = Cache()
-    # `session` and `cwd` repeat enormously -- a few dozen sessions and a
-    # handful of directories across a whole history -- so equal values are
-    # shared rather than allocated per entry. Measured on 52,000 entries: no
-    # difference in time, and 30% less memory retained. One table for the whole
-    # file, because the same values recur across days.
-    shared: dict[str, str] = {}
-    share = shared.setdefault
     for chunk in chunks[1:]:
         header, _, body = chunk.partition(_RECORD)
         relpath, host, size, mtime_ns, offset, head = header.split(_FIELD)
         cache.meta[relpath] = FileMeta(
-            size=int(size), mtime_ns=int(mtime_ns), offset=int(offset), head=bytes.fromhex(head)
+            size=int(size),
+            mtime_ns=int(mtime_ns),
+            offset=int(offset),
+            head=bytes.fromhex(head),
+            host=host,
         )
         if not body:
             cache.files[relpath] = []
             continue
 
         flat = body.replace(_RECORD, _FIELD).split(_FIELD)
-        count, remainder = divmod(len(flat), _FIELDS_PER_ENTRY)
+        remainder = len(flat) % _FIELDS_PER_ENTRY
         if remainder:
             raise ValueError(f"{relpath}: {len(flat)} fields is not a whole number of entries")
-        cache.files[relpath] = list(
-            map(
-                tuple.__new__,
-                (Entry,) * count,
-                zip(
-                    map(int, flat[0::6]),
-                    (host,) * count,
-                    map(share, flat[1::6], flat[1::6]),
-                    map(share, flat[2::6], flat[2::6]),
-                    map(int, flat[3::6]),
-                    map(int, flat[4::6]),
-                    flat[5::6],
-                    strict=True,
-                ),
-            )
-        )
+        cache.files[relpath] = flat
     return cache
 
 
@@ -293,21 +374,22 @@ def refresh(cache: Cache) -> bool:
         rewritten = known is not None and (stat.st_size < known.offset or head != known.head)
         offset = 0 if (known is None or rewritten) else known.offset
 
-        entries, new_offset = _read_from(log.path, log.host_id, offset)
+        flat, new_offset = _read_from(log.path, log.host_id, offset)
         if offset == 0:
             # Parsed from the start, so this replaces whatever was held before --
             # which is also how a rewritten file gets its stale entries dropped.
-            cache.files[log.relpath] = entries
+            cache.files[log.relpath] = flat
         else:
-            cache.files.setdefault(log.relpath, []).extend(entries)
+            cache.files.setdefault(log.relpath, []).extend(flat)
 
         cache.meta[log.relpath] = FileMeta(
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             offset=new_offset,
             head=head,
+            host=log.host_id,
         )
-        cache.unsaved += len(entries)
+        cache.unsaved += len(flat) // _FIELDS_PER_ENTRY
         changed = True
 
     for gone in set(cache.meta) - seen:
@@ -327,12 +409,22 @@ def save(cache: Cache) -> None:
         return
 
 
-def load_entries() -> list[Entry]:
-    """The one call search needs: load, incrementally update, persist, flatten."""
+def load_columns() -> Cache:
+    """The cache, refreshed and persisted, without building any `Entry`.
+
+    What `load_entries` does minus its last step. Ctrl-R takes this route and
+    asks the `Cache` for the two columns it displays; anything that wants whole
+    entries calls `load_entries` and pays for them.
+    """
     cache = load()
     refresh(cache)
     # Always write the first build -- that is what makes every later run cheap.
     # After that, defer until enough has accumulated to be worth the ~48 ms.
     if cache.unsaved and (cache.unsaved >= _SAVE_THRESHOLD or not store.cache_file().exists()):
         save(cache)
-    return cache.entries()
+    return cache
+
+
+def load_entries() -> list[Entry]:
+    """Load, incrementally update, persist, and build every `Entry`."""
+    return load_columns().entries()

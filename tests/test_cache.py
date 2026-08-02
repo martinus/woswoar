@@ -201,15 +201,25 @@ class TestTheOnDiskFormat(WoswoarTestCase):
     RELPATH = "hosts/abc/2026-07-29.tsv"
 
     def sample(self, entries: list[Entry]) -> cache.Cache:
+        """A cache holding these entries, in the columnar form it stores.
+
+        The tests are written in `Entry` because that is what the format is
+        *about*; the flattening is the storage detail, so it lives here rather
+        than in every test.
+        """
         built = cache.Cache()
-        built.files[self.RELPATH] = entries
+        built.files[self.RELPATH] = [value for entry in entries for value in cache.fields_of(entry)]
         built.meta[self.RELPATH] = cache.FileMeta(
-            size=10, mtime_ns=20, offset=30, head=b"\x00\xff\x01"
+            size=10,
+            mtime_ns=20,
+            offset=30,
+            head=b"\x00\xff\x01",
+            host=entries[0].host if entries else MACHINE_ID,
         )
         return built
 
     def roundtrip(self, entries: list[Entry]) -> list[Entry]:
-        return cache.loads(cache.dumps(self.sample(entries))).files[self.RELPATH]
+        return cache.loads(cache.dumps(self.sample(entries))).entries()
 
     def test_file_metadata_survives(self) -> None:
         built = self.sample([make_entry(1, "git status")])
@@ -245,8 +255,10 @@ class TestTheOnDiskFormat(WoswoarTestCase):
 
     def test_one_poisoned_file_does_not_cost_the_others(self) -> None:
         built = self.sample([make_entry(1, "echo \x00 marker")])
-        built.files["hosts/abc/2026-07-30.tsv"] = [make_entry(2, "git status")]
-        built.meta["hosts/abc/2026-07-30.tsv"] = cache.FileMeta(1, 2, 3, b"")
+        built.files["hosts/abc/2026-07-30.tsv"] = [
+            value for entry in [make_entry(2, "git status")] for value in cache.fields_of(entry)
+        ]
+        built.meta["hosts/abc/2026-07-30.tsv"] = cache.FileMeta(1, 2, 3, b"", MACHINE_ID)
         restored = cache.loads(cache.dumps(built))
         self.assertEqual(list(restored.files), ["hosts/abc/2026-07-30.tsv"])
 
@@ -268,8 +280,10 @@ class TestTheOnDiskFormat(WoswoarTestCase):
         trip passes whether the check runs or not.
         """
         original = cache.Cache()
-        original.files["hosts/abc/2026-07-29.tsv"] = [make_entry(1, "git status")]
-        original.meta["hosts/abc/2026-07-29.tsv"] = cache.FileMeta(0, 0, 0, b"")
+        original.files["hosts/abc/2026-07-29.tsv"] = [
+            value for entry in [make_entry(1, "git status")] for value in cache.fields_of(entry)
+        ]
+        original.meta["hosts/abc/2026-07-29.tsv"] = cache.FileMeta(0, 0, 0, b"", MACHINE_ID)
         blob = cache.dumps(original)
 
         self.assertEqual(cache.loads(blob).files, original.files)
@@ -287,7 +301,7 @@ class TestTheOnDiskFormat(WoswoarTestCase):
         """
         built = self.sample([make_entry(1, "git status"), make_entry(2, "ninja")])
         blob = cache.dumps(built)
-        self.assertEqual(len(cache.loads(blob).files[self.RELPATH]), 2)
+        self.assertEqual(len(cache.loads(blob).entries()), 2)
 
         short = blob[: blob.rindex(b"\x00")]  # drop the final field
         with self.assertRaises(ValueError):
@@ -295,8 +309,10 @@ class TestTheOnDiskFormat(WoswoarTestCase):
 
     def test_a_truncated_file_is_refused_rather_than_half_read(self) -> None:
         original = cache.Cache()
-        original.files["hosts/abc/2026-07-29.tsv"] = [make_entry(1, "git status")]
-        original.meta["hosts/abc/2026-07-29.tsv"] = cache.FileMeta(0, 0, 0, b"")
+        original.files["hosts/abc/2026-07-29.tsv"] = [
+            value for entry in [make_entry(1, "git status")] for value in cache.fields_of(entry)
+        ]
+        original.meta["hosts/abc/2026-07-29.tsv"] = cache.FileMeta(0, 0, 0, b"", MACHINE_ID)
         blob = cache.dumps(original)
         with self.assertRaises((ValueError, IndexError)):
             cache.loads(blob[: len(blob) // 2])
