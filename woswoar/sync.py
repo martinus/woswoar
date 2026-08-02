@@ -923,6 +923,22 @@ class Candidate(NamedTuple):
         return repr(self.label)
 
 
+def others_enrolled() -> bool:
+    """Is any machine but this one enrolled here?
+
+    Its own function because the answer decides whether a human is told about a
+    step they must take on another machine, and because working out "this one"
+    can fail: `_readers` wraps the same call in a `try` and says why. Failing
+    soft here means erring towards *mentioning* the step, which costs a sentence
+    someone does not need -- the other direction costs them the setup.
+    """
+    try:
+        mine = _own_recipient(store.machine())
+    except (WoswoarError, OSError):
+        mine = ""
+    return any(key != mine for key in recipients())
+
+
 def _refresh() -> None:
     """Take the remote's view, under a lock the caller already holds.
 
@@ -2359,21 +2375,22 @@ def readers() -> list[Reader]:
         return _readers()
 
 
-def _readers() -> list[Reader]:
+def _readers(owners: dict[str, str] | None = None) -> list[Reader]:
     """The list itself, assuming the caller holds the lock and has fetched.
 
     Split from `readers` for `newcomers`, which needs this and
-    `_trust_candidates` from one fetch rather than two.
+    `_trust_candidates` from one fetch rather than two. `owners` is passed by a
+    caller that has already scanned every `signer.pub`, for the same reason.
     """
     granted = set(State.load().granted)
     enrolled = recipients()
-    owners = _host_owners()
+    owners = _host_owners() if owners is None else owners
 
     # Not fatal if this machine's own key cannot be worked out: the list is
     # still true, it just loses the "(this machine)" note. `grant` is the
     # command someone runs *because* something is wrong with enrolment.
     try:
-        mine = crypto.recipient_for(identity_path(store.machine())).strip()
+        mine = _own_recipient(store.machine())
     except (WoswoarError, OSError):
         mine = ""
 
@@ -2409,13 +2426,23 @@ class Newcomer(NamedTuple):
     what a machine that is not yours looks like.
     """
 
-    label: str
-    #: The age recipient it reads with. None when nothing in the repo ties this
-    #: host to a live recipient -- which `trust_candidates` already refuses.
+    #: The age recipient it reads with. None for a host publishing a signer this
+    #: machine cannot tie to any recipient it has -- two host directories naming
+    #: one owner, where `_host_owners` keeps the first.
     reader: Reader | None
     #: The signing key it publishes with. None for a machine that enrolled but
     #: has never pushed a `signer.pub`.
     candidate: Candidate | None
+
+    @property
+    def label(self) -> str:
+        """Both halves resolve the same name for the same host, so either does."""
+        return self.candidate.label if self.candidate is not None else self._reader.label
+
+    @property
+    def _reader(self) -> Reader:
+        assert self.reader is not None, "a Newcomer has a reader or a candidate"
+        return self.reader
 
     @property
     def needs_grant(self) -> bool:
@@ -2427,15 +2454,52 @@ class Newcomer(NamedTuple):
 
     @property
     def changed_key(self) -> bool:
-        """Re-enrolled, or someone rewriting the repository. Never guessed at."""
+        """Re-enrolled, or someone rewriting the repository. Never guessed at.
+
+        Kept apart from `needs_grant` and `needs_trust` by every caller, because
+        a machine can be *both* new to read and changed to sign -- which is the
+        ordinary state on a machine that has just joined, where TOFU has pinned
+        every peer and `granted` is still empty. Listing such a machine among
+        the newcomers printed its unpinned new key under the words "already
+        accepted here", while the same screen said its key had changed.
+        """
         return self.candidate is not None and self.candidate.changed
+
+    @property
+    def shares_name(self) -> bool:
+        """Another enrolled key carries this name too.
+
+        Legitimate -- two machines really can both be `martin@laptop` -- and also
+        exactly what a key somebody else added looks like. `grant` has said this
+        out loud since it existed; `accept` widens read access on the same
+        evidence, so it cannot be the quieter of the two.
+        """
+        return self.reader is not None and self.reader.shares_name
 
     def display_name(self) -> str:
         """See `Reader.display_name`: never print `label` directly."""
         return repr(self.label)
 
 
-def newcomers() -> list[Newcomer]:
+class Pending(NamedTuple):
+    """What `accept` has left to do, and the list it was decided against.
+
+    `enrolled` is here because `grant(approved=...)` means "the list a human at
+    this machine agreed to", and it refuses if its own fetch disagrees. Getting
+    that list by asking again *after* the prompt makes the refusal unable to
+    fire for the window it exists to cover: a machine that enrols while the
+    prompt is on screen is picked up by both reads, they agree, and it is sealed
+    into the whole history without ever having been shown. So the list travels
+    with the machines it was shown beside, from the one fetch that produced it.
+    """
+
+    machines: list[Newcomer]
+    #: Every enrolled recipient at the moment `machines` was computed -- not
+    #: only the ones with something to decide. `grant` re-seals to all of them.
+    enrolled: list[str]
+
+
+def newcomers() -> Pending:
     """Every machine `accept` has something to do about, from one fetch.
 
     Own machine excluded -- `_trust_candidates` drops it already, and a reader
@@ -2445,38 +2509,34 @@ def newcomers() -> list[Newcomer]:
     """
     with lock():
         _refresh()
-        by_host = {c.host_id: c for c in _trust_candidates()}
+        # One scan of every `signer.pub`, shared by both halves. Built here and
+        # passed down because `_readers` would otherwise build its own: the
+        # measurement in `_host_owners` is 0.35 ms at five machines and 89 ms at
+        # a hundred, and `accept` was paying it three times over.
         owners = _host_owners()
-        # Recipient -> host, inverted so a Reader can find its Candidate. A
-        # recipient with no host directory has nothing to pair with and cannot
-        # be trusted anyway, so it is carried with `candidate=None` and shows up
-        # as grant-only.
-        readers_by_host: dict[str, Reader] = {}
-        loose: list[Reader] = []
-        for reader in _readers():
-            host = owners.get(reader.key)
-            if host is None:
-                loose.append(reader)
-            else:
-                readers_by_host[host] = reader
+        by_host = {c.host_id: c for c in _trust_candidates()}
 
         out: list[Newcomer] = []
-        for host_id, candidate in by_host.items():
-            paired = readers_by_host.pop(host_id, None)
-            out.append(
-                Newcomer(
-                    label=candidate.label,
-                    reader=paired,
-                    candidate=candidate,
-                )
-            )
-        # Enrolled, but publishing nothing this machine can be asked to believe:
-        # granting is still a real decision, so it is still offered.
-        for reader in [*readers_by_host.values(), *loose]:
-            if not reader.is_mine:
-                out.append(Newcomer(label=reader.label, reader=reader, candidate=None))
+        enrolled = _readers(owners)
+        for reader in enrolled:
+            # `pop`, so what is left in `by_host` is exactly the hosts no reader
+            # claimed. `""` is never a host id, so an unpaired recipient misses.
+            candidate = by_host.pop(owners.get(reader.key, ""), None)
+            # Our own machine is not a newcomer to itself. It has no candidate
+            # either -- `_trust_candidates` drops it -- so this is the same test.
+            if candidate is None and reader.is_mine:
+                continue
+            out.append(Newcomer(reader=reader, candidate=candidate))
 
-        return [n for n in out if n.needs_grant or n.needs_trust or n.changed_key]
+        # Publishing a signer, but tied to no recipient this machine can see.
+        # Still offered: trusting it is a real decision, and refusing to show it
+        # would hide the machine rather than the problem.
+        out += [Newcomer(reader=None, candidate=c) for c in by_host.values()]
+
+        return Pending(
+            machines=[n for n in out if n.needs_grant or n.needs_trust or n.changed_key],
+            enrolled=[reader.key for reader in enrolled],
+        )
 
 
 class _AccessChange(NamedTuple):

@@ -16,7 +16,7 @@ from .entry import make_inert
 from .errors import WoswoarError
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
-    from .sync import Reader
+    from .sync import Reader, ReencryptReport
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
 #: used to say so in two independently worded paragraphs.
@@ -415,14 +415,26 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("\nNext: 'woswoar sync'.")
     else:
         print()
-        report = sync.run()
-        print(
-            f"published {report.lines_exported} line(s) of this machine's history; "
-            f"merged {report.lines_imported} line(s) from {len(report.hosts_seen)} other machine(s)"
-        )
+        try:
+            report = sync.run()
+        except WoswoarError as exc:
+            # The join itself is done and durable by this point -- the identity
+            # is saved, the repo is cloned, the peers are pinned. A remote that
+            # blinked must not make all of that report failure, because the
+            # obvious response to a failed `init` is to run it again.
+            print(f"joined, but the first sync failed:\n  {exc}", file=sys.stderr)
+            print("Nothing is lost; run 'woswoar sync' when the remote is reachable.")
+        else:
+            print(
+                f"published {report.lines_exported} line(s) of this machine's history; "
+                f"merged {report.lines_imported} line(s) from "
+                f"{len(report.hosts_seen)} other machine(s)"
+            )
 
-    others = [key for key in sync.recipients() if key != crypto.recipient_for(identity).strip()]
-    if others:
+    # Asked of `sync`, which already knows how to fail softly at working out
+    # this machine's own key: open-coding `crypto.recipient_for` here turned an
+    # unreadable identity into a failed `init` that had actually succeeded.
+    if sync.others_enrolled():
         # The step that is easy to miss, because it happens somewhere else. Said
         # in terms of what is missing rather than of the commands: `accept` is
         # one thing to run, and it names both halves itself.
@@ -658,7 +670,20 @@ def cmd_grant(args: argparse.Namespace) -> int:
     if new and not _confirm(f"Grant {len(new)} new machine(s) full access?", args.yes):
         return 1
 
-    report = sync.grant(approved=[reader.key for reader in readers])
+    _report_reseal(sync.grant(approved=[reader.key for reader in readers]))
+    return 0
+
+
+def _report_reseal(report: ReencryptReport, waiting: bool = True) -> None:
+    """Say what re-sealing did. Shared, because the half that is easy to omit
+    is the half that matters.
+
+    `skipped` is what distinguishes "nothing needed doing" from "this machine
+    could not do it" -- the state a *newly joined* machine is in, which is
+    exactly where someone lands after being told to run this. `accept` reported
+    only `resealed`, so on that machine it said "re-sealed 0 key file(s), so
+    they can read the older history", which is false in both halves.
+    """
     if report.resealed or report.skipped:
         print(f"\nre-sealed {report.resealed} key file(s)")
     else:
@@ -667,7 +692,8 @@ def cmd_grant(args: argparse.Namespace) -> int:
         print("\nnothing to do: every key is already sealed to these machines")
     if report.pushed:
         print("published to the remote")
-        print("\nOn each machine that was waiting, run:  woswoar sync")
+        if waiting:
+            print("\nOn each machine that was waiting, run:  woswoar sync")
     else:
         print("no remote configured, so nothing was published")
 
@@ -681,7 +707,6 @@ def cmd_grant(args: argparse.Namespace) -> int:
             "those instead.",
             file=sys.stderr,
         )
-    return 0
 
 
 def cmd_revoke(args: argparse.Namespace) -> int:
@@ -812,12 +837,17 @@ def cmd_accept(args: argparse.Namespace) -> int:
     from . import crypto, sync
 
     pending = sync.newcomers()
-    if not pending:
+    if not pending.machines:
         print("nothing to accept; every machine here is already granted and trusted")
         return 0
 
-    changed = [n for n in pending if n.changed_key]
-    fresh = [n for n in pending if n.needs_grant or n.needs_trust]
+    # A partition, not two overlapping filters. A machine can be new to read
+    # *and* changed to sign -- the ordinary state on a machine that has just
+    # joined, where TOFU pinned every peer and nothing has been granted yet --
+    # and listing it among the newcomers printed its unpinned new key under
+    # "already accepted here" on the same screen that said its key had changed.
+    changed = [n for n in pending.machines if n.changed_key]
+    fresh = [n for n in pending.machines if not n.changed_key]
 
     if not fresh:
         print(
@@ -831,7 +861,11 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
     print(f"{len(fresh)} machine(s) not yet accepted here:\n")
     for machine in fresh:
-        print(f"  {machine.display_name()}")
+        # `shares_name` is why this cannot just print the name: two machines
+        # really can both be `martin@laptop`, and so can a key someone else
+        # added. `grant` has said this since it existed.
+        note = "   (SAME NAME AS ANOTHER KEY)" if machine.shares_name else ""
+        print(f"  {machine.display_name()}{note}")
         if machine.reader is not None:
             said = "reads with" if machine.needs_grant else "already reads your history"
             print(f"      {said:<28}{machine.reader.fingerprint}")
@@ -877,21 +911,31 @@ def cmd_accept(args: argparse.Namespace) -> int:
         # Deliberately not part of the prompt above. Accepting a *new* machine
         # and accepting a new key for one already accepted are different
         # decisions, and rolling them together is how the second gets made by
-        # someone answering the first.
-        print(
-            f"\nSeparately, {len(changed)} machine(s) changed their signing key. That is not"
-            "\npart of this and needs:  woswoar trust --replace"
-        )
+        # someone answering the first. Both fingerprints, as `trust --replace`
+        # shows them: which key is being left behind is half the question.
+        print(f"\nSeparately, {len(changed)} machine(s) changed their signing key:\n")
+        for machine in changed:
+            print(f"  {machine.display_name()}")
+            if machine.candidate is not None:
+                print(f"      now signs with              {machine.candidate.fingerprint}")
+                print(f"      accepted here              {machine.candidate.pinned_fingerprint}")
+        print("\nThat is not part of this, and needs:  woswoar trust --replace")
 
     if not _confirm(f"Accept {len(fresh)} machine(s)?", args.yes):
         return 1
 
     if granting:
-        report = sync.grant(approved=[reader.key for reader in sync.readers()])
-        print(f"\nre-sealed {report.resealed} key file(s), so they can read the older history")
+        # `pending.enrolled`, from the fetch that produced what was on screen --
+        # never a fresh `readers()` call. `grant` refuses when its own fetch
+        # disagrees with what a human agreed to, and asking again *after* the
+        # prompt makes that refusal unable to fire for the window it exists to
+        # cover: a machine enrolling while the prompt is up would be picked up
+        # by both reads, they would agree, and it would be sealed into the whole
+        # history without ever having been shown.
+        _report_reseal(sync.grant(approved=pending.enrolled), waiting=False)
     if trusting:
         sync.trust([n.candidate for n in trusting if n.candidate is not None])
-        print(f"accepted the history published by {len(trusting)} machine(s)")
+        print(f"\naccepted the history published by {len(trusting)} machine(s)")
 
     print("\nNext: 'woswoar sync' to exchange history with them.")
     return 0
