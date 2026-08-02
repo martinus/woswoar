@@ -4745,6 +4745,307 @@ class TestTheCommitIdentityIsStillPinned(SyncTestCase):
             self.assertFalse(report.pushed)
 
 
+class TestAcceptIsGrantAndTrustAtOnce(SyncTestCase):
+    """One command for "that machine is mine", which is the whole of setup.
+
+    `grant` and `trust` answer genuinely different questions and stay separate
+    commands. What they were not is something a person adding their second
+    laptop should have to hold in their head, and both being needed -- one of
+    them on *every* machine you already own -- is what made the setup feel like
+    too much.
+    """
+
+    def two_machines(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "history from before beta existed")
+            sync.run()
+
+        beta = self.machine("beta", display="martin@laptop")
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "history beta published itself")
+            sync.run()
+        return alpha, beta
+
+    def test_one_command_does_what_grant_and_trust_did(self) -> None:
+        alpha, beta = self.two_machines()
+
+        code, out, _ = self.run_cli(alpha, "accept", "--yes")
+        self.assertEqual(code, 0, out)
+
+        # Both halves, checked by what each machine can actually see afterwards
+        # rather than by what the command printed.
+        with alpha.active():
+            sync.run()
+            self.assertIn("history beta published itself", alpha.commands())
+        with beta.active():
+            sync.run()
+            self.assertIn("history from before beta existed", beta.commands())
+
+    def test_it_names_both_keys_and_both_things_it_does(self) -> None:
+        """The prompt may get shorter; it may not get vaguer.
+
+        Two keys really are involved and they are checked with different
+        commands, so both fingerprints and both check lines have to be on
+        screen -- one of them being unfamiliar is what a machine that is not
+        yours looks like.
+        """
+        alpha, beta = self.two_machines()
+        with beta.active():
+            reads = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+            signs = crypto.fingerprint(sync.signing_public())
+
+        out = self.run_cli(alpha, "accept", "--yes").out
+        self.assertIn(reads, out)
+        self.assertIn(signs, out)
+        self.assertIn("ENTIRE history", out)
+        self.assertIn(crypto.how_to_check_signer(), out)
+        self.assertIn(crypto.how_to_check(reads), out)
+
+    def test_there_is_nothing_to_do_the_second_time(self) -> None:
+        alpha, _ = self.two_machines()
+        self.run_cli(alpha, "accept", "--yes")
+        code, out, _ = self.run_cli(alpha, "accept", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("already granted and trusted", out)
+
+    def test_a_machine_enrolling_during_the_prompt_is_refused(self) -> None:
+        """`grant(approved=...)` means "what a human agreed to", and refuses if
+        its own fetch disagrees. Rebuilding that list *after* the prompt made
+        the refusal unable to fire for the window it exists to cover: the new
+        machine is picked up by both reads, they agree, and it is sealed into
+        the entire history without ever having been displayed.
+
+        Found by a review of this command, not by the suite -- the existing test
+        of the refusal drives `sync.grant` directly, so `accept` walked past it.
+        """
+        alpha, _ = self.two_machines()
+
+        def enrol_then_agree(question: str, yes: bool = False) -> bool:
+            # Somebody runs `woswoar init` on a third machine while the prompt
+            # is on screen. Written straight into the repo, which is what that
+            # looks like from here.
+            alpha.append_recipient("martin@somewhere-else")
+            return True
+
+        with mock.patch("woswoar.__main__._confirm", enrol_then_agree):
+            code, out, err = self.run_cli(alpha, "accept")
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("changed while you were deciding", err + out)
+
+    def test_a_machine_new_to_read_and_changed_to_sign_is_not_called_accepted(self) -> None:
+        """The two lists have to be a partition.
+
+        `changed_key` excludes `needs_trust` but not `needs_grant`, and a
+        machine that has just joined has granted nobody while TOFU has pinned
+        everybody -- so any peer that re-keys is both. Listed among the
+        newcomers, its *unpinned* new fingerprint was printed under the words
+        "already accepted here", on the same screen that said its key had
+        changed.
+        """
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "old history")
+            sync.run()
+
+        gamma = self.machine("gamma", display="martin@server")  # pins alpha, grants nobody
+        with gamma.active():
+            sync.run()
+
+        with alpha.active():
+            store.signing_key_file().unlink()
+            alpha.record("2023-11-17", 1_700_300_001, "after alpha re-keyed")
+            sync.run()
+
+        with gamma.active():
+            (machine,) = sync.newcomers().machines
+            self.assertTrue(machine.needs_grant, "precondition: also new to read")
+            self.assertTrue(machine.changed_key, "precondition: and changed to sign")
+
+        code, out, err = self.run_cli(gamma, "accept", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("already accepted here", out)
+        self.assertIn("trust --replace", err + out)
+
+    def test_two_machines_with_one_name_are_flagged(self) -> None:
+        """`grant` has said this since it existed, and `accept` widens read
+        access on the same evidence -- so it cannot be the quieter of the two.
+        Two machines really can share a name, and so can a key someone added."""
+        alpha, _ = self.two_machines()
+        with alpha.active():
+            alpha.append_recipient("martin@laptop")  # the name beta already uses
+
+        out = self.run_cli(alpha, "accept", "--yes").out
+        self.assertIn("SAME NAME AS ANOTHER KEY", out)
+
+    def test_it_says_when_this_machine_could_not_open_the_keys(self) -> None:
+        """Run on the machine that just joined -- which is where the remedies
+        now send people -- `accept` said "re-sealed 0 key file(s), so they can
+        read the older history". Both halves of that are false."""
+        _, beta = self.two_machines()
+        _, out, err = self.run_cli(beta, "accept", "--yes")
+        self.assertNotIn("so they can read the older history", out)
+        self.assertIn("could not be opened by this machine", err)
+
+    def test_a_changed_signing_key_is_not_swept_along(self) -> None:
+        """The one thing `accept` must not make easy.
+
+        A key that changed is either a machine you re-enrolled or someone
+        rewriting the repository, and nothing can tell those apart. Rolling it
+        into the newcomer prompt is exactly how the second gets agreed to by
+        someone answering the first.
+        """
+        alpha, beta = self.two_machines()
+        self.run_cli(alpha, "accept", "--yes")
+
+        # beta re-enrols with a new signing key and publishes under it.
+        with beta.active():
+            store.signing_key_file().unlink()
+            beta.record("2023-11-16", 1_700_200_001, "after the key changed")
+            sync.run()
+
+        code, out, err = self.run_cli(alpha, "accept", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("trust --replace", err)
+        # And it did not quietly pin the new key on the way past.
+        with alpha.active():
+            changed = [c for c in sync.trust_candidates() if c.changed]
+        self.assertEqual(len(changed), 1)
+
+
+class TestInitFinishesTheJob(SyncTestCase):
+    """`init` used to end by telling you to run `sync`."""
+
+    def joining_machine(self) -> Fake:
+        """A machine with history of its own, not yet enrolled.
+
+        Not through the harness's `machine()`, which calls `sync.initialise`
+        directly -- this is the real `woswoar init` and nothing else. Recording
+        before enrolment is the ordinary case: the shell hook starts logging the
+        moment `woswoar install` runs, which is before anyone types a git URL.
+        """
+        beta = Fake(self.root, "beta")
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "typed before beta enrolled")
+        return beta
+
+    def test_it_syncs_rather_than_telling_you_to(self) -> None:
+        """Reading old history still waits for `accept` -- that is the design.
+        What no longer waits is this machine publishing its own."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+
+        beta = self.joining_machine()
+        code, out, _ = self.run_cli(beta, "init", str(self.origin), "--new-identity")
+        self.assertEqual(code, 0, out)
+        self.assertIn("published 1 line(s)", out)
+
+        # On the remote, not merely on disk here: "it synced" means the other
+        # machines can see it.
+        with alpha.active():
+            sync.run()
+            self.assertIn(beta.id, store.repo_hosts())
+            self.assertTrue(store.chunk_names(beta.id, "2023-11-15"))
+
+    def test_no_sync_still_joins_without_exchanging_anything(self) -> None:
+        beta = self.joining_machine()
+        out = self.run_cli(beta, "init", str(self.origin), "--new-identity", "--no-sync").out
+        self.assertIn("Next: 'woswoar sync'", out)
+        with beta.active():
+            self.assertEqual(list(store.chunk_days(beta.id)), [])
+
+    def test_a_failed_first_sync_does_not_fail_the_join(self) -> None:
+        """The join is done and durable by the time the sync runs -- identity
+        saved, repo cloned, peers pinned. A remote that blinked must not report
+        all of that as failure, because the obvious response to a failed `init`
+        is to run it again."""
+        beta = self.joining_machine()
+
+        def unreachable(*args: object, **kwargs: object) -> None:
+            raise sync.SyncError("could not read from remote repository")
+
+        with mock.patch.object(sync, "run", unreachable):
+            code, out, err = self.run_cli(beta, "init", str(self.origin), "--new-identity")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("joined, but the first sync failed", err)
+        self.assertIn("woswoar sync", out + err)
+        with beta.active():
+            self.assertTrue(sync.is_repo(), "the join itself was still completed")
+
+    def test_it_points_at_accept_when_there_is_another_machine(self) -> None:
+        """The step that is easy to miss, because it happens somewhere else."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+
+        beta = Fake(self.root, "beta")
+        out = self.run_cli(beta, "init", str(self.origin), "--new-identity").out
+        self.assertIn("woswoar accept", out)
+
+    def test_the_first_machine_is_not_told_to_accept_anything(self) -> None:
+        """There is nobody to run it on, and a step that cannot be done is
+        worse than no step: it reads as something having gone wrong."""
+        alpha = Fake(self.root, "alpha")
+        out = self.run_cli(alpha, "init", str(self.origin), "--new-identity").out
+        self.assertNotIn("woswoar accept", out)
+        self.assertIn("first machine", out)
+
+
+class TestNewcomersIsAskedDirectly(SyncTestCase):
+    """The pairing decides who is offered read access, so it is asserted here
+    rather than through `accept`'s stdout -- which is the rule `Reader`'s own
+    docstring states and the one place the new seam was not following it."""
+
+    def test_this_machine_is_not_a_newcomer_to_itself(self) -> None:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            sync.run()
+            self.assertEqual(sync.newcomers().machines, [])
+
+    def test_the_enrolled_list_is_every_recipient_not_only_the_new_ones(self) -> None:
+        """`grant` re-seals to all of them, so a partial list would narrow
+        access to whoever happened to be pending."""
+        alpha, _ = self.two()
+        with alpha.active():
+            pending = sync.newcomers()
+            self.assertEqual(sorted(pending.enrolled), sorted(sync.recipients()))
+            self.assertEqual(len(pending.machines), 1, "only the newcomer is pending")
+
+    def test_a_machine_already_accepted_is_not_offered_again(self) -> None:
+        alpha, _ = self.two()
+        self.run_cli(alpha, "accept", "--yes")
+        with alpha.active():
+            self.assertEqual(sync.newcomers().machines, [])
+
+    def test_the_reader_and_the_candidate_are_the_same_machine(self) -> None:
+        alpha, beta = self.two()
+        with beta.active():
+            reads = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+            signs = sync.signing_public()
+        with alpha.active():
+            (machine,) = sync.newcomers().machines
+        self.assertIsNotNone(machine.reader)
+        self.assertIsNotNone(machine.candidate)
+        assert machine.reader is not None and machine.candidate is not None
+        self.assertEqual(machine.reader.key, reads)
+        self.assertEqual(machine.candidate.verify_key, signs)
+        self.assertEqual(machine.label, "martin@laptop")
+
+    def two(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "old history")
+            sync.run()
+        beta = self.machine("beta", display="martin@laptop")
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "beta history")
+            sync.run()
+        return alpha, beta
+
+
 class TestLongCommandsSayWhatTheyAreDoing(SyncTestCase):
     """Reported from a real setup: "some commands take a long time and do not
     print anything, so I don't know if they are doing something or hanging".

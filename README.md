@@ -57,51 +57,59 @@ Then on **every** machine, first or fifth, the same four lines:
 pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
 woswoar install                                       # hook it into bash
 woswoar import atuin --this-host-only                 # optional: this machine's past
-woswoar init git@github.com:you/woswoar-history.git   # join the repo
+woswoar init git@github.com:you/woswoar-history.git   # join, and sync
 ```
 
-From the **second** machine onwards, one extra step on a machine you set up
-earlier:
+`init` does the first sync itself, so the new machine starts publishing straight
+away — it signs its own commands and waits for nobody.
+
+From the **second** machine onwards, one more line, on each machine you already
+use:
 
 ```bash
-woswoar grant
+woswoar accept
 ```
 
-That is what lets the newcomer read history from before it existed. It lists the
-machines by name and asks first, because it widens who can read *everything*:
-
-```
-This will let each of these machines read your ENTIRE history,
-including days recorded before it ever existed:
-
-  martinus@box   (this machine)
-  martin@work-laptop
-
-Grant all 2 machines full access? [y/N]
-```
-
-That is what lets the newcomer read history from before it existed. It starts
-publishing its own commands straight away, without waiting for anything: it
-signs them with a key of its own.
-
-The other direction needs one more step, on each machine that will read the
-newcomer:
+That is the whole of it. `accept` lists what is new, says what accepting it
+does, and asks:
 
 ```console
-$ woswoar trust
-These machines publish history this one has not been told to accept.
+$ woswoar accept
+1 machine(s) not yet accepted here:
 
-  SHA256:2xQ5…  'martin@work-laptop'
+  'martin@work-laptop'
+      reads with                  age1qjg…
+      signs with                  SHA256:2xQ5…
 
-Accept history from 1 machine(s) here? [y/N]
+Accepting does two separate things:
+
+  read     1 machine(s) get to read your ENTIRE history, including
+           days recorded before they existed. This is published, so it
+           applies everywhere — and it cannot be taken back for what
+           they have already read.
+
+  believe  this machine will accept what 1 machine(s) publish.
+           Local only: every other machine of yours has to be told
+           separately, because the repository is the thing that decision
+           defends against.
+
+A name is free text written by whoever added the key. The fingerprints are
+not — run these on the machine they belong to and compare:
+
+    reads with   age-keygen -y ~/.config/woswoar/identity
+    signs with   ssh-keygen -lf ~/.config/woswoar/signing_key.pub
+
+Accept 1 machine(s)? [y/N]
 ```
 
-That is deliberate. The history repo is somewhere anyone with push access can
-write, so every machine signs what it publishes and each of your machines
-decides for itself whose signature it believes — a decision that cannot be kept
-in the repository, because the repository is the thing it defends against.
-Revoking a machine removes that decision everywhere automatically, since taking
-trust away can only ever cause a refusal.
+Two keys, because there really are two questions, and they stay separate
+commands — [`grant`](docs/security.md) for who may *read*, `trust` for whose
+word this machine *believes*. `accept` is both at once for the ordinary case
+where the machine is yours. The second one is why it has to be run on each
+machine you already own rather than once: the repository is somewhere anyone
+with push access can write, so what a machine believes cannot be decided by
+anything kept inside it. Revoking removes that decision everywhere
+automatically, since taking trust away can only ever cause a refusal.
 
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared
@@ -185,7 +193,9 @@ truthful. Re-running an import is idempotent.
 | `woswoar doctor` | check the installation and the tools it needs |
 | `woswoar init [url]` | create or join an encrypted history repo |
 | `woswoar sync` | exchange history with the remote |
+| `woswoar accept` | add a machine you own: `grant` and `trust` at once |
 | `woswoar grant` | let newly enrolled machines read the older history |
+| `woswoar trust` | accept another machine's published history here |
 | `woswoar compact` | merge old chunks to reduce the working-tree file count |
 
 | variable | meaning |
@@ -234,10 +244,12 @@ machine recorded. `history/` beside it is the encrypted git checkout, and
   everything. `woswoar grant` on that other machine lists every enrolled
   machine by fingerprint and name, which is where that value comes from — it
   asks before changing anything, and does nothing at all if nothing is new.
+  (`woswoar accept` shows the same fingerprints, but only for machines it has
+  something left to do about.)
 - **Reinstalling later?** Deleting `~/.config/woswoar/` discards the identity.
   The machine can rejoin with `woswoar init <url>`, but it enrols as a *new*
-  machine: someone must run `woswoar grant` again, and every other machine must
-  `woswoar trust` it. Keep that directory if you only meant to move the data.
+  machine: `woswoar accept` has to be run again on every machine you keep.
+  Keep that directory if you only meant to move the data.
 
 The remote repository is untouched by all of this. Delete it separately if you
 want it gone, remembering that other machines still hold their own copies of

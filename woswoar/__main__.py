@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+import textwrap
 import time
 from collections import Counter
 from pathlib import Path
@@ -16,13 +17,13 @@ from .entry import make_inert
 from .errors import WoswoarError
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
-    from .sync import Reader
+    from .sync import Reader, ReencryptReport
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
 #: used to say so in two independently worded paragraphs.
 _GRANT_REMEDY = (
     "On a machine that is already enrolled run:\n"
-    "    woswoar grant\n"
+    "    woswoar accept\n"
     "then sync here again. Nothing is lost in the meantime."
 )
 
@@ -403,10 +404,49 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  {crypto.fingerprint(verify_key)}")
         print("Check these against the machines themselves if the repository is shared.")
 
-    if args.remote:
+    if not args.remote:
+        return 0
+
+    # The sync `init` used to tell you to run. Nothing about it is a separate
+    # decision -- joining a repository and then not exchanging anything with it
+    # is not a state anyone wants -- and leaving it to a second command meant
+    # the machine published nothing until one was run. `--no-sync` is there for
+    # the case where the remote is not reachable yet.
+    if args.no_sync:
         print("\nNext: 'woswoar sync'.")
-        print("On a machine that already has access, run 'woswoar grant' so this")
-        print("one can read history sealed before it joined.")
+    else:
+        print()
+        try:
+            report = sync.run()
+        except WoswoarError as exc:
+            # The join itself is done and durable by this point -- the identity
+            # is saved, the repo is cloned, the peers are pinned. A remote that
+            # blinked must not make all of that report failure, because the
+            # obvious response to a failed `init` is to run it again.
+            print(f"joined, but the first sync failed:\n  {exc}", file=sys.stderr)
+            print("Nothing is lost; run 'woswoar sync' when the remote is reachable.")
+        else:
+            print(
+                f"published {report.lines_exported} line(s) of this machine's history; "
+                f"merged {report.lines_imported} line(s) from "
+                f"{len(report.hosts_seen)} other machine(s)"
+            )
+
+    # Asked of `sync`, which already knows how to fail softly at working out
+    # this machine's own key: open-coding `crypto.recipient_for` here turned an
+    # unreadable identity into a failed `init` that had actually succeeded.
+    if sync.others_enrolled():
+        # The step that is easy to miss, because it happens somewhere else. Said
+        # in terms of what is missing rather than of the commands: `accept` is
+        # one thing to run, and it names both halves itself.
+        print(
+            "\nLast step, on each machine you already use:\n"
+            "    woswoar accept\n"
+            "That is what lets this machine read history from before it joined, and"
+            "\nwhat tells the others to accept what it publishes."
+        )
+    else:
+        print("\nThis is the first machine here. Run 'woswoar init' on the next one.")
     return 0
 
 
@@ -462,7 +502,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
             "told to accept, so none of it was merged. That is what a machine enrolled\n"
             "since this one last looked is supposed to look like.\n"
-            "    woswoar trust",
+            "    woswoar accept",
             file=sys.stderr,
         )
 
@@ -631,7 +671,20 @@ def cmd_grant(args: argparse.Namespace) -> int:
     if new and not _confirm(f"Grant {len(new)} new machine(s) full access?", args.yes):
         return 1
 
-    report = sync.grant(approved=[reader.key for reader in readers])
+    _report_reseal(sync.grant(approved=[reader.key for reader in readers]))
+    return 0
+
+
+def _report_reseal(report: ReencryptReport, waiting: bool = True) -> None:
+    """Say what re-sealing did. Shared, because the half that is easy to omit
+    is the half that matters.
+
+    `skipped` is what distinguishes "nothing needed doing" from "this machine
+    could not do it" -- the state a *newly joined* machine is in, which is
+    exactly where someone lands after being told to run this. `accept` reported
+    only `resealed`, so on that machine it said "re-sealed 0 key file(s), so
+    they can read the older history", which is false in both halves.
+    """
     if report.resealed or report.skipped:
         print(f"\nre-sealed {report.resealed} key file(s)")
     else:
@@ -640,7 +693,8 @@ def cmd_grant(args: argparse.Namespace) -> int:
         print("\nnothing to do: every key is already sealed to these machines")
     if report.pushed:
         print("published to the remote")
-        print("\nOn each machine that was waiting, run:  woswoar sync")
+        if waiting:
+            print("\nOn each machine that was waiting, run:  woswoar sync")
     else:
         print("no remote configured, so nothing was published")
 
@@ -654,7 +708,6 @@ def cmd_grant(args: argparse.Namespace) -> int:
             "those instead.",
             file=sys.stderr,
         )
-    return 0
 
 
 def cmd_revoke(args: argparse.Namespace) -> int:
@@ -772,6 +825,123 @@ def cmd_trust(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_accept(args: argparse.Namespace) -> int:
+    """`grant` and `trust` for a machine you own, in one step.
+
+    The two stay separate commands: they answer different questions, and someone
+    sharing a repository with a colleague may well answer them differently. This
+    is for the common case, where the answer to both is "yes, that one is mine"
+    -- reported as the thing that made setting up a second machine feel like too
+    much. Both are still named and described here, because what is being agreed
+    to is exactly what it was before.
+    """
+    from . import crypto, sync
+
+    pending = sync.newcomers()
+    if not pending.machines:
+        print("nothing to accept; every machine here is already granted and trusted")
+        return 0
+
+    # A partition, not two overlapping filters. A machine can be new to read
+    # *and* changed to sign -- the ordinary state on a machine that has just
+    # joined, where TOFU pinned every peer and nothing has been granted yet --
+    # and listing it among the newcomers printed its unpinned new key under
+    # "already accepted here" on the same screen that said its key had changed.
+    changed = [n for n in pending.machines if n.changed_key]
+    fresh = [n for n in pending.machines if not n.changed_key]
+
+    if not fresh:
+        print(
+            f"{len(changed)} machine(s) now sign with a different key than the one\n"
+            "accepted here. That is either a machine you re-enrolled or someone\n"
+            "rewriting the repository, and nothing can tell those apart:\n"
+            "    woswoar trust --replace",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"{len(fresh)} machine(s) not yet accepted here:\n")
+    for machine in fresh:
+        # `shares_name` is why this cannot just print the name: two machines
+        # really can both be `martin@laptop`, and so can a key someone else
+        # added. `grant` has said this since it existed.
+        note = "   (SAME NAME AS ANOTHER KEY)" if machine.shares_name else ""
+        print(f"  {machine.display_name()}{note}")
+        if machine.reader is not None:
+            said = "reads with" if machine.needs_grant else "already reads your history"
+            print(f"      {said:<28}{machine.reader.fingerprint}")
+        if machine.candidate is not None:
+            said = "signs with" if machine.needs_trust else "already accepted here"
+            print(f"      {said:<28}{machine.candidate.fingerprint}")
+
+    granting = [n for n in fresh if n.needs_grant]
+    trusting = [n for n in fresh if n.needs_trust]
+    print("\nAccepting does two separate things:\n")
+    if granting:
+        print(
+            f"  read     {len(granting)} machine(s) get to read your ENTIRE history, including"
+            "\n           days recorded before they existed. This is published, so it"
+            "\n           applies everywhere -- and it cannot be taken back for what"
+            "\n           they have already read.\n"
+        )
+    if trusting:
+        print(
+            f"  believe  this machine will accept what {len(trusting)} machine(s) publish."
+            "\n           Local only: every other machine of yours has to be told"
+            "\n           separately, because the repository is the thing that decision"
+            "\n           defends against.\n"
+        )
+    # One line per *kind* of key on screen, not one blanket command. There are
+    # two here and they are checked differently -- `grant` sends you to the age
+    # identity, `trust` to woswoar's own signing key -- and advice that does not
+    # match what is above it is advice nobody follows.
+    checks = []
+    if granting:
+        reads = dict.fromkeys(
+            crypto.how_to_check(n.reader.fingerprint) for n in granting if n.reader is not None
+        )
+        checks += [f"    reads with   {command}" for command in reads]
+    if trusting:
+        checks.append(f"    signs with   {crypto.how_to_check_signer()}")
+    print(
+        "A name is free text written by whoever added the key. The fingerprints are"
+        "\nnot -- run these on the machine they belong to and compare:\n"
+    )
+    print("\n".join(checks))
+    if changed:
+        # Deliberately not part of the prompt above. Accepting a *new* machine
+        # and accepting a new key for one already accepted are different
+        # decisions, and rolling them together is how the second gets made by
+        # someone answering the first. Both fingerprints, as `trust --replace`
+        # shows them: which key is being left behind is half the question.
+        print(f"\nSeparately, {len(changed)} machine(s) changed their signing key:\n")
+        for machine in changed:
+            print(f"  {machine.display_name()}")
+            if machine.candidate is not None:
+                print(f"      now signs with              {machine.candidate.fingerprint}")
+                print(f"      accepted here              {machine.candidate.pinned_fingerprint}")
+        print("\nThat is not part of this, and needs:  woswoar trust --replace")
+
+    if not _confirm(f"Accept {len(fresh)} machine(s)?", args.yes):
+        return 1
+
+    if granting:
+        # `pending.enrolled`, from the fetch that produced what was on screen --
+        # never a fresh `readers()` call. `grant` refuses when its own fetch
+        # disagrees with what a human agreed to, and asking again *after* the
+        # prompt makes that refusal unable to fire for the window it exists to
+        # cover: a machine enrolling while the prompt is up would be picked up
+        # by both reads, they would agree, and it would be sealed into the whole
+        # history without ever having been shown.
+        _report_reseal(sync.grant(approved=pending.enrolled), waiting=False)
+    if trusting:
+        sync.trust([n.candidate for n in trusting if n.candidate is not None])
+        print(f"\naccepted the history published by {len(trusting)} machine(s)")
+
+    print("\nNext: 'woswoar sync' to exchange history with them.")
+    return 0
+
+
 def cmd_compact(args: argparse.Namespace) -> int:
     from . import sync
 
@@ -800,23 +970,73 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"woswoar {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def sub(
+        name: str, summary: str, detail: str, aliases: list[str] | None = None
+    ) -> argparse.ArgumentParser:
+        """One subcommand, with the same sentence in the listing and in `-h`.
+
+        `help=` alone appears only in `woswoar --help`; `woswoar doctor -h` used
+        to print a usage line, `-h, --help`, and nothing whatever about what
+        doctor does. Every subcommand was like that. So `description` is not
+        optional here, and `Raw...HelpFormatter` keeps the paragraphs from being
+        reflowed into one block.
+        """
+        return subparsers.add_parser(
+            name,
+            help=summary,
+            description=f"{summary[0].upper()}{summary[1:]}.\n\n{textwrap.dedent(detail).strip()}",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            aliases=aliases or [],
+        )
+
     def add_scope(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--scope", choices=search.SCOPES, default="global")
         sub.add_argument(
             "--no-dedup", action="store_true", help="keep repeated commands instead of collapsing"
         )
 
-    p_search = subparsers.add_parser("search", help="pick a command interactively with fzf")
+    p_search = sub(
+        "search",
+        "pick a command interactively with fzf",
+        """
+        What Ctrl-R runs. The chosen command is placed on your prompt for
+        editing, never executed.
+
+        Ctrl-G, Ctrl-H and Ctrl-S switch between every machine, this machine,
+        and this shell session, without leaving the picker.
+        """,
+    )
     add_scope(p_search)
     p_search.add_argument("--query", default="", help="initial fzf query")
     p_search.set_defaults(func=cmd_search)
 
-    p_list = subparsers.add_parser("list", help="print matching lines (used by fzf reload)")
+    p_list = sub(
+        "list",
+        "print matching lines as plain text",
+        """
+        Mostly internal: this is what the picker re-runs when you switch scope
+        with Ctrl-G, Ctrl-H or Ctrl-S. It is also how to read your history
+        without fzf installed, and it pipes -- `woswoar list | grep docker`.
+        """,
+    )
     add_scope(p_list)
     p_list.add_argument("--limit", type=int, default=None)
     p_list.set_defaults(func=cmd_list)
 
-    p_import = subparsers.add_parser("import", help="import an existing shell history")
+    p_import = sub(
+        "import",
+        "import an existing shell history",
+        """
+        Idempotent: importing the same file twice adds nothing the second time,
+        so it is safe to re-run. Commands that look like credentials are
+        skipped; `--dry-run` lists what would be skipped without importing.
+
+        For atuin on more than one woswoar machine, use `--this-host-only` on
+        each. atuin keeps every machine it has synced with in one database, and
+        sync publishes only this machine's own commands -- so importing all of
+        them everywhere stores each machine's history once per machine.
+        """,
+    )
     p_import.add_argument("kind", choices=importer.KINDS)
     p_import.add_argument(
         "--file",
@@ -831,18 +1051,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_import.set_defaults(func=cmd_import)
 
-    p_install = subparsers.add_parser("install", help="install the shell hook into .bashrc")
+    p_install = sub(
+        "install",
+        "install the shell hook into .bashrc",
+        """
+        Copies the bash hook and adds a marked block to your rcfile. Safe to
+        re-run: the block is replaced rather than repeated, which is also how
+        to upgrade the hook after installing a new woswoar.
+
+        Reports any missing tool (fzf, age, git) and the command to install it.
+        """,
+    )
     p_install.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
     p_install.set_defaults(func=cmd_install)
 
-    p_stats = subparsers.add_parser("stats", help="summarise recorded history")
+    p_stats = sub(
+        "stats",
+        "summarise recorded history",
+        """
+        How much is recorded, over what period, per machine, and which commands
+        you run most.
+        """,
+    )
     p_stats.add_argument("--top", type=int, default=10)
     p_stats.set_defaults(func=cmd_stats)
 
-    p_doctor = subparsers.add_parser("doctor", help="check the installation")
+    p_doctor = sub(
+        "doctor",
+        "check the installation and report what is wrong",
+        """
+        Run this first when something is not working. Checks the tools woswoar
+        needs, the shell hook, file permissions, the identity and signing keys,
+        and the state of the history repo -- and prints what to do about each
+        failure rather than only that it failed.
+
+        Changes nothing.
+        """,
+    )
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_init = subparsers.add_parser("init", help="create or join a history repo")
+    p_init = sub(
+        "init",
+        "create or join an encrypted history repo",
+        """
+        Run once per machine, with the git URL of a repository you own -- an
+        empty GitHub repo, a bare repo on a NAS, a folder on a USB stick. There
+        is no server and no account.
+
+        It enrols this machine, does the first sync, and tells you the one
+        remaining step. On the second and later machines that step is
+        `woswoar accept`, run on a machine you already use.
+        """,
+    )
     p_init.add_argument("remote", nargs="?", help="git URL of the history repo")
     p_init.add_argument(
         "--new-identity",
@@ -850,24 +1110,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate a dedicated age key instead of reusing an SSH key",
     )
     p_init.add_argument("--identity", help="use this private key")
+    p_init.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="join the repo but do not exchange history yet",
+    )
     p_init.set_defaults(func=cmd_init)
 
-    p_sync = subparsers.add_parser("sync", help="exchange history with the remote")
+    p_sync = sub(
+        "sync",
+        "exchange history with the remote",
+        """
+        Publishes this machine's new commands and merges everyone else's. Safe
+        to run at any time and safe to run concurrently; normally a systemd
+        timer runs it once a minute.
+
+        Only this machine's own commands are ever published from here.
+        """,
+    )
     p_sync.add_argument("--no-push", action="store_true", help="stay local; do not contact remote")
     p_sync.set_defaults(func=cmd_sync)
 
-    p_grant = subparsers.add_parser(
+    p_grant = sub(
         "grant",
+        "let newly enrolled machines read the older history",
+        """
+        Answers one question: who may READ what is already here. It re-seals
+        the small per-day keys to every enrolled machine, so they can decrypt
+        days recorded before they existed. The history itself is not rewritten.
+
+        Widens access to everything, so it lists the machines and asks first.
+        Run it once, on any machine that can already read the history.
+
+        Most of the time you want `woswoar accept`, which does this and the
+        other half together. Reach for `grant` on its own to let a machine read
+        the history WITHOUT this machine believing what that machine publishes
+        -- sharing a repository with someone else, rather than adding your own
+        laptop.
+        """,
         # `reencrypt` named the mechanism, which hid what it does to the user's
         # history. Kept working so older notes and error messages do not rot.
         aliases=["reencrypt"],
-        help="let newly enrolled machines read the older history",
     )
     p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_grant.set_defaults(func=cmd_grant)
 
-    p_revoke = subparsers.add_parser(
-        "revoke", help="withdraw a machine's access to history recorded from now on"
+    p_revoke = sub(
+        "revoke",
+        "withdraw a machine's access to history recorded from now on",
+        """
+        Permanent, and deliberately so: there is no un-revoke. Every other
+        machine stops accepting what the revoked one publishes, automatically,
+        at its next sync.
+
+        Three things it cannot do. It cannot make the revoked machine forget
+        history it has already read; it cannot recall what it already
+        published; and it cannot re-key days it could already open. Take the
+        machine's own copy seriously.
+
+        Run `woswoar sync` before revoking if you still want the history that
+        machine published and yours have not merged yet.
+        """,
     )
     p_revoke.add_argument(
         "fingerprint",
@@ -876,8 +1179,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_revoke.set_defaults(func=cmd_revoke)
 
-    p_trust = subparsers.add_parser(
-        "trust", help="accept another machine's published history on this machine"
+    p_trust = sub(
+        "trust",
+        "accept another machine's published history on this machine",
+        """
+        Answers the other question: whose new history does THIS machine
+        believe. Every machine signs what it publishes, and each of yours
+        decides for itself whose signature it accepts.
+
+        Local only. Nothing is written to the repository and nothing is
+        published -- which is the point, because the repository is exactly what
+        this decision defends against: anyone who can push to it can rewrite
+        what it claims. So it has to be run on each machine that will read the
+        new one.
+
+        Most of the time you want `woswoar accept`. Use `--replace` for a
+        machine whose signing key CHANGED, which `accept` refuses on purpose:
+        that is either a machine you re-enrolled or someone rewriting the
+        repository, and nothing can tell those apart -- you can.
+        """,
     )
     p_trust.add_argument(
         "--replace",
@@ -887,7 +1207,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_trust.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_trust.set_defaults(func=cmd_trust)
 
-    p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
+    p_accept = sub(
+        "accept",
+        "add a machine you own: 'grant' and 'trust' in one step",
+        """
+        Run this on each machine you already use, after `woswoar init` on the
+        new one. It does both halves of adding a machine:
+
+          read     the new machine may read your entire history, including
+                   days recorded before it existed. Published, so it applies
+                   everywhere, and it cannot be taken back for what has already
+                   been read.
+          believe  this machine accepts what the new one publishes. Local only,
+                   so every other machine of yours needs telling separately.
+
+        Shows both keys and asks first. A name is free text written by whoever
+        added the key; the fingerprints are not, so check those on the machine
+        they belong to.
+
+        It will not accept a CHANGED signing key -- see `woswoar trust
+        --replace`.
+        """,
+    )
+    p_accept.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_accept.set_defaults(func=cmd_accept)
+
+    p_compact = sub(
+        "compact",
+        "merge old chunks to reduce the file count",
+        """
+        Each sync writes a small encrypted chunk, so a busy machine accumulates
+        a lot of files. This merges each past day's chunks into one.
+
+        Only days before today, and only this machine's own. Nothing is lost:
+        the plaintext in logs/ is untouched, and the old chunks stay in git
+        history like every other commit.
+        """,
+    )
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
     p_compact.set_defaults(func=cmd_compact)
 

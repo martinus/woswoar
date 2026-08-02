@@ -115,6 +115,14 @@ trust` on each machine that will read it**, on top of `woswoar grant` once. A
 machine that clones later pins whatever it finds at that moment, so the ceremony
 only runs in one direction.
 
+`woswoar accept` runs both for a machine you own, which is what almost everyone
+is doing. It does not merge the two decisions — it shows both keys, says what
+each half does, and asks once. The one thing it deliberately will not do is
+accept a *changed* signing key: that is either a machine you re-enrolled or
+someone rewriting the repository, nothing can tell those apart, and rolling it
+into the newcomer prompt is how it would get agreed to by someone answering a
+different question. It stays behind `woswoar trust --replace`.
+
 ## 🔑 No secret is ever copied between machines
 
 age takes **SSH public keys as recipients**, so each machine encrypts to the
@@ -202,6 +210,9 @@ with `--identity <path>` or `--new-identity`.
 
 Two commands, both asking a human, and it is easy to assume one could replace
 the other. They are on different axes and neither can absorb the other.
+
+`woswoar accept` is both of these at once, for the ordinary case where the
+machine in question is yours. The distinction below is still what it does.
 
 | | `woswoar grant` | `woswoar trust` |
 |---|---|---|
