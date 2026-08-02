@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+import textwrap
 import time
 from collections import Counter
 from pathlib import Path
@@ -969,23 +970,73 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"woswoar {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def sub(
+        name: str, summary: str, detail: str, aliases: list[str] | None = None
+    ) -> argparse.ArgumentParser:
+        """One subcommand, with the same sentence in the listing and in `-h`.
+
+        `help=` alone appears only in `woswoar --help`; `woswoar doctor -h` used
+        to print a usage line, `-h, --help`, and nothing whatever about what
+        doctor does. Every subcommand was like that. So `description` is not
+        optional here, and `Raw...HelpFormatter` keeps the paragraphs from being
+        reflowed into one block.
+        """
+        return subparsers.add_parser(
+            name,
+            help=summary,
+            description=f"{summary[0].upper()}{summary[1:]}.\n\n{textwrap.dedent(detail).strip()}",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            aliases=aliases or [],
+        )
+
     def add_scope(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--scope", choices=search.SCOPES, default="global")
         sub.add_argument(
             "--no-dedup", action="store_true", help="keep repeated commands instead of collapsing"
         )
 
-    p_search = subparsers.add_parser("search", help="pick a command interactively with fzf")
+    p_search = sub(
+        "search",
+        "pick a command interactively with fzf",
+        """
+        What Ctrl-R runs. The chosen command is placed on your prompt for
+        editing, never executed.
+
+        Ctrl-G, Ctrl-H and Ctrl-S switch between every machine, this machine,
+        and this shell session, without leaving the picker.
+        """,
+    )
     add_scope(p_search)
     p_search.add_argument("--query", default="", help="initial fzf query")
     p_search.set_defaults(func=cmd_search)
 
-    p_list = subparsers.add_parser("list", help="print matching lines (used by fzf reload)")
+    p_list = sub(
+        "list",
+        "print matching lines as plain text",
+        """
+        Mostly internal: this is what the picker re-runs when you switch scope
+        with Ctrl-G, Ctrl-H or Ctrl-S. It is also how to read your history
+        without fzf installed, and it pipes -- `woswoar list | grep docker`.
+        """,
+    )
     add_scope(p_list)
     p_list.add_argument("--limit", type=int, default=None)
     p_list.set_defaults(func=cmd_list)
 
-    p_import = subparsers.add_parser("import", help="import an existing shell history")
+    p_import = sub(
+        "import",
+        "import an existing shell history",
+        """
+        Idempotent: importing the same file twice adds nothing the second time,
+        so it is safe to re-run. Commands that look like credentials are
+        skipped; `--dry-run` lists what would be skipped without importing.
+
+        For atuin on more than one woswoar machine, use `--this-host-only` on
+        each. atuin keeps every machine it has synced with in one database, and
+        sync publishes only this machine's own commands -- so importing all of
+        them everywhere stores each machine's history once per machine.
+        """,
+    )
     p_import.add_argument("kind", choices=importer.KINDS)
     p_import.add_argument(
         "--file",
@@ -1000,18 +1051,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_import.set_defaults(func=cmd_import)
 
-    p_install = subparsers.add_parser("install", help="install the shell hook into .bashrc")
+    p_install = sub(
+        "install",
+        "install the shell hook into .bashrc",
+        """
+        Copies the bash hook and adds a marked block to your rcfile. Safe to
+        re-run: the block is replaced rather than repeated, which is also how
+        to upgrade the hook after installing a new woswoar.
+
+        Reports any missing tool (fzf, age, git) and the command to install it.
+        """,
+    )
     p_install.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
     p_install.set_defaults(func=cmd_install)
 
-    p_stats = subparsers.add_parser("stats", help="summarise recorded history")
+    p_stats = sub(
+        "stats",
+        "summarise recorded history",
+        """
+        How much is recorded, over what period, per machine, and which commands
+        you run most.
+        """,
+    )
     p_stats.add_argument("--top", type=int, default=10)
     p_stats.set_defaults(func=cmd_stats)
 
-    p_doctor = subparsers.add_parser("doctor", help="check the installation")
+    p_doctor = sub(
+        "doctor",
+        "check the installation and report what is wrong",
+        """
+        Run this first when something is not working. Checks the tools woswoar
+        needs, the shell hook, file permissions, the identity and signing keys,
+        and the state of the history repo -- and prints what to do about each
+        failure rather than only that it failed.
+
+        Changes nothing.
+        """,
+    )
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_init = subparsers.add_parser("init", help="create or join a history repo")
+    p_init = sub(
+        "init",
+        "create or join an encrypted history repo",
+        """
+        Run once per machine, with the git URL of a repository you own -- an
+        empty GitHub repo, a bare repo on a NAS, a folder on a USB stick. There
+        is no server and no account.
+
+        It enrols this machine, does the first sync, and tells you the one
+        remaining step. On the second and later machines that step is
+        `woswoar accept`, run on a machine you already use.
+        """,
+    )
     p_init.add_argument("remote", nargs="?", help="git URL of the history repo")
     p_init.add_argument(
         "--new-identity",
@@ -1026,22 +1117,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.set_defaults(func=cmd_init)
 
-    p_sync = subparsers.add_parser("sync", help="exchange history with the remote")
+    p_sync = sub(
+        "sync",
+        "exchange history with the remote",
+        """
+        Publishes this machine's new commands and merges everyone else's. Safe
+        to run at any time and safe to run concurrently; normally a systemd
+        timer runs it once a minute.
+
+        Only this machine's own commands are ever published from here.
+        """,
+    )
     p_sync.add_argument("--no-push", action="store_true", help="stay local; do not contact remote")
     p_sync.set_defaults(func=cmd_sync)
 
-    p_grant = subparsers.add_parser(
+    p_grant = sub(
         "grant",
+        "let newly enrolled machines read the older history",
+        """
+        Answers one question: who may READ what is already here. It re-seals
+        the small per-day keys to every enrolled machine, so they can decrypt
+        days recorded before they existed. The history itself is not rewritten.
+
+        Widens access to everything, so it lists the machines and asks first.
+        Run it once, on any machine that can already read the history.
+
+        Most of the time you want `woswoar accept`, which does this and the
+        other half together. Reach for `grant` on its own to let a machine read
+        the history WITHOUT this machine believing what that machine publishes
+        -- sharing a repository with someone else, rather than adding your own
+        laptop.
+        """,
         # `reencrypt` named the mechanism, which hid what it does to the user's
         # history. Kept working so older notes and error messages do not rot.
         aliases=["reencrypt"],
-        help="let newly enrolled machines read the older history",
     )
     p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_grant.set_defaults(func=cmd_grant)
 
-    p_revoke = subparsers.add_parser(
-        "revoke", help="withdraw a machine's access to history recorded from now on"
+    p_revoke = sub(
+        "revoke",
+        "withdraw a machine's access to history recorded from now on",
+        """
+        Permanent, and deliberately so: there is no un-revoke. Every other
+        machine stops accepting what the revoked one publishes, automatically,
+        at its next sync.
+
+        Three things it cannot do. It cannot make the revoked machine forget
+        history it has already read; it cannot recall what it already
+        published; and it cannot re-key days it could already open. Take the
+        machine's own copy seriously.
+
+        Run `woswoar sync` before revoking if you still want the history that
+        machine published and yours have not merged yet.
+        """,
     )
     p_revoke.add_argument(
         "fingerprint",
@@ -1050,8 +1179,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_revoke.set_defaults(func=cmd_revoke)
 
-    p_trust = subparsers.add_parser(
-        "trust", help="accept another machine's published history on this machine"
+    p_trust = sub(
+        "trust",
+        "accept another machine's published history on this machine",
+        """
+        Answers the other question: whose new history does THIS machine
+        believe. Every machine signs what it publishes, and each of yours
+        decides for itself whose signature it accepts.
+
+        Local only. Nothing is written to the repository and nothing is
+        published -- which is the point, because the repository is exactly what
+        this decision defends against: anyone who can push to it can rewrite
+        what it claims. So it has to be run on each machine that will read the
+        new one.
+
+        Most of the time you want `woswoar accept`. Use `--replace` for a
+        machine whose signing key CHANGED, which `accept` refuses on purpose:
+        that is either a machine you re-enrolled or someone rewriting the
+        repository, and nothing can tell those apart -- you can.
+        """,
     )
     p_trust.add_argument(
         "--replace",
@@ -1061,14 +1207,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_trust.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_trust.set_defaults(func=cmd_trust)
 
-    p_accept = subparsers.add_parser(
+    p_accept = sub(
         "accept",
-        help="add a machine you own: 'grant' and 'trust' in one step",
+        "add a machine you own: 'grant' and 'trust' in one step",
+        """
+        Run this on each machine you already use, after `woswoar init` on the
+        new one. It does both halves of adding a machine:
+
+          read     the new machine may read your entire history, including
+                   days recorded before it existed. Published, so it applies
+                   everywhere, and it cannot be taken back for what has already
+                   been read.
+          believe  this machine accepts what the new one publishes. Local only,
+                   so every other machine of yours needs telling separately.
+
+        Shows both keys and asks first. A name is free text written by whoever
+        added the key; the fingerprints are not, so check those on the machine
+        they belong to.
+
+        It will not accept a CHANGED signing key -- see `woswoar trust
+        --replace`.
+        """,
     )
     p_accept.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_accept.set_defaults(func=cmd_accept)
 
-    p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
+    p_compact = sub(
+        "compact",
+        "merge old chunks to reduce the file count",
+        """
+        Each sync writes a small encrypted chunk, so a busy machine accumulates
+        a lot of files. This merges each past day's chunks into one.
+
+        Only days before today, and only this machine's own. Nothing is lost:
+        the plaintext in logs/ is untouched, and the old chunks stay in git
+        history like every other commit.
+        """,
+    )
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
     p_compact.set_defaults(func=cmd_compact)
 
