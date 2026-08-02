@@ -45,6 +45,13 @@ one machine.
 `woswoar install` checks for these and prints the install command for your
 distribution. `woswoar doctor` diagnoses anything else that looks wrong.
 
+> [!WARNING]
+> **Do not install `age` as a snap.** It works, and it starts a sandbox on every
+> call — about 250 ms against 2 ms for a distribution binary. woswoar runs `age`
+> roughly twice per day of recorded history, so on two years of history that is
+> the difference between a `sync` taking three seconds and taking six minutes.
+> `woswoar doctor` measures it and says so.
+
 ## Adding another machine
 
 Sync goes through **an ordinary git repository you already own** — no server, no

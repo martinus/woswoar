@@ -279,9 +279,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         info("age", f"not found, needed for 'woswoar sync' - {deps.advice([deps.AGE])}")
     else:
         failure = crypto.selftest()
-        check("age", not failure, age_path)
+        cost = crypto.startup_ms() if not failure else -1.0
+        detail = age_path if cost < 0 else f"{age_path}  ({cost:.0f} ms to start)"
+        check("age", not failure and 0 <= cost < crypto.SLOW_MS, detail)
         for line in failure.splitlines():
             print(f"     {line}")
+        if not failure and cost >= crypto.SLOW_MS:
+            # Not a broken age -- a slow one, which is worse to diagnose because
+            # everything works. woswoar runs it about twice per day of history,
+            # so this is the difference between a grant taking three seconds and
+            # taking six minutes, and nothing on screen would say why.
+            print(
+                f"     age takes {cost:.0f} ms to start. woswoar runs it about twice per\n"
+                f"     day of recorded history, so a year costs about "
+                f"{cost * 2 * 365 / 1000:.0f} s per sync,\n"
+                "     grant or accept that has work to do.",
+            )
+            if "/snap/" in age_path:
+                print(
+                    "     This one is a snap, which sets up a sandbox on every call.\n"
+                    "     Install the distribution package or the release binary instead:\n"
+                    f"       sudo snap remove age  &&  {deps.advice([deps.AGE])}"
+                )
+            else:
+                print(
+                    "     A distribution binary starts in a millisecond or two:\n"
+                    f"       {deps.advice([deps.AGE])}"
+                )
 
     # Checked whether or not a repo exists: `init` is exactly when this breaks,
     # and gating it behind is_repo() meant doctor was silent in the one state
