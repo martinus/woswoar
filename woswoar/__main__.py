@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
 #: used to say so in two independently worded paragraphs.
 _GRANT_REMEDY = (
     "On a machine that is already enrolled run:\n"
-    "    woswoar grant\n"
+    "    woswoar accept\n"
     "then sync here again. Nothing is lost in the meantime."
 )
 
@@ -403,10 +403,37 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  {crypto.fingerprint(verify_key)}")
         print("Check these against the machines themselves if the repository is shared.")
 
-    if args.remote:
+    if not args.remote:
+        return 0
+
+    # The sync `init` used to tell you to run. Nothing about it is a separate
+    # decision -- joining a repository and then not exchanging anything with it
+    # is not a state anyone wants -- and leaving it to a second command meant
+    # the machine published nothing until one was run. `--no-sync` is there for
+    # the case where the remote is not reachable yet.
+    if args.no_sync:
         print("\nNext: 'woswoar sync'.")
-        print("On a machine that already has access, run 'woswoar grant' so this")
-        print("one can read history sealed before it joined.")
+    else:
+        print()
+        report = sync.run()
+        print(
+            f"published {report.lines_exported} line(s) of this machine's history; "
+            f"merged {report.lines_imported} line(s) from {len(report.hosts_seen)} other machine(s)"
+        )
+
+    others = [key for key in sync.recipients() if key != crypto.recipient_for(identity).strip()]
+    if others:
+        # The step that is easy to miss, because it happens somewhere else. Said
+        # in terms of what is missing rather than of the commands: `accept` is
+        # one thing to run, and it names both halves itself.
+        print(
+            "\nLast step, on each machine you already use:\n"
+            "    woswoar accept\n"
+            "That is what lets this machine read history from before it joined, and"
+            "\nwhat tells the others to accept what it publishes."
+        )
+    else:
+        print("\nThis is the first machine here. Run 'woswoar init' on the next one.")
     return 0
 
 
@@ -462,7 +489,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
             "told to accept, so none of it was merged. That is what a machine enrolled\n"
             "since this one last looked is supposed to look like.\n"
-            "    woswoar trust",
+            "    woswoar accept",
             file=sys.stderr,
         )
 
@@ -772,6 +799,104 @@ def cmd_trust(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_accept(args: argparse.Namespace) -> int:
+    """`grant` and `trust` for a machine you own, in one step.
+
+    The two stay separate commands: they answer different questions, and someone
+    sharing a repository with a colleague may well answer them differently. This
+    is for the common case, where the answer to both is "yes, that one is mine"
+    -- reported as the thing that made setting up a second machine feel like too
+    much. Both are still named and described here, because what is being agreed
+    to is exactly what it was before.
+    """
+    from . import crypto, sync
+
+    pending = sync.newcomers()
+    if not pending:
+        print("nothing to accept; every machine here is already granted and trusted")
+        return 0
+
+    changed = [n for n in pending if n.changed_key]
+    fresh = [n for n in pending if n.needs_grant or n.needs_trust]
+
+    if not fresh:
+        print(
+            f"{len(changed)} machine(s) now sign with a different key than the one\n"
+            "accepted here. That is either a machine you re-enrolled or someone\n"
+            "rewriting the repository, and nothing can tell those apart:\n"
+            "    woswoar trust --replace",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"{len(fresh)} machine(s) not yet accepted here:\n")
+    for machine in fresh:
+        print(f"  {machine.display_name()}")
+        if machine.reader is not None:
+            said = "reads with" if machine.needs_grant else "already reads your history"
+            print(f"      {said:<28}{machine.reader.fingerprint}")
+        if machine.candidate is not None:
+            said = "signs with" if machine.needs_trust else "already accepted here"
+            print(f"      {said:<28}{machine.candidate.fingerprint}")
+
+    granting = [n for n in fresh if n.needs_grant]
+    trusting = [n for n in fresh if n.needs_trust]
+    print("\nAccepting does two separate things:\n")
+    if granting:
+        print(
+            f"  read     {len(granting)} machine(s) get to read your ENTIRE history, including"
+            "\n           days recorded before they existed. This is published, so it"
+            "\n           applies everywhere -- and it cannot be taken back for what"
+            "\n           they have already read.\n"
+        )
+    if trusting:
+        print(
+            f"  believe  this machine will accept what {len(trusting)} machine(s) publish."
+            "\n           Local only: every other machine of yours has to be told"
+            "\n           separately, because the repository is the thing that decision"
+            "\n           defends against.\n"
+        )
+    # One line per *kind* of key on screen, not one blanket command. There are
+    # two here and they are checked differently -- `grant` sends you to the age
+    # identity, `trust` to woswoar's own signing key -- and advice that does not
+    # match what is above it is advice nobody follows.
+    checks = []
+    if granting:
+        reads = dict.fromkeys(
+            crypto.how_to_check(n.reader.fingerprint) for n in granting if n.reader is not None
+        )
+        checks += [f"    reads with   {command}" for command in reads]
+    if trusting:
+        checks.append(f"    signs with   {crypto.how_to_check_signer()}")
+    print(
+        "A name is free text written by whoever added the key. The fingerprints are"
+        "\nnot -- run these on the machine they belong to and compare:\n"
+    )
+    print("\n".join(checks))
+    if changed:
+        # Deliberately not part of the prompt above. Accepting a *new* machine
+        # and accepting a new key for one already accepted are different
+        # decisions, and rolling them together is how the second gets made by
+        # someone answering the first.
+        print(
+            f"\nSeparately, {len(changed)} machine(s) changed their signing key. That is not"
+            "\npart of this and needs:  woswoar trust --replace"
+        )
+
+    if not _confirm(f"Accept {len(fresh)} machine(s)?", args.yes):
+        return 1
+
+    if granting:
+        report = sync.grant(approved=[reader.key for reader in sync.readers()])
+        print(f"\nre-sealed {report.resealed} key file(s), so they can read the older history")
+    if trusting:
+        sync.trust([n.candidate for n in trusting if n.candidate is not None])
+        print(f"accepted the history published by {len(trusting)} machine(s)")
+
+    print("\nNext: 'woswoar sync' to exchange history with them.")
+    return 0
+
+
 def cmd_compact(args: argparse.Namespace) -> int:
     from . import sync
 
@@ -850,6 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate a dedicated age key instead of reusing an SSH key",
     )
     p_init.add_argument("--identity", help="use this private key")
+    p_init.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="join the repo but do not exchange history yet",
+    )
     p_init.set_defaults(func=cmd_init)
 
     p_sync = subparsers.add_parser("sync", help="exchange history with the remote")
@@ -886,6 +1016,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_trust.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_trust.set_defaults(func=cmd_trust)
+
+    p_accept = subparsers.add_parser(
+        "accept",
+        help="add a machine you own: 'grant' and 'trust' in one step",
+    )
+    p_accept.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_accept.set_defaults(func=cmd_accept)
 
     p_compact = subparsers.add_parser("compact", help="merge old chunks (reduces file count)")
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
