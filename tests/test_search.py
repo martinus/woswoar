@@ -154,8 +154,8 @@ class TestFzfArgv(unittest.TestCase):
 
 MINUTE, HOUR, DAY = 60, 3600, 86400
 
-#: The history from the report that #115 came out of, newest first -- which is
-#: the order `rank_rows` hands to fzf, so any deviation in the output below is
+#: The history from the report this came out of, newest first -- which is the
+#: order `rank_rows` hands to fzf, so any deviation in the output below is
 #: fzf's ranking and nothing else. Every one of these matches "sync" equally
 #: well as far as fzf's score is concerned, which is the whole point: with the
 #: scores tied, the tiebreak decides the entire list.
@@ -187,15 +187,20 @@ class TestRealFzfRanking(unittest.TestCase):
     stand-in -- the behaviour under test is fzf's, not woswoar's.
     """
 
-    def ordered(self, query: str) -> list[str]:
+    def filtered(self, query: str) -> subprocess.CompletedProcess[str]:
+        """The fixture through the real fzf, with the real argv."""
         lines = search.render_rows([(NOW - age, cmd) for age, cmd in SYNC_HISTORY], now=NOW)
-        completed = subprocess.run(
+        # No `check`: 1 means "nothing matched", which one test below wants.
+        return subprocess.run(
             [*search._fzf_argv("global", "", True), f"--filter={query}"],
             input="\n".join(lines) + "\n",
             capture_output=True,
             text=True,
-            check=True,
         )
+
+    def ordered(self, query: str) -> list[str]:
+        completed = self.filtered(query)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         return [search.command_from_line(line) for line in completed.stdout.splitlines()]
 
     def test_the_newest_match_comes_first(self) -> None:
@@ -235,17 +240,15 @@ class TestRealFzfRanking(unittest.TestCase):
         """The reason `--nth=2..` is there, asserted through fzf itself.
 
         `TestFzfArgv` checks the flag is passed; this checks what it buys. "10h"
-        is the age of five entries in the fixture and a substring of no command
+        is the age of four entries in the fixture and a substring of no command
         in it, so without the flag this query returns them and with it nothing.
+
+        The exit code is asserted too: an fzf that failed to start would also
+        print nothing, and this would pass having matched nothing at all.
         """
-        completed = subprocess.run(
-            [*search._fzf_argv("global", "", True), "--filter=10h"],
-            input="\n".join(search.render_rows([(NOW - age, c) for age, c in SYNC_HISTORY], NOW))
-            + "\n",
-            capture_output=True,
-            text=True,
-        )
+        completed = self.filtered("10h")
         self.assertEqual(completed.stdout, "", "the relative-time column was matched against")
+        self.assertEqual(completed.returncode, 1, f"not fzf's no-match exit: {completed.stderr}")
 
 
 class TestRecalledCommandIsInert(unittest.TestCase):
