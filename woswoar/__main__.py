@@ -113,7 +113,9 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    lines = search.lines_for(args.scope, dedup=not args.no_dedup, limit=args.limit)
+    lines = search.lines_for(
+        args.scope, dedup=not args.no_dedup, limit=args.limit, colour=args.colour
+    )
     if lines:
         sys.stdout.write("\n".join(lines) + "\n")
     return 0
@@ -1317,6 +1319,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_scope(p_list)
     p_list.add_argument("--limit", type=int, default=None)
+    # Off by default, so `woswoar list | grep` stays plain text. The picker's
+    # own reload bindings pass it, because that output goes into fzf.
+    p_list.add_argument(
+        "--colour",
+        "--color",
+        action="store_true",
+        help="mark failed commands, for a terminal that understands it",
+    )
     p_list.set_defaults(func=cmd_list)
 
     p_import = sub(

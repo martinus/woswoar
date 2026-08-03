@@ -29,8 +29,17 @@ SCOPES: tuple[Scope, ...] = ("global", "host", "session")
 _TIME_WIDTH = 4
 _PREFIX = _TIME_WIDTH + 2
 
-#: Sort key for a (timestamp, command) row. In C, like `rank`'s `attrgetter`.
+#: Sort key for a row. In C, rather than a lambda.
 _STAMP = itemgetter(0)
+
+#: One display row: when, what, and how it ended.
+Row = tuple[int, str, str]
+
+#: Dim red for a command that failed. Dim rather than plain red so a screen of
+#: failures does not shout, and so it reads as "this one did not work" rather
+#: than as an error message woswoar is producing now.
+_FAILED = "\x1b[2;31m"
+_RESET = "\x1b[0m"
 
 
 def relative_time(ts: int, now: int | None = None) -> str:
@@ -62,7 +71,9 @@ def command_from_line(line: str) -> str:
     return make_inert(unescape(line[_PREFIX:]))
 
 
-def lines_for(scope: Scope, dedup: bool = True, limit: int | None = None) -> list[str]:
+def lines_for(
+    scope: Scope, dedup: bool = True, limit: int | None = None, colour: bool = False
+) -> list[str]:
     """The full pipeline: load, filter, rank, render.
 
     The two columns a line is made of come straight out of the cache, without
@@ -78,6 +89,12 @@ def lines_for(scope: Scope, dedup: bool = True, limit: int | None = None) -> lis
     if scope == "host":
         loaded = cache.load_columns()
         stamps, commands = loaded.stamps_and_commands({store.machine().id})
+        codes = [
+            code
+            for relpath, flat in loaded.files.items()
+            if loaded.meta[relpath].host == store.machine().id
+            for code in flat[3::6]
+        ]
     elif scope == "session":
         session = os.environ.get("WOSWOAR_SESSION", "")
         if not session:
@@ -85,24 +102,35 @@ def lines_for(scope: Scope, dedup: bool = True, limit: int | None = None) -> lis
             return []
         loaded = cache.load_columns()
         stamps, commands = loaded.stamps_and_commands()
+        every = loaded.exit_codes()
         wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
         stamps = [stamps[i] for i in wanted]
         commands = [commands[i] for i in wanted]
+        codes = [every[i] for i in wanted]
     else:
         loaded = cache.load_columns()
         stamps, commands = loaded.stamps_and_commands()
+        codes = loaded.exit_codes()
 
-    rows = rank_rows(stamps, commands, dedup=dedup)
+    rows = rank_rows(stamps, commands, codes, dedup=dedup)
     if limit is not None:
         rows = rows[:limit]
-    return render_rows(rows)
+    return render_rows(rows, colour=colour)
 
 
-def rank_rows(stamps: list[str], commands: list[str], dedup: bool = True) -> list[tuple[int, str]]:
-    """Newest first, optionally collapsing repeats. See `rank`."""
+def rank_rows(
+    stamps: list[str], commands: list[str], codes: list[str], dedup: bool = True
+) -> list[Row]:
+    """Newest first, optionally collapsing repeats.
+
+    The exit status rides along so the display can colour by it. Deduplication
+    keeps the *most recent* run, so a command that failed last time is shown as
+    failed even if it has succeeded a hundred times before -- which is the way
+    round that helps.
+    """
     # One `int` per row, here, where the sort needs it -- rather than on every
     # entry of a history at parse time.
-    ordered = sorted(zip(map(int, stamps), commands, strict=True), key=_STAMP, reverse=True)
+    ordered = sorted(zip(map(int, stamps), commands, codes, strict=True), key=_STAMP, reverse=True)
     if not dedup:
         return ordered
 
@@ -114,11 +142,26 @@ def rank_rows(stamps: list[str], commands: list[str], dedup: bool = True) -> lis
     return [row for row in ordered if not (row[1] in seen or add(row[1]))]
 
 
-def render_rows(rows: list[tuple[int, str]], now: int | None = None) -> list[str]:
-    """Format ranked rows as display lines. See `render`."""
+def render_rows(rows: list[Row], now: int | None = None, colour: bool = False) -> list[str]:
+    """Format ranked rows as display lines.
+
+    With `colour`, a command that exited non-zero is dimmed red. Safe only
+    because `make_inert` has already removed every C0 byte -- ESC among them --
+    from the command on its way into the cache, so nothing a peer published can
+    add escapes of its own. That is also why fzf is given `--ansi` only here:
+    without inert text, `--ansi` would turn another machine's history into
+    something that can drive this terminal.
+
+    fzf hands back the line with the escapes stripped, so `command_from_line`
+    needs to know nothing about any of this.
+    """
     if now is None:
         now = int(time.time())
-    return [f"{relative_time(ts, now):>{_TIME_WIDTH}}  {escape(cmd)}" for ts, cmd in rows]
+    out = []
+    for ts, cmd, code in rows:
+        line = f"{relative_time(ts, now):>{_TIME_WIDTH}}  {escape(cmd)}"
+        out.append(f"{_FAILED}{line}{_RESET}" if colour and code not in ("0", "") else line)
+    return out
 
 
 def _self_command() -> str:
@@ -137,6 +180,9 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool) -> list[str]:
 
     argv = [
         "fzf",
+        # Safe here and only here: `render_rows` writes the escapes and
+        # `make_inert` guarantees no command can contain any of its own.
+        "--ansi",
         "--height=60%",
         "--layout=reverse",
         "--border",
@@ -163,7 +209,7 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool) -> list[str]:
     ]
     for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
         argv.append(
-            f"--bind={key}:reload({self_cmd} list --scope {target}{dedup_flag})"
+            f"--bind={key}:reload({self_cmd} list --colour --scope {target}{dedup_flag})"
             f"+change-prompt(woswoar ({target}) )"
         )
     return argv
@@ -207,7 +253,7 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
     assert process.stdin is not None and process.stdout is not None
 
     try:
-        _feed(process.stdin, lines_for(scope, dedup=dedup))
+        _feed(process.stdin, lines_for(scope, dedup=dedup, colour=True))
     finally:
         # Both closes can raise the same way, and neither is a failure: it only
         # means fzf is already gone. Selecting the first line the moment it
