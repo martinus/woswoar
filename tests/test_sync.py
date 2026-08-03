@@ -310,12 +310,12 @@ class TestTwoMachines(SyncTestCase):
             self.assertEqual(report.chunks_merged, 1)
             self.assertEqual(beta.commands(), {"git status", "make -j8"})
 
-    def test_reencrypt_alone_grants_access_without_a_surrounding_sync(self) -> None:
+    def test_grant_alone_gives_access_without_a_surrounding_sync(self) -> None:
         """The recipient list is a file in the working tree.
 
         Re-sealing against a checkout taken before the new machine enrolled
         rewrites every key to the *old* recipients and reports full success,
-        while granting nothing. So `reencrypt` has to fetch first, and this
+        while granting nothing. So `grant` has to fetch first, and this
         pins that it does -- alpha never syncs after beta joins.
         """
         alpha = self.machine("alpha")
@@ -334,7 +334,7 @@ class TestTwoMachines(SyncTestCase):
             sync.run()
             self.assertEqual(beta.commands(), {"git status"})
 
-    def test_a_new_machine_cannot_reencrypt_for_itself(self) -> None:
+    def test_a_new_machine_cannot_grant_to_itself(self) -> None:
         """Re-sealing means opening the key first, which beta cannot do.
 
         This is the property the encryption rests on, not a missing feature:
