@@ -5529,3 +5529,115 @@ class TestTheHookKeepsItselfUpToDate(SyncTestCase):
         hook.write_text("# older\n", encoding="utf-8")
         with mock.patch.object(Path, "write_bytes", side_effect=OSError("read-only")):
             self.assertEqual(self.run_cli(alpha, "sync").code, 0)
+
+
+class TestTheStatusLineOnAMachineThatCannotReadYet(SyncTestCase):
+    """The screen a new machine actually gets, reported from a real install:
+
+        3 machine(s) waiting to be accepted here:
+            '(unnamed)'
+            '(unnamed)'
+            '(unnamed)'
+
+    A name lives in `hosts/<id>/name.age`, sealed to the recipients, so a
+    machine nobody has granted yet cannot open one of them. That part is
+    working as designed -- but three identical placeholders distinguish
+    nothing, and `accept` here does not get that machine any history.
+    """
+
+    def joined_but_not_granted(self) -> tuple[Fake, list[Fake]]:
+        """A newcomer, and the machines that have not accepted it yet."""
+        others = []
+        for name in ("alpha", "beta"):
+            machine = self.machine(name, display=f"martin@{name}")
+            with machine.active():
+                machine.record("2023-11-14", 1_700_000_001, f"{name} history")
+                sync.run()
+            others.append(machine)
+        newcomer = self.machine("newcomer", display="martin@newcomer")
+        with newcomer.active():
+            newcomer.record("2023-11-15", 1_700_100_001, "its own history")
+            sync.run()
+        return newcomer, others
+
+    def test_each_machine_is_told_apart_by_its_fingerprint(self) -> None:
+        newcomer, _ = self.joined_but_not_granted()
+        out = self.run_cli(newcomer).out
+        lines = [line for line in out.splitlines() if "(unnamed)" in line]
+        self.assertEqual(len(lines), 2, f"expected two unnamed machines:\n{out}")
+        self.assertEqual(len(set(lines)), 2, f"the two lines are identical:\n{out}")
+
+    def test_it_says_why_they_have_no_names_and_what_is_missing(self) -> None:
+        """`accept` on this machine changes nothing about what it can read, and
+        a screen that only says `Next: woswoar accept` sends someone to it."""
+        newcomer, _ = self.joined_but_not_granted()
+        out = self.run_cli(newcomer).out
+        self.assertIn("sealed", out, "it does not say why they have no names")
+        self.assertIn("already use", out, "the other-machine step is missing")
+        # Both, and in that order: the explanation has to come before the
+        # commands, or "Next: woswoar accept" is immediately contradicted.
+        self.assertLess(out.index("sealed"), out.index("Next:"))
+
+    def test_a_machine_that_can_read_is_not_lectured(self) -> None:
+        """Once granted, the names resolve and the explanation would be noise --
+        and worse, wrong."""
+        newcomer, others = self.joined_but_not_granted()
+        for machine in others:
+            self.run_cli(machine, "accept", "--yes")
+        with newcomer.active():
+            sync.run()
+        out = self.run_cli(newcomer).out
+        self.assertNotIn("already use", out)
+        self.assertNotIn("sealed", out)
+        self.assertIn("Next:  woswoar accept", out, "it still has to name the step")
+
+    def test_the_fingerprint_is_the_one_accept_will_ask_about(self) -> None:
+        """Two screens describing one decision have to name it the same way, or
+        checking the first against the second proves nothing.
+
+        Asserted against `candidate.fingerprint` -- the signing key, which is
+        what `accept` prints and what `ssh-keygen -lf` reproduces on the machine
+        itself -- and not against `Newcomer.fingerprint`. The first version did
+        the latter, which is the same expression the code under test uses: both
+        sides moved together, and a mutation swapping in the *reader's*
+        fingerprint went unnoticed.
+        """
+        newcomer, _ = self.joined_but_not_granted()
+        status = self.run_cli(newcomer).out
+        with newcomer.active():
+            pending = sync.local_newcomers().machines
+        self.assertTrue(pending, "precondition: something is pending")
+        for machine in pending:
+            candidate = machine.candidate
+            assert candidate is not None, "these machines all publish a signer"
+            self.assertIn(candidate.fingerprint, status)
+            self.assertTrue(
+                candidate.fingerprint.startswith("SHA256:"),
+                "that is not the signing fingerprint accept shows",
+            )
+
+    def test_a_peer_calling_itself_unnamed_does_not_look_unreadable(self) -> None:
+        """`(unnamed)` is a string a peer can put in its own `name.age`, which
+        sealing needs no secret to write -- so "has this name been read" cannot
+        be answered by comparing against the placeholder's text. See `Name`.
+
+        The cost of getting it wrong is that a machine which *can* read its
+        peers is told it cannot, and pointed at a step it has already done.
+        """
+        others = []
+        for name, display in (("alpha", sync.UNNAMED), ("beta", sync.UNNAMED)):
+            machine = self.machine(name, display=display)
+            with machine.active():
+                machine.record("2023-11-14", 1_700_000_001, f"{name} history")
+                sync.run()
+            others.append(machine)
+        newcomer = self.machine("newcomer", display="martin@newcomer")
+        with newcomer.active():
+            sync.run()
+        for machine in others:
+            self.run_cli(machine, "accept", "--yes")
+        with newcomer.active():
+            sync.run()
+
+        out = self.run_cli(newcomer).out
+        self.assertNotIn("sealed", out, "a readable name was read as unreadable")
