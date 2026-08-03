@@ -63,11 +63,16 @@ one machine.
 
 > [!TIP]
 > **The same line upgrades an existing install** — run it again whenever you want
-> the latest release, then `woswoar install` to refresh the shell hook, which is
-> a copy and does not update with the program. `woswoar` and `woswoar doctor`
-> both say so when it is out of date. `stable` tracks the most recent tag, so the
-> command never changes and you never edit a version number on five machines.
-> Swap `@stable` for `@main` to track the tip, or `@v0.7.0` to pin exactly.
+> the latest release. The shell hook is a copy rather than the packaged file, but
+> it brings itself up to date on the next background sync, so there is nothing
+> else to run; open a new shell to pick it up. `stable` tracks the most recent
+> tag, so the command never changes and you never edit a version number on five
+> machines. Swap `@stable` for `@main` to track the tip, or `@v0.7.0` to pin
+> exactly.
+>
+> **Coming from 0.6.x or earlier, run `woswoar install` once.** Those versions
+> had no background sync, so there is nothing running that could notice.
+> `woswoar` and `woswoar doctor` both say so if it is skipped.
 >
 > If `--force` fails with **"A virtual environment already exists"**, your pipx
 > is using `uv` as its backend and cannot reuse the old venv. Either

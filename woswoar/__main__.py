@@ -45,10 +45,17 @@ def _hook_bytes() -> bytes:
     thing is what makes that comparison true by construction rather than by
     hoping two readers agree.
 
-    Imported here rather than at module scope: importlib.resources costs ~8 ms
-    of startup and only `install` and `doctor` need it, while every Ctrl-R pays
-    for whatever this module imports eagerly.
+    Beside this file first, and `importlib.resources` only if that is not
+    there. `resources` costs a measured 8.7 ms to import -- a fifth of an idle
+    sync, which now runs once a minute and calls this every time -- while the
+    package layout puts the hook next to this module in every install that has
+    a filesystem at all, wheel or editable. The fallback is for a zipapp, where
+    `__file__` is a path inside the archive and nothing can open it.
     """
+    beside = Path(__file__).resolve().parent / "shell" / HOOK_NAME
+    if beside.is_file():
+        return beside.read_bytes()
+
     from importlib import resources
 
     return (resources.files("woswoar") / "shell" / HOOK_NAME).read_bytes()
@@ -533,6 +540,11 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
+    # Before the sync, not after: a remote that is unreachable must not be able
+    # to keep the hook out of date, and these two have nothing to do with each
+    # other beyond both being things this command is well placed to do.
+    _refresh_hook()
+
     # The shell hook fires this detached, with its output going nowhere, so a
     # failure has to be left somewhere the bare `woswoar` can find it.
     #
@@ -787,6 +799,46 @@ def _hook_is_stale() -> bool:
     """
     hook = store.data_dir() / HOOK_NAME
     return hook.is_file() and hook.read_bytes() != _hook_bytes()
+
+
+def _refresh_hook() -> bool:
+    """Bring the installed hook up to this version, if it is behind.
+
+    `install` copies the hook rather than sourcing it out of the package, so
+    upgrading the program used to leave the old shell code running until
+    somebody re-ran `install`. Since the hook now starts a `woswoar sync` about
+    once a minute, that sync is the thing best placed to notice -- an upgrade
+    heals itself within a minute and the reinstall step goes away.
+
+    Deliberately *not* a symlink into the installed package, which was the first
+    idea and is worse. That path contains the Python version
+    (`.../lib/python3.14/site-packages/...`), so a distribution's Python bump or
+    a `pipx reinstall` leaves it dangling -- and a dangling `source` prints an
+    error at every shell start and switches recording off, where a merely stale
+    hook still records and still searches. It would also make `doctor` report
+    the packaged file's mode as an exposure, because its permission walk uses
+    `stat`, which follows links.
+
+    Only ever *re*-writes. A machine with no hook at all has not run `install`,
+    its `.bashrc` sources nothing, and writing a file it does not reference
+    would be a confusing way to say so.
+    """
+    if not _hook_is_stale():
+        return False
+    hook = store.data_dir() / HOOK_NAME
+    # The mode was set when `install` created it and `write_bytes` truncates
+    # rather than recreates, so it survives -- and the hook is public code
+    # anyway. Failure is not fatal: a read-only data directory is a real
+    # situation and it must not stop the sync this command exists for.
+    try:
+        hook.write_bytes(_hook_bytes())
+    except OSError:
+        return False
+    # Shells already running keep the code they sourced, exactly as they do
+    # after a hand-run `install`. New ones get this. Nothing to do about the
+    # difference, and nothing anyone needs to do.
+    print(f"updated the shell hook at {hook} to {__version__}")
+    return True
 
 
 def _report_stale_hook() -> None:

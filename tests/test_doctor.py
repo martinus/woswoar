@@ -221,3 +221,18 @@ class TestAHookLeftBehindByAnUpgrade(WoswoarTestCase):
         out = support.run_cli("doctor").out
         self.assertIn("[FAIL] hook", out)
         self.assertNotIn("older than this woswoar", out)
+
+
+class TestReadingThePackagedHook(unittest.TestCase):
+    def test_the_fast_path_and_the_fallback_agree(self) -> None:
+        """`_hook_bytes` reads the file beside the module and only falls back to
+        `importlib.resources` when there is none -- 8.7 ms saved on a sync that
+        now runs once a minute. Two routes to one file is two chances to read a
+        different one, and the fallback is exercised by nothing else here: it is
+        for a zipapp, which nothing in CI builds.
+        """
+        from importlib import resources
+
+        via_resources = (resources.files("woswoar") / "shell" / main_module.HOOK_NAME).read_bytes()
+        self.assertEqual(main_module._hook_bytes(), via_resources)
+        self.assertTrue(via_resources.startswith(b"# woswoar"), "that is not the hook")
