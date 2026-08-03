@@ -66,13 +66,20 @@ def relative_time(ts: int, now: int | None = None) -> str:
     return f"{years}y" if years < 100 else "old"
 
 
-#: Widest a host name may be in the picker. Long enough for `martin@work-laptop`
-#: to survive, short enough that the commands still start near the left.
-_HOST_WIDTH = 16
+#: Widest a machine label may be. Generous, because it is only ever as wide as
+#: the longest label actually present, and a column of ellipses distinguishes
+#: nothing -- which is what a tight cap produced: `martinleitnerank` and
+#: `martinus@DT-24YY`, both cut, from two machines that share neither.
+_HOST_WIDTH = 20
+
+#: Cut here rather than at the end. A name is `user@host`, and the *host* is
+#: what tells two of your machines apart -- it is also the part a long username
+#: pushes off the end.
+_ELLIPSIS = "\u2026"
 
 
 def host_label(host_id: str) -> str:
-    """What to show for a machine, in a form safe to put on a coloured line.
+    """What to show for one machine, in a form safe to put on a coloured line.
 
     `make_inert` because this is *another machine's* text: `_merge_name` writes
     whatever decrypted out of its `name.age` straight to disk, and sealing one
@@ -85,10 +92,32 @@ def host_label(host_id: str) -> str:
     is what the host directory is called.
     """
     name = make_inert(store.host_name(host_id)).strip()
-    # A short slice of the id when no name has arrived -- the full 16 hex
-    # characters would be a wide column of nothing anyone can read, and the
-    # first eight already tell two machines apart.
-    return (name or host_id[:8])[:_HOST_WIDTH]
+    return name or host_id[:8]
+
+
+def host_labels(hosts: set[str]) -> dict[str, str]:
+    """A short label per machine, chosen so that they stay *different*.
+
+    Names are `user@host` by default, and on one person's machines the user is
+    usually the same and the host is what differs -- so the host half is tried
+    first. It is dropped only if two machines would then look alike, because a
+    column that cannot tell them apart is worse than a long one.
+
+    Reported: two machines showing as `martinleitnerank` and
+    `martinus@DT-24YY`, both cut at sixteen characters, neither saying which
+    machine it was.
+    """
+    full = {host: host_label(host) for host in hosts}
+    short = {host: label.rsplit("@", 1)[-1] or label for host, label in full.items()}
+    chosen = short if len(set(short.values())) == len(short) else full
+    return {host: _clip(label) for host, label in chosen.items()}
+
+
+def _clip(label: str) -> str:
+    """Trim to `_HOST_WIDTH`, keeping the end -- see `_ELLIPSIS`."""
+    if len(label) <= _HOST_WIDTH:
+        return label
+    return _ELLIPSIS + label[-(_HOST_WIDTH - 1) :]
 
 
 def command_from_line(line: str, host_width: int = 0) -> str:
@@ -206,7 +235,7 @@ def render_rows(
     """
     if now is None:
         now = int(time.time())
-    labels = {host: host_label(host) for host in {row[3] for row in rows}} if host_width else {}
+    labels = host_labels({row[3] for row in rows}) if host_width else {}
 
     out = []
     for ts, cmd, code, host in rows:
@@ -228,7 +257,7 @@ def host_width_for(hosts: set[str]) -> int:
     """
     if len(hosts) < 2:
         return 0
-    return min(_HOST_WIDTH, max(len(host_label(host)) for host in hosts))
+    return max(len(label) for label in host_labels(hosts).values())
 
 
 def _self_command() -> str:
@@ -239,6 +268,49 @@ def _self_command() -> str:
     if found:
         return found
     return f"{sys.executable} -m woswoar"
+
+
+def fzf_supports_transform() -> bool:
+    """Whether this fzf has the `transform` action, added in 0.45.
+
+    Needed because an unknown *action* in a `--bind` makes fzf refuse to start,
+    so this cannot be offered optimistically -- an older fzf would get no picker
+    at all rather than no Ctrl-R cycling. One `fzf --version`, on a path that is
+    already forking fzf.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["fzf", "--version"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    digits = out.strip().split()[0].split(".") if out.strip() else []
+    try:
+        major, minor = int(digits[0]), int(digits[1])
+    except (IndexError, ValueError):
+        return False
+    return (major, minor) >= (0, 45)
+
+
+def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
+    """Ctrl-R inside the picker moves to the next scope.
+
+    fzf holds no variables, so the current scope is read back out of the prompt
+    it is already showing -- which is why `change-prompt` is not cosmetic. The
+    order matches the header: global, host, session, round again.
+    """
+    reload = f"{self_cmd} list --colour{width} --scope"
+    script = (
+        'case "$FZF_PROMPT" in '
+        "*global*) n=host ;; "
+        "*host*) n=session ;; "
+        "*) n=global ;; "
+        "esac; "
+        f'printf "reload({reload} $n{dedup_flag})+change-prompt(woswoar ($n) )"'
+    )
+    return f"--bind=ctrl-r:transform:{script}"
 
 
 def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[str]:
@@ -277,8 +349,13 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
         "--tiebreak=index",
         f"--query={query}",
         f"--prompt=woswoar ({scope}) ",
-        "--header=ctrl-g global | ctrl-h host | ctrl-s session",
+        "--header=ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session",
     ]
+    if fzf_supports_transform():
+        argv.append(_cycle_binding(self_cmd, dedup_flag, width))
+    else:
+        # Say what is on offer, rather than advertising a key that does nothing.
+        argv[-1] = "--header=ctrl-g global | ctrl-h host | ctrl-s session"
     for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
         argv.append(
             f"--bind={key}:reload({self_cmd} list --colour{width} --scope {target}{dedup_flag})"

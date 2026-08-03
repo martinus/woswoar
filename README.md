@@ -16,15 +16,17 @@ when you need that one command from last Tuesday, on the other machine.
 
 ```
   woswoar (global) > docker
-   2m  laptop   docker compose up -d --build
-   3h  desktop  docker logs -f api
-   6d  laptop   docker system prune -af
-  ctrl-g global | ctrl-h host | ctrl-s session
+   2m  thinkpad  docker compose up -d --build
+   3h  DT-24YYQ3 docker logs -f api
+   6d  thinkpad  docker system prune -af
+  ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session
 ```
 
 The machine column appears once you have more than one, and fzf matches on it —
-so typing `desktop` narrows to that machine. A command that exited non-zero is
-dimmed red.
+so typing `thinkpad` narrows to that machine. It shows the *host* part of each
+machine's name, because that is usually what differs between your own machines.
+A command that exited non-zero is dimmed red, and <kbd>Ctrl</kbd>+<kbd>R</kbd>
+again cycles global → host → session.
 
 ## Quick start
 
@@ -64,6 +66,18 @@ one machine.
 > the latest release. `stable` tracks the most recent tag, so the command never
 > changes and you never edit a version number on five machines. Swap `@stable`
 > for `@main` to track the tip, or `@v0.6.0` to pin exactly.
+>
+> If `--force` fails with **"A virtual environment already exists"**, your pipx
+> is using `uv` as its backend and cannot reuse the old venv. Either
+> `UV_VENV_CLEAR=1 pipx install --force …`, or the version that always works:
+>
+> ```bash
+> pipx uninstall woswoar
+> pipx install "git+https://github.com/martinus/woswoar.git@stable"
+> ```
+>
+> Neither touches your history: it lives in `~/.local/share/woswoar`, not in the
+> venv.
 
 **Needs:** bash 5.0+ (Linux) · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
