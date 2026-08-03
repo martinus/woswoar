@@ -187,6 +187,33 @@ class Cache:
             commands += flat[5::6]
         return stamps, commands
 
+    def display_columns(
+        self, hosts: set[str] | None = None
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Timestamps, commands, exit codes and host ids, aligned, as strings.
+
+        One pass and one place. Each caller used to slice what it happened to
+        need, so adding a column meant adding it to every scope separately --
+        and the `host` scope grew a hand-rolled comprehension that repeated what
+        `stamps_and_commands` already knew.
+
+        ``hosts`` narrows to those machines, which costs one dict lookup per
+        *file*: the host belongs to the file, not the row.
+        """
+        stamps: list[str] = []
+        commands: list[str] = []
+        codes: list[str] = []
+        owners: list[str] = []
+        for relpath, flat in self.files.items():
+            host = self.meta[relpath].host
+            if hosts is not None and host not in hosts:
+                continue
+            stamps += flat[0::6]
+            commands += flat[5::6]
+            codes += flat[3::6]
+            owners += [host] * (len(flat) // _FIELDS_PER_ENTRY)
+        return stamps, commands, codes, owners
+
     def exit_codes(self) -> list[str]:
         """The exit status column, in the same order as `stamps_and_commands`."""
         return [value for flat in self.files.values() for value in flat[3::6]]

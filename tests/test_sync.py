@@ -449,7 +449,12 @@ class TestTwoMachines(SyncTestCase):
             sync.run()
 
             def recall(scope: search.Scope) -> list[str]:
-                return [search.command_from_line(line) for line in search.lines_for(scope)]
+                # One width, decided once and used for both, as the picker does.
+                width = search.host_width_for(set(store.host_names()))
+                return [
+                    search.command_from_line(line, width)
+                    for line in search.lines_for(scope, host_width=width)
+                ]
 
             self.assertEqual(len(recall("global")), 2)
             self.assertEqual(recall("host"), ["from beta"])

@@ -114,7 +114,11 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     lines = search.lines_for(
-        args.scope, dedup=not args.no_dedup, limit=args.limit, colour=args.colour
+        args.scope,
+        dedup=not args.no_dedup,
+        limit=args.limit,
+        colour=args.colour,
+        host_width=args.host_width,
     )
     if lines:
         sys.stdout.write("\n".join(lines) + "\n")
@@ -1321,6 +1325,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--limit", type=int, default=None)
     # Off by default, so `woswoar list | grep` stays plain text. The picker's
     # own reload bindings pass it, because that output goes into fzf.
+    # Passed by the picker's reload bindings so both sides lay the line out the
+    # same way. Not something to type by hand, hence no help text.
+    p_list.add_argument("--host-width", type=int, default=None, help=argparse.SUPPRESS)
     p_list.add_argument(
         "--colour",
         "--color",
