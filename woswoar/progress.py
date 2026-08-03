@@ -36,7 +36,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO, cast
 
 #: How long a command may run before it owes the user a word. Below this,
 #: printing costs more attention than it saves: an idle sync is ~10 ms, and the
@@ -57,6 +57,13 @@ class Reporter(Protocol):
 
     def tick(self, done: int, total: int, noun: str) -> None:
         """Report position within the current phase."""
+
+    def clear(self) -> None:
+        """Give the line back, without ending the run.
+
+        Called before anything else writes to the terminal, and possibly many
+        times. A later `tick` may redraw.
+        """
 
     def finish(self) -> None:
         """Leave the line as it was found."""
@@ -105,11 +112,19 @@ class _Terminal:
         share = f" ({done * 100 // total}%)" if total > 0 else ""
         self._write(f"  {self._label}... {done}/{total} {noun}{share}")
 
+    def clear(self) -> None:
+        if not self._showing:
+            return
+        # Lowered before the write, not after: the write goes to a stream that
+        # `_sharing_the_screen` may have wrapped, and a wrapped write calls back
+        # in here. Clearing the flag first makes that second call a no-op rather
+        # than an unbounded recursion.
+        self._showing = False
+        self._stream.write("\r" + " " * self._width + "\r")
+        self._stream.flush()
+
     def finish(self) -> None:
-        if self._showing:
-            self._stream.write("\r" + " " * self._width + "\r")
-            self._stream.flush()
-            self._showing = False
+        self.clear()
 
 
 class _Recorder:
@@ -123,6 +138,14 @@ class _Recorder:
 
     def tick(self, done: int, total: int, noun: str) -> None:
         self.said.append(f"tick:{done}/{total} {noun}")
+
+    def clear(self) -> None:
+        """Nothing to give back: a recorder never held the line.
+
+        Deliberately unrecorded. It fires on every write to stdout, so recording
+        it would bury what a test is actually asserting on under one entry per
+        printed line.
+        """
 
     def finish(self) -> None:
         self.said.append("finish")
@@ -143,6 +166,53 @@ def tick(done: int, total: int, noun: str) -> None:
         _current.tick(done, total, noun)
 
 
+def clear() -> None:
+    """Take the progress line off the screen before something else uses it."""
+    if _current is not None:
+        _current.clear()
+
+
+class _Shared:
+    """An output stream, with the progress line cleared out of the way first.
+
+    The counter is rewritten in place and so ends in no newline, and
+    `to_terminal` wraps the *whole* command -- so a command that prints while it
+    is still working prints onto the counter:
+
+        merging other machines... 3/5 days (60%)Merged 12 commands
+
+    Reported from a real install as output that "doesn't properly print a
+    newline when done". Only the first such line is damaged, which is what makes
+    it look intermittent: after it the cursor is on a fresh line again.
+
+    Done here rather than by calling `clear` before each `print` because the
+    commands that print mid-run are not a closed set -- `sync` reports resealing
+    and newcomers, `doctor` prints a line per check -- and a rule every future
+    command has to remember is one a future command will forget.
+
+    Both streams are wrapped, not just stdout. The counter goes to stderr, so
+    stderr is where a collision is most obvious, and `init` prints "joined, but
+    the first sync failed" there (`__main__.py:489`) partway through exactly the
+    kind of slow command that has a counter running.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        # Empty writes reach here from `print`'s separator handling, and must
+        # not disturb a counter that is mid-redraw.
+        if text:
+            clear()
+        return self._stream.write(text)
+
+    def __getattr__(self, name: str) -> Any:
+        # `isatty` above all: `doctor`'s tick marks and `list --colour` decide
+        # on colour by asking stdout, and a wrapper that answered for itself
+        # would turn the colour off whenever progress was installed.
+        return getattr(self._stream, name)
+
+
 @contextmanager
 def _install(reporter: Reporter | None) -> Iterator[None]:
     global _current
@@ -157,17 +227,40 @@ def _install(reporter: Reporter | None) -> Iterator[None]:
 
 
 @contextmanager
+def _sharing_the_screen() -> Iterator[None]:
+    """Route both output streams through `_Shared` for the duration.
+
+    The reporter keeps the raw stream it was built with, so its own writes do
+    not recurse back through here.
+    """
+    before_out, before_err = sys.stdout, sys.stderr
+    sys.stdout = cast(TextIO, _Shared(before_out))
+    sys.stderr = cast(TextIO, _Shared(before_err))
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = before_out, before_err
+
+
+@contextmanager
 def to_terminal(stream: TextIO | None = None) -> Iterator[None]:
     """Report progress, if there is a terminal to report it to.
 
     Wrapped around the *whole* command rather than each slow part, so the
     patience clock measures what the user is waiting for rather than what any
-    one loop is doing.
+    one loop is doing. Which is also why stdout is borrowed for that whole time:
+    the command keeps printing while progress is showing.
     """
     out = sys.stderr if stream is None else stream
     watched = out.isatty()
     with _install(_Terminal(out) if watched else None):
-        yield
+        if not watched:
+            # Nothing holds the line, so nothing has to give it back -- and
+            # `list` piped into fzf writes every row through here.
+            yield
+        else:
+            with _sharing_the_screen():
+                yield
 
 
 @contextmanager
