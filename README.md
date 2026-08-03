@@ -41,7 +41,7 @@ one machine.
 > **The same line upgrades an existing install** — run it again whenever you want
 > the latest release. `stable` tracks the most recent tag, so the command never
 > changes and you never edit a version number on five machines. Swap `@stable`
-> for `@main` to track the tip, or `@v0.4.1` to pin exactly.
+> for `@main` to track the tip, or `@v0.5.0` to pin exactly.
 
 **Needs:** bash 5.0+ (Linux) · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
