@@ -48,12 +48,19 @@ jobs:
             exit 1
           fi
 
-      - name: install age
+      - name: install age and fzf
         # The sync suite skips itself without age, and a skipped suite is green
         # -- so prove age is here rather than assume the install worked.
+        #
+        # fzf for a different reason: the suite does not skip without it, it
+        # takes a *different branch* -- `setup` asks an extra question when a
+        # tool is missing. CI installs both, this installed only age, and the
+        # two therefore ran different code. That difference is what failed a
+        # release after every check on the pull request was green.
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          sudo apt-get update -qq && sudo apt-get install -y -qq age fzf
           age --version
+          fzf --version
 
       - name: tests
         # A tag can be pushed to any commit by anyone. Re-running the suite here

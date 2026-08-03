@@ -60,6 +60,15 @@ class SetupTestCase(WoswoarTestCase):
                 else os.environ.pop("HOME", None)
             )
         )
+        # Step 1 asks an extra question when a tool is missing, so leaving this
+        # to the machine makes every scripted answer below land on a different
+        # prompt depending on whether fzf happens to be installed. CI installs
+        # it and the release workflow did not, which is exactly how this got
+        # through review and then failed while cutting a release.
+        self._tools = mock.patch("woswoar.deps.missing", return_value=[])
+        self._tools.start()
+        self.addCleanup(self._tools.stop)
+
         self.rcfile = Path(self.root) / "bashrc"
         self.rcfile.write_text("# existing\n", encoding="utf-8")
 
@@ -105,6 +114,24 @@ class TestItRefusesWithNobodyToAsk(WoswoarTestCase):
         ):
             support.run_cli("setup", "--rcfile", str(rcfile))
         self.assertEqual(rcfile.read_text(encoding="utf-8"), "# existing\n")
+
+
+class TestTheToolsStep(SetupTestCase):
+    """The branch the other tests patch away, tested on its own."""
+
+    def test_a_missing_tool_is_reported_and_can_be_carried_past(self) -> None:
+        from woswoar import deps
+
+        with mock.patch("woswoar.deps.missing", return_value=[deps.FZF]):
+            answers = self.run_setup("y", "")  # carry on, then blank URL
+        self.assertTrue(any("Carry on without them" in prompt for prompt in answers.asked))
+
+    def test_declining_stops_before_anything_is_written(self) -> None:
+        from woswoar import deps
+
+        with mock.patch("woswoar.deps.missing", return_value=[deps.FZF]):
+            self.run_setup("n")
+        self.assertEqual(self.rcfile.read_text(encoding="utf-8"), "# existing\n")
 
 
 class TestWhatItOffersToImport(SetupTestCase):
