@@ -5091,6 +5091,90 @@ class TestAHostCannotClaimAnotherMachinesKey(SyncTestCase):
         self.assertNotIn("claimed by more than one machine", out)
 
 
+class TestTheStatusLine(SyncTestCase):
+    """`woswoar` on its own: the one command somebody has to know.
+
+    It routes; it does not act. Everything it can point at is still a command of
+    its own, and the ones that widen who can read the history stay that way --
+    a consent prompt that appears because you typed the bare command is one
+    whose moment somebody else chose.
+    """
+
+    def two_machines(self) -> tuple[Fake, Fake]:
+        alpha = self.machine("alpha", display="martin@desktop")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "old history")
+            sync.run()
+        beta = self.machine("beta", display="martin@laptop")
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "beta history")
+            sync.run()
+        with alpha.active():
+            # The timer, which runs once a minute. `status` reports what the
+            # last sync brought in rather than fetching, so a beta that has not
+            # arrived here yet is correctly nothing for alpha to decide about.
+            sync.run()
+        return alpha, beta
+
+    def test_it_names_the_machine_waiting_and_the_command_to_run(self) -> None:
+        alpha, _ = self.two_machines()
+        ran = self.run_cli(alpha)
+        self.assertIn("martin@laptop", ran.out)
+        self.assertIn("woswoar accept", ran.out)
+
+    def test_it_asks_nothing_and_changes_nothing(self) -> None:
+        """The whole reason this reports rather than offers.
+
+        `input` raises, so a status line that grew a prompt fails here rather
+        than teaching someone to answer one they did not go looking for.
+        """
+        alpha, _ = self.two_machines()
+        with alpha.active():
+            before = sync.State.load()
+            granted, signers = set(before.granted), dict(before.signers)
+
+        def never(prompt: str = "") -> str:
+            raise AssertionError(f"the status line asked a question: {prompt!r}")
+
+        with mock.patch("builtins.input", never):
+            self.assertEqual(self.run_cli(alpha).code, 0)
+
+        with alpha.active():
+            after = sync.State.load()
+        self.assertEqual(set(after.granted), granted, "status granted something")
+        self.assertEqual(dict(after.signers), signers, "status trusted something")
+
+    def test_it_does_not_reach_the_network(self) -> None:
+        """Typed for its own sake, so it answers from what is already here --
+        and the timer fetches once a minute regardless."""
+        alpha, _ = self.two_machines()
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the status line fetched")
+
+        with mock.patch.object(sync, "_refresh", refuse):
+            self.assertEqual(self.run_cli(alpha).code, 0)
+
+    def test_a_settled_machine_is_told_to_press_ctrl_r(self) -> None:
+        alpha, _ = self.two_machines()
+        self.run_cli(alpha, "accept", "--yes")
+        self.assertIn("Ctrl-R", self.run_cli(alpha).out)
+
+    def test_a_changed_key_is_routed_to_trust_replace_not_accept(self) -> None:
+        alpha, beta = self.two_machines()
+        self.run_cli(alpha, "accept", "--yes")
+        with beta.active():
+            store.signing_key_file().unlink()
+            beta.record("2023-11-16", 1_700_200_001, "after the key changed")
+            sync.run()
+        with alpha.active():
+            sync.run()
+
+        out = self.run_cli(alpha).out
+        self.assertIn("trust --replace", out)
+        self.assertNotIn("woswoar accept", out)
+
+
 class TestNewcomersIsAskedDirectly(SyncTestCase):
     """The pairing decides who is offered read access, so it is asserted here
     rather than through `accept`'s stdout -- which is the rule `Reader`'s own

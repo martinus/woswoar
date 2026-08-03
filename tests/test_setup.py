@@ -223,5 +223,45 @@ class TestItIsSafeToRunTwice(SetupTestCase):
         self.assertEqual(text.count(main_module._BEGIN), 1)
 
 
+class TestTheBareCommandOnAFreshMachine(SetupTestCase):
+    def test_nothing_at_all_here_runs_setup(self) -> None:
+        answers = Answers("")  # only the repository URL, which is left blank
+        with mock.patch("builtins.input", answers):
+            main_module.cmd_status(argparse.Namespace())
+        self.assertTrue(answers.asked, "setup never ran")
+        # `cmd_status` passes no --rcfile, so this is the default ~/.bashrc --
+        # under the redirected HOME, not the one the other tests here point at.
+        self.assertIn("woswoar", (Path.home() / ".bashrc").read_text(encoding="utf-8"))
+
+    def test_a_hook_alone_is_enough_to_be_reported_on_instead(self) -> None:
+        """Someone who ran `install` and nothing else has set something up, and
+        running `setup` at them would answer a question they did not ask."""
+        hook = Path(os.environ["WOSWOAR_DIR"]) / main_module.HOOK_NAME
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#", encoding="utf-8")
+
+        def never(prompt: str = "") -> str:
+            raise AssertionError(f"setup ran on a machine that was not fresh: {prompt!r}")
+
+        with mock.patch("builtins.input", never):
+            ran = support.run_cli()
+        self.assertEqual(ran.code, 0)
+        self.assertIn("woswoar init", ran.out)
+
+    def test_an_imported_history_alone_is_too(self) -> None:
+        support.run_cli("import", "bash", "--file", str(self._history()))
+
+        def never(prompt: str = "") -> str:
+            raise AssertionError(f"setup ran on a machine that was not fresh: {prompt!r}")
+
+        with mock.patch("builtins.input", never):
+            self.assertEqual(support.run_cli().code, 0)
+
+    def _history(self) -> Path:
+        path = Path(self.root) / "history"
+        path.write_text("echo one\necho two\n", encoding="utf-8")
+        return path
+
+
 if __name__ == "__main__":
     unittest.main()

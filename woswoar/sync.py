@@ -2540,35 +2540,55 @@ def newcomers() -> Pending:
     """
     with lock():
         _refresh()
-        # One scan of every `signer.pub`, shared by both halves. Built here and
-        # passed down because `_readers` would otherwise build its own: the
-        # measurement in `_host_owners` is 0.35 ms at five machines and 89 ms at
-        # a hundred, and `accept` was paying it three times over.
-        owners = _host_owners()
-        by_host = {c.host_id: c for c in _trust_candidates()}
+        return _newcomers()
 
-        out: list[Newcomer] = []
-        enrolled = _readers(owners)
-        for reader in enrolled:
-            # `pop`, so what is left in `by_host` is exactly the hosts no reader
-            # claimed. `""` is never a host id, so an unpaired recipient misses.
-            candidate = by_host.pop(owners.by_recipient.get(reader.key, ""), None)
-            # Our own machine is not a newcomer to itself. It has no candidate
-            # either -- `_trust_candidates` drops it -- so this is the same test.
-            if candidate is None and reader.is_mine:
-                continue
-            out.append(Newcomer(reader=reader, candidate=candidate))
 
-        # Publishing a signer, but tied to no recipient this machine can see.
-        # Still offered: trusting it is a real decision, and refusing to show it
-        # would hide the machine rather than the problem.
-        out += [Newcomer(reader=None, candidate=c) for c in by_host.values()]
+def local_newcomers() -> Pending:
+    """`newcomers` without the fetch: what the last sync already brought in.
 
-        return Pending(
-            machines=[n for n in out if n.needs_grant or n.needs_trust or n.changed_key],
-            enrolled=[reader.key for reader in enrolled],
-            contested=owners.contested,
-        )
+    For the status line, which is typed for its own sake and must not reach the
+    network to answer. It is also the honest answer there: a machine that has
+    not arrived here yet is not something this machine has to decide about, and
+    the timer fetches once a minute anyway.
+
+    `accept` keeps the fetching version, because *that* is the moment the list
+    has to be current -- see `readers`.
+    """
+    with lock():
+        return _newcomers()
+
+
+def _newcomers() -> Pending:
+    """The pairing itself, assuming the caller holds the lock."""
+    # One scan of every `signer.pub`, shared by both halves. Built here and
+    # passed down because `_readers` would otherwise build its own: the
+    # measurement in `_host_owners` is 0.35 ms at five machines and 89 ms at
+    # a hundred, and `accept` was paying it three times over.
+    owners = _host_owners()
+    by_host = {c.host_id: c for c in _trust_candidates()}
+
+    out: list[Newcomer] = []
+    enrolled = _readers(owners)
+    for reader in enrolled:
+        # `pop`, so what is left in `by_host` is exactly the hosts no reader
+        # claimed. `""` is never a host id, so an unpaired recipient misses.
+        candidate = by_host.pop(owners.by_recipient.get(reader.key, ""), None)
+        # Our own machine is not a newcomer to itself. It has no candidate
+        # either -- `_trust_candidates` drops it -- so this is the same test.
+        if candidate is None and reader.is_mine:
+            continue
+        out.append(Newcomer(reader=reader, candidate=candidate))
+
+    # Publishing a signer, but tied to no recipient this machine can see.
+    # Still offered: trusting it is a real decision, and refusing to show it
+    # would hide the machine rather than the problem.
+    out += [Newcomer(reader=None, candidate=c) for c in by_host.values()]
+
+    return Pending(
+        machines=[n for n in out if n.needs_grant or n.needs_trust or n.changed_key],
+        enrolled=[reader.key for reader in enrolled],
+        contested=owners.contested,
+    )
 
 
 class _AccessChange(NamedTuple):
