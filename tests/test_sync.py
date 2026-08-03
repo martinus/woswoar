@@ -25,7 +25,7 @@ from typing import Any, ClassVar
 from unittest import mock
 
 from woswoar import cache, crypto, progress, search, store, sync
-from woswoar.__main__ import _GRANT_REMEDY, main
+from woswoar.__main__ import _GRANT_REMEDY, HOOK_NAME, main
 from woswoar.entry import Entry, format_line
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
@@ -240,10 +240,10 @@ class SyncTestCase(unittest.TestCase):
             for day in days:
                 os.utime(store.chunk_dir(host.id, day), (aged, aged))
 
-    def run_cli(self, fake: Fake, *argv: str) -> support.Ran:
+    def run_cli(self, fake: Fake, *argv: str, tty: bool = False) -> support.Ran:
         """Drive the real CLI as ``fake``. Both streams -- see `support.run_cli`."""
         with fake.active():
-            return support.run_cli(*argv)
+            return support.run_cli(*argv, tty=tty)
 
 
 class TestSingleMachine(SyncTestCase):
@@ -5180,6 +5180,110 @@ class TestTheStatusLine(SyncTestCase):
         self.assertNotIn("woswoar accept", out)
 
 
+class TestABackgroundSyncThatKeepsFailing(SyncTestCase):
+    """A sync fired from the prompt is detached and its output goes nowhere.
+
+    The systemd timer at least had the journal. Nobody reads the journal either,
+    but "nowhere" is a step down from "somewhere", so the failure is recorded
+    where the bare `woswoar` will put it in front of someone. See #134.
+    """
+
+    MESSAGE = "could not connect to the remote"
+
+    @contextmanager
+    def broken_export(self) -> Iterator[None]:
+        """Make the export step raise, as a broken remote would."""
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise sync.SyncError(self.MESSAGE)
+
+        with mock.patch.object(sync, "export", boom):
+            yield
+
+    def failing(self, alpha: Fake, tty: bool = False) -> support.Ran:
+        with self.broken_export():
+            return self.run_cli(alpha, "sync", tty=tty)
+
+    def test_the_failure_is_kept_and_shown_by_the_bare_command(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.assertEqual(self.failing(alpha).code, 1)
+
+        out = self.run_cli(alpha).out
+        self.assertIn("could not connect to the remote", out)
+        self.assertIn("woswoar sync", out)
+
+    def test_a_sync_that_works_clears_it_again(self) -> None:
+        """Otherwise the first failure is reported forever, which teaches people
+        to read past the one line this exists to make them read."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.failing(alpha)
+        self.run_cli(alpha, "sync")
+        self.assertNotIn("could not connect", self.run_cli(alpha).out)
+
+    def test_nothing_is_said_when_nothing_has_failed(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.assertNotIn("failing", self.run_cli(alpha).out)
+
+    def test_an_unreadable_record_is_not_a_broken_status_line(self) -> None:
+        """`woswoar` on its own is what someone types when something is wrong.
+
+        It reporting on a background failure must not be a second way for it to
+        fail -- so a damaged record degrades to silence, the same way
+        `State.load` treats a value it cannot read.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            store.sync_failure_file().write_text("{not json", encoding="utf-8")
+            self.assertIsNone(sync.last_failure())
+        self.assertEqual(self.run_cli(alpha).code, 0)
+
+    def test_an_escape_sequence_in_the_message_is_defanged(self) -> None:
+        """The message can carry a remote's text -- a git error quotes the URL
+        and the server's reply -- and this is printed straight to a terminal."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            sync.record_failure("remote said \x1b[2J\x1b]0;pwned\x07 no")
+        out = self.run_cli(alpha).out
+        self.assertNotIn("\x1b", out)
+        self.assertIn("remote said", out)
+
+    def test_a_failure_a_person_is_watching_is_not_recorded(self) -> None:
+        """Somebody who types `woswoar sync`, reads the error and deals with it
+        must not then be told by every later `woswoar` that a *background* sync
+        has been failing -- with "run woswoar sync" as the remedy, which is the
+        command they just ran.
+
+        The question asked is whether anyone was watching, not which subcommand
+        this was: a terminal on stderr is the same test `progress.to_terminal`
+        makes, and it means the message has already been read.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.failing(alpha, tty=True)
+        with alpha.active():
+            self.assertIsNone(sync.last_failure())
+
+    def test_a_hand_run_sync_that_works_clears_a_background_failure(self) -> None:
+        """Whoever fixed the problem should not have to wait for a background
+        run to stop being told about it."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.failing(alpha)
+        self.run_cli(alpha, "sync", tty=True)
+        with alpha.active():
+            self.assertIsNone(sync.last_failure())
+
+
 class TestNewcomersIsAskedDirectly(SyncTestCase):
     """The pairing decides who is offered read access, so it is asserted here
     rather than through `accept`'s stdout -- which is the rule `Reader`'s own
@@ -5310,3 +5414,44 @@ class TestLongCommandsSayWhatTheyAreDoing(SyncTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAHookLeftBehindByAnUpgradeIsSurfaced(SyncTestCase):
+    """`install` copies the hook, so upgrading the Python leaves old shell code.
+
+    `doctor` reports it, but only somebody who already suspects a problem runs
+    doctor -- and the symptom is that nothing syncs while every other line looks
+    healthy. So the bare `woswoar` says it too, ahead of everything else.
+    """
+
+    def stale(self, alpha: Fake) -> None:
+        with alpha.active():
+            hook = store.data_dir() / HOOK_NAME
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            hook.write_text("# woswoar, but from last year\n", encoding="utf-8")
+
+    def test_the_bare_command_names_the_command_that_fixes_it(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.stale(alpha)
+        out = self.run_cli(alpha).out
+        self.assertIn("older woswoar", out)
+        self.assertIn("woswoar install", out)
+
+    def test_a_current_hook_says_nothing(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            pass
+        self.run_cli(alpha, "install", "--rcfile", str(self.root / "bashrc"))
+        self.assertNotIn("older woswoar", self.run_cli(alpha).out)
+
+    def test_a_machine_with_no_hook_at_all_is_not_told_to_reinstall_it(self) -> None:
+        """That is a different problem with a different fix, and `doctor` owns
+        it. Saying "an older woswoar installed this" about a file that is not
+        there would send someone looking for something that never existed."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.assertNotIn("older woswoar", self.run_cli(alpha).out)

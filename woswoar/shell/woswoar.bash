@@ -157,6 +157,41 @@ fi
 #: Mirrors MAX_CMD_CHARS in woswoar/entry.py.
 __woswoar_max=8000
 
+#: Seconds between prompt-triggered syncs; 0 turns them off entirely, which is
+#: what to set if you run the systemd timer in `contrib/systemd` instead. The
+#: two are safe together -- `sync.lock` is non-blocking, so whichever arrives
+#: second exits at once -- but running both is just paying twice.
+#:
+#: Validated rather than trusted, because it reaches `((...))`, where a value
+#: like `x[$(...)]` is not a syntax error but a command substitution. One test
+#: rather than a `:=` default followed by a test: unset and empty both fail the
+#: pattern, so the default falls out of the same line.
+#:
+#: Then normalised through `10#`, because `((...))` reads a leading zero as
+#: octal -- so a perfectly reasonable `WOSWOAR_SYNC_INTERVAL=08` is not merely
+#: wrong, it is `value too great for base` printed to an un-redirected stderr
+#: at every prompt. That is the shape of the bug 0.4.1 shipped.
+[[ ${WOSWOAR_SYNC_INTERVAL:-} =~ ^[0-9]+$ ]] || WOSWOAR_SYNC_INTERVAL=60
+WOSWOAR_SYNC_INTERVAL=$((10#$WOSWOAR_SYNC_INTERVAL))
+
+#: Shared between every shell on this machine, deliberately: ten open terminals
+#: with ten private clocks would each come due on their own schedule and sync
+#: ten times an hour between them rather than once.
+#:
+#: Not a claim of atomicity. Ten shells starting in the same instant -- a tmux
+#: session restore -- all read the same stale stamp and all fork, and `sync.lock`
+#: is what stops nine of them doing any work. That costs nine interpreter starts
+#: (~30ms each) once per restore, which is worth accepting rather than
+#: introducing a lock file of this one's own. See store.sync_stamp_file.
+__woswoar_syncstamp=$__woswoar_dir/sync-stamp
+
+#: Earliest $EPOCHSECONDS at which the stamp above is worth opening. Keeps the
+#: per-command cost to one integer comparison: a stamp can only ever move
+#: forward, so "not due until T" cannot become due sooner than T. Another
+#: shell syncing in the meantime pushes T out, and the worst that costs is one
+#: file read that decides against syncing.
+__woswoar_next_sync=0
+
 #: Set by preexec, consumed by precmd. Empty also means "no command has been
 #: timed since the last prompt", which is what makes a separate armed flag
 #: unnecessary: preexec only stamps when it is empty, so the first simple
@@ -207,12 +242,27 @@ __woswoar_precmd() {
     # user's exit status for the *first* of them -- after that it is the status
     # of the previous entry. Anything already in PROMPT_COMMAND (a title hook,
     # a prompt framework) therefore made every recorded command look successful.
-    # __woswoar_stamp is prepended so it captures the real one before any of
-    # that runs. Consumed rather than cached: leaving it set would make a shell
-    # whose PROMPT_COMMAND was replaced wholesale record a *stale* code, which
-    # is worse than falling back to whatever $? holds here.
+    # __woswoar_status is set by a string prepended to PROMPT_COMMAND, so it
+    # captures the real one before any of that runs. Consumed rather than
+    # cached: leaving it set would make a shell whose PROMPT_COMMAND was
+    # replaced wholesale record a *stale* code, which is worse than falling
+    # back to whatever $? holds here.
     local exit_code=${__woswoar_status:-$?}
     __woswoar_status=
+
+    # Recording first, so a command reaches the repository in the sync it
+    # triggers rather than in the one after it -- which for someone who types
+    # one command and walks away is the difference between a minute and never.
+    #
+    # Two functions rather than one because `__woswoar_record` returns early
+    # from seven places -- an ignored command, a duplicate, a bare Enter -- and
+    # a shell must still come due for a sync in every one of those cases.
+    __woswoar_record "$exit_code"
+    __woswoar_maybe_sync
+}
+
+__woswoar_record() {
+    local exit_code=$1
 
     # Taken and cleared in one place, so every path out of this function is
     # covered by construction. Recording deliberately does not depend on the
@@ -335,6 +385,71 @@ __woswoar_precmd() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$EPOCHSECONDS" "$WOSWOAR_SESSION" "$cwd" "$exit_code" "$duration" "$cmd" \
         2>/dev/null >>"$__woswoar_logdir/$day.tsv"
+}
+
+# Fires a sync when one is due. Runs on every prompt, and forks on roughly one
+# prompt a minute -- which is the one deliberate exception to the builtins-only
+# rule above, and the reason `test_it_syncs_once_per_interval_not_once_per_command`
+# exists beside the strict fork-count test rather than replacing it.
+#
+# The steady-state cost is the single `((...))` below. Everything that touches
+# the filesystem is behind it.
+__woswoar_maybe_sync() {
+    ((WOSWOAR_SYNC_INTERVAL > 0 && EPOCHSECONDS >= __woswoar_next_sync)) || return 0
+
+    # `2>/dev/null` *before* the `<`, not after. Redirections are applied left
+    # to right, so the other order reports a missing stamp to a stderr that has
+    # not been redirected yet -- and prints a path at the user's prompt after
+    # every command. That is not hypothetical: it is the 0.4.1 bug, in the
+    # append a few lines above, written the other way round.
+    local last=
+    read -r last 2>/dev/null <"$__woswoar_syncstamp"
+    # A torn or truncated write must not reach `((...))`, where a non-numeric
+    # value is a variable name to dereference rather than an error. Rejected
+    # outright rather than stripped to the digits in it: stripping turns half of
+    # `1785...` followed by a leftover tail into a *plausible* epoch, and one in
+    # the future stops this shell syncing until the file changes again. The same
+    # test as the interval above, for the same reason, in the same shape.
+    [[ $last =~ ^[0-9]+$ ]] || last=0
+    last=$((10#$last))
+
+    if ((EPOCHSECONDS - last < WOSWOAR_SYNC_INTERVAL)); then
+        __woswoar_next_sync=$((last + WOSWOAR_SYNC_INTERVAL))
+        return 0
+    fi
+
+    # Set before the check below rather than in both of its arms: coming due
+    # and finding nothing to do still costs a `stat` on every command until the
+    # interval is put back.
+    __woswoar_next_sync=$((EPOCHSECONDS + WOSWOAR_SYNC_INTERVAL))
+
+    # Nothing to sync with, so nothing to fork for. Checked here rather than
+    # once at startup because `woswoar init` may well be the command that just
+    # ran, and a per-shell flag would leave that shell never syncing.
+    #
+    # `history/.git`, matching `sync.is_repo`, not `history/` itself: a clone
+    # that died partway leaves the directory without the repository in it, and
+    # `woswoar sync` calls that "not initialised". Testing the directory would
+    # have this machine fork an interpreter a minute, forever, to print that
+    # error into /dev/null.
+    [[ -e $__woswoar_dir/history/.git ]] || return 0
+
+    # `( ... & )`: the subshell backgrounds the sync and exits immediately, so
+    # the prompt waits for two forks (~1ms) and never for the sync itself. A
+    # plain `&` here would put it in this shell's job table and print `[1] 1234`
+    # and `[1]+ Done` at the prompt once a minute, forever.
+    #
+    # The stamp is written *inside* that subshell, which is why it costs no
+    # extra fork -- and under `umask 077`, because a file's mode is fixed when
+    # it is created and `>` would otherwise make it 0644 for `doctor` to flag.
+    #
+    # Stamped before the sync runs, not after it succeeds: a `woswoar` that is
+    # not on PATH must cost one attempt a minute, not one per command.
+    (
+        umask 077
+        printf '%s\n' "$EPOCHSECONDS" >"$__woswoar_syncstamp"
+        woswoar sync >/dev/null 2>&1 </dev/null &
+    ) 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -519,5 +634,12 @@ if [[ -z ${WOSWOAR_NO_BIND:-} ]]; then
     bind -m vi-insert -x '"\C-r": __woswoar_widget' 2>/dev/null
     bind -m vi-command -x '"\C-r": __woswoar_widget' 2>/dev/null
 fi
+
+# No `__woswoar_maybe_sync` call here, deliberately. Bash runs PROMPT_COMMAND
+# once before the *first* prompt, so a shell where nobody has typed anything yet
+# has already been through `__woswoar_precmd` and has already synced -- which is
+# what makes sitting down and pressing Ctrl-R show current history. An explicit
+# call at the end of this file was written first and is redundant; a mutation
+# that deleted it changed no behaviour, which is how that was noticed.
 
 __WOSWOAR_LOADED=1

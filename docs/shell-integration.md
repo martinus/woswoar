@@ -175,6 +175,8 @@ Measured on a real **54,943-entry** history across ~750 daily files:
 | | |
 |---|---|
 | record a command | **~150 µs**, 0 forks |
+| decide whether a sync is due | **~5 µs**, 0 forks |
+| start a background sync | once per `WOSWOAR_SYNC_INTERVAL`, 2 forks, no wait |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
 
 No index, no SQLite — a parse cache that only re-reads what changed is enough,

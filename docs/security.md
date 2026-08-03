@@ -433,7 +433,7 @@ Claims rot. The ones that matter are asserted in CI on every push:
 |---|---|
 | History is never readable by others | every path woswoar creates is walked under a stock `umask 022`, on both the Python and the shell-hook side |
 | The hook's scratch file is never in a directory another user can write | `TMPDIR` and `/tmp` are never consulted; an `XDG_RUNTIME_DIR` this user cannot write falls back to woswoar's own `0700` tree instead of switching recording off |
-| The hook forks nothing | recording runs under `strace`; the clone/fork/execve count must be **0** |
+| Recording forks nothing | the clone count under `strace` must be *identical* for 3 commands and for 30, so nothing on the record path scales with use. Syncing is the one exception and is deliberate: at most one fork per `WOSWOAR_SYNC_INTERVAL`, asserted separately |
 | Search stays fast | latency measured on 52,000 entries |
 | The repo does not blow up | a simulated multi-day, multi-machine run is measured after `git gc` |
 

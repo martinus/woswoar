@@ -17,7 +17,7 @@ from .entry import make_inert
 from .errors import WoswoarError
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
-    from .sync import Reader, ReencryptReport
+    from .sync import Failure, Reader, ReencryptReport
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
 #: used to say so in two independently worded paragraphs.
@@ -33,14 +33,25 @@ _END = "# <<< woswoar <<<"
 _BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
 
 
-def _hook_source() -> Path:
-    # Imported here rather than at module scope: importlib.resources costs ~8 ms
-    # of startup and only `install` needs it, while every Ctrl-R pays for
-    # whatever this module imports eagerly.
+def _hook_bytes() -> bytes:
+    """The hook as this version ships it.
+
+    The bytes rather than a path, which is what replaced an `as_file` dance
+    here. `as_file` hands back a *temporary* path for a zipped install and
+    deletes it when its context exits, so the previous version of this returned
+    a path that no longer existed and `install` copied from it. Nothing noticed,
+    because nobody installs woswoar as a zipapp -- but `doctor` now compares
+    what is installed against what is packaged, and one function returning one
+    thing is what makes that comparison true by construction rather than by
+    hoping two readers agree.
+
+    Imported here rather than at module scope: importlib.resources costs ~8 ms
+    of startup and only `install` and `doctor` need it, while every Ctrl-R pays
+    for whatever this module imports eagerly.
+    """
     from importlib import resources
 
-    with resources.as_file(resources.files("woswoar") / "shell" / HOOK_NAME) as path:
-        return Path(str(path))
+    return (resources.files("woswoar") / "shell" / HOOK_NAME).read_bytes()
 
 
 def portable_hook_path(target: Path) -> str:
@@ -64,13 +75,11 @@ def portable_hook_path(target: Path) -> str:
 
 def cmd_install(args: argparse.Namespace) -> int:
     """Set up machine identity, install the hook, and wire up .bashrc."""
-    import shutil
-
     machine = store.machine()
     store.private_dir(store.data_dir())
     target = store.data_dir() / HOOK_NAME
-    shutil.copyfile(_hook_source(), target)
-    # After the copy, not before: `copyfile` creates at the ambient umask, so
+    target.write_bytes(_hook_bytes())
+    # After the copy, not before: `write_bytes` creates at the ambient umask, so
     # hardening first would leave the one file install itself writes as the one
     # file its own migration missed. This is also what re-tightens a tree from
     # a woswoar that predated owner-only directories -- `install` is the
@@ -302,7 +311,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("machine", has_machine, str(machine_file))
 
     hook = store.data_dir() / HOOK_NAME
-    check("hook", hook.is_file(), str(hook))
+    if _hook_is_stale():
+        # `install` copies the hook into the data directory rather than sourcing
+        # it out of the package, so upgrading woswoar leaves the old shell code
+        # running -- and nothing said so. That was survivable while the hook only
+        # recorded; syncing lives in it now, so a machine that never re-ran
+        # `install` silently keeps whatever sync arrangement it had.
+        check("hook", False, f"{hook} is older than this woswoar - run 'woswoar install'")
+    else:
+        check("hook", hook.is_file(), str(hook))
 
     rcfile = Path.home() / ".bashrc"
     sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
@@ -516,7 +533,31 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
-    report = sync.run(push=not args.no_push)
+    # The shell hook fires this detached, with its output going nowhere, so a
+    # failure has to be left somewhere the bare `woswoar` can find it.
+    #
+    # Gated on whether anyone is watching, not on which command this is. The
+    # first version asked the latter -- recorded from `sync`, not from `init`,
+    # `accept` or `grant` -- and got the common case backwards: somebody who
+    # types `woswoar sync`, reads the error and deals with it was then told by
+    # every later `woswoar` that a *background* sync had been failing for days,
+    # with "run woswoar sync to see it in full" as the remedy. That is the
+    # command they had just run.
+    #
+    # `stderr.isatty()` is the same question `progress.to_terminal` asks, and
+    # for the same reason: a terminal means the message has already been read
+    # by the person it was for.
+    watched = sys.stderr.isatty()
+    try:
+        report = sync.run(push=not args.no_push)
+    except Exception as exc:
+        if not watched:
+            sync.record_failure(str(exc) or exc.__class__.__name__)
+        raise
+    # Cleared whoever was watching: a sync that worked is proof the recorded
+    # failure is stale, and someone who fixed the problem by hand should not
+    # have to wait for a background run to stop being told about it.
+    sync.clear_failure()
     if report.revoked:
         print(
             "This machine's access to the shared history was revoked, so nothing\n"
@@ -736,6 +777,44 @@ def cmd_grant(args: argparse.Namespace) -> int:
 
     _report_reseal(sync.grant(approved=[reader.key for reader in readers]))
     return 0
+
+
+def _hook_is_stale() -> bool:
+    """Whether the installed hook is some older woswoar's copy of it.
+
+    False for a missing hook: that is a different problem with a different fix,
+    and `doctor` already has a line for it.
+    """
+    hook = store.data_dir() / HOOK_NAME
+    return hook.is_file() and hook.read_bytes() != _hook_bytes()
+
+
+def _report_stale_hook() -> None:
+    if not _hook_is_stale():
+        return
+    print(
+        "\nThe shell hook here was installed by an older woswoar, so this"
+        "\nmachine is still running that version's shell code -- including"
+        "\nwhatever it did or did not do about syncing."
+        "\n\nNext:  woswoar install   then open a new shell"
+    )
+
+
+def _report_sync_failure(failure: Failure | None) -> None:
+    """Surface a background sync that has been failing where nobody could see.
+
+    The one thing the systemd timer had over a detached fork from the prompt:
+    its stderr went to the journal. This is the replacement, and it is put in
+    front of someone who typed `woswoar` rather than someone who thought to run
+    `journalctl --user -u woswoar-sync`, so it is the better half of the trade.
+    """
+    if failure is None:
+        return
+    print(f"\nBackground sync has been failing for {search.relative_time(int(failure.when))}:")
+    print(f"    {make_inert(failure.message)}")
+    # The remedy is the same one every time and it is not "run sync again":
+    # what a detached sync hides is the *message*, so the fix is to look at it.
+    print("\nNext:  woswoar sync   to see it in full")
 
 
 def _report_reseal(report: ReencryptReport, waiting: bool = True) -> None:
@@ -977,12 +1056,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     machines = f"{len(hosts)} machine{'s' if len(hosts) != 1 else ''}"
     print(f"woswoar {__version__} -- {len(stamps)} commands from {machines}")
 
+    # Ahead of everything else, because it is the condition under which the rest
+    # of this report is describing a machine that is not running this version.
+    # `install` copies the hook, so upgrading the Python leaves the old shell
+    # code in place -- and syncing lives in the hook, so the visible symptom is
+    # that nothing syncs while every other line here says all is well. `doctor`
+    # says so too, but only somebody who already suspects a problem runs doctor.
+    _report_stale_hook()
+
     if not sync.is_repo():
         print(
             "\nThis machine keeps its history to itself.\n"
             "Next:  woswoar init <url>   to share it with your other machines"
         )
         return 0
+
+    _report_sync_failure(sync.last_failure())
 
     # Local only: see `sync.local_newcomers`. Typing this must not reach the
     # network, and what has not arrived here is not yet this machine's decision.

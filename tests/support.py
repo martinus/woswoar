@@ -35,7 +35,24 @@ class Ran(NamedTuple):
     err: str
 
 
-def run_cli(*argv: str) -> Ran:
+class Captured(io.StringIO):
+    """A captured stream that can claim to be a terminal, which StringIO cannot.
+
+    Several commands branch on `isatty` -- `doctor` picks its markers, `sync`
+    decides whether a failure was witnessed, `progress` decides whether to draw
+    at all -- and capturing the output is exactly what turns that answer to
+    False. So the harness has to be able to say otherwise.
+    """
+
+    def __init__(self, tty: bool = False) -> None:
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def run_cli(*argv: str, tty: bool = False) -> Ran:
     """Drive the real CLI in process, capturing both streams.
 
     Both, because several commands put the thing a test cares about on stderr --
@@ -45,8 +62,13 @@ def run_cli(*argv: str) -> Ran:
     only check the exit code, and would have passed had the warning been
     deleted. That is the failure mode `CLAUDE.md` rule 3 is about, and it was
     invisible at each individual call site.
+
+    `tty` makes both streams answer `isatty` the way a real terminal would.
+    Patching `sys.stderr.isatty` from a test does not work and fails quietly:
+    the patch lands on whatever object was installed at the time, and then this
+    function replaces it.
     """
-    out, err = io.StringIO(), io.StringIO()
+    out, err = Captured(tty), Captured(tty)
     with redirect_stdout(out), redirect_stderr(err):
         code = main(list(argv))
     return Ran(code, out.getvalue(), err.getvalue())

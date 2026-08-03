@@ -480,6 +480,31 @@ def state_file() -> Path:
     return data_dir() / "state.json"
 
 
+def sync_stamp_file() -> Path:
+    """When a sync was last *started*, as decimal seconds on one line.
+
+    Written by the shell hook, which is the only thing that reads it, and read
+    with bash's `read` builtin -- so it holds the time rather than relying on
+    its own mtime, which bash cannot ask for without forking `stat`.
+
+    "Started", not "finished": the hook stamps it before it forks. A sync that
+    dies immediately -- `woswoar` not on PATH, a half-finished install -- must
+    still cost one attempt a minute rather than one per command.
+    """
+    return data_dir() / "sync-stamp"
+
+
+def sync_failure_file() -> Path:
+    """The last unattended sync's failure, or absent if the last one worked.
+
+    A sync fired from the prompt is detached and its output goes nowhere, so
+    without this a sync that has been failing for a week says nothing at all.
+    The systemd timer had the journal, which was already only a theoretical
+    improvement -- nobody reads that either.
+    """
+    return data_dir() / "sync-failure.json"
+
+
 def repo_host_dir(machine_id: str) -> Path:
     return history_dir() / _HOSTS / machine_id
 
