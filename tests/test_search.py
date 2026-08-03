@@ -433,6 +433,10 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
         with (
             mock.patch("subprocess.Popen", Spawned),
             mock.patch.object(search, "lines_for", slow_lines),
+            # The version probe would otherwise be caught by the fake `Popen`
+            # above -- `subprocess.run` uses it. This test is about the order of
+            # two things, not about which fzf is installed.
+            mock.patch.object(search, "fzf_supports_transform", return_value=False),
         ):
             search.interactive("global")
 
@@ -604,3 +608,120 @@ class TestTheMachineColumn(WoswoarTestCase):
         is a way to erase the line above, so it is neutralised here."""
         store.write_atomic(store.name_file(self.OTHER), b"ok\x1b[1A\x1b[2K\n")
         self.assertNotIn("\x1b", search.host_label(self.OTHER))
+
+
+class TestCtrlRCyclesTheScope(unittest.TestCase):
+    """Ctrl-R inside the picker moves global -> host -> session -> global.
+
+    fzf holds no variables, so the binding reads the current scope back out of
+    the prompt fzf is already showing. What is asserted here is that shell
+    script, run the way fzf runs it: the decision it makes is the part that can
+    be wrong, and it needs no terminal.
+
+    The keypress itself is not driven here -- fzf needs a tty and the result was
+    not something I could assert reliably. The binding's *shape* is checked
+    against a real fzf's acceptance by `TestRealFzfRanking`, which runs one.
+    """
+
+    def next_scope(self, prompt: str) -> str:
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        script = binding.split("transform:", 1)[1]
+        out = subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True,
+            text=True,
+            env={"FZF_PROMPT": prompt, "PATH": "/usr/bin:/bin"},
+            check=True,
+        ).stdout
+        return out.split("--scope ", 1)[1].split(")", 1)[0].strip()
+
+    def test_it_goes_round(self) -> None:
+        self.assertEqual(self.next_scope("woswoar (global) "), "host")
+        self.assertEqual(self.next_scope("woswoar (host) "), "session")
+        self.assertEqual(self.next_scope("woswoar (session) "), "global")
+
+    def test_it_repaints_the_prompt_it_reads_back(self) -> None:
+        """`change-prompt` is not decoration: the next press reads it."""
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        script = binding.split("transform:", 1)[1]
+        out = subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True,
+            text=True,
+            env={"FZF_PROMPT": "woswoar (global) ", "PATH": "/usr/bin:/bin"},
+            check=True,
+        ).stdout
+        self.assertIn("change-prompt(woswoar (host) )", out)
+
+    def test_the_reload_keeps_the_colour_and_the_width(self) -> None:
+        """A cycle that dropped either would change the layout mid-picker, and
+        `command_from_line` slices at a width decided when it opened."""
+        self.assertIn(
+            "--colour --host-width 7",
+            search._cycle_binding("woswoar", "", " --host-width 7"),
+        )
+
+    def test_an_older_fzf_is_offered_nothing_it_cannot_do(self) -> None:
+        """An unknown action in a `--bind` makes fzf refuse to start, so this
+        cannot be offered optimistically: the cost of guessing wrong is no
+        picker at all."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=False):
+            argv = search._fzf_argv("global", "", True, 0)
+        self.assertFalse([a for a in argv if "ctrl-r:" in a])
+        self.assertNotIn("ctrl-r cycles", " ".join(argv))
+
+    def test_a_new_enough_fzf_gets_it(self) -> None:
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            argv = search._fzf_argv("global", "", True, 0)
+        self.assertTrue([a for a in argv if a.startswith("--bind=ctrl-r:transform:")])
+        self.assertIn("ctrl-r cycles", " ".join(argv))
+
+    def test_the_version_gate_reads_a_version(self) -> None:
+        for version, wanted in (("0.44.1 (Fedora)", False), ("0.45.0", True), ("0.73.1", True)):
+            with self.subTest(version=version):
+                done = subprocess.CompletedProcess([], 0, stdout=version, stderr="")
+                with mock.patch("subprocess.run", return_value=done):
+                    self.assertEqual(search.fzf_supports_transform(), wanted)
+
+    def test_an_fzf_that_says_nothing_useful_is_treated_as_old(self) -> None:
+        """Erring towards the picker still opening."""
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch("subprocess.run", return_value=done):
+            self.assertFalse(search.fzf_supports_transform())
+
+
+class TestLabelsStayDifferent(WoswoarTestCase):
+    """Reported: two machines showing as `martinleitnerank` and
+    `martinus@DT-24YY`, both cut at sixteen, neither saying which machine.
+
+    A name is `user@host`, and on one person's machines the user is usually the
+    same while the host is what differs -- and it is the host that a long
+    username pushes off the end.
+    """
+
+    A, B = "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"
+
+    def named(self, **names: str) -> dict[str, str]:
+        for host, name in names.items():
+            store.write_atomic(store.name_file(getattr(self, host)), f"{name}\n".encode())
+        return search.host_labels({self.A, self.B})
+
+    def test_the_reported_case(self) -> None:
+        labels = self.named(A="martinleitnerankerl@thinkpad", B="martinus@DT-24YYQ3")
+        self.assertEqual(labels[self.A], "thinkpad")
+        self.assertEqual(labels[self.B], "DT-24YYQ3")
+
+    def test_the_full_name_comes_back_when_hosts_would_collide(self) -> None:
+        """Two accounts on one machine, or the same hostname twice: the host
+        half no longer distinguishes, so it is not used."""
+        labels = self.named(A="martin@box", B="root@box")
+        self.assertEqual({labels[self.A], labels[self.B]}, {"martin@box", "root@box"})
+
+    def test_something_too_long_keeps_its_end(self) -> None:
+        labels = self.named(A="x@" + "a" * 40, B="y@short")
+        self.assertTrue(labels[self.A].startswith("…"), labels[self.A])
+        self.assertEqual(len(labels[self.A]), search._HOST_WIDTH)
+
+    def test_the_column_is_only_as_wide_as_the_labels(self) -> None:
+        self.named(A="martinleitnerankerl@thinkpad", B="martinus@DT-24YYQ3")
+        self.assertEqual(search.host_width_for({self.A, self.B}), len("DT-24YYQ3"))
