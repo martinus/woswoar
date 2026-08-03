@@ -266,6 +266,23 @@ accept history they published. Disclosure would be prevented and injection
 introduced. `trust` avoids it by showing the verify key's own fingerprint, which
 is the thing being decided.
 
+`woswoar accept` shows both keys at once, which reopened the same question in a
+new form: a fingerprint you *can* check sitting directly above one you cannot
+reads as the first vouching for the second, and what puts them on the same line
+is the `owner` field of `signer.pub` — the very file this is about.
+
+Two things answer it. The pairing is **labelled as the repository's claim**
+where it is shown, rather than left to look like a fact. And a recipient that
+**more than one host directory claims** is paired with neither and reported:
+the mapping used to keep the first claim in sorted order and drop the rest, so
+a host id chosen to sort first could take another machine's recipient — and the
+name attached to it — without anything saying so. Two hosts claiming one key is
+not an ambiguity to resolve, because nothing in the repository could resolve it.
+
+> Asserted by `tests/test_sync.py::TestAHostCannotClaimAnotherMachinesKey`,
+> which mounts exactly that attack: a host directory whose id sorts first,
+> naming another machine's recipient as its own.
+
 ### What that costs, and what it does not
 
 Adding a laptop is `grant` once, and `trust` on the machines that will read it —

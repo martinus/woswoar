@@ -930,6 +930,12 @@ def cmd_accept(args: argparse.Namespace) -> int:
         if machine.candidate is not None:
             said = "signs with" if machine.needs_trust else "already accepted here"
             print(f"      {said:<28}{machine.candidate.fingerprint}")
+        if machine.reader is not None and machine.candidate is not None:
+            # That these two keys belong to one machine is something the
+            # *repository* says, in a file anyone who can push can write. Left
+            # unsaid, a fingerprint the reader can verify sitting above one they
+            # cannot reads as the first vouching for the second (#110).
+            print("      (that these are one machine is the repository's claim)")
 
     granting = [n for n in fresh if n.needs_grant]
     trusting = [n for n in fresh if n.needs_trust]
@@ -978,6 +984,20 @@ def cmd_accept(args: argparse.Namespace) -> int:
                 print(f"      now signs with              {machine.candidate.fingerprint}")
                 print(f"      accepted here              {machine.candidate.pinned_fingerprint}")
         print("\nThat is not part of this, and needs:  woswoar trust --replace")
+
+    if pending.contested:
+        # Not a warning about a machine -- a statement about the repository.
+        # Two host directories claiming one recipient cannot both be right, and
+        # nothing here can say which is, so neither was paired with it above.
+        print(
+            f"\n{len(pending.contested)} key(s) are claimed by more than one machine"
+            " directory in the\nrepository. An honest repository does not do that."
+            " Nothing here can tell you\nwhich claim is real, so those keys are"
+            " listed on their own above rather than\nbeside a signing key."
+            "\nCheck the fingerprints on the machines themselves before accepting"
+            " anything.",
+            file=sys.stderr,
+        )
 
     if not _confirm(f"Accept {len(fresh)} machine(s)?", args.yes):
         return 1
