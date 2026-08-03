@@ -26,6 +26,7 @@ from unittest import mock
 
 from woswoar import cache, crypto, progress, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, HOOK_NAME, main
+from woswoar.__main__ import _hook_bytes as main_hook_bytes
 from woswoar.entry import Entry, format_line
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
@@ -5455,3 +5456,76 @@ class TestAHookLeftBehindByAnUpgradeIsSurfaced(SyncTestCase):
         with alpha.active():
             sync.run()
         self.assertNotIn("older woswoar", self.run_cli(alpha).out)
+
+
+class TestTheHookKeepsItselfUpToDate(SyncTestCase):
+    """An upgrade should not need a second command (#136 follow-up).
+
+    `install` copies the hook, so upgrading the program leaves the old shell
+    code running. The hook now starts a `woswoar sync` about once a minute, so
+    that sync is what notices -- an upgrade heals itself within a minute.
+    """
+
+    def install(self, alpha: Fake) -> Path:
+        self.run_cli(alpha, "install", "--rcfile", str(self.root / "bashrc"))
+        with alpha.active():
+            return store.data_dir() / HOOK_NAME
+
+    def test_a_stale_hook_is_brought_up_to_date_by_a_sync(self) -> None:
+        alpha = self.machine("alpha")
+        hook = self.install(alpha)
+        hook.write_text("# woswoar, but from last year\n", encoding="utf-8")
+        self.run_cli(alpha, "sync")
+        self.assertEqual(hook.read_bytes(), main_hook_bytes())
+
+    def test_the_bare_command_stops_reporting_it_afterwards(self) -> None:
+        """The report and the repair have to agree, or somebody is told to run
+        a command that has already been run for them."""
+        alpha = self.machine("alpha")
+        hook = self.install(alpha)
+        hook.write_text("# older\n", encoding="utf-8")
+        self.assertIn("older woswoar", self.run_cli(alpha).out)
+        self.run_cli(alpha, "sync")
+        self.assertNotIn("older woswoar", self.run_cli(alpha).out)
+
+    def test_a_machine_with_no_hook_does_not_get_one(self) -> None:
+        """It never ran `install`, so its `.bashrc` sources nothing. Writing a
+        file nothing references would be a confusing way to say that."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            hook = store.data_dir() / HOOK_NAME
+            self.assertFalse(hook.exists(), "precondition: no hook installed")
+        self.run_cli(alpha, "sync")
+        with alpha.active():
+            self.assertFalse(hook.exists())
+
+    def test_an_unreachable_remote_does_not_keep_the_hook_stale(self) -> None:
+        """The two have nothing to do with each other, and a machine that
+        cannot reach its remote is exactly one nobody is attending to."""
+        alpha = self.machine("alpha")
+        hook = self.install(alpha)
+        hook.write_text("# older\n", encoding="utf-8")
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise sync.SyncError("could not connect to the remote")
+
+        with mock.patch.object(sync, "export", boom):
+            self.assertEqual(self.run_cli(alpha, "sync").code, 1)
+        self.assertEqual(hook.read_bytes(), main_hook_bytes())
+
+    def test_a_current_hook_is_left_exactly_alone(self) -> None:
+        """Rewriting an identical file once a minute is a pointless write, and
+        it would reset the mtime every time on a file `doctor` reports on."""
+        alpha = self.machine("alpha")
+        hook = self.install(alpha)
+        before = hook.stat().st_mtime_ns
+        self.run_cli(alpha, "sync")
+        self.assertEqual(hook.stat().st_mtime_ns, before)
+
+    def test_a_read_only_data_directory_does_not_stop_the_sync(self) -> None:
+        """Repairing the hook is a courtesy; syncing is the job."""
+        alpha = self.machine("alpha")
+        hook = self.install(alpha)
+        hook.write_text("# older\n", encoding="utf-8")
+        with mock.patch.object(Path, "write_bytes", side_effect=OSError("read-only")):
+            self.assertEqual(self.run_cli(alpha, "sync").code, 0)
