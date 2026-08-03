@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -903,3 +904,71 @@ class TestTheScratchFileIsPrivate(ShellHookTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_bash5
+class TestALostLogDirectory(ShellHookTestCase):
+    """Reported from a real machine, on v0.4.1:
+
+        $ git s
+        ## mla/OA-...  [gone]
+        -bash: /home/.../logs/hosts/76326ac.../2026-08-03.tsv: No such file or directory
+
+    The hook makes its log directory when the shell starts, and a shell outlives
+    a lot -- an uninstall, a home directory moved, a work machine's cleanup. Once
+    it is gone, every command in every open shell writes into nothing, and said
+    so at the prompt, every time.
+    """
+
+    def logdir(self) -> Path:
+        return Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts" / MACHINE_ID
+
+    def test_losing_it_mid_session_is_silent(self) -> None:
+        """Recording may stop. It may not talk about it.
+
+        The redirection order is the whole of this: `>>file 2>/dev/null` applies
+        the append first, so bash reports its failure to a stderr it has not
+        redirected yet.
+        """
+        out = self.run_shell(
+            f"""
+            echo first
+            rm -rf {self.logdir()}
+            echo second
+            echo third
+            """
+        )
+        self.assertNotIn("No such file or directory", out)
+        self.assertIn("third", out, "precondition: the shell kept running")
+
+    def test_it_comes_back_when_the_day_turns(self) -> None:
+        """The directory is remade on the once-a-day path, so a shell that was
+        open when it vanished records again rather than staying broken until
+        someone thinks to restart it."""
+        target = self.logdir()
+        out = self.run_shell(
+            f"""
+            echo before
+            rm -rf {target}
+            __woswoar_today=not-today
+            echo after
+            """
+        )
+        self.assertNotIn("No such file or directory", out)
+        self.assertTrue(target.is_dir(), "the log directory was not remade")
+        # The command as typed, which is what the hook records -- not its output.
+        self.assertIn("echo after", self.commands(), f"recording did not resume: {self.commands()}")
+
+    def test_the_remade_directory_is_owner_only(self) -> None:
+        """Remade under the same umask as the original, or an uninstall followed
+        by a day boundary quietly downgrades what is recorded afterwards."""
+        target = self.logdir()
+        self.run_shell(
+            f"""
+            echo before
+            rm -rf {target}
+            __woswoar_today=not-today
+            echo after
+            """
+        )
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)

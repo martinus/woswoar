@@ -313,14 +313,28 @@ __woswoar_precmd() {
         # inline instead would be fork-free, but reading it costs a fork at
         # startup anyway and a failed read would leave this *setting* the user's
         # umask to a guess -- loosening it, in the one case it must not.
-        (umask 077 && : >>"$__woswoar_logdir/$day.tsv") 2>/dev/null
+        # `mkdir -p` as well, because the directory is otherwise only made when
+        # the shell starts, and a shell outlives a lot. Delete the data
+        # directory -- an uninstall, a home moved, a work machine's cleanup --
+        # and every command in every open shell writes into nothing until each
+        # of them is restarted. Once a day, in the subshell that was already
+        # being forked, is the cheapest place to notice.
+        (umask 077 && mkdir -p "$__woswoar_logdir" && : >>"$__woswoar_logdir/$day.tsv") \
+            2>/dev/null
     fi
 
     # One O_APPEND write. Linux serialises these under the inode lock, so
     # concurrent shells on this host cannot interleave lines.
+    #
+    # `2>/dev/null` *before* the append, not after. Redirections are applied
+    # left to right, so with it second bash reports a failed `>>` to a stderr it
+    # has not redirected yet -- and prints
+    # `bash: .../2026-08-03.tsv: No such file or directory` at the user's
+    # prompt, after every command, which is how this was reported. Recording is
+    # meant to fail silently; the whole hook is written that way.
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$EPOCHSECONDS" "$WOSWOAR_SESSION" "$cwd" "$exit_code" "$duration" "$cmd" \
-        >>"$__woswoar_logdir/$day.tsv" 2>/dev/null
+        2>/dev/null >>"$__woswoar_logdir/$day.tsv"
 }
 
 # ---------------------------------------------------------------------------
