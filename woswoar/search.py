@@ -32,8 +32,8 @@ _PREFIX = _TIME_WIDTH + 2
 #: Sort key for a row. In C, rather than a lambda.
 _STAMP = itemgetter(0)
 
-#: One display row: when, what, and how it ended.
-Row = tuple[int, str, str]
+#: One display row: when, what, how it ended, and which machine ran it.
+Row = tuple[int, str, str, str]
 
 #: Dim red for a command that failed. Dim rather than plain red so a screen of
 #: failures does not shout, and so it reads as "this one did not work" rather
@@ -66,13 +66,49 @@ def relative_time(ts: int, now: int | None = None) -> str:
     return f"{years}y" if years < 100 else "old"
 
 
-def command_from_line(line: str) -> str:
-    """Recover the original command from a rendered line."""
-    return make_inert(unescape(line[_PREFIX:]))
+#: Widest a host name may be in the picker. Long enough for `martin@work-laptop`
+#: to survive, short enough that the commands still start near the left.
+_HOST_WIDTH = 16
+
+
+def host_label(host_id: str) -> str:
+    """What to show for a machine, in a form safe to put on a coloured line.
+
+    `make_inert` because this is *another machine's* text: `_merge_name` writes
+    whatever decrypted out of its `name.age` straight to disk, and sealing one
+    needs no secret, so anyone who can push chooses it. Harmless while the
+    picker was escape-free; with `--ansi` it is a way to drive the terminal, so
+    it is neutralised here rather than trusted to have been neutralised
+    somewhere upstream.
+
+    Falls back to a short slice of the opaque id, which is at least stable and
+    is what the host directory is called.
+    """
+    name = make_inert(store.host_name(host_id)).strip()
+    # A short slice of the id when no name has arrived -- the full 16 hex
+    # characters would be a wide column of nothing anyone can read, and the
+    # first eight already tell two machines apart.
+    return (name or host_id[:8])[:_HOST_WIDTH]
+
+
+def command_from_line(line: str, host_width: int = 0) -> str:
+    """Recover the original command from a rendered line.
+
+    ``host_width`` must be the one the line was rendered with. It is passed
+    explicitly rather than recomputed because the two happen in different
+    processes -- the picker's reload runs `woswoar list` -- and a machine
+    arriving in between would otherwise change the answer and slice somebody's
+    recalled command in the wrong place.
+    """
+    return make_inert(unescape(line[_PREFIX + (host_width + 2 if host_width else 0) :]))
 
 
 def lines_for(
-    scope: Scope, dedup: bool = True, limit: int | None = None, colour: bool = False
+    scope: Scope,
+    dedup: bool = True,
+    limit: int | None = None,
+    colour: bool = False,
+    host_width: int | None = None,
 ) -> list[str]:
     """The full pipeline: load, filter, rank, render.
 
@@ -86,51 +122,53 @@ def lines_for(
     fetches one more column. `host` needs none: it is a property of the file,
     so the cache filters whole files out before a single row is looked at.
     """
+    loaded = cache.load_columns()
     if scope == "host":
-        loaded = cache.load_columns()
-        stamps, commands = loaded.stamps_and_commands({store.machine().id})
-        codes = [
-            code
-            for relpath, flat in loaded.files.items()
-            if loaded.meta[relpath].host == store.machine().id
-            for code in flat[3::6]
-        ]
+        stamps, commands, codes, hosts = loaded.display_columns({store.machine().id})
     elif scope == "session":
         session = os.environ.get("WOSWOAR_SESSION", "")
         if not session:
             # Not an error: this is what a shell without the hook loaded looks like.
             return []
-        loaded = cache.load_columns()
-        stamps, commands = loaded.stamps_and_commands()
-        every = loaded.exit_codes()
+        stamps, commands, codes, hosts = loaded.display_columns()
+        # The one column that is per entry rather than per file, so it is the
+        # one scope that cannot be answered by dropping whole files.
         wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
         stamps = [stamps[i] for i in wanted]
         commands = [commands[i] for i in wanted]
-        codes = [every[i] for i in wanted]
+        codes = [codes[i] for i in wanted]
+        hosts = [hosts[i] for i in wanted]
     else:
-        loaded = cache.load_columns()
-        stamps, commands = loaded.stamps_and_commands()
-        codes = loaded.exit_codes()
+        stamps, commands, codes, hosts = loaded.display_columns()
 
-    rows = rank_rows(stamps, commands, codes, dedup=dedup)
+    rows = rank_rows(stamps, commands, codes, hosts, dedup=dedup)
     if limit is not None:
         rows = rows[:limit]
-    return render_rows(rows, colour=colour)
+    if host_width is None:
+        host_width = host_width_for({meta.host for meta in loaded.meta.values() if meta.host})
+    return render_rows(rows, colour=colour, host_width=host_width)
 
 
 def rank_rows(
-    stamps: list[str], commands: list[str], codes: list[str], dedup: bool = True
+    stamps: list[str],
+    commands: list[str],
+    codes: list[str],
+    hosts: list[str],
+    dedup: bool = True,
 ) -> list[Row]:
     """Newest first, optionally collapsing repeats.
 
-    The exit status rides along so the display can colour by it. Deduplication
+    The exit status and the host ride along so the display can colour by one and
+    label by the other. Deduplication
     keeps the *most recent* run, so a command that failed last time is shown as
     failed even if it has succeeded a hundred times before -- which is the way
     round that helps.
     """
     # One `int` per row, here, where the sort needs it -- rather than on every
     # entry of a history at parse time.
-    ordered = sorted(zip(map(int, stamps), commands, codes, strict=True), key=_STAMP, reverse=True)
+    ordered = sorted(
+        zip(map(int, stamps), commands, codes, hosts, strict=True), key=_STAMP, reverse=True
+    )
     if not dedup:
         return ordered
 
@@ -142,7 +180,12 @@ def rank_rows(
     return [row for row in ordered if not (row[1] in seen or add(row[1]))]
 
 
-def render_rows(rows: list[Row], now: int | None = None, colour: bool = False) -> list[str]:
+def render_rows(
+    rows: list[Row],
+    now: int | None = None,
+    colour: bool = False,
+    host_width: int = 0,
+) -> list[str]:
     """Format ranked rows as display lines.
 
     With `colour`, a command that exited non-zero is dimmed red. Safe only
@@ -150,18 +193,42 @@ def render_rows(rows: list[Row], now: int | None = None, colour: bool = False) -
     from the command on its way into the cache, so nothing a peer published can
     add escapes of its own. That is also why fzf is given `--ansi` only here:
     without inert text, `--ansi` would turn another machine's history into
-    something that can drive this terminal.
+    something that can drive this terminal. `host_label` does the same job for
+    the machine name, which arrives by the same route and is *not* made inert
+    where it is stored.
+
+    With `host_width`, each line names the machine that ran the command. Which
+    is also how you filter by one: fzf matches from the second field on, so the
+    name is matched and the relative time still is not.
 
     fzf hands back the line with the escapes stripped, so `command_from_line`
-    needs to know nothing about any of this.
+    only has to know the width.
     """
     if now is None:
         now = int(time.time())
+    labels = {host: host_label(host) for host in {row[3] for row in rows}} if host_width else {}
+
     out = []
-    for ts, cmd, code in rows:
-        line = f"{relative_time(ts, now):>{_TIME_WIDTH}}  {escape(cmd)}"
+    for ts, cmd, code, host in rows:
+        when = f"{relative_time(ts, now):>{_TIME_WIDTH}}"
+        if host_width:
+            line = f"{when}  {labels[host]:<{host_width}}  {escape(cmd)}"
+        else:
+            line = f"{when}  {escape(cmd)}"
         out.append(f"{_FAILED}{line}{_RESET}" if colour and code not in ("0", "") else line)
     return out
+
+
+def host_width_for(hosts: set[str]) -> int:
+    """How wide the machine column should be, or 0 for no column at all.
+
+    Nothing to say on a machine whose history is all its own, which is every
+    single-machine install and the whole of the README's Quick Start -- so the
+    column simply is not there, rather than being there and empty.
+    """
+    if len(hosts) < 2:
+        return 0
+    return min(_HOST_WIDTH, max(len(host_label(host)) for host in hosts))
 
 
 def _self_command() -> str:
@@ -174,9 +241,14 @@ def _self_command() -> str:
     return f"{sys.executable} -m woswoar"
 
 
-def _fzf_argv(scope: Scope, query: str, dedup: bool) -> list[str]:
+def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[str]:
     self_cmd = _self_command()
     dedup_flag = "" if dedup else " --no-dedup"
+    # Passed to the reloads rather than recomputed by them. Both sides must lay
+    # the line out identically or the recalled command is sliced in the wrong
+    # place, and a peer's history arriving between the picker opening and a
+    # scope switch would otherwise change one side's answer and not the other's.
+    width = f" --host-width {host_width}"
 
     argv = [
         "fzf",
@@ -209,7 +281,7 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool) -> list[str]:
     ]
     for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
         argv.append(
-            f"--bind={key}:reload({self_cmd} list --colour --scope {target}{dedup_flag})"
+            f"--bind={key}:reload({self_cmd} list --colour{width} --scope {target}{dedup_flag})"
             f"+change-prompt(woswoar ({target}) )"
         )
     return argv
@@ -244,8 +316,9 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
     # render, measured at 125 ms on a real 55k-command history. The work is the
     # same either way; what changes is that you are looking at the picker while
     # it happens instead of at nothing.
+    host_width = host_width_for(set(store.host_names()))
     process = subprocess.Popen(
-        _fzf_argv(scope, query, dedup),
+        _fzf_argv(scope, query, dedup, host_width),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
@@ -253,7 +326,10 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
     assert process.stdin is not None and process.stdout is not None
 
     try:
-        _feed(process.stdin, lines_for(scope, dedup=dedup, colour=True))
+        _feed(
+            process.stdin,
+            lines_for(scope, dedup=dedup, colour=True, host_width=host_width),
+        )
     finally:
         # Both closes can raise the same way, and neither is a failure: it only
         # means fzf is already gone. Selecting the first line the moment it
@@ -269,7 +345,7 @@ def interactive(scope: Scope, query: str = "", dedup: bool = True) -> str | None
     # outcomes, not failures.
     if returncode != 0 or not selected.strip():
         return None
-    return command_from_line(selected.rstrip("\n"))
+    return command_from_line(selected.rstrip("\n"), host_width)
 
 
 #: Lines per write into fzf. Large enough that the write syscalls are not the

@@ -16,11 +16,15 @@ when you need that one command from last Tuesday, on the other machine.
 
 ```
   woswoar (global) > docker
-   2m  docker compose up -d --build
-   3h  docker logs -f api
-   6d  docker system prune -af
+   2m  laptop   docker compose up -d --build
+   3h  desktop  docker logs -f api
+   6d  laptop   docker system prune -af
   ctrl-g global | ctrl-h host | ctrl-s session
 ```
+
+The machine column appears once you have more than one, and fzf matches on it —
+so typing `desktop` narrows to that machine. A command that exited non-zero is
+dimmed red.
 
 ## Quick start
 
