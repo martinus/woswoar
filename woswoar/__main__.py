@@ -882,6 +882,141 @@ def cmd_trust(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ask(question: str, default: str = "") -> str:
+    """Free text, with a default shown. Empty answer takes the default."""
+    shown = f" [{default}]" if default else ""
+    return input(f"{question}{shown}: ").strip() or default
+
+
+def _ask_yes(question: str, default: bool = True) -> bool:
+    """A yes/no with a default, for questions that change nothing dangerous.
+
+    Deliberately not `_confirm`: that one is a security control with an
+    `isatty` branch and a fixed refusal message about widening access. These
+    are "shall I install the shell hook" -- reusing the access gate for them
+    would blunt the thing it is for.
+    """
+    hint = "[Y/n]" if default else "[y/N]"
+    answer = input(f"{question} {hint} ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+#: What `setup` offers to import, in the order it offers them. `importer` owns
+#: where each one lives; this only asks whether it is there.
+def _importable() -> list[tuple[str, Path, int]]:
+    """``(kind, path, size)`` for each history on this machine, largest first."""
+    from . import importer
+
+    found = []
+    for kind in importer.KINDS:
+        path = importer.atuin_db() if kind == "atuin" else importer.default_path(kind)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size:
+            found.append((kind, path, size))
+    return sorted(found, key=lambda item: item[2], reverse=True)
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Walk a fresh machine through the whole thing, asking as it goes."""
+    from . import deps
+
+    if not sys.stdin.isatty():
+        # It asks questions, so it cannot run unattended -- and silently
+        # choosing defaults for someone's script would be worse than refusing.
+        print(
+            "woswoar setup asks questions, so it needs a terminal.\n"
+            "Without one, the same thing is:\n"
+            "    woswoar install\n"
+            "    woswoar import bash|zsh|atuin      # optional\n"
+            "    woswoar init <url>                 # optional",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Setting up woswoar. Everything here can be re-run safely.\n")
+
+    print("1/4  Tools")
+    absent = deps.missing()
+    if absent:
+        print(f"     {deps.report(absent)}")
+        if not _ask_yes("     Carry on without them?", default=False):
+            return 1
+    else:
+        print("     everything woswoar needs is installed")
+
+    print("\n2/4  Shell hook")
+    cmd_install(argparse.Namespace(rcfile=args.rcfile))
+
+    print("\n3/4  Existing history")
+    _offer_imports()
+
+    print("\n4/4  Sync with your other machines")
+    return _offer_remote(args)
+
+
+def _offer_imports() -> None:
+    """Offer each history found on this machine, one at a time."""
+    found = _importable()
+    if not found:
+        print("     nothing to import (no bash, zsh or atuin history found)")
+        return
+
+    for kind, path, size in found:
+        if not _ask_yes(f"     Import {kind} history from {path} ({size / 1e6:.1f} MB)?"):
+            continue
+        this_host_only = False
+        if kind == "atuin":
+            # atuin keeps every machine it has synced with in one database, and
+            # woswoar publishes only this machine's own commands -- so importing
+            # all of them on every machine stores each machine's history once
+            # per machine. Asked rather than assumed: on a single woswoar
+            # machine, importing the lot is exactly what you want.
+            print(
+                "       atuin keeps other machines' history in the same database.\n"
+                "       If you will run woswoar on those machines too, import only\n"
+                "       this one's here and let each machine import its own --\n"
+                "       otherwise every machine stores every other machine twice."
+            )
+            this_host_only = _ask_yes("       Import only this machine's history?")
+        cmd_import(
+            argparse.Namespace(
+                kind=kind, file=str(path), dry_run=False, this_host_only=this_host_only
+            )
+        )
+
+
+def _offer_remote(args: argparse.Namespace) -> int:
+    """Join a history repo, or finish without one."""
+    from . import sync
+
+    if sync.is_repo():
+        print("     already joined a history repo; syncing")
+        return cmd_sync(argparse.Namespace(no_push=False))
+
+    print(
+        "     woswoar syncs through an ordinary git repository you own -- an\n"
+        "     empty GitHub repo, a bare repo on a NAS, a folder on a USB stick.\n"
+        "     There is no server and no account. Leave blank to stay on this\n"
+        "     machine only; you can run 'woswoar init <url>' any time later."
+    )
+    remote = _ask("     Repository URL")
+    if not remote:
+        print("\n     Staying local. Open a new shell and press Ctrl-R.")
+        return 0
+
+    # Through `cmd_init`, so the sequence has one source of truth: whatever it
+    # prints as the next step is what someone following this reads, and there
+    # is no second copy here to disagree with it.
+    return cmd_init(
+        argparse.Namespace(remote=remote, new_identity=False, identity=None, no_sync=False)
+    )
+
+
 def cmd_accept(args: argparse.Namespace) -> int:
     """`grant` and `trust` for a machine you own, in one step.
 
@@ -1128,6 +1263,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_import.set_defaults(func=cmd_import)
 
+    p_setup = sub(
+        "setup",
+        "set woswoar up from scratch, asking as it goes",
+        """
+        The guided version of `install`, `import` and `init`. Run it on a fresh
+        machine and answer four questions; it calls the same commands you would
+        have run yourself, so there is nothing it can do that they cannot.
+
+        Safe to re-run: the hook is replaced rather than repeated, importing the
+        same history twice adds nothing, and a machine that already joined a
+        repository just syncs.
+
+        Needs a terminal, because it asks. Without one it says what to run
+        instead rather than choosing for you.
+        """,
+    )
+    p_setup.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
+    p_setup.set_defaults(func=cmd_setup)
+
     p_install = sub(
         "install",
         "install the shell hook into .bashrc",
@@ -1225,9 +1379,6 @@ def build_parser() -> argparse.ArgumentParser:
         -- sharing a repository with someone else, rather than adding your own
         laptop.
         """,
-        # `reencrypt` named the mechanism, which hid what it does to the user's
-        # history. Kept working so older notes and error messages do not rot.
-        aliases=["reencrypt"],
     )
     p_grant.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_grant.set_defaults(func=cmd_grant)

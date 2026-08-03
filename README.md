@@ -26,9 +26,13 @@ when you need that one command from last Tuesday, on the other machine.
 
 ```bash
 pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
-woswoar install                  # hook it into ~/.bashrc
-woswoar import bash              # optional: bring your existing history along
+woswoar setup
 ```
+
+`setup` asks four questions — it checks the tools, installs the shell hook,
+offers to import whatever history it finds, and asks for a sync repository (leave
+it blank to stay on one machine). Every step is a command you can also run
+yourself: `install`, `import`, `init`.
 
 Open a new shell, press <kbd>Ctrl</kbd>+<kbd>R</kbd>. That is the whole thing on
 one machine.
@@ -58,17 +62,35 @@ Sync goes through **an ordinary git repository you already own** — no server, 
 account, no daemon. Create an empty one (`woswoar-history` on GitHub, a bare repo
 on a NAS, a folder on a USB stick). You do that once, ever.
 
-Then on **every** machine, first or fifth, the same four lines:
+Then on **every** machine, first or fifth, the same two lines:
 
 ```bash
 pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
-woswoar install                                       # hook it into bash
-woswoar import atuin --this-host-only                 # optional: this machine's past
-woswoar init git@github.com:you/woswoar-history.git   # join, and sync
+woswoar setup                    # paste the repository URL when it asks
 ```
 
-`init` does the first sync itself, so the new machine starts publishing straight
-away — it signs its own commands and waits for nobody.
+`setup` joins the repo and does the first sync itself, so the new machine starts
+publishing straight away — it signs its own commands and waits for nobody.
+
+> [!TIP]
+> **Importing atuin on more than one machine?** `setup` asks whether to import
+> only *this* machine's history, and on a fleet the answer is yes. atuin keeps
+> every machine it has synced with in one database, and woswoar publishes only a
+> machine's own commands — so importing all of them everywhere stores each
+> machine's history once per machine. Let each machine import its own.
+
+<details>
+<summary>The same thing without the questions</summary>
+
+```bash
+woswoar install
+woswoar import atuin --this-host-only     # optional
+woswoar init git@github.com:you/woswoar-history.git
+```
+
+`setup` calls exactly these. It needs a terminal, so this is also what to use
+from a script or a dotfiles bootstrap.
+</details>
 
 From the **second** machine onwards, one more line, on each machine you already
 use:
@@ -193,6 +215,7 @@ truthful. Re-running an import is idempotent.
 
 | command | |
 |---|---|
+| `woswoar setup` | guided first run: tools, hook, import, sync repo |
 | `woswoar search` | interactive picker (what <kbd>Ctrl</kbd>+<kbd>R</kbd> runs) |
 | `woswoar list` | plain output, used by fzf's scope-switch reload |
 | `woswoar import bash\|zsh\|atuin` | import an existing history |
