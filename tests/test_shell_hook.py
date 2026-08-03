@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar
 
-from woswoar import cache, store
+from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
@@ -972,3 +972,41 @@ class TestALostLogDirectory(ShellHookTestCase):
             """
         )
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+
+
+@requires_bash5
+class TestTwoShellsOnOneMachine(ShellHookTestCase):
+    """A second shell sees the first one's commands, with nothing in between.
+
+    Asked directly: "when I have two different shells open on the same computer,
+    shouldn't one shell immediately pick up the history of the other?" It should
+    and it does -- both write to the same per-host, per-day log, and every Ctrl-R
+    is a fresh process that re-reads the tail of it. There was no test for it,
+    which for the thing woswoar exists to do is an odd gap: every other test of
+    this runs one shell.
+    """
+
+    def test_the_second_shell_sees_the_first_ones_commands(self) -> None:
+        self.run_shell("echo from_the_first_shell\n")
+        self.run_shell("echo from_the_second_shell\n")
+
+        # Global is what Ctrl-R opens in -- `${WOSWOAR_SCOPE:-global}` in the
+        # hook -- so this is what the second shell's picker actually shows.
+        shown = [search.command_from_line(line) for line in search.lines_for("global")]
+        self.assertIn("echo from_the_first_shell", shown)
+        self.assertIn("echo from_the_second_shell", shown)
+
+    def test_no_sync_or_other_step_is_needed_in_between(self) -> None:
+        """One machine, one log file. Nothing has to be exchanged with anything:
+        the second shell is reading the same file the first one appended to."""
+        self.run_shell("echo written_by_one_shell\n")
+        recorded = self.by_cmd()["echo written_by_one_shell"]
+        self.assertEqual(recorded.host, MACHINE_ID, "both shells are the same host")
+
+    def test_each_shell_still_has_its_own_session(self) -> None:
+        """Which is what `--scope session` is for, and what would be broken by
+        making them share history the crude way."""
+        self.run_shell("echo first_shell\n")
+        self.run_shell("echo second_shell\n")
+        sessions = {e.session for e in self.recorded()}
+        self.assertEqual(len(sessions), 2, f"the two shells shared a session: {sessions}")
