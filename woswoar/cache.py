@@ -187,6 +187,10 @@ class Cache:
             commands += flat[5::6]
         return stamps, commands
 
+    def exit_codes(self) -> list[str]:
+        """The exit status column, in the same order as `stamps_and_commands`."""
+        return [value for flat in self.files.values() for value in flat[3::6]]
+
     def sessions(self) -> list[str]:
         """The session column, in the same order as `stamps_and_commands`."""
         return [value for flat in self.files.values() for value in flat[1::6]]

