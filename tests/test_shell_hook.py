@@ -754,6 +754,43 @@ class TestForkFree(ShellHookTestCase):
     #: pins them with a stamp file rather than with a clock.
     NO_SYNC: ClassVar[dict[str, str]] = {"WOSWOAR_SYNC_INTERVAL": "0"}
 
+    def stamp_opens(self, command_count: int) -> int:
+        """How many times the shell opened the sync stamp across the run.
+
+        The fork count cannot see this: skipping the `__woswoar_next_sync` memo
+        adds a file open per prompt, not a fork, so the clone-count assertions
+        stay green while every command grows a syscall. Counted the same way and
+        for the same reason -- a per-command cost has to be pinned by something
+        that scales with commands, not by a stopwatch.
+        """
+        script = "".join(f"echo cmd{i}\n" for i in range(command_count))
+        proc = subprocess.run(
+            ["strace", "-f", "-e", "trace=openat", "bash", "--norc", "-i"],
+            input=f"source {HOOK}\n{script}",
+            text=True,
+            env=self.shell_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
+        return proc.stderr.count(store.sync_stamp_file().name)
+
+    def test_the_stamp_is_read_once_a_shell_not_once_a_command(self) -> None:
+        """The memo is the whole reason the due check is affordable.
+
+        Measured at ~16 us for the read against ~1.5 us for the arithmetic it
+        replaces, in a hook whose comments argue over 7 us.
+        """
+        (store.history_dir() / ".git").mkdir(parents=True, exist_ok=True)
+        counts = []
+        for count in (3, 30):
+            store.sync_stamp_file().write_text(f"{int(time.time())}\n", encoding="utf-8")
+            counts.append(self.stamp_opens(count))
+        few, many = counts
+        self.assertGreater(few, 0, "the stamp was never consulted at all")
+        self.assertEqual(few, many, f"{few} stamp reads for 3 commands, {many} for 30")
+
     def test_clone_count_does_not_scale_with_commands(self) -> None:
         # Not "zero forks": startup legitimately runs mkdir and two `trap -p`
         # subshells -- one to see whether the EXIT trap is free, one at the first
@@ -774,6 +811,24 @@ class TestForkFree(ShellHookTestCase):
                     many,
                     f"record path forks: {few} clones for 3 commands, {many} for 30",
                 )
+
+    def test_the_record_path_forks_nothing_at_the_shipped_interval_either(self) -> None:
+        """The case above turns syncing off, so on its own it stops covering the
+        configuration people actually run -- including the stamp file every shell
+        reads at its first prompt.
+
+        Deterministic without a clock: a stamp written immediately beforehand
+        means the interval cannot elapse during the run, so a due sync is not
+        merely unlikely, it is impossible. That is what lets this assert strict
+        equality rather than a tolerance.
+        """
+        (store.history_dir() / ".git").mkdir(parents=True, exist_ok=True)
+        counts = []
+        for count in (3, 30):
+            store.sync_stamp_file().write_text(f"{int(time.time())}\n", encoding="utf-8")
+            counts.append(self.clone_count(count))
+        few, many = counts
+        self.assertEqual(few, many, f"{few} clones for 3 commands, {many} for 30")
 
     #: Each takes a different branch of the PROMPT_COMMAND assembly, and the
     #: last two are shapes where `__woswoar_unboot`'s exact-match removal can
@@ -838,8 +893,11 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         self.bindir = bindir
         # `__woswoar_maybe_sync` will not fork without one, on the grounds that
         # a machine that never ran `init` has nothing to sync.
-        self.repo = Path(os.environ["WOSWOAR_DIR"]) / "history"
-        self.repo.mkdir(parents=True, exist_ok=True)
+        # `store`'s idea of the path, not a second copy of it -- same reason
+        # as the stamp below, and the hook's `history/.git` test has to keep
+        # agreeing with `sync.is_repo`.
+        self.repo = store.history_dir()
+        (self.repo / ".git").mkdir(parents=True, exist_ok=True)
         # `store`'s idea of the path, not a second copy of it. The hook is
         # copied verbatim into a shell and cannot import anything, so the two
         # can only be held together from here -- and they came apart at the
@@ -849,8 +907,21 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         # shell happened to be in.
         self.stamp = store.sync_stamp_file()
 
-    def env(self, **extra: str) -> dict[str, str]:
-        return {"PATH": f"{self.bindir}:{os.environ.get('PATH', '')}", **extra}
+    def shell_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Every shell in this class needs the stand-in ahead of the real one."""
+        return super().shell_env(
+            {"PATH": f"{self.bindir}:{os.environ.get('PATH', '')}", **(extra or {})}
+        )
+
+    def fired(self) -> bool:
+        """Whether this run decided to sync, without waiting for anything.
+
+        The stamp is written *inside* the subshell the prompt waits for, before
+        the `&` -- so by the time `run_shell` returns, the decision is already on
+        disk. Asserting a negative through `syncs()` instead means polling for
+        something that will never arrive, which was three seconds a test.
+        """
+        return self.stamp.exists()
 
     def syncs(self, timeout: float = 20.0) -> int:
         """How many times the stand-in ran, once the dust has settled.
@@ -875,42 +946,75 @@ class TestPromptTriggeredSync(ShellHookTestCase):
 
     def test_a_shell_that_types_nothing_still_syncs_at_startup(self) -> None:
         """Sitting down and pressing Ctrl-R has to show current history."""
-        self.run_shell("", self.env())
+        self.run_shell("")
         self.assertEqual(self.syncs(), 1)
 
     def test_it_syncs_once_per_interval_not_once_per_command(self) -> None:
         """The whole cost argument in #134 rests on this number."""
-        self.run_shell("".join(f"echo cmd{i}\n" for i in range(30)), self.env())
+        self.run_shell("".join(f"echo cmd{i}\n" for i in range(30)))
         self.assertEqual(self.syncs(), 1)
 
     def test_a_fresh_stamp_from_another_shell_suppresses_the_sync(self) -> None:
-        """The stamp is shared, so ten terminals opening at once are one sync.
-
-        Written as if another shell had just synced -- which is what makes this
-        about the shared clock rather than about this shell's own memory.
-        """
-        self.stamp.write_text(f"{int(time.time())}\n", encoding="utf-8")
-        self.run_shell("echo one\necho two\n", self.env())
-        self.assertEqual(self.syncs(timeout=3.0), 0)
+        """The stamp is shared, so a shell that another just synced for stays
+        quiet -- which is what makes this about the shared clock rather than
+        about this shell's own memory."""
+        # Five seconds ago, not "now": the hook writes `$EPOCHSECONDS`, so a
+        # stamp written in the same second is byte-identical to the one an
+        # unwanted sync would leave, and this assertion could not tell them
+        # apart. Still far inside the interval, so it still suppresses.
+        fresh = f"{int(time.time()) - 5}\n"
+        self.stamp.write_text(fresh, encoding="utf-8")
+        self.run_shell("echo one\necho two\n")
+        self.assertEqual(self.stamp.read_text(encoding="utf-8"), fresh, "it synced anyway")
 
     def test_a_stale_stamp_comes_due_again(self) -> None:
         """Without this, the test above would also pass if syncing never fired."""
         self.stamp.write_text(f"{int(time.time()) - 3600}\n", encoding="utf-8")
-        self.run_shell("echo one\n", self.env())
+        self.run_shell("echo one\n")
         self.assertEqual(self.syncs(), 1)
 
     def test_a_zero_interval_turns_it_off(self) -> None:
         """For anyone running the systemd timer instead."""
-        self.run_shell("echo one\n", self.env(WOSWOAR_SYNC_INTERVAL="0"))
-        self.assertEqual(self.syncs(timeout=3.0), 0)
+        self.run_shell("echo one\n", {"WOSWOAR_SYNC_INTERVAL": "0"})
+        self.assertFalse(self.fired())
+
+    def test_a_hostile_interval_from_the_environment_is_not_evaluated(self) -> None:
+        """`WOSWOAR_SYNC_INTERVAL` is inherited, and it reaches `((...))` -- where
+        bash evaluates an array subscript, so `x[$(...)]` runs a command rather
+        than being a syntax error. An exported variable is a plausible way in:
+        anything that spawns your shell chooses this value.
+        """
+        canary = self.root / "interval-ran"
+        out = self.run_shell("echo marker\n", {"WOSWOAR_SYNC_INTERVAL": f"x[$(touch {canary})]"})
+        self.assertIn("marker", out)
+        self.assertFalse(canary.exists(), "the interval was evaluated as arithmetic")
+        self.assertTrue(self.fired(), "it should fall back to the default, not switch off")
+
+    def test_a_leading_zero_is_read_as_decimal_not_octal(self) -> None:
+        """`((08))` is `value too great for base`, printed to an un-redirected
+        stderr at every prompt -- the exact shape of the bug 0.4.1 shipped. And
+        `08` is a perfectly reasonable thing to write for eight seconds."""
+        out = self.run_shell("echo marker\n", {"WOSWOAR_SYNC_INTERVAL": "08"})
+        self.assertIn("marker", out)
+        self.assertNotIn("value too great", out)
+        self.assertTrue(self.fired(), "a valid interval stopped it syncing at all")
 
     def test_nothing_forks_before_the_machine_has_joined_a_repository(self) -> None:
         """`woswoar sync` on a machine that never ran `init` fails every time,
         and doing it once a minute from every shell is a fork and an interpreter
         start to produce an error nobody reads."""
         shutil.rmtree(self.repo)
-        self.run_shell("echo one\n", self.env())
-        self.assertEqual(self.syncs(timeout=3.0), 0)
+        self.run_shell("echo one\n")
+        self.assertFalse(self.fired())
+
+    def test_a_clone_that_died_partway_is_not_a_repository(self) -> None:
+        """`history/` without `.git` in it is what an interrupted `init` leaves,
+        and `sync.is_repo` calls it not a repository. A hook that disagreed would
+        have that machine start an interpreter a minute, forever, to print an
+        error into /dev/null."""
+        shutil.rmtree(self.repo / ".git")
+        self.run_shell("echo one\n")
+        self.assertFalse(self.fired())
 
     def test_the_prompt_does_not_wait_for_the_sync(self) -> None:
         """The constraint the maintainer named directly: "Sync on shell startup
@@ -921,7 +1025,7 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         takes about a fifth of a second.
         """
         started = time.monotonic()
-        self.run_shell("".join(f"echo cmd{i}\n" for i in range(10)), self.env())
+        self.run_shell("".join(f"echo cmd{i}\n" for i in range(10)))
         self.assertLess(time.monotonic() - started, 2.0)
 
     def test_a_command_is_recorded_before_the_sync_it_triggers(self) -> None:
@@ -940,15 +1044,36 @@ class TestPromptTriggeredSync(ShellHookTestCase):
             "__woswoar_record() { printf 'MARK %s\\n' record; }; "
             "__woswoar_maybe_sync() { printf 'MARK %s\\n' sync; }\n"
             "echo trigger\n",
-            self.env(),
         )
         marks = re.findall(r"MARK (\w+)", out)
         self.assertEqual(marks[:2], ["record", "sync"], f"got {marks} from:\n{out}")
 
+    def test_a_stamp_that_is_not_a_plain_number_is_rejected_not_salvaged(self) -> None:
+        """Stripping the non-digits out instead turns junk into a *plausible*
+        epoch, and one in the future stops this shell syncing until the file
+        changes again -- a machine that quietly never syncs, from a bad write.
+
+        `08` is the other half: `((...))` reads a leading zero as octal, so it
+        is not merely wrong but `value too great for base` printed to an
+        un-redirected stderr at every prompt.
+        """
+        for junk in ("9999999999oops", "08", "not-a-number", ""):
+            with self.subTest(stamp=junk):
+                self.stamp.write_text(f"{junk}\n", encoding="utf-8")
+                out = self.run_shell("echo marker\n")
+                self.assertIn("marker", out)
+                self.assertNotIn("value too great", out)
+                self.assertNotIn("syntax error", out)
+                self.assertNotEqual(
+                    self.stamp.read_text(encoding="utf-8").strip(),
+                    junk,
+                    "an unreadable stamp was believed rather than replaced",
+                )
+
     def test_the_stamp_is_owner_only(self) -> None:
         """It is written by the shell, so `>` alone would create it 0644 and
         `doctor` would report an exposure in woswoar's own data directory."""
-        self.run_shell("", self.env())
+        self.run_shell("")
         self.syncs()
         self.assertTrue(self.stamp.exists(), "no stamp was written")
         self.assertEqual(self.stamp.stat().st_mode & 0o077, 0)
@@ -964,7 +1089,7 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         bare `&`. Job *table* membership is the same fact and is observable
         here. The stand-in sleeps, so the job is still running when `jobs` asks.
         """
-        out = self.run_shell("echo marker\njobs\n", self.env())
+        out = self.run_shell("echo marker\njobs\n")
         self.assertIn("marker", out, "precondition: the shell ran at all")
         self.assertNotIn("woswoar sync", out, "the sync is a job of this shell")
 
@@ -983,7 +1108,7 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         """
         canary = self.root / "arithmetic-ran"
         self.stamp.write_text(f"x[$(touch {canary})]\n", encoding="utf-8")
-        out = self.run_shell("echo marker\n", self.env())
+        out = self.run_shell("echo marker\n")
         self.assertIn("marker", out)
         self.assertFalse(canary.exists(), "the stamp's contents were executed")
 

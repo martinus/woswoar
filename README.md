@@ -63,9 +63,11 @@ one machine.
 
 > [!TIP]
 > **The same line upgrades an existing install** — run it again whenever you want
-> the latest release. `stable` tracks the most recent tag, so the command never
-> changes and you never edit a version number on five machines. Swap `@stable`
-> for `@main` to track the tip, or `@v0.6.1` to pin exactly.
+> the latest release, then `woswoar install` to refresh the shell hook, which is
+> a copy and does not update with the program. `woswoar` and `woswoar doctor`
+> both say so when it is out of date. `stable` tracks the most recent tag, so the
+> command never changes and you never edit a version number on five machines.
+> Swap `@stable` for `@main` to track the tip, or `@v0.6.1` to pin exactly.
 >
 > If `--force` fails with **"A virtual environment already exists"**, your pipx
 > is using `uv` as its backend and cannot reuse the old venv. Either
@@ -302,6 +304,7 @@ truthful. Re-running an import is idempotent.
 | `WOSWOAR_DIR` | data directory (default `~/.local/share/woswoar`) |
 | `WOSWOAR_IGNORE` | extended regex of commands never to record |
 | `WOSWOAR_IGNORE_EXTRA` | extra regex joined onto the default, instead of replacing it |
+| `WOSWOAR_SYNC_INTERVAL` | seconds between background syncs; `0` turns them off (default `60`) |
 | `WOSWOAR_SCOPE` | default scope for <kbd>Ctrl</kbd>+<kbd>R</kbd> (default `global`) |
 | `WOSWOAR_NO_BIND` | set to skip binding <kbd>Ctrl</kbd>+<kbd>R</kbd> |
 

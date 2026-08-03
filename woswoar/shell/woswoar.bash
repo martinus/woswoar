@@ -162,15 +162,27 @@ __woswoar_max=8000
 #: two are safe together -- `sync.lock` is non-blocking, so whichever arrives
 #: second exits at once -- but running both is just paying twice.
 #:
-#: Validated rather than trusted: this reaches `((...))`, where a value like
-#: `x[$(...)]` is not a syntax error but a command substitution.
-: "${WOSWOAR_SYNC_INTERVAL:=60}"
-[[ $WOSWOAR_SYNC_INTERVAL =~ ^[0-9]+$ ]] || WOSWOAR_SYNC_INTERVAL=60
+#: Validated rather than trusted, because it reaches `((...))`, where a value
+#: like `x[$(...)]` is not a syntax error but a command substitution. One test
+#: rather than a `:=` default followed by a test: unset and empty both fail the
+#: pattern, so the default falls out of the same line.
+#:
+#: Then normalised through `10#`, because `((...))` reads a leading zero as
+#: octal -- so a perfectly reasonable `WOSWOAR_SYNC_INTERVAL=08` is not merely
+#: wrong, it is `value too great for base` printed to an un-redirected stderr
+#: at every prompt. That is the shape of the bug 0.4.1 shipped.
+[[ ${WOSWOAR_SYNC_INTERVAL:-} =~ ^[0-9]+$ ]] || WOSWOAR_SYNC_INTERVAL=60
+WOSWOAR_SYNC_INTERVAL=$((10#$WOSWOAR_SYNC_INTERVAL))
 
-#: Shared between every shell on this machine, deliberately. Ten open terminals
-#: with ten private clocks all come due at the same moment and fire ten syncs;
-#: nine of them lose the lock instantly, but an interpreter start is ~40ms and
-#: nine of those is real. See store.sync_stamp_file.
+#: Shared between every shell on this machine, deliberately: ten open terminals
+#: with ten private clocks would each come due on their own schedule and sync
+#: ten times an hour between them rather than once.
+#:
+#: Not a claim of atomicity. Ten shells starting in the same instant -- a tmux
+#: session restore -- all read the same stale stamp and all fork, and `sync.lock`
+#: is what stops nine of them doing any work. That costs nine interpreter starts
+#: (~30ms each) once per restore, which is worth accepting rather than
+#: introducing a lock file of this one's own. See store.sync_stamp_file.
 __woswoar_syncstamp=$__woswoar_dir/sync-stamp
 
 #: Earliest $EPOCHSECONDS at which the stamp above is worth opening. Keeps the
@@ -393,9 +405,13 @@ __woswoar_maybe_sync() {
     local last=
     read -r last 2>/dev/null <"$__woswoar_syncstamp"
     # A torn or truncated write must not reach `((...))`, where a non-numeric
-    # value is a variable name to dereference rather than an error.
-    last=${last//[^0-9]/}
-    last=${last:-0}
+    # value is a variable name to dereference rather than an error. Rejected
+    # outright rather than stripped to the digits in it: stripping turns half of
+    # `1785...` followed by a leftover tail into a *plausible* epoch, and one in
+    # the future stops this shell syncing until the file changes again. The same
+    # test as the interval above, for the same reason, in the same shape.
+    [[ $last =~ ^[0-9]+$ ]] || last=0
+    last=$((10#$last))
 
     if ((EPOCHSECONDS - last < WOSWOAR_SYNC_INTERVAL)); then
         __woswoar_next_sync=$((last + WOSWOAR_SYNC_INTERVAL))
@@ -410,7 +426,13 @@ __woswoar_maybe_sync() {
     # Nothing to sync with, so nothing to fork for. Checked here rather than
     # once at startup because `woswoar init` may well be the command that just
     # ran, and a per-shell flag would leave that shell never syncing.
-    [[ -d $__woswoar_dir/history ]] || return 0
+    #
+    # `history/.git`, matching `sync.is_repo`, not `history/` itself: a clone
+    # that died partway leaves the directory without the repository in it, and
+    # `woswoar sync` calls that "not initialised". Testing the directory would
+    # have this machine fork an interpreter a minute, forever, to print that
+    # error into /dev/null.
+    [[ -e $__woswoar_dir/history/.git ]] || return 0
 
     # `( ... & )`: the subshell backgrounds the sync and exits immediately, so
     # the prompt waits for two forks (~1ms) and never for the sync itself. A

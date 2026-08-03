@@ -33,22 +33,21 @@ _END = "# <<< woswoar <<<"
 _BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
 
 
-def _hook_source() -> Path:
-    # Imported here rather than at module scope: importlib.resources costs ~8 ms
-    # of startup and only `install` needs it, while every Ctrl-R pays for
-    # whatever this module imports eagerly.
-    from importlib import resources
-
-    with resources.as_file(resources.files("woswoar") / "shell" / HOOK_NAME) as path:
-        return Path(str(path))
-
-
 def _hook_bytes() -> bytes:
     """The hook as this version ships it.
 
-    Read through `files(...).read_bytes()` rather than `_hook_source()` so it is
-    correct for a zipped install too, where `as_file` hands back a temporary
-    path that is deleted as soon as its context exits.
+    The bytes rather than a path, which is what replaced an `as_file` dance
+    here. `as_file` hands back a *temporary* path for a zipped install and
+    deletes it when its context exits, so the previous version of this returned
+    a path that no longer existed and `install` copied from it. Nothing noticed,
+    because nobody installs woswoar as a zipapp -- but `doctor` now compares
+    what is installed against what is packaged, and one function returning one
+    thing is what makes that comparison true by construction rather than by
+    hoping two readers agree.
+
+    Imported here rather than at module scope: importlib.resources costs ~8 ms
+    of startup and only `install` and `doctor` need it, while every Ctrl-R pays
+    for whatever this module imports eagerly.
     """
     from importlib import resources
 
@@ -76,13 +75,11 @@ def portable_hook_path(target: Path) -> str:
 
 def cmd_install(args: argparse.Namespace) -> int:
     """Set up machine identity, install the hook, and wire up .bashrc."""
-    import shutil
-
     machine = store.machine()
     store.private_dir(store.data_dir())
     target = store.data_dir() / HOOK_NAME
-    shutil.copyfile(_hook_source(), target)
-    # After the copy, not before: `copyfile` creates at the ambient umask, so
+    target.write_bytes(_hook_bytes())
+    # After the copy, not before: `write_bytes` creates at the ambient umask, so
     # hardening first would leave the one file install itself writes as the one
     # file its own migration missed. This is also what re-tightens a tree from
     # a woswoar that predated owner-only directories -- `install` is the
@@ -314,7 +311,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("machine", has_machine, str(machine_file))
 
     hook = store.data_dir() / HOOK_NAME
-    if hook.is_file() and hook.read_bytes() != _hook_bytes():
+    if _hook_is_stale():
         # `install` copies the hook into the data directory rather than sourcing
         # it out of the package, so upgrading woswoar leaves the old shell code
         # running -- and nothing said so. That was survivable while the hook only
@@ -537,15 +534,29 @@ def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
     # The shell hook fires this detached, with its output going nowhere, so a
-    # failure has to be left somewhere the bare `woswoar` can find it. Recorded
-    # here rather than inside `sync.run` because `init`, `accept` and `grant`
-    # call that too, and a failure a person is standing in front of has already
-    # been reported to them by the message on their screen.
+    # failure has to be left somewhere the bare `woswoar` can find it.
+    #
+    # Gated on whether anyone is watching, not on which command this is. The
+    # first version asked the latter -- recorded from `sync`, not from `init`,
+    # `accept` or `grant` -- and got the common case backwards: somebody who
+    # types `woswoar sync`, reads the error and deals with it was then told by
+    # every later `woswoar` that a *background* sync had been failing for days,
+    # with "run woswoar sync to see it in full" as the remedy. That is the
+    # command they had just run.
+    #
+    # `stderr.isatty()` is the same question `progress.to_terminal` asks, and
+    # for the same reason: a terminal means the message has already been read
+    # by the person it was for.
+    watched = sys.stderr.isatty()
     try:
         report = sync.run(push=not args.no_push)
     except Exception as exc:
-        sync.record_failure(str(exc) or exc.__class__.__name__)
+        if not watched:
+            sync.record_failure(str(exc) or exc.__class__.__name__)
         raise
+    # Cleared whoever was watching: a sync that worked is proof the recorded
+    # failure is stale, and someone who fixed the problem by hand should not
+    # have to wait for a background run to stop being told about it.
     sync.clear_failure()
     if report.revoked:
         print(
@@ -766,6 +777,27 @@ def cmd_grant(args: argparse.Namespace) -> int:
 
     _report_reseal(sync.grant(approved=[reader.key for reader in readers]))
     return 0
+
+
+def _hook_is_stale() -> bool:
+    """Whether the installed hook is some older woswoar's copy of it.
+
+    False for a missing hook: that is a different problem with a different fix,
+    and `doctor` already has a line for it.
+    """
+    hook = store.data_dir() / HOOK_NAME
+    return hook.is_file() and hook.read_bytes() != _hook_bytes()
+
+
+def _report_stale_hook() -> None:
+    if not _hook_is_stale():
+        return
+    print(
+        "\nThe shell hook here was installed by an older woswoar, so this"
+        "\nmachine is still running that version's shell code -- including"
+        "\nwhatever it did or did not do about syncing."
+        "\n\nNext:  woswoar install   then open a new shell"
+    )
 
 
 def _report_sync_failure(failure: Failure | None) -> None:
@@ -1023,6 +1055,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     hosts = {meta.host for meta in loaded.meta.values() if meta.host}
     machines = f"{len(hosts)} machine{'s' if len(hosts) != 1 else ''}"
     print(f"woswoar {__version__} -- {len(stamps)} commands from {machines}")
+
+    # Ahead of everything else, because it is the condition under which the rest
+    # of this report is describing a machine that is not running this version.
+    # `install` copies the hook, so upgrading the Python leaves the old shell
+    # code in place -- and syncing lives in the hook, so the visible symptom is
+    # that nothing syncs while every other line here says all is well. `doctor`
+    # says so too, but only somebody who already suspects a problem runs doctor.
+    _report_stale_hook()
 
     if not sync.is_repo():
         print(
