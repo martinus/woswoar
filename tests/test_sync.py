@@ -4997,6 +4997,100 @@ class TestInitFinishesTheJob(SyncTestCase):
         self.assertIn("first machine", out)
 
 
+class TestAHostCannotClaimAnotherMachinesKey(SyncTestCase):
+    """Issue #110: the pairing is a claim, and it used to be resolved silently.
+
+    `accept` shows a machine's age recipient and its signing key one above the
+    other. That they belong to one machine comes from the `owner` line in
+    `hosts/<id>/signer.pub` -- a file anyone with push access can write. The
+    mapping was built with `setdefault` over `store.repo_hosts()`, which is
+    sorted, and host ids are locally chosen hex: so a directory whose id sorts
+    first could name *your* recipient and win it.
+
+    The result was the attacker's verify key printed directly beneath your own
+    real, checkable age fingerprint -- which reads as the one confirming the
+    other, in the command that widens read access to everything.
+    """
+
+    def hostile_claim_on(self, victim_key: str) -> str:
+        """A host directory that says it owns `victim_key`. Returns its host id.
+
+        Written straight into the repo, like `append_recipient`: this is what
+        arrives by `git pull` from someone who can push.
+
+        The id is forced to sort *first*, because that is what made the old
+        `setdefault` prefer it -- an id chosen at random would win only half the
+        time and turn this into a coin flip.
+        """
+        host = "0" * 16
+        verify_key = crypto.generate_signing_key(self.root / f"signer-{host}")
+        store.write_atomic(store.signer_public(host), f"{verify_key}\n{victim_key}\n".encode())
+        store.write_atomic(store.name_file(host), b"martin@laptop\n")
+        return host
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.alpha = self.machine("alpha", display="martin@desktop")
+        with self.alpha.active():
+            self.alpha.record("2023-11-14", 1_700_000_001, "history")
+            sync.run()
+        self.beta = self.machine("beta", display="martin@laptop")
+        with self.beta.active():
+            self.beta.record("2023-11-15", 1_700_100_001, "beta history")
+            sync.run()
+            self.beta_key = crypto.recipient_for(sync.identity_path(store.machine())).strip()
+            self.beta_signer = sync.signing_public()
+
+    def test_the_stolen_key_is_not_paired_with_the_thief(self) -> None:
+        with self.alpha.active():
+            paired_before = {
+                n.reader.key: n.candidate.verify_key
+                for n in sync.newcomers().machines
+                if n.reader is not None and n.candidate is not None
+            }
+            self.assertEqual(
+                paired_before.get(self.beta_key),
+                self.beta_signer,
+                "precondition: beta's own two keys are paired before the attack",
+            )
+
+            host = self.hostile_claim_on(self.beta_key)
+            self.assertLess(host, self.beta.id, "precondition: the hostile id sorts first")
+
+            after = sync.newcomers()
+            paired = {
+                n.reader.key: n.candidate.verify_key
+                for n in after.machines
+                if n.reader is not None and n.candidate is not None
+            }
+        # Not paired with anyone -- neither the thief nor beta. Nothing in the
+        # repository can say which claim is real, so it makes neither.
+        self.assertNotIn(self.beta_key, paired)
+        self.assertIn(self.beta_key, after.contested)
+
+    def test_the_thief_cannot_put_a_name_on_the_stolen_key_either(self) -> None:
+        with self.alpha.active():
+            self.hostile_claim_on(self.beta_key)
+            labels = {r.key: r.label for r in sync.readers()}
+        self.assertEqual(labels[self.beta_key], sync.UNNAMED)
+
+    def test_accept_says_the_repository_is_claiming_it(self) -> None:
+        with self.alpha.active():
+            self.hostile_claim_on(self.beta_key)
+        _, _, err = self.run_cli(self.alpha, "accept", "--yes")
+        self.assertIn("claimed by more than one machine", err)
+
+    def test_an_honest_repository_still_pairs_and_says_it_is_a_claim(self) -> None:
+        """The other half: without an attacker nothing is contested, the two
+        keys are still shown together, and the line saying where that pairing
+        comes from is still there."""
+        with self.alpha.active():
+            self.assertEqual(sync.newcomers().contested, set())
+        _, out, _ = self.run_cli(self.alpha, "accept", "--yes")
+        self.assertIn("the repository's claim", out)
+        self.assertNotIn("claimed by more than one machine", out)
+
+
 class TestNewcomersIsAskedDirectly(SyncTestCase):
     """The pairing decides who is offered read access, so it is asserted here
     rather than through `accept`'s stdout -- which is the rule `Reader`'s own

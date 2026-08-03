@@ -304,22 +304,45 @@ def recipients() -> list[str]:
 UNNAMED = "(unnamed)"
 
 
-def _host_owners() -> dict[str, str]:
-    """``owning recipient -> host id``, from what each host publishes.
+class Owners(NamedTuple):
+    """Which host claims which recipient, and where two of them disagree."""
+
+    #: ``owning recipient -> host id``, for recipients exactly one host claims.
+    by_recipient: dict[str, str]
+    #: Recipients that more than one host directory claims to own. Deliberately
+    #: *not* resolved: see `_host_owners`.
+    contested: set[str]
+
+
+def _host_owners() -> Owners:
+    """Who each host says it is, and which of those claims collide.
 
     Built once per prompt rather than rescanned per recipient: `read_signer`
     opens a file per host, so asking "which host owns this key?" separately for
     each of them is quadratic -- 0.35 ms at five machines, 89 ms at a hundred.
 
-    Untrusted, like everything else `signer.pub` says: it decides a *label*, and
-    a label is shown quoted beside a fingerprint that cannot be chosen.
+    Everything `signer.pub` says is untrusted, and this used to keep the first
+    claim in sorted order and drop the rest -- `setdefault` over
+    `store.repo_hosts()`. Host ids are chosen locally, so anyone who can push
+    could add a directory whose id sorts first, name *your* recipient as its
+    owner, and win the mapping for it (#110). `accept` would then print that
+    host's verify key directly beneath your own real, checkable age
+    fingerprint, which reads as one machine confirming the other.
+
+    A recipient two hosts claim is not an ambiguity to resolve -- there is no
+    evidence here that could resolve it -- so it belongs to neither. It is
+    reported instead, and its keys are shown alone rather than beside each
+    other. Silently picking one is what made a contradiction look like a fact.
     """
-    owners: dict[str, str] = {}
+    claims: dict[str, list[str]] = {}
     for host_id in store.repo_hosts():
         signer = read_signer(host_id)
         if signer is not None:
-            owners.setdefault(signer.owner, host_id)
-    return owners
+            claims.setdefault(signer.owner, []).append(host_id)
+    return Owners(
+        by_recipient={key: hosts[0] for key, hosts in claims.items() if len(hosts) == 1},
+        contested={key for key, hosts in claims.items() if len(hosts) > 1},
+    )
 
 
 def name_of(recipient: str) -> str:
@@ -337,7 +360,7 @@ def name_of(recipient: str) -> str:
     ``(unnamed)`` and its fingerprint, which is the identity anyway -- a name is
     a convenience and was never the thing being consented to.
     """
-    return name_for(_host_owners().get(recipient)).text
+    return name_for(_host_owners().by_recipient.get(recipient)).text
 
 
 class Name(NamedTuple):
@@ -2375,7 +2398,7 @@ def readers() -> list[Reader]:
         return _readers()
 
 
-def _readers(owners: dict[str, str] | None = None) -> list[Reader]:
+def _readers(owners: Owners | None = None) -> list[Reader]:
     """The list itself, assuming the caller holds the lock and has fetched.
 
     Split from `readers` for `newcomers`, which needs this and
@@ -2394,8 +2417,11 @@ def _readers(owners: dict[str, str] | None = None) -> list[Reader]:
     except (WoswoarError, OSError):
         mine = ""
 
-    learn_names(store.machine(), {host for host in owners.values() if host})
-    labelled = [(key, name_for(owners.get(key))) for key in enrolled]
+    learn_names(store.machine(), {host for host in owners.by_recipient.values() if host})
+    # A contested recipient resolves to no host, so it also gets no name: a
+    # machine that could win the pairing by claiming someone else's key could
+    # otherwise put a *name* on it too.
+    labelled = [(key, name_for(owners.by_recipient.get(key))) for key in enrolled]
     names = Counter(name.text for _, name in labelled if name.known)
     return [
         Reader(
@@ -2428,7 +2454,7 @@ class Newcomer(NamedTuple):
 
     #: The age recipient it reads with. None for a host publishing a signer this
     #: machine cannot tie to any recipient it has -- two host directories naming
-    #: one owner, where `_host_owners` keeps the first.
+    #: one owner -- which `_host_owners` refuses to resolve, so neither gets it.
     reader: Reader | None
     #: The signing key it publishes with. None for a machine that enrolled but
     #: has never pushed a `signer.pub`.
@@ -2497,6 +2523,11 @@ class Pending(NamedTuple):
     #: Every enrolled recipient at the moment `machines` was computed -- not
     #: only the ones with something to decide. `grant` re-seals to all of them.
     enrolled: list[str]
+    #: Recipients that more than one host directory claims to own. Nothing here
+    #: can say which is telling the truth, so neither is paired with them and
+    #: the fact is put on screen: two hosts claiming one key is not something
+    #: an honest repository does.
+    contested: set[str]
 
 
 def newcomers() -> Pending:
@@ -2521,7 +2552,7 @@ def newcomers() -> Pending:
         for reader in enrolled:
             # `pop`, so what is left in `by_host` is exactly the hosts no reader
             # claimed. `""` is never a host id, so an unpaired recipient misses.
-            candidate = by_host.pop(owners.get(reader.key, ""), None)
+            candidate = by_host.pop(owners.by_recipient.get(reader.key, ""), None)
             # Our own machine is not a newcomer to itself. It has no candidate
             # either -- `_trust_candidates` drops it -- so this is the same test.
             if candidate is None and reader.is_mine:
@@ -2536,6 +2567,7 @@ def newcomers() -> Pending:
         return Pending(
             machines=[n for n in out if n.needs_grant or n.needs_trust or n.changed_key],
             enrolled=[reader.key for reader in enrolled],
+            contested=owners.contested,
         )
 
 
