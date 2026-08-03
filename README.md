@@ -41,7 +41,7 @@ names the one command to run next, if there is one:
 
 ```console
 $ woswoar
-woswoar 0.6.1 — 54,804 commands from 3 machines
+woswoar 0.7.0 — 54,804 commands from 3 machines
 
 1 machine(s) waiting to be accepted here:
     'martin@laptop'
@@ -67,7 +67,7 @@ one machine.
 > a copy and does not update with the program. `woswoar` and `woswoar doctor`
 > both say so when it is out of date. `stable` tracks the most recent tag, so the
 > command never changes and you never edit a version number on five machines.
-> Swap `@stable` for `@main` to track the tip, or `@v0.6.1` to pin exactly.
+> Swap `@stable` for `@main` to track the tip, or `@v0.7.0` to pin exactly.
 >
 > If `--force` fails with **"A virtual environment already exists"**, your pipx
 > is using `uv` as its backend and cannot reuse the old venv. Either
