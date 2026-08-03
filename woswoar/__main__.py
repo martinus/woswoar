@@ -921,6 +921,86 @@ def _importable() -> list[tuple[str, Path, int]]:
     return sorted(found, key=lambda item: item[2], reverse=True)
 
 
+def _untouched() -> bool:
+    """Is there nothing here at all yet?
+
+    Three cheap questions, and it takes any of them as a yes: the shell hook,
+    a history repo, or a single recorded line. Not "has `install` run" -- a
+    machine that imported a history without wiring the hook, or joined a repo
+    without it, is set up enough to be told where it stands, and running `setup`
+    at it would be answering a question it did not ask.
+
+    `store.machine_file` is deliberately not one of them: `store.machine()`
+    creates it, so almost any command makes it exist and it says nothing about
+    whether anyone has set anything up.
+    """
+    from . import sync
+
+    if (store.data_dir() / HOOK_NAME).is_file() or sync.is_repo():
+        return False
+    return not any(store.iter_log_files())
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """`woswoar` on its own: where you are, and the one command to run next.
+
+    The single entry point. Everything else is still there and still does
+    exactly what it did; this is so that nobody has to know which of them
+    applies before they can find out.
+
+    What it deliberately does *not* do is act on anything that widens who can
+    read your history. It names `accept` and shows what is waiting; it does not
+    ask. A prompt that appears because you typed the bare command is a prompt
+    someone else chose the moment for -- anyone who can push to the repository
+    can enrol a machine, and then the next `woswoar` you type for any reason has
+    a consent question in it. The one thing that makes that question mean
+    anything is that you went looking for it.
+
+    `setup` is the exception, and only when nothing is installed: it is all
+    questions already, and there is nothing here yet to widen access to.
+    """
+    from . import cache, sync
+
+    if _untouched():
+        print("Nothing installed here yet -- setting up.\n")
+        return cmd_setup(argparse.Namespace(rcfile=None))
+
+    loaded = cache.load_columns()
+    stamps, _ = loaded.stamps_and_commands()
+    hosts = {meta.host for meta in loaded.meta.values() if meta.host}
+    machines = f"{len(hosts)} machine{'s' if len(hosts) != 1 else ''}"
+    print(f"woswoar {__version__} -- {len(stamps)} commands from {machines}")
+
+    if not sync.is_repo():
+        print(
+            "\nThis machine keeps its history to itself.\n"
+            "Next:  woswoar init <url>   to share it with your other machines"
+        )
+        return 0
+
+    # Local only: see `sync.local_newcomers`. Typing this must not reach the
+    # network, and what has not arrived here is not yet this machine's decision.
+    pending = sync.local_newcomers().machines
+    if not pending:
+        print("\nNothing to do. Press Ctrl-R.")
+        return 0
+
+    waiting = [n for n in pending if not n.changed_key]
+    changed = [n for n in pending if n.changed_key]
+    if waiting:
+        print(f"\n{len(waiting)} machine(s) waiting to be accepted here:")
+        for machine in waiting:
+            print(f"    {machine.display_name()}")
+        print("\nNext:  woswoar accept")
+    if changed:
+        print(
+            f"\n{len(changed)} machine(s) changed their signing key, which is either a"
+            "\nre-enrolment or someone rewriting the repository:"
+            "\n\nNext:  woswoar trust --replace"
+        )
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Walk a fresh machine through the whole thing, asking as it goes."""
     from . import deps
@@ -1180,7 +1260,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Distributed shell history over git, searched with fzf.",
     )
     parser.add_argument("--version", action="version", version=f"woswoar {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # Not required: `woswoar` on its own is the status line, which is the one
+    # command somebody has to know. argparse's answer to a bare invocation was
+    # a usage error listing fourteen names.
+    parser.set_defaults(func=cmd_status)
+    subparsers = parser.add_subparsers(dest="command")
 
     def sub(
         name: str, summary: str, detail: str, aliases: list[str] | None = None
@@ -1262,6 +1346,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="atuin: skip history belonging to other machines",
     )
     p_import.set_defaults(func=cmd_import)
+
+    p_status = sub(
+        "status",
+        "where this machine is, and what to run next",
+        """
+        What `woswoar` on its own prints. Everything else is still a command of
+        its own; this is so that nobody has to know which one applies before
+        they can find out.
+
+        It reads only what is already here -- no network -- and it does not act
+        on anything that widens who can read your history. It names the command
+        and shows what is waiting; deciding is still something you go and do.
+        """,
+    )
+    p_status.set_defaults(func=cmd_status)
 
     p_setup = sub(
         "setup",

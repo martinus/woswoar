@@ -26,10 +26,28 @@ when you need that one command from last Tuesday, on the other machine.
 
 ```bash
 pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
-woswoar setup
+woswoar
 ```
 
-`setup` asks four questions — it checks the tools, installs the shell hook,
+**`woswoar` on its own is the only command you have to remember.** On a machine
+with nothing installed it sets up; after that it tells you where you stand and
+names the one command to run next, if there is one:
+
+```console
+$ woswoar
+woswoar 0.5.0 — 54,804 commands from 3 machines
+
+1 machine(s) waiting to be accepted here:
+    'martin@laptop'
+
+Next:  woswoar accept
+```
+
+It reads only what is already here and never widens who can read your history —
+it names `accept`, it does not ask. Deciding that stays something you go and do,
+so the moment you are asked is one you chose.
+
+`woswoar setup` asks four questions — it checks the tools, installs the shell hook,
 offers to import whatever history it finds, and asks for a sync repository (leave
 it blank to stay on one machine). Every step is a command you can also run
 yourself: `install`, `import`, `init`.
@@ -66,7 +84,7 @@ Then on **every** machine, first or fifth, the same two lines:
 
 ```bash
 pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
-woswoar setup                    # paste the repository URL when it asks
+woswoar                          # paste the repository URL when it asks
 ```
 
 `setup` joins the repo and does the first sync itself, so the new machine starts
@@ -215,6 +233,7 @@ truthful. Re-running an import is idempotent.
 
 | command | |
 |---|---|
+| `woswoar` | where this machine stands, and what to run next |
 | `woswoar setup` | guided first run: tools, hook, import, sync repo |
 | `woswoar search` | interactive picker (what <kbd>Ctrl</kbd>+<kbd>R</kbd> runs) |
 | `woswoar list` | plain output, used by fzf's scope-switch reload |
