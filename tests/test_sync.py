@@ -5180,6 +5180,91 @@ class TestTheStatusLine(SyncTestCase):
         self.assertNotIn("woswoar accept", out)
 
 
+class TestABackgroundSyncThatKeepsFailing(SyncTestCase):
+    """A sync fired from the prompt is detached and its output goes nowhere.
+
+    The systemd timer at least had the journal. Nobody reads the journal either,
+    but "nowhere" is a step down from "somewhere", so the failure is recorded
+    where the bare `woswoar` will put it in front of someone. See #134.
+    """
+
+    def failing(self, alpha: Fake) -> support.Ran:
+        """Run `sync` with the export step raising, as a broken remote would."""
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise sync.SyncError("could not connect to the remote")
+
+        with mock.patch.object(sync, "export", boom):
+            return self.run_cli(alpha, "sync")
+
+    def test_the_failure_is_kept_and_shown_by_the_bare_command(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.assertEqual(self.failing(alpha).code, 1)
+
+        out = self.run_cli(alpha).out
+        self.assertIn("could not connect to the remote", out)
+        self.assertIn("woswoar sync", out)
+
+    def test_a_sync_that_works_clears_it_again(self) -> None:
+        """Otherwise the first failure is reported forever, which teaches people
+        to read past the one line this exists to make them read."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.failing(alpha)
+        self.run_cli(alpha, "sync")
+        self.assertNotIn("could not connect", self.run_cli(alpha).out)
+
+    def test_nothing_is_said_when_nothing_has_failed(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        self.assertNotIn("failing", self.run_cli(alpha).out)
+
+    def test_an_unreadable_record_is_not_a_broken_status_line(self) -> None:
+        """`woswoar` on its own is what someone types when something is wrong.
+
+        It reporting on a background failure must not be a second way for it to
+        fail -- so a damaged record degrades to silence, the same way
+        `State.load` treats a value it cannot read.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            store.sync_failure_file().write_text("{not json", encoding="utf-8")
+            self.assertIsNone(sync.last_failure())
+        self.assertEqual(self.run_cli(alpha).code, 0)
+
+    def test_an_escape_sequence_in_the_message_is_defanged(self) -> None:
+        """The message can carry a remote's text -- a git error quotes the URL
+        and the server's reply -- and this is printed straight to a terminal."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            sync.record_failure("remote said \x1b[2J\x1b]0;pwned\x07 no")
+        out = self.run_cli(alpha).out
+        self.assertNotIn("\x1b", out)
+        self.assertIn("remote said", out)
+
+    def test_a_failure_a_person_is_watching_is_not_recorded(self) -> None:
+        """`init`, `accept` and `grant` sync too, and they print the error to
+        the screen of whoever typed them. Recording it as a *background*
+        failure would then have the status line report a problem that was
+        already dealt with, every time until the next background sync."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+
+            def boom(*args: object, **kwargs: object) -> None:
+                raise sync.SyncError("could not connect to the remote")
+
+            with mock.patch.object(sync, "export", boom):
+                self.run_cli(alpha, "grant", "--yes")
+            self.assertIsNone(sync.last_failure())
+
+
 class TestNewcomersIsAskedDirectly(SyncTestCase):
     """The pairing decides who is offered read access, so it is asserted here
     rather than through `accept`'s stdout -- which is the rule `Reader`'s own

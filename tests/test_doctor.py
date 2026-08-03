@@ -13,9 +13,10 @@ import os
 import shutil
 import stat
 import unittest
+from pathlib import Path
 
 from woswoar import __main__ as main_module
-from woswoar import crypto
+from woswoar import crypto, store
 
 from . import support
 from .support import WoswoarTestCase, requires_age
@@ -185,3 +186,38 @@ class TestDoctorsMarkers(WoswoarTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAHookLeftBehindByAnUpgrade(WoswoarTestCase):
+    """`install` copies the hook; upgrading woswoar does not.
+
+    So a machine can run this version's Python against an older version's shell
+    code indefinitely, with every other check passing. That was survivable while
+    the hook only recorded commands. Since #134 it also decides when to sync, so
+    an un-re-installed machine silently keeps whatever arrangement it had --
+    which is the "running machine silently wrong" CLAUDE.md rule 8 is about.
+    """
+
+    def hook(self) -> Path:
+        path = store.data_dir() / main_module.HOOK_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_an_older_copy_is_reported_with_the_command_that_fixes_it(self) -> None:
+        self.hook().write_text("# woswoar, but from last year\n", encoding="utf-8")
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] hook", out)
+        self.assertIn("woswoar install", out)
+
+    def test_the_shipped_hook_passes(self) -> None:
+        """Otherwise the check above would fail for everyone, always -- and the
+        comparison is against the packaged bytes, so a stray newline written by
+        `install` would do exactly that."""
+        support.run_cli("install", "--rcfile", str(self.root / "bashrc"))
+        self.assertIn("[ok] hook", support.run_cli("doctor").out)
+
+    def test_a_missing_hook_still_reads_as_missing(self) -> None:
+        """Not as "older than this woswoar", which would name the wrong fix."""
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] hook", out)
+        self.assertNotIn("older than this woswoar", out)

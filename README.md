@@ -182,16 +182,48 @@ automatically, since taking trust away can only ever cause a refusal.
 
 ### Sync automatically
 
+Nothing to install — the shell hook does it. At most once a minute, and only on
+a machine somebody is actually typing on, it starts a `woswoar sync` in the
+background. Your prompt never waits for it: the shell hands the work to a
+detached process and returns immediately, so a slow `git push` cannot hold up a
+shell, and neither can a laptop that woke up on the wrong network.
+
+```bash
+# Sync at most every 5 minutes instead of every minute.
+export WOSWOAR_SYNC_INTERVAL=300
+```
+
+An idle machine costs nothing, which is the point: a timer firing every minute
+on four machines is 5,760 fetches a day whether or not anyone typed anything.
+Recorded history reaches your other machines within a minute of you typing it,
+and about 6 MB of repository per machine per year — real typing is bursty, so a
+minute rather than five roughly doubles the syncs that carry anything, not
+quintuples them.
+
+<details>
+<summary>Keeping a machine current while nobody is using it</summary>
+
+The trade is that a machine nobody types on never syncs, so it never *receives*
+either — a laptop left shut for a week is a week stale until the first command
+is typed. Opening a shell syncs, so in practice you are current by the time you
+have a prompt. If you would rather have a machine stay current while idle, the
+systemd timer is still there:
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp contrib/systemd/woswoar-sync.* ~/.config/systemd/user/
 systemctl --user enable --now woswoar-sync.timer
+export WOSWOAR_SYNC_INTERVAL=0   # and turn the hook's off, or you pay twice
 ```
 
-One-minute interval by default, which costs about **6 MB of repository per
-machine per year** — real typing is bursty, so a minute rather than five roughly
-doubles the syncs that carry anything, not quintuples them. Sync never runs on
-your prompt: a `git push` must not be able to block a shell.
+The two are safe to run together — syncs take a non-blocking lock, so whichever
+arrives second exits immediately — but there is no reason to.
+
+</details>
+
+If a background sync starts failing, nothing is on screen to say so. Typing
+`woswoar` on its own reports it, because a detached sync's error message would
+otherwise go nowhere at all.
 
 ## Why woswoar?
 
@@ -279,7 +311,8 @@ There is no `woswoar uninstall`, because every step is one you should see. In
 order, and each is independent:
 
 ```sh
-# 1. Stop the timer, if you installed one.
+# 1. Stop the timer, if you installed one. Syncing from the shell hook stops
+#    with the hook itself, in step 2.
 systemctl --user disable --now woswoar-sync.timer
 rm -f ~/.config/systemd/user/woswoar-sync.{service,timer}
 

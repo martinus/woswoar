@@ -17,7 +17,7 @@ from .entry import make_inert
 from .errors import WoswoarError
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
-    from .sync import Reader, ReencryptReport
+    from .sync import Failure, Reader, ReencryptReport
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
 #: used to say so in two independently worded paragraphs.
@@ -41,6 +41,18 @@ def _hook_source() -> Path:
 
     with resources.as_file(resources.files("woswoar") / "shell" / HOOK_NAME) as path:
         return Path(str(path))
+
+
+def _hook_bytes() -> bytes:
+    """The hook as this version ships it.
+
+    Read through `files(...).read_bytes()` rather than `_hook_source()` so it is
+    correct for a zipped install too, where `as_file` hands back a temporary
+    path that is deleted as soon as its context exits.
+    """
+    from importlib import resources
+
+    return (resources.files("woswoar") / "shell" / HOOK_NAME).read_bytes()
 
 
 def portable_hook_path(target: Path) -> str:
@@ -302,7 +314,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("machine", has_machine, str(machine_file))
 
     hook = store.data_dir() / HOOK_NAME
-    check("hook", hook.is_file(), str(hook))
+    if hook.is_file() and hook.read_bytes() != _hook_bytes():
+        # `install` copies the hook into the data directory rather than sourcing
+        # it out of the package, so upgrading woswoar leaves the old shell code
+        # running -- and nothing said so. That was survivable while the hook only
+        # recorded; syncing lives in it now, so a machine that never re-ran
+        # `install` silently keeps whatever sync arrangement it had.
+        check("hook", False, f"{hook} is older than this woswoar - run 'woswoar install'")
+    else:
+        check("hook", hook.is_file(), str(hook))
 
     rcfile = Path.home() / ".bashrc"
     sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
@@ -516,7 +536,17 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
-    report = sync.run(push=not args.no_push)
+    # The shell hook fires this detached, with its output going nowhere, so a
+    # failure has to be left somewhere the bare `woswoar` can find it. Recorded
+    # here rather than inside `sync.run` because `init`, `accept` and `grant`
+    # call that too, and a failure a person is standing in front of has already
+    # been reported to them by the message on their screen.
+    try:
+        report = sync.run(push=not args.no_push)
+    except Exception as exc:
+        sync.record_failure(str(exc) or exc.__class__.__name__)
+        raise
+    sync.clear_failure()
     if report.revoked:
         print(
             "This machine's access to the shared history was revoked, so nothing\n"
@@ -736,6 +766,23 @@ def cmd_grant(args: argparse.Namespace) -> int:
 
     _report_reseal(sync.grant(approved=[reader.key for reader in readers]))
     return 0
+
+
+def _report_sync_failure(failure: Failure | None) -> None:
+    """Surface a background sync that has been failing where nobody could see.
+
+    The one thing the systemd timer had over a detached fork from the prompt:
+    its stderr went to the journal. This is the replacement, and it is put in
+    front of someone who typed `woswoar` rather than someone who thought to run
+    `journalctl --user -u woswoar-sync`, so it is the better half of the trade.
+    """
+    if failure is None:
+        return
+    print(f"\nBackground sync has been failing for {search.relative_time(int(failure.when))}:")
+    print(f"    {make_inert(failure.message)}")
+    # The remedy is the same one every time and it is not "run sync again":
+    # what a detached sync hides is the *message*, so the fix is to look at it.
+    print("\nNext:  woswoar sync   to see it in full")
 
 
 def _report_reseal(report: ReencryptReport, waiting: bool = True) -> None:
@@ -983,6 +1030,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             "Next:  woswoar init <url>   to share it with your other machines"
         )
         return 0
+
+    _report_sync_failure(sync.last_failure())
 
     # Local only: see `sync.local_newcomers`. Typing this must not reach the
     # network, and what has not arrived here is not yet this machine's decision.

@@ -572,6 +572,45 @@ def lock() -> Iterator[None]:
         handle.close()
 
 
+class Failure(NamedTuple):
+    """A recorded sync failure, and when it happened."""
+
+    when: float
+    message: str
+
+
+def record_failure(message: str) -> None:
+    """Remember that the last unattended sync failed, for the status line.
+
+    Deliberately not in `state.json`. That file is written only when something
+    in it changed (`State.save`), which is what keeps a one-minute sync from
+    rewriting a megabyte to say nothing happened -- and a timestamp changes
+    every time, so putting one there would defeat exactly that.
+    """
+    store.save_json(store.sync_failure_file(), {"when": time.time(), "error": message})
+
+
+def clear_failure() -> None:
+    """Forget any recorded failure. Called when a sync works."""
+    store.sync_failure_file().unlink(missing_ok=True)
+
+
+def last_failure() -> Failure | None:
+    """The recorded failure, if the last unattended sync left one.
+
+    Degrades to `None` rather than raising, the same way `State.load` treats a
+    value it cannot read: this is reported by the bare `woswoar`, and a status
+    line that cannot be printed because the thing it reports on is broken is
+    the worst of both.
+    """
+    payload = store.load_json(store.sync_failure_file())
+    message = payload.get("error")
+    if not isinstance(message, str) or not message:
+        return None
+    when = payload.get("when")
+    return Failure(when if isinstance(when, int | float) else 0.0, message)
+
+
 # ---------------------------------------------------------------------------
 # Keys
 # ---------------------------------------------------------------------------

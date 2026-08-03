@@ -809,8 +809,20 @@ the working copy. This is also why git clean/smudge filters were rejected: they
 re-encrypt whole files on every `git add`, which is precisely the failure mode
 above.
 
-Triggering is manual (`woswoar sync`) plus an optional systemd `--user` timer.
-Never on a prompt: a git push must not be able to block a shell.
+Triggering is the shell hook, at most once per `WOSWOAR_SYNC_INTERVAL` (default
+60s), plus `woswoar sync` by hand and an optional systemd `--user` timer for
+machines that should stay current while nobody is typing on them.
+
+Never *on* a prompt, which is the constraint that has not changed: a git push
+must not be able to block a shell. The hook forks a subshell that backgrounds
+the sync and exits, so the prompt waits for two forks and never for the network.
+The due check ahead of that is one integer comparison against a shared stamp
+file, so the per-command cost is nothing until the interval has actually passed.
+
+Prompt-triggered rather than polled because an idle machine should cost nothing:
+four machines on a one-minute timer are 5,760 fetches a day whether or not
+anyone typed anything, and the number of syncs that carry something is set by
+how much someone types, not by how often a timer fires.
 
 ### Residual leakage
 
