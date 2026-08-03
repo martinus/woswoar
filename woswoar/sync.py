@@ -2541,6 +2541,36 @@ class Newcomer(NamedTuple):
         """
         return self.reader is not None and self.reader.shares_name
 
+    @property
+    def host_id(self) -> str | None:
+        """The host directory it publishes under, when it has published one."""
+        return self.candidate.host_id if self.candidate is not None else None
+
+    @property
+    def named(self) -> bool:
+        """Whether this machine's name could actually be read here.
+
+        A name lives in `hosts/<id>/name.age`, sealed to the recipients, so a
+        machine that has not been granted yet cannot open a single one of them
+        and reads every peer as `(unnamed)`. Asked through `name_for` rather
+        than by comparing `label` against `UNNAMED`, for the reason `Name`
+        gives: sealing a `name.age` needs no secret, so a peer can spell the
+        placeholder itself.
+        """
+        return name_for(self.host_id).known
+
+    @property
+    def fingerprint(self) -> str:
+        """The part of this machine's identity the repository cannot choose.
+
+        Which is the whole reason it is worth printing beside an unreadable
+        name: three lines reading `(unnamed)` distinguish nothing, and the
+        fingerprint was always the thing being consented to.
+        """
+        if self.candidate is not None:
+            return self.candidate.fingerprint
+        return self._reader.fingerprint
+
     def display_name(self) -> str:
         """See `Reader.display_name`: never print `label` directly."""
         return repr(self.label)

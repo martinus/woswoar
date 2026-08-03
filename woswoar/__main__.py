@@ -1137,8 +1137,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     if waiting:
         print(f"\n{len(waiting)} machine(s) waiting to be accepted here:")
         for machine in waiting:
-            print(f"    {machine.display_name()}")
-        print("\nNext:  woswoar accept")
+            # Fingerprint first, then the name, matching `_show_readers`: it is
+            # the only part of the line the repository cannot choose. It also
+            # has to be here at all, because on a machine that has not been
+            # granted yet *every* name is unreadable -- reported from a fresh
+            # install as three consecutive lines reading `'(unnamed)'`, which
+            # is not a list of three machines so much as a list of nothing.
+            print(f"    {machine.fingerprint}  {machine.display_name()}")
+        if any(machine.named for machine in waiting):
+            print("\nNext:  woswoar accept")
+        else:
+            # Why they have no names, and the half of the job that happens
+            # somewhere else. `init` says this once and then nobody sees it
+            # again, which is exactly when it is needed.
+            #
+            # Both commands named in one breath, and the explanation before
+            # rather than after them: an earlier version printed the ordinary
+            # `Next: woswoar accept` and *then* said accepting here changes
+            # nothing about what this machine can read, which reads as a
+            # contradiction and leaves someone unsure which half to believe.
+            print(
+                "\nNone of them could be named here: a name is sealed to the machines"
+                "\nthat can read this history, and nothing has granted that to this one"
+                "\nyet. So it takes the same command in two places --"
+                "\n\nNext:  woswoar accept   here, so they can read what this machine"
+                "\n                        publishes"
+                "\n       woswoar accept   on a machine you already use, so this one can"
+                "\n                        read the history from before it joined"
+            )
     if changed:
         print(
             f"\n{len(changed)} machine(s) changed their signing key, which is either a"
