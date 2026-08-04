@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sqlite3
 import subprocess
 import unittest
@@ -506,22 +507,70 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
         self.assertEqual(chosen, f"cmd {search._CHUNK * 2 + 6}", "a chunk went missing")
 
 
+#: What fzf hands back with `--ansi`: the line, with every escape removed.
+_ESCAPES = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def unstyled(line: str) -> str:
+    return _ESCAPES.sub("", line)
+
+
 class TestFailedCommandsAreMarked(WoswoarTestCase):
     """Colour by exit status, which the picker can show and a pipe must not."""
 
-    def rows(self) -> list[str]:
+    def rows(self, codes: tuple[int, int] = (0, 1)) -> list[str]:
+        good, bad = codes
         with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
-            for ts, code, cmd in ((NOW - 1, 0, "worked"), (NOW, 1, "failed")):
+            for ts, code, cmd in ((NOW - 1, good, "worked"), (NOW, bad, "failed")):
                 handle.write(format_line(Entry(ts, MACHINE_ID, "s1", "~", code, 1, cmd)) + "\n")
         return search.lines_for("global", colour=True)
 
     def test_a_failure_is_marked_and_a_success_is_not(self) -> None:
         failed, worked = self.rows()
         self.assertIn("failed", failed)
-        self.assertTrue(failed.startswith("\x1b["), f"not marked: {failed!r}")
-        self.assertTrue(failed.endswith("\x1b[0m"), "the colour is never reset")
+        self.assertIn(search._FAILED, failed, f"not marked: {failed!r}")
+        self.assertIn(search._RESET, failed, "the colour is never reset")
+        self.assertFalse(failed.endswith(search._RESET), "the whole line is coloured again")
         self.assertIn("worked", worked)
         self.assertNotIn("\x1b[", worked, "a command that succeeded was marked")
+
+    def test_only_the_age_is_coloured_not_the_whole_line(self) -> None:
+        """Reported as "a bit much if the whole line is red" -- and on a history
+        with any real proportion of failures, a mark covering half the lines has
+        stopped marking anything."""
+        (failed, _) = self.rows()
+        before, _, after = failed.partition(search._RESET)
+        self.assertNotIn("failed", before, "the command itself is inside the colour")
+        self.assertIn("failed", after)
+        # The escapes wrap the age and nothing else, so what they contain is
+        # exactly what `relative_time` produced, padding included.
+        self.assertEqual(before.removeprefix(search._FAILED).strip(), "now")
+
+    def test_the_columns_still_line_up(self) -> None:
+        """The escapes go outside the padding, so a coloured line and a plain
+        one are the same width once fzf has stripped them."""
+        failed, worked = self.rows()
+        self.assertEqual(len(unstyled(failed)) - len("failed"), len(worked) - len("worked"))
+
+    def test_an_unknown_exit_code_is_not_a_failure(self) -> None:
+        """`~/.bash_history` and `~/.zsh_history` carry no exit codes at all, so
+        `importer` records -1. Treating "anything but 0" as failure painted a
+        freshly imported history entirely red, which is what this is for."""
+        for unknown in (-1, -2):
+            with self.subTest(code=unknown):
+                self.setUp()
+                failed, worked = self.rows(codes=(unknown, unknown))
+                for line in (failed, worked):
+                    self.assertNotIn("\x1b[", line, f"an unknown code was marked: {line!r}")
+
+    def test_what_counts_as_failure_is_decided_in_one_place(self) -> None:
+        """So a fourth caller cannot invent a fifth answer."""
+        self.assertFalse(search.is_failure("0"))
+        self.assertFalse(search.is_failure(""))
+        self.assertFalse(search.is_failure("-1"))
+        self.assertFalse(search.is_failure("not-a-number"))
+        self.assertTrue(search.is_failure("1"))
+        self.assertTrue(search.is_failure("130"))
 
     def test_plain_by_default_so_a_pipe_stays_plain(self) -> None:
         """`woswoar list | grep` is a documented thing to do."""
@@ -534,8 +583,7 @@ class TestFailedCommandsAreMarked(WoswoarTestCase):
         prefix `command_from_line` slices is unchanged -- but if that ever stops
         being true, this is where it shows."""
         failed, _ = self.rows()
-        stripped = failed.removeprefix(search._FAILED).removesuffix(search._RESET)
-        self.assertEqual(search.command_from_line(stripped), "failed")
+        self.assertEqual(search.command_from_line(unstyled(failed)), "failed")
 
     def test_a_command_cannot_smuggle_its_own_escapes(self) -> None:
         """The whole reason `--ansi` is safe. `make_inert` removes every C0
