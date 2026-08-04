@@ -982,10 +982,23 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
         self.assertNotIn("not mine", " ".join(found))
 
     def test_the_picker_binds_it_and_says_so(self) -> None:
-        argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        # `transform` is fzf 0.45+, and the binding is not offered without it.
+        # Forced rather than skipped: the runner's fzf decides whether this test
+        # runs at all otherwise, which is how a green pull request failed while
+        # cutting a release once already.
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            argv = search._fzf_argv("global", "", dedup=True, host_width=0)
         binds = " ".join(a for a in argv if a.startswith("--bind="))
         self.assertIn("ctrl-t:", binds)
         for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload("):
             self.assertIn(piece, binds, f"the ctrl-t binding is missing {piece}")
         header = next(a for a in argv if a.startswith("--header="))
         self.assertIn("ctrl-t timeline", header, "the key is bound but never mentioned")
+
+    def test_the_key_is_not_advertised_on_an_fzf_that_cannot_do_it(self) -> None:
+        with mock.patch.object(search, "fzf_supports_transform", return_value=False):
+            argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        binds = " ".join(a for a in argv if a.startswith("--bind="))
+        self.assertNotIn("ctrl-t:", binds)
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertNotIn("ctrl-t", header, "a key that does nothing here is named anyway")
