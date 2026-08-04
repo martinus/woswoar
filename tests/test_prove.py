@@ -13,7 +13,11 @@ would then vary by machine -- the anonymity assertions here must not.
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import tempfile
+import time
+import unittest
 import zlib
 from pathlib import Path
 from unittest import mock
@@ -21,15 +25,15 @@ from unittest import mock
 from woswoar import crypto, prove, store, sync
 
 from . import support
-from .support import WoswoarTestCase, requires_age, requires_git, requires_ssh_keygen
+from .support import WoswoarTestCase, requires_age, requires_bash, requires_git, requires_ssh_keygen
 
 
 @requires_age
 @requires_git
 @requires_ssh_keygen
 class ProveTestCase(WoswoarTestCase):
-    def prove(self) -> support.Ran:
-        with mock.patch.object(store, "default_machine_name", return_value="canaryuser@canaryhost"):
+    def prove(self, name: str = "canaryuser@canaryhost") -> support.Ran:
+        with mock.patch.object(store, "default_machine_name", return_value=name):
             return support.run_cli("doctor", "--prove")
 
 
@@ -121,3 +125,100 @@ class TestAWrongChunkGoesRed(ProveTestCase):
         # The canary genuinely never reached the remote, so the absence scans
         # still hold; only the presence proof may be what failed.
         self.assertIn("[ok] unreadable", ran.out)
+
+
+class TestACollidingNameIsSkippedNotFailed(ProveTestCase):
+    """A user or host that collides with woswoar's own boilerplate.
+
+    `hosts/` and `keys/` sit in every tree object, "localhost" is in the commit
+    email -- a machine actually named after any of those must not be told the
+    proof failed and to file a bug. The token is skipped, *said* to be skipped,
+    and the full `user@host` form is searched regardless. This is the branch
+    the pinned fixture name everywhere else deliberately avoids.
+    """
+
+    def test_boilerplate_and_short_tokens_are_reported_not_searched(self) -> None:
+        ran = self.prove(name="keys@localhost")
+        self.assertEqual(ran.code, 0, ran.out + ran.err)
+        self.assertIn("[ok] anonymous", ran.out)
+        self.assertIn("'keys@localhost'", ran.out)
+        self.assertIn("'keys' was not searched for", ran.out)
+        self.assertIn("'localhost' was not searched for", ran.out)
+
+    def test_a_short_token_is_reported_not_searched(self) -> None:
+        ran = self.prove(name="ab@canaryhost")
+        self.assertEqual(ran.code, 0, ran.out + ran.err)
+        self.assertIn("'ab' was not searched for", ran.out)
+        self.assertIn("'canaryhost'", ran.out)
+
+
+@requires_age
+@requires_git
+@requires_ssh_keygen
+@requires_bash
+class TestTheDocsRecipeStillDecrypts(unittest.TestCase):
+    """docs/verify.md's "read your history without woswoar" block, executed.
+
+    The recipe hardcodes the repo layout -- `hosts/<id>/keys/<day>.age`, the
+    `machine` kv file, the zlib step -- because its whole point is to work with
+    no woswoar in the pipeline. Nothing else would notice that layout moving
+    under it, and a silently broken recipe is the worst outcome for a page
+    whose premise is that you should not have to trust the page.
+    """
+
+    @staticmethod
+    def _recipe() -> str:
+        text = (Path(__file__).parent.parent / "docs" / "verify.md").read_text(encoding="utf-8")
+        blocks: list[str] = [
+            b for b in re.findall(r"```sh\n(.*?)```", text, re.S) if "for chunk in" in b
+        ]
+        assert len(blocks) == 1, "expected exactly one decrypt recipe in docs/verify.md"
+        return blocks[0]
+
+    def test_the_recipe_prints_the_recorded_command(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="woswoar-docs-") as tmp:
+            root = Path(tmp)
+            (root / "home").mkdir()
+            (root / "home" / ".gitconfig").write_text(prove.QUIET_MAINTENANCE, encoding="utf-8")
+            saved = {key: os.environ.get(key) for key in prove._ENV_KEYS}
+            try:
+                # Only HOME is set: the recipe spells paths as `~/...`, so the
+                # fixture must resolve them the way a stock install would.
+                for key in prove._ENV_KEYS:
+                    os.environ.pop(key, None)
+                os.environ["HOME"] = str(root / "home")
+                origin = root / "origin.git"
+                subprocess.run(
+                    ["git", "init", "--quiet", "--bare", "--template=", str(origin)],
+                    check=True,
+                    timeout=60,
+                )
+                sync.initialise(remote=str(origin), new_identity=True)
+                known = store.machine()
+
+                # Twice at most: the recipe reads `date +%F` on its own clock,
+                # so a run that straddles midnight records into yesterday's
+                # chunk and finds nothing. Re-recording is then enough; a
+                # recipe that is genuinely broken fails both times.
+                for _ in range(2):
+                    entry = support.make_entry(
+                        int(time.time()), "echo docs-recipe-canary", host=known.id
+                    )
+                    store.append_entries(known.id, [entry])
+                    sync.run()
+                    ran = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", self._recipe()],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if ran.returncode == 0 and "echo docs-recipe-canary" in ran.stdout:
+                        break
+                self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+                self.assertIn("echo docs-recipe-canary", ran.stdout)
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value

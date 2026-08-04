@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import crypto, deps, store, sync
-from .entry import Entry, format_line
+from .entry import Entry
 from .errors import WoswoarError
 
 #: Print one pass/fail line, in whatever shape the caller renders checks.
@@ -42,37 +42,44 @@ Check = Callable[[str, bool, str], None]
 #: Print one line of context that cannot fail.
 Info = Callable[[str, str], None]
 
-#: Everything that decides where woswoar -- and git -- read and write. All
-#: redirected into the sandbox: HOME because git reads ``~/.gitconfig``, whose
-#: hooks and filters must neither run against the sandbox nor colour the proof.
-_ENV_KEYS = (
-    "HOME",
-    "WOSWOAR_DIR",
-    "WOSWOAR_SESSION",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-)
+#: `store.ENV_KEYS` is everything woswoar itself resolves paths from; HOME is
+#: for git, which reads ``~/.gitconfig``, whose hooks and filters must neither
+#: run against the sandbox nor colour the proof.
+_ENV_KEYS = (*store.ENV_KEYS, "HOME")
 
 #: git's background `gc --auto` detaches and keeps repacking after the command
-#: that triggered it returns -- so it would still be rewriting the origin while
-#: the scan below reads it and the cleanup deletes it. Same setting, same
-#: reason, as the sync test suite.
-_QUIET_MAINTENANCE = "[gc]\n\tauto = 0\n\tautoDetach = false\n[receive]\n\tautogc = false\n"
+#: that triggered it returns -- so it would still be rewriting a short-lived
+#: repository while a scan reads it and the cleanup deletes it. The sync test
+#: suite met that as five separate red mains in three disguises before pinning
+#: it down (see tests/test_sync.py, which imports this); here it would surface
+#: as a randomly failed proof.
+QUIET_MAINTENANCE = "[gc]\n\tauto = 0\n\tautoDetach = false\n[receive]\n\tautogc = false\n"
 
-#: Strings woswoar itself writes into every repository. A username or hostname
-#: that happens to be one of them cannot be told from this boilerplate by
-#: searching bytes, so it is reported as not searchable rather than searched
-#: and wrongly failed. Two real shapes, met on the first two machines this ran
-#: on: a machine named "localhost" collides with the commit email, and a user
-#: sharing a name with the maintainer collides with the repository URL in the
-#: committed README.
+#: Strings woswoar itself writes into every repository -- commit boilerplate,
+#: the committed files, and every path component a tree object carries. A
+#: username or hostname that happens to be one of them cannot be told from
+#: this boilerplate by searching bytes, so it is reported as not searchable
+#: rather than searched and wrongly failed. Two real shapes, met on the first
+#: two machines this ran on: a machine named "localhost" collides with the
+#: commit email, and a user sharing a name with the maintainer collides with
+#: the repository URL in the committed README.
 _BOILERPLATE = (
     sync.COMMIT_NAME,
     sync.COMMIT_EMAIL,
     sync.COMMIT_MESSAGE,
     store.README_CONTENT,
+    store.GITATTRIBUTES_CONTENT,
+    store.README,
+    store.GITATTRIBUTES,
+    store.RECIPIENTS,
+    # The repo-layout names, from the module that owns them: tree objects
+    # spell out every directory and file name under `hosts/`.
+    store._HOSTS,
+    store._KEYS,
+    store._MANIFESTS,
+    store.signer_public("x").name,
+    store.name_seal("x").name,
+    # git's own vocabulary in refs and config.
     "main",
     "master",
     "origin",
@@ -91,15 +98,16 @@ def _sandbox() -> Iterator[Path]:
     Restoring the environment in ``finally`` is what makes this safe to run
     from inside a live installation: every store path is resolved from the
     environment on each call, so nothing read or written in here can land in
-    the real one.
+    the real one. Only ``home`` is created up front -- the write below does
+    not make parents -- everything else woswoar creates itself, owner-only,
+    exactly as it would on a real machine.
     """
     saved = {key: os.environ.get(key) for key in _ENV_KEYS}
     tmp = tempfile.mkdtemp(prefix="woswoar-prove-")
     try:
         root = Path(tmp)
-        for name in ("data", "conf", "cache", "home"):
-            (root / name).mkdir()
-        (root / "home" / ".gitconfig").write_text(_QUIET_MAINTENANCE, encoding="utf-8")
+        (root / "home").mkdir()
+        (root / "home" / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
         for key in _ENV_KEYS:
             os.environ.pop(key, None)
         os.environ.update(
@@ -121,9 +129,9 @@ def _sandbox() -> Iterator[Path]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _git_bytes(*args: str) -> bytes:
+def _git_bytes(*args: str, cwd: Path | None = None) -> bytes:
     """git output as raw bytes; `sync.git` decodes, and objects are not text."""
-    done = subprocess.run(["git", *args], capture_output=True, check=False, timeout=60)
+    done = subprocess.run(["git", *args], capture_output=True, check=False, timeout=60, cwd=cwd)
     if done.returncode != 0:
         raise WoswoarError(
             f"git {args[0]} failed in the sandbox:\n{done.stderr.decode('utf-8', 'replace')}"
@@ -131,24 +139,33 @@ def _git_bytes(*args: str) -> bytes:
     return done.stdout
 
 
-def _published_bytes(origin: Path) -> list[tuple[str, bytes]]:
-    """Every byte the sandbox pushed, by name, decompressed where git compresses.
+def _published_bytes(repo: Path) -> list[tuple[str, bytes]]:
+    """Every byte ``repo`` holds, by name, decompressed where git compresses.
 
-    Two passes over the same repository, because each is blind where the other
-    sees. The raw files cover refs, config and packed-refs -- but a leak inside
-    a *committed* file lives zlib-compressed in ``objects/``, where no byte
-    scan can recognise it. ``cat-file --batch-all-objects`` prints every
-    object inflated: blobs, and also the trees and commits that carry paths,
+    Two passes, because each is blind where the other sees. The raw files
+    cover refs, config, packed-refs and any working tree -- but a committed
+    byte lives zlib-compressed under ``objects/``, where no byte scan can
+    recognise it, so that directory is skipped raw and read through
+    ``cat-file --batch-all-objects`` instead, which prints every object
+    inflated: blobs, and also the trees and commits that carry paths,
     directory names and author lines.
     """
+    git_dir = Path(_git_bytes("rev-parse", "--absolute-git-dir", cwd=repo).decode().strip())
+    objects = git_dir / "objects"
     streams = [
-        (str(path.relative_to(origin)), path.read_bytes())
-        for path in sorted(origin.rglob("*"))
-        if path.is_file()
+        (str(path.relative_to(repo)), path.read_bytes())
+        for path in sorted(repo.rglob("*"))
+        if path.is_file() and objects not in path.parents
     ]
-    inflated = _git_bytes("-C", str(origin), "cat-file", "--batch-all-objects", "--batch")
+    inflated = _git_bytes("cat-file", "--batch-all-objects", "--batch", cwd=repo)
     streams.append(("every git object, decompressed", inflated))
     return streams
+
+
+def _find(streams: list[tuple[str, bytes]], text: str) -> list[str]:
+    """The stream names in which ``text``'s bytes appear."""
+    needle = text.encode("utf-8")
+    return [where for where, data in streams if needle in data]
 
 
 def _pushed_plaintext(origin: Path, known: store.Machine, day: str) -> bytes:
@@ -157,41 +174,41 @@ def _pushed_plaintext(origin: Path, known: store.Machine, day: str) -> bytes:
     Read from the origin's objects, not from the local checkout: the claim
     being proven is about what *left* the machine, so that is what is opened.
     """
-    tip = _git_bytes("-C", str(origin), "rev-list", "--all", "-n", "1").decode().strip()
+    tip = _git_bytes("rev-list", "--all", "-n", "1", cwd=origin).decode().strip()
     if not tip:
         raise WoswoarError("the sandbox remote holds no commit")
     history = store.history_dir()
     sealed_rel = store.day_key(known.id, day).relative_to(history)
-    sealed = _git_bytes("-C", str(origin), "cat-file", "blob", f"{tip}:{sealed_rel}")
-    day_secret = crypto.decrypt_with_file(sealed, sync.identity_path(known)).decode("utf-8")
+    sealed = _git_bytes("cat-file", "blob", f"{tip}:{sealed_rel}", cwd=origin)
+    day_secret = sync.open_day_key_bytes(known, sealed)
 
     chunk_rel = store.chunk_dir(known.id, day).relative_to(history)
-    listing = _git_bytes(
-        "-C", str(origin), "ls-tree", "-r", "--name-only", tip, str(chunk_rel)
-    ).decode("utf-8")
-    plaintext = b""
+    listing = _git_bytes("ls-tree", "-r", "--name-only", tip, str(chunk_rel), cwd=origin).decode(
+        "utf-8"
+    )
+    pieces = []
     for name in listing.splitlines():
-        blob = _git_bytes("-C", str(origin), "cat-file", "blob", f"{tip}:{name}")
-        plaintext += sync.unpack(crypto.decrypt_with_secret(blob, day_secret))
-    return plaintext
+        blob = _git_bytes("cat-file", "blob", f"{tip}:{name}", cwd=origin)
+        pieces.append(sync.unpack(crypto.decrypt_with_secret(blob, day_secret)))
+    return b"".join(pieces)
 
 
-def _name_tokens(name: str) -> tuple[list[str], list[str]]:
+def _name_tokens(name: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Split ``user@host`` into what can be searched for and what cannot.
 
     The full name is always searchable -- ``@`` keeps it out of any encoding a
     repository legitimately contains. The halves are searched one by one so a
     leak of either alone is still caught, except where a byte search cannot
-    mean anything: a token short enough to appear in ciphertext by chance, or
-    one that woswoar's own boilerplate already contains everywhere.
+    mean anything; those come back as ``(token, why not)`` pairs, said to the
+    user rather than silently narrowing the claim.
     """
     user, _, host = name.partition("@")
     searchable, unsearchable = [name], []
     for token in (user, host):
         if len(token) < _MIN_TOKEN:
-            unsearchable.append(f"{token!r} (short enough to appear in ciphertext by chance)")
+            unsearchable.append((token, "short enough to appear in ciphertext by chance"))
         elif any(token in text for text in _BOILERPLATE):
-            unsearchable.append(f"{token!r} (woswoar's own boilerplate happens to contain it)")
+            unsearchable.append((token, "woswoar's own boilerplate happens to contain it"))
         else:
             searchable.append(token)
     return searchable, unsearchable
@@ -205,15 +222,23 @@ def run(check: Check, info: Info) -> None:
     """
     crypto.require()
     crypto.require_signing()
-    if shutil.which("git") is None:
-        raise WoswoarError(f"git is required - {deps.advice([deps.GIT])}")
+    if not deps.GIT.present:
+        raise WoswoarError(deps.report([deps.GIT]))
 
     # Long enough that finding it anywhere is a fact, not a coincidence.
     marker = f"woswoar-canary-{secrets.token_hex(12)}"
 
     with _sandbox() as root:
         origin = root / "origin.git"
-        _git_bytes("init", "--quiet", "--bare", str(origin))
+        # `--template=` keeps git from copying its ~27 KB of sample hooks into
+        # the "remote": they would dominate the byte count reported below, and
+        # none of them was published by anything.
+        _git_bytes("init", "--quiet", "--bare", "--template=", str(origin))
+        # Belt and braces beside the sandbox HOME: a push's `receive-pack`
+        # runs on the origin side, and the origin's own config governs it
+        # wherever it inherits its environment from.
+        with (origin / "config").open("a", encoding="utf-8") as handle:
+            handle.write(QUIET_MAINTENANCE)
         info("sandbox", f"{root} - a throwaway install; your real history is not touched")
 
         sync.initialise(remote=str(origin), new_identity=True)
@@ -230,8 +255,7 @@ def run(check: Check, info: Info) -> None:
             duration_ms=1,
             cmd=f"echo {marker}",
         )
-        with store.private_append(store.log_file(known.id, day)) as handle:
-            handle.write(format_line(entry) + "\n")
+        store.append_entries(known.id, [entry])
 
         logged = store.log_file(known.id, day).read_bytes()
         check(
@@ -264,7 +288,7 @@ def run(check: Check, info: Info) -> None:
 
         streams = _published_bytes(origin)
         total = sum(len(data) for _, data in streams)
-        hits = [where for where, data in streams if marker.encode("utf-8") in data]
+        hits = _find(streams, marker)
         check(
             "unreadable",
             not hits,
@@ -274,14 +298,7 @@ def run(check: Check, info: Info) -> None:
         )
 
         searchable, unsearchable = _name_tokens(known.name)
-        named = sorted(
-            {
-                token
-                for token in searchable
-                for where, data in streams
-                if token.encode("utf-8") in data
-            }
-        )
+        named = [token for token in searchable if _find(streams, token)]
         check(
             "anonymous",
             not named,
@@ -289,5 +306,5 @@ def run(check: Check, info: Info) -> None:
             if not named
             else f"readable on the remote: {', '.join(repr(t) for t in named)}",
         )
-        for token in unsearchable:
-            info("", f"{token} was not searched for; the full name above still was")
+        for token, why in unsearchable:
+            info("", f"{token!r} was not searched for ({why}); the full name above still was")

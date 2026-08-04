@@ -886,6 +886,17 @@ def open_day_key(known: Machine, host_id: str, day: str) -> str:
         sealed = sealed_path.read_bytes()
     except OSError as exc:
         raise SyncError(f"missing day key {sealed_path}") from exc
+    return open_day_key_bytes(known, sealed)
+
+
+def open_day_key_bytes(known: Machine, sealed: bytes) -> str:
+    """The identity inside a sealed day key, wherever the bytes came from.
+
+    Split from `open_day_key` so that `prove`, which reads the sealed bytes
+    out of a git object rather than the working tree, opens them through the
+    same code -- a change to how day keys are sealed then has one reader to
+    update, not two.
+    """
     return crypto.decrypt_with_file(sealed, identity_path(known)).decode("utf-8")
 
 

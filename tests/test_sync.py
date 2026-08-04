@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from woswoar import cache, crypto, progress, search, store, sync
+from woswoar import cache, crypto, progress, prove, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, HOOK_NAME, main
 from woswoar.__main__ import _hook_bytes as main_hook_bytes
 from woswoar.entry import Entry, format_line
@@ -53,7 +53,11 @@ _ENV = (*support.ENV_KEYS, "HOME")
 #: new each time teaches people to re-run it rather than read it. What makes the
 #: *clone* safe is `--no-local`, which has its own test; this only stops git's
 #: housekeeping showing up as whichever test was unlucky.
-QUIET_MAINTENANCE = "[gc]\n\tauto = 0\n\tautoDetach = false\n[receive]\n\tautogc = false\n"
+#:
+#: The constant itself lives in `prove`, which builds the same kind of
+#: short-lived repository for users and would show the same flakes as a failed
+#: proof; one copy, so a knob learned here reaches there and back.
+QUIET_MAINTENANCE = prove.QUIET_MAINTENANCE
 
 
 class Fake:
@@ -271,7 +275,13 @@ class TestSingleMachine(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "sudo rm -rf /very-secret-path")
             sync.run()
-            blob = b"".join(p.read_bytes() for p in store.history_dir().rglob("*") if p.is_file())
+            # Through the same scanner `doctor --prove` ships, so the suite and
+            # the user-facing proof cannot disagree about what "no readable
+            # byte" means. It inflates the git objects too: a raw walk cannot
+            # see into a superseded revision of a rewritten file, which lives
+            # only zlib-compressed under `objects/` -- and is pushed all the
+            # same.
+            blob = b"".join(data for _, data in prove._published_bytes(store.history_dir()))
         self.assertNotIn(b"very-secret-path", blob)
         self.assertNotIn(b"sudo", blob)
 
@@ -2888,13 +2898,13 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            # `.git` included, deliberately: it is where git would record an
-            # author identity, so leaving it out would skip the weakest link in
-            # the claim. `_ensure_repo_config` pins the author to a constant,
-            # and this is what keeps that true.
-            committed = b"".join(
-                path.read_bytes() for path in store.history_dir().rglob("*") if path.is_file()
-            )
+            # Through `doctor --prove`'s scanner: it walks `.git` -- where git
+            # would record an author identity, kept constant by
+            # `_ensure_repo_config` -- and additionally inflates every object,
+            # where a name in a *superseded* revision of `recipients.txt`
+            # would hide from a raw walk and still be pushed. That rewritten
+            # file is exactly how #22 leaked names in the first place.
+            committed = b"".join(data for _, data in prove._published_bytes(store.history_dir()))
         self.assertNotIn(b"secret-box", committed)
         self.assertNotIn(b"zqoperator", committed)
 
