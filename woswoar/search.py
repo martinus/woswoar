@@ -38,8 +38,31 @@ Row = tuple[int, str, str, str]
 #: Dim red for a command that failed. Dim rather than plain red so a screen of
 #: failures does not shout, and so it reads as "this one did not work" rather
 #: than as an error message woswoar is producing now.
-_FAILED = "\x1b[2;31m"
+#: Plain red rather than the dim red this started as. Dim was the right choice
+#: while the whole line carried it -- a screen of dim red is legible where a
+#: screen of bright red is not -- but it now marks the age column alone, and
+#: dim red on three characters is close to not being there at all.
+_FAILED = "\x1b[31m"
 _RESET = "\x1b[0m"
+
+
+def is_failure(code: str) -> bool:
+    """Whether a recorded exit code is a *known* failure.
+
+    Unknown is not failure, and that distinction is the whole function.
+    `~/.bash_history` and `~/.zsh_history` record no exit codes whatsoever, so
+    `importer` stores -1 for "never knew" -- and "anything but 0" painted every
+    imported command red, which on a freshly imported history is the entire
+    screen. Reported as "I think bash import marks all lines as red?".
+
+    Parsed rather than string-compared against a list of the codes seen so far:
+    the same bug would come back for any other sentinel, and the cache holds
+    these as text only because it is columnar.
+    """
+    try:
+        return int(code) > 0
+    except ValueError:
+        return False
 
 
 def relative_time(ts: int, now: int | None = None) -> str:
@@ -240,11 +263,22 @@ def render_rows(
     out = []
     for ts, cmd, code, host in rows:
         when = f"{relative_time(ts, now):>{_TIME_WIDTH}}"
+        if colour and is_failure(code):
+            # The age column only. Colouring the whole line was the first
+            # version and was reported as "a bit much" -- on a history with any
+            # real proportion of failures it is most of the screen in red, and a
+            # mark that covers half the lines has stopped marking anything.
+            #
+            # Wrapped *after* the padding, so the escapes are outside the width
+            # and every column still lines up. fzf renders them as zero-width
+            # and strips them from what it hands back, so `command_from_line`
+            # slices the same fixed prefix it always did.
+            when = f"{_FAILED}{when}{_RESET}"
         if host_width:
             line = f"{when}  {labels[host]:<{host_width}}  {escape(cmd)}"
         else:
             line = f"{when}  {escape(cmd)}"
-        out.append(f"{_FAILED}{line}{_RESET}" if colour and code not in ("0", "") else line)
+        out.append(line)
     return out
 
 
