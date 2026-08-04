@@ -97,16 +97,11 @@ def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -
     return Entry(ts=ts, host=host, session=session, cwd="/tmp", exit_code=0, duration_ms=1, cmd=cmd)
 
 
-#: Every environment variable store.py consults. Shared with tests/test_sync.py
-#: so a new one cannot be isolated in one place and leak in the other.
-ENV_KEYS = (
-    "WOSWOAR_DIR",
-    "WOSWOAR_SESSION",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-)
+#: Every environment variable store.py consults, from the module that owns the
+#: list -- so a variable added there cannot be isolated here and leak in
+#: `prove`'s sandbox, or the reverse. This alias keeps the suite's historical
+#: import path working.
+ENV_KEYS = store.ENV_KEYS
 
 
 class WoswoarTestCase(unittest.TestCase):

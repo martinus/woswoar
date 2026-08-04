@@ -276,7 +276,8 @@ editing, never executed behind your back.
 | ⚡ **~150 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
 | 🔎 **fzf as the UI** | the fuzzy finder you already know, not a bespoke TUI |
 | 🚚 **Imports what you have** | bash, zsh and atuin histories, idempotently |
-| 🧱 **~3500 lines of implementation** | small enough to read in an afternoon |
+| 🧱 **~4300 lines of implementation** | small enough to read in an afternoon |
+| 🐤 **Verifiable on your machine** | `woswoar doctor --prove` demonstrates, not asserts — see [verify it yourself](docs/verify.md) |
 
 > [!NOTE]
 > woswoar is a lighter alternative to [atuin](https://github.com/atuinsh/atuin).
@@ -294,8 +295,16 @@ and woswoar's wrapper is a few dozen lines of `subprocess`.
 Your **local** history is plaintext, though, and metadata like "how many machines
 and how often they sync" is visible to anyone holding the repo.
 
+None of that has to be taken on faith. `woswoar doctor --prove` records a
+canary command in a throwaway sandbox, syncs it, and shows you that it reaches
+the remote unreadable — and that is only the first of the checks you can run
+yourself, decrypting a chunk with stock `age` and no woswoar in the pipeline
+among them.
+
 📖 **[The full security model](docs/security.md)** — what is protected, what is
 not, and the guarantees CI asserts on every push.
+🐤 **[Verify it yourself](docs/verify.md)** — checks you run on your own
+machine, none of which ask you to believe a document.
 
 ## Coming from atuin
 
@@ -326,6 +335,7 @@ truthful. Re-running an import is idempotent.
 | `woswoar import bash\|zsh\|atuin` | import an existing history |
 | `woswoar stats` | entry counts, date range, most-used commands |
 | `woswoar doctor` | check the installation and the tools it needs |
+| `woswoar doctor --prove` | demonstrate in a sandbox that nothing readable is published |
 | `woswoar init [url]` | create or join an encrypted history repo |
 | `woswoar sync` | exchange history with the remote |
 | `woswoar accept` | add a machine you own: `grant` and `trust` at once |

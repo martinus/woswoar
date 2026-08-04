@@ -87,6 +87,22 @@ class Machine(NamedTuple):
     identity: str = ""
 
 
+#: Every environment variable this module consults when resolving paths. One
+#: authoritative list, owned by the module the variables belong to: the test
+#: suite redirects all of them into throwaway roots, and `prove` builds its
+#: sandbox from them -- a variable added here but missed in a hand-kept copy
+#: would silently point a "sandbox" at the real installation, with nothing
+#: failing. Three copies of this tuple existed before it moved here.
+ENV_KEYS = (
+    "WOSWOAR_DIR",
+    "WOSWOAR_SESSION",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+)
+
+
 def _xdg(env_var: str, default: str) -> Path:
     value = os.environ.get(env_var)
     base = Path(value) if value else Path.home() / default

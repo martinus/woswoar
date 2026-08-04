@@ -300,6 +300,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         """Context that cannot fail, kept visually distinct from a real check."""
         print(f"{marker['info']} {label:<12} {detail}")
 
+    if args.prove:
+        from . import prove
+
+        prove.run(check, info)
+        if not ok:
+            # Unlike the checks below, nothing here is the user's to fix: the
+            # sandbox is built from scratch, so a FAIL can only be woswoar
+            # publishing something it promised not to.
+            print(
+                "\nA FAIL above is a defect in woswoar itself, not in your setup."
+                "\nPlease report it: https://github.com/martinus/woswoar/issues"
+            )
+        return 0 if ok else 1
+
     bash = shutil.which("bash")
     version = ""
     if bash:
@@ -1634,8 +1648,15 @@ def build_parser() -> argparse.ArgumentParser:
         and the state of the history repo -- and prints what to do about each
         failure rather than only that it failed.
 
-        Changes nothing.
+        Changes nothing. With --prove it instead demonstrates, in a throwaway
+        sandbox that never touches your real history, that a recorded command
+        reaches the remote unreadable: see docs/verify.md.
         """,
+    )
+    p_doctor.add_argument(
+        "--prove",
+        action="store_true",
+        help="record a canary in a sandbox, sync it, and prove nothing readable was published",
     )
     p_doctor.set_defaults(func=cmd_doctor)
 
