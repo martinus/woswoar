@@ -155,6 +155,25 @@ git clone -q --branch "v$VERSION" https://github.com/martinus/woswoar /tmp/woswo
 diff -r -x __pycache__ "$SRC/woswoar" /tmp/woswoar-src/woswoar && echo identical
 ```
 
+Release artefacts (the `.tar.gz` and `.whl` on each GitHub release, from
+v0.8.1 on) additionally carry a **build provenance attestation**: a
+Sigstore-backed statement, signed by the release workflow's own identity,
+that these exact bytes were built by this repository's public pipeline at
+this commit — the pipeline that refuses a tag not on the protected branch and
+re-runs the whole suite first. There is no key anyone holds, so there is no
+key anyone can lose. Verify a download with:
+
+```console
+$ gh attestation verify woswoar.tar.gz --repo martinus/woswoar
+✓ Verification succeeded
+```
+
+What that does not prove is intent: anyone with push access to the
+repository could cut a release through the same pipeline, and it would attest
+cleanly. It rules out the quieter failures — an asset replaced after
+publication, or a tarball built on somebody's compromised laptop rather than
+in the audited workflow.
+
 The install line in the README tracks `stable`, a branch the release workflow
 fast-forwards — convenient, and it means whoever controls the GitHub
 repository controls what your next upgrade installs. If that is a trade you
