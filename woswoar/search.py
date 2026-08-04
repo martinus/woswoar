@@ -347,6 +347,29 @@ def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     return f"--bind=ctrl-r:transform:{script}"
 
 
+def _header(host_width: int) -> str:
+    """The line above the prompt: what the keys do, and how to pick a machine.
+
+    `^box` restricts a search to the machine called `box`, and has since the
+    column existed -- `--nth=2..` starts the searched region at the machine
+    name, and fzf anchors `^` to the start of that region rather than of the
+    line. Nothing said so, which made it a feature only its author knew about:
+    reported as "I have a host named box and that is short enough to also be
+    part of a few commands", which is the exact case it solves.
+
+    Only with a column to filter on. On a single-machine install there is no
+    machine name in the line and the hint would describe nothing.
+
+    Ctrl-R is listed only where it works: `transform` needs fzf 0.45+, and
+    advertising a key that does nothing is worse than staying quiet about it.
+    """
+    hints = ["ctrl-r cycles"] if fzf_supports_transform() else []
+    hints += ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
+    if host_width:
+        hints.append("^name one machine")
+    return " | ".join(hints)
+
+
 def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[str]:
     self_cmd = _self_command()
     dedup_flag = "" if dedup else " --no-dedup"
@@ -383,13 +406,10 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
         "--tiebreak=index",
         f"--query={query}",
         f"--prompt=woswoar ({scope}) ",
-        "--header=ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session",
+        f"--header={_header(host_width)}",
     ]
     if fzf_supports_transform():
         argv.append(_cycle_binding(self_cmd, dedup_flag, width))
-    else:
-        # Say what is on offer, rather than advertising a key that does nothing.
-        argv[-1] = "--header=ctrl-g global | ctrl-h host | ctrl-s session"
     for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
         argv.append(
             f"--bind={key}:reload({self_cmd} list --colour{width} --scope {target}{dedup_flag})"
