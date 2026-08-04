@@ -5,11 +5,13 @@ from __future__ import annotations
 import io
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 from woswoar import search, store
@@ -773,3 +775,93 @@ class TestLabelsStayDifferent(WoswoarTestCase):
     def test_the_column_is_only_as_wide_as_the_labels(self) -> None:
         self.named(A="martinleitnerankerl@thinkpad", B="martinus@DT-24YYQ3")
         self.assertEqual(search.host_width_for({self.A, self.B}), len("DT-24YYQ3"))
+
+
+class TestSayingHowToFilterByMachine(WoswoarTestCase):
+    """`^box` matches only the machine called box.
+
+    It works because `--nth=2..` starts the searched region at the machine name
+    and fzf anchors `^` to the start of that region, not of the line -- so this
+    needed no new key, no new mode, and no change to the line. It needed saying.
+
+    Reported as "I have a host named box and that is short enough to also be
+    part of a few commands", which is exactly what an unanchored query cannot
+    tell apart.
+    """
+
+    def test_the_hint_appears_once_there_is_a_column_to_filter_on(self) -> None:
+        header = search._header(host_width=8)
+        self.assertIn("^name", header)
+
+    def test_a_single_machine_is_not_told_about_it(self) -> None:
+        """There is no machine column on a one-machine install, so the hint
+        would describe something that is not on screen."""
+        self.assertNotIn("^name", search._header(host_width=0))
+
+    def test_the_scope_keys_are_still_listed(self) -> None:
+        for width in (0, 8):
+            with self.subTest(host_width=width):
+                header = search._header(host_width=width)
+                for key in ("ctrl-g", "ctrl-h", "ctrl-s"):
+                    self.assertIn(key, header)
+
+    def test_ctrl_r_is_listed_only_where_it_works(self) -> None:
+        """`transform` needs fzf 0.45+, and a header naming a key that does
+        nothing is worse than one that stays quiet about it."""
+        for supported in (True, False):
+            with (
+                self.subTest(transform=supported),
+                mock.patch.object(search, "fzf_supports_transform", return_value=supported),
+            ):
+                self.assertEqual("ctrl-r" in search._header(8), supported)
+
+    def test_the_header_reaches_fzf(self) -> None:
+        """A header nothing passes on is a string in a unit test."""
+        argv = search._fzf_argv("global", "", dedup=True, host_width=8)
+        self.assertIn(f"--header={search._header(8)}", argv)
+
+    ROWS: ClassVar[list[str]] = [
+        "  2m  box       docker run sandbox",
+        "  3h  thinkpad  docker ps",
+        "  6d  box       ls",
+        "  1d  at1i-ws07 echo box",
+    ]
+
+    def fzf_filter(self, query: str) -> str:
+        """Run the real fzf with the matching flags the picker actually passes.
+
+        `--nth` is taken out of `_fzf_argv` rather than written again here. The
+        claim under test is about how fzf resolves `^` against *that* field
+        range, so a test spelling its own range has quietly stopped testing the
+        code: with the value hardcoded, changing it to `--nth=1..` -- which
+        anchors `^` to the age column and breaks the feature outright -- left
+        every assertion below passing.
+        """
+        argv = search._fzf_argv("global", "", dedup=True, host_width=8)
+        matching = [arg for arg in argv if arg.startswith("--nth=") or arg == "--ansi"]
+        self.assertTrue(matching, "no matching flags found; _fzf_argv changed shape")
+        return subprocess.run(
+            ["fzf", "--filter", query, *matching],
+            input="\n".join(self.ROWS),
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf required")
+    def test_the_anchor_really_does_restrict_to_the_machine(self) -> None:
+        """Driven through the real fzf, because the whole claim is about how fzf
+        resolves `^` against a field range -- which no assertion about our own
+        strings can check."""
+        got = self.fzf_filter("^box")
+        chosen = sorted(line.split()[1] for line in got.splitlines() if line.strip())
+        self.assertEqual(chosen, ["box", "box"], "the anchor did not restrict to the machine")
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf required")
+    def test_it_composes_with_an_ordinary_search(self) -> None:
+        """Filtering to a machine is worth little if it cannot then be searched,
+        and that is two terms in one query rather than a mode to leave."""
+        got = self.fzf_filter("^box docker")
+        self.assertIn("docker run sandbox", got)
+        self.assertNotIn("docker ps", got, "another machine survived the anchor")
+        self.assertNotIn("  ls", got, "the second term was ignored")

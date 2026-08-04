@@ -19,14 +19,20 @@ when you need that one command from last Tuesday, on the other machine.
    2m  thinkpad  docker compose up -d --build
    3h  DT-24YYQ3 docker logs -f api
    6d  thinkpad  docker system prune -af
-  ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session
+  ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session | ^name one machine
 ```
 
 The machine column appears once you have more than one, and fzf matches on it —
 so typing `thinkpad` narrows to that machine. It shows the *host* part of each
 machine's name, because that is usually what differs between your own machines.
-A command that exited non-zero is dimmed red, and <kbd>Ctrl</kbd>+<kbd>R</kbd>
+The age of a command that exited non-zero is red, and <kbd>Ctrl</kbd>+<kbd>R</kbd>
 again cycles global → host → session.
+
+**A short machine name is also an ordinary word.** If yours is `box`, typing it
+finds `sandbox` and `~/dropbox` too — so anchor it: **`^box`** matches only the
+machine, because the search starts at the machine column and `^` sticks to the
+front of it. It composes with everything else, so `^box docker` is "docker, on
+box" and `^box !docker` is "on box, but not docker".
 
 ## Quick start
 
