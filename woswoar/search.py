@@ -460,9 +460,23 @@ def _header(host_width: int) -> str:
     Ctrl-R and Ctrl-T are listed only where they work: both need `transform`,
     which is fzf 0.45+, and advertising a key that does nothing is worse than
     staying quiet about it.
+
+    Ordered by how far each takes you from an ordinary search: change what is
+    listed, then change the *kind* of list, then narrow the one you have.
     """
-    hints = ["ctrl-r cycles", "ctrl-t timeline"] if fzf_supports_transform() else []
-    hints += ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
+    if fzf_supports_transform():
+        # Naming the scopes in the order Ctrl-R visits them is what lets the
+        # three direct keys collapse into one segment: `g`, `h` and `s` are the
+        # initials of the words right beside them, so spelling each out again
+        # was three quarters of the line saying the same thing twice.
+        #
+        # `ctrl-` in full rather than the usual `^r`, because `^` already means
+        # something else on this line: `^name` is fzf's anchor, not a key.
+        hints = ["ctrl-r global \u2192 host \u2192 session, or ctrl-g/h/s", "ctrl-t timeline"]
+    else:
+        # Neither key exists here, and with no cycle to name the scopes the
+        # three that do have to introduce themselves.
+        hints = ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
     if host_width:
         hints.append("^name one machine")
     return " | ".join(hints)

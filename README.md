@@ -19,7 +19,7 @@ when you need that one command from last Tuesday, on the other machine.
    2m  thinkpad  docker compose up -d --build
    3h  DT-24YYQ3 docker logs -f api
    6d  thinkpad  docker system prune -af
-  ctrl-r cycles | ctrl-t timeline | ctrl-g global | ctrl-h host | ctrl-s session | ^name one machine
+  ctrl-r global → host → session, or ctrl-g/h/s | ctrl-t timeline | ^name one machine
 ```
 
 The machine column appears once you have more than one, and fzf matches on it —

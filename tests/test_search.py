@@ -718,13 +718,14 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         with mock.patch.object(search, "fzf_supports_transform", return_value=False):
             argv = search._fzf_argv("global", "", True, 0)
         self.assertFalse([a for a in argv if "ctrl-r:" in a])
-        self.assertNotIn("ctrl-r cycles", " ".join(argv))
+        self.assertNotIn("ctrl-r", " ".join(argv), "a key that does nothing here is named anyway")
 
     def test_a_new_enough_fzf_gets_it(self) -> None:
         with mock.patch.object(search, "fzf_supports_transform", return_value=True):
             argv = search._fzf_argv("global", "", True, 0)
         self.assertTrue([a for a in argv if a.startswith("--bind=ctrl-r:transform:")])
-        self.assertIn("ctrl-r cycles", " ".join(argv))
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertIn("ctrl-r", header, "the key is bound but never mentioned")
 
     def test_the_version_gate_reads_a_version(self) -> None:
         for version, wanted in (("0.44.1 (Fedora)", False), ("0.45.0", True), ("0.73.1", True)):
@@ -798,12 +799,37 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         would describe something that is not on screen."""
         self.assertNotIn("^name", search._header(host_width=0))
 
-    def test_the_scope_keys_are_still_listed(self) -> None:
-        for width in (0, 8):
-            with self.subTest(host_width=width):
-                header = search._header(host_width=width)
-                for key in ("ctrl-g", "ctrl-h", "ctrl-s"):
-                    self.assertIn(key, header)
+    def test_every_scope_is_named_and_every_key_reachable(self) -> None:
+        """The three direct keys share one segment where Ctrl-R names the
+        scopes, because `g`, `h` and `s` are the initials of the words beside
+        them -- but all three still have to be *findable*, and so does each
+        scope, or the compaction has quietly dropped one."""
+        for supported in (True, False):
+            for width in (0, 8):
+                with (
+                    self.subTest(transform=supported, host_width=width),
+                    mock.patch.object(search, "fzf_supports_transform", return_value=supported),
+                ):
+                    header = search._header(host_width=width)
+                    for scope in ("global", "host", "session"):
+                        self.assertIn(scope, header, f"{scope} is not named")
+                    for key in ("g", "h", "s"):
+                        self.assertRegex(header, rf"ctrl-(\w+/)*{key}\b|ctrl-{key}\b")
+
+    def test_the_cycle_says_which_order_it_goes_in(self) -> None:
+        """`ctrl-r cycles` said that it cycled and not through what, so the
+        only way to learn the order was to press it three times."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            header = search._header(host_width=0)
+        self.assertIn("global \u2192 host \u2192 session", header)
+
+    def test_the_timeline_comes_after_the_scopes(self) -> None:
+        """Ordered by how far each takes you from an ordinary search: change
+        what is listed, then change the kind of list, then narrow it."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            header = search._header(host_width=8)
+        self.assertLess(header.index("ctrl-r"), header.index("ctrl-t"))
+        self.assertLess(header.index("ctrl-t"), header.index("^name"))
 
     def test_ctrl_r_is_listed_only_where_it_works(self) -> None:
         """`transform` needs fzf 0.45+, and a header naming a key that does
