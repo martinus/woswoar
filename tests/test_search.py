@@ -934,11 +934,20 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
 
     def test_the_cursor_lands_on_the_command_that_was_found(self) -> None:
         """`pos` is 1-based. Without it fzf resets to the top of the window and
-        the command you searched for is forty rows below the cursor."""
-        row = self.row_of("vim")
-        at = search.anchor_position(row, "global")
-        found = search.lines_for("global", around=row)
-        self.assertEqual(search.command_from_line(found[at - 1]), "vim src/lib.rs")
+        the command you searched for is forty rows below the cursor.
+
+        Checked at the ends as well as the middle, and that is not padding: the
+        first version only asked about a command in the *centre* of the window,
+        where the position before reversing and the position after it are the
+        same number. A mutation that dropped the reversal from the arithmetic
+        went unnoticed until an off-centre anchor was asked about.
+        """
+        for needle in ("cd ~/proj", "vim src/lib.rs", "git commit -m wip"):
+            with self.subTest(command=needle):
+                row = self.row_of(needle)
+                at = search.anchor_position(row, "global")
+                found = search.lines_for("global", around=row)
+                self.assertEqual(search.command_from_line(found[at - 1]), needle)
 
     def test_the_anchor_sits_mid_window_once_there_is_history_either_side(self) -> None:
         """With fewer commands than the span there is nothing above, and the
