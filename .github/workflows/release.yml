@@ -10,6 +10,8 @@ on:
 
 permissions:
   contents: write # create the release, and move `stable`
+  id-token: write # prove to Sigstore which workflow is signing
+  attestations: write # store the provenance attestation
 
 jobs:
   release:
@@ -79,6 +81,19 @@ jobs:
           # artefacts cannot serve that; a PEP 508 direct reference supplies the
           # project name instead, which is what makes the arbitrary name legal.
           cp dist/woswoar-*.tar.gz dist/woswoar.tar.gz
+
+      - name: attest what was built
+        # Binds each artefact to this repository, this workflow file and this
+        # commit, signed via Sigstore with the run's own OIDC identity -- no
+        # key exists that could be lost or stolen. Anyone can then check a
+        # downloaded file with
+        #   gh attestation verify woswoar.tar.gz --repo martinus/woswoar
+        # which turns "this tarball came from the audited release pipeline"
+        # from a claim into something docs/verify.md can tell people to run.
+        # Before `publish`, so nothing unattested is ever offered for download.
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
 
       - name: publish the release
         env:
