@@ -1,3 +1,3 @@
 """woswoar - distributed shell history over git, searched with fzf."""
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
