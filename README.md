@@ -70,7 +70,7 @@ names the one command to run next, if there is one:
 
 ```console
 $ woswoar
-woswoar 0.7.1 — 54,804 commands from 3 machines
+woswoar 0.7.2 — 54,804 commands from 3 machines
 
 1 machine(s) waiting to be accepted here:
     'martin@laptop'
@@ -96,7 +96,7 @@ one machine.
 > it brings itself up to date on the next background sync, so there is nothing
 > else to run; open a new shell to pick it up. `stable` tracks the most recent
 > tag, so the command never changes and you never edit a version number on five
-> machines. Swap `@stable` for `@main` to track the tip, or `@v0.7.1` to pin
+> machines. Swap `@stable` for `@main` to track the tip, or `@v0.7.2` to pin
 > exactly.
 >
 > **Coming from 0.6.x or earlier, run `woswoar install` once.** Those versions
