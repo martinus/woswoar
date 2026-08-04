@@ -19,7 +19,7 @@ when you need that one command from last Tuesday, on the other machine.
    2m  thinkpad  docker compose up -d --build
    3h  DT-24YYQ3 docker logs -f api
    6d  thinkpad  docker system prune -af
-  ctrl-r cycles | ctrl-g global | ctrl-h host | ctrl-s session | ^name one machine
+  ctrl-r global → host → session, or ctrl-g/h/s | ctrl-t timeline | ^name one machine
 ```
 
 The machine column appears once you have more than one, and fzf matches on it —
@@ -33,6 +33,29 @@ finds `sandbox` and `~/dropbox` too — so anchor it: **`^box`** matches only th
 machine, because the search starts at the machine column and `^` sticks to the
 front of it. It composes with everything else, so `^box docker` is "docker, on
 box" and `^box !docker` is "on box, but not docker".
+### Find one command, then read around it
+
+Half of what you want from history is not a command but the *next* one — you
+remember running the migration, and what you actually need is what you ran after
+it. Find anything, press <kbd>Ctrl</kbd>+<kbd>T</kbd>, and the list becomes the
+timeline either side of it, with the cursor still on what you found:
+
+```
+  woswoar (timeline global) >
+   3h  git commit -m wip
+   3h  git add -A
+   4h  cargo test
+   4h  vim src/lib.rs          <- where you were
+   4h  cargo test
+   4h  cargo build
+   4h  cd ~/proj
+```
+
+Newest first, like every other list here. Scroll up into what came next, down
+into what led there, and press <kbd>Enter</kbd> on any of them. The search box
+is cleared, so typing now filters *the timeline* rather than repeating the search
+that got you here. Repeats are kept — running `cargo test` twice is the shape of
+what happened, and the deduplicated search list hides it.
 
 ## Quick start
 

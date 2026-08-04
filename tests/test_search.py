@@ -718,13 +718,37 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         with mock.patch.object(search, "fzf_supports_transform", return_value=False):
             argv = search._fzf_argv("global", "", True, 0)
         self.assertFalse([a for a in argv if "ctrl-r:" in a])
-        self.assertNotIn("ctrl-r cycles", " ".join(argv))
+        self.assertNotIn("ctrl-r", " ".join(argv), "a key that does nothing here is named anyway")
 
     def test_a_new_enough_fzf_gets_it(self) -> None:
         with mock.patch.object(search, "fzf_supports_transform", return_value=True):
             argv = search._fzf_argv("global", "", True, 0)
         self.assertTrue([a for a in argv if a.startswith("--bind=ctrl-r:transform:")])
-        self.assertIn("ctrl-r cycles", " ".join(argv))
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertIn("ctrl-r", header, "the key is bound but never mentioned")
+
+    def test_the_version_is_reported_as_well_as_judged(self) -> None:
+        """`doctor` shows a person the string fzf printed while the gate below
+        compares numbers, so both come from one call -- deriving either from the
+        other at each call site is how the two would come to disagree."""
+        cases = [
+            ("0.73.1 (Fedora)", ("0.73.1 (Fedora)", (0, 73))),
+            ("0.44.1 (debian)", ("0.44.1 (debian)", (0, 44))),
+            ("nonsense", ("nonsense", None)),
+            ("", ("", None)),
+        ]
+        for printed, wanted in cases:
+            with self.subTest(version=printed):
+                done = subprocess.CompletedProcess([], 0, stdout=printed, stderr="")
+                with mock.patch("subprocess.run", return_value=done):
+                    self.assertEqual(search.fzf_version(), wanted)
+
+    def test_an_fzf_that_cannot_be_run_is_not_an_exception(self) -> None:
+        """It is a machine without fzf, which `doctor` reports and the picker
+        has to survive rather than crash on."""
+        with mock.patch("subprocess.run", side_effect=OSError("no such file")):
+            self.assertEqual(search.fzf_version(), ("", None))
+            self.assertFalse(search.fzf_supports_transform())
 
     def test_the_version_gate_reads_a_version(self) -> None:
         for version, wanted in (("0.44.1 (Fedora)", False), ("0.45.0", True), ("0.73.1", True)):
@@ -798,12 +822,37 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         would describe something that is not on screen."""
         self.assertNotIn("^name", search._header(host_width=0))
 
-    def test_the_scope_keys_are_still_listed(self) -> None:
-        for width in (0, 8):
-            with self.subTest(host_width=width):
-                header = search._header(host_width=width)
-                for key in ("ctrl-g", "ctrl-h", "ctrl-s"):
-                    self.assertIn(key, header)
+    def test_every_scope_is_named_and_every_key_reachable(self) -> None:
+        """The three direct keys share one segment where Ctrl-R names the
+        scopes, because `g`, `h` and `s` are the initials of the words beside
+        them -- but all three still have to be *findable*, and so does each
+        scope, or the compaction has quietly dropped one."""
+        for supported in (True, False):
+            for width in (0, 8):
+                with (
+                    self.subTest(transform=supported, host_width=width),
+                    mock.patch.object(search, "fzf_supports_transform", return_value=supported),
+                ):
+                    header = search._header(host_width=width)
+                    for scope in ("global", "host", "session"):
+                        self.assertIn(scope, header, f"{scope} is not named")
+                    for key in ("g", "h", "s"):
+                        self.assertRegex(header, rf"ctrl-(\w+/)*{key}\b|ctrl-{key}\b")
+
+    def test_the_cycle_says_which_order_it_goes_in(self) -> None:
+        """`ctrl-r cycles` said that it cycled and not through what, so the
+        only way to learn the order was to press it three times."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            header = search._header(host_width=0)
+        self.assertIn("global \u2192 host \u2192 session", header)
+
+    def test_the_timeline_comes_after_the_scopes(self) -> None:
+        """Ordered by how far each takes you from an ordinary search: change
+        what is listed, then change the kind of list, then narrow it."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            header = search._header(host_width=8)
+        self.assertLess(header.index("ctrl-r"), header.index("ctrl-t"))
+        self.assertLess(header.index("ctrl-t"), header.index("^name"))
 
     def test_ctrl_r_is_listed_only_where_it_works(self) -> None:
         """`transform` needs fzf 0.45+, and a header naming a key that does
@@ -865,3 +914,158 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         self.assertIn("docker run sandbox", got)
         self.assertNotIn("docker ps", got, "another machine survived the anchor")
         self.assertNotIn("  ls", got, "the second term was ignored")
+
+
+class TestTheTimelineAroundACommand(WoswoarTestCase):
+    """Find a command, then read what happened either side of it.
+
+    Asked for as: "use fzf search to find a particular command, then press
+    ctrl-t to switch to timeline mode, the commands above and below unfold and
+    I can scroll up and down and choose the surrounding ones."
+
+    So it is one fzf session throughout -- `reload` swaps the list underneath a
+    picker that never closes, and `pos` puts the cursor back on the command that
+    was found, without which the surrounding commands unfold forty rows away
+    from where you are looking.
+    """
+
+    SESSION_CMDS: ClassVar[list[str]] = [
+        "cd ~/proj",
+        "cargo build",
+        "cargo test",
+        "vim src/lib.rs",
+        "cargo test",
+        "git add -A",
+        "git commit -m wip",
+    ]
+
+    def setUp(self) -> None:
+        super().setUp()
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            for i, cmd in enumerate(self.SESSION_CMDS):
+                entry = Entry(NOW + i * 60, MACHINE_ID, "s1", "~", 0, 1, cmd)
+                handle.write(format_line(entry) + "\n")
+
+    def ranked(self) -> list[str]:
+        return search.lines_for("global")
+
+    def row_of(self, needle: str) -> int:
+        return next(i for i, line in enumerate(self.ranked()) if needle in line)
+
+    def timeline(self, needle: str) -> list[str]:
+        return [
+            search.command_from_line(line)
+            for line in search.lines_for("global", around=self.row_of(needle))
+        ]
+
+    def test_it_shows_what_came_before_and_after(self) -> None:
+        """Both directions, which is the whole feature: the list you arrived
+        from could only ever show you the command itself."""
+        found = self.timeline("vim")
+        at = found.index("vim src/lib.rs")
+        self.assertEqual(found[at + 1 :], ["cargo test", "cargo build", "cd ~/proj"])
+        self.assertEqual(found[:at], ["git commit -m wip", "git add -A", "cargo test"])
+
+    def test_it_reads_newest_first_like_every_other_list(self) -> None:
+        """This started out reversed, on the theory that a timeline should read
+        downwards into the future. Wrong in use: every other screen here puts
+        the recent thing at the top, and one screen that does not is a screen
+        you have to stop and reorient on."""
+        self.assertEqual(self.timeline("vim"), self.SESSION_CMDS[::-1])
+
+    def test_repeats_are_not_collapsed(self) -> None:
+        """A timeline with the repeats removed is not a timeline. Running
+        `cargo test` twice while fixing something is the shape of what
+        happened, and the deduped list this was reached from shows it once."""
+        self.assertEqual(self.timeline("vim").count("cargo test"), 2)
+        listed = [search.command_from_line(line) for line in self.ranked()]
+        self.assertEqual(listed.count("cargo test"), 1)
+
+    def test_the_cursor_lands_on_the_command_that_was_found(self) -> None:
+        """`pos` is 1-based. Without it fzf resets to the top of the window and
+        the command you searched for is forty rows below the cursor.
+
+        Checked at the ends as well as the middle, and that is not padding: the
+        first version only asked about a command in the *centre* of the window,
+        where the position before reversing and the position after it are the
+        same number. A mutation that dropped the reversal from the arithmetic
+        went unnoticed until an off-centre anchor was asked about.
+        """
+        for needle in ("cd ~/proj", "vim src/lib.rs", "git commit -m wip"):
+            with self.subTest(command=needle):
+                row = self.row_of(needle)
+                at = search.anchor_position(row, "global")
+                found = search.lines_for("global", around=row)
+                self.assertEqual(search.command_from_line(found[at - 1]), needle)
+
+    def test_the_anchor_sits_mid_window_once_there_is_history_either_side(self) -> None:
+        """With fewer commands than the span there is nothing above, and the
+        cursor is near the top -- which is correct, and is also why the position
+        cannot be a constant fzf could be told once."""
+        long_day = [f"cmd {i}" for i in range(search.TIMELINE_SPAN * 3)]
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-30")) as handle:
+            for i, cmd in enumerate(long_day):
+                entry = Entry(NOW + 10_000 + i * 60, MACHINE_ID, "s1", "~", 0, 1, cmd)
+                handle.write(format_line(entry) + "\n")
+        middle = self.row_of(f"cmd {search.TIMELINE_SPAN + 5}")
+        self.assertEqual(search.anchor_position(middle, "global"), search.TIMELINE_SPAN + 1)
+
+    def test_an_index_past_the_end_of_the_list_gives_nothing(self) -> None:
+        """The index comes from fzf and a background sync can merge commands
+        between the picker opening and the key being pressed. Showing the wrong
+        moment in history confidently is worse than showing none."""
+        self.assertEqual(search.lines_for("global", around=9999), [])
+        self.assertEqual(search.anchor_position(9999, "global"), 0)
+
+    def test_an_anchor_that_is_not_in_the_history_gives_nothing(self) -> None:
+        """The other way the anchor can be lost, and the one an out-of-range
+        index does not reach: a row that is *in* the ranked list but not in the
+        rows the timeline is built from.
+
+        Reached by making `rank_rows` return something the data does not
+        contain, because by construction today it cannot -- both come from the
+        same columns. That is exactly why this needs a test rather than a
+        comment: the branch is unreachable until the day the two stop agreeing,
+        and then it is the difference between an empty timeline and a
+        confidently wrong one.
+        """
+        invented = (NOW + 999_999, "never ran this", "0", MACHINE_ID)
+        with mock.patch.object(search, "rank_rows", return_value=[invented]):
+            self.assertEqual(search.lines_for("global", around=0), [])
+            self.assertEqual(search.anchor_position(0, "global"), 0)
+
+    def test_the_scope_is_kept(self) -> None:
+        """A timeline of another machine's evening is not what ctrl-t on a
+        host-scoped list means."""
+        with store.private_append(store.log_file("ffffffffffffffff", "2026-07-29")) as handle:
+            entry = Entry(NOW + 200, "ffffffffffffffff", "elsewhere", "~", 0, 1, "not mine")
+            handle.write(format_line(entry) + "\n")
+        row = next(i for i, line in enumerate(search.lines_for("host")) if "vim" in line)
+        found = search.lines_for("host", around=row)
+        self.assertNotIn("not mine", " ".join(found))
+
+    def test_the_picker_binds_it_and_says_so(self) -> None:
+        # `transform` is fzf 0.45+, and the binding is not offered without it.
+        # Forced rather than skipped: the runner's fzf decides whether this test
+        # runs at all otherwise, which is how a green pull request failed while
+        # cutting a release once already.
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        binds = " ".join(a for a in argv if a.startswith("--bind="))
+        self.assertIn("ctrl-t:", binds)
+        # `reload-sync`, not `reload`: the asynchronous one lets `pos` run
+        # against the list still on screen, which put the cursor anywhere but
+        # on what was found. `clear-query` so that typing next filters the
+        # timeline rather than re-applying the search that got you here.
+        for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload-sync(", "clear-query"):
+            self.assertIn(piece, binds, f"the ctrl-t binding is missing {piece}")
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertIn("ctrl-t timeline", header, "the key is bound but never mentioned")
+
+    def test_the_key_is_not_advertised_on_an_fzf_that_cannot_do_it(self) -> None:
+        with mock.patch.object(search, "fzf_supports_transform", return_value=False):
+            argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        binds = " ".join(a for a in argv if a.startswith("--bind="))
+        self.assertNotIn("ctrl-t:", binds)
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertNotIn("ctrl-t", header, "a key that does nothing here is named anyway")

@@ -129,12 +129,20 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    if args.print_anchor:
+        # Where fzf should park the cursor once it has unfolded the timeline.
+        # A separate invocation because `transform` composes `reload(...)` and
+        # `pos(...)` in one string, so the position has to be known before the
+        # reload it belongs to has run.
+        print(search.anchor_position(args.around or 0, args.scope, dedup=not args.no_dedup))
+        return 0
     lines = search.lines_for(
         args.scope,
         dedup=not args.no_dedup,
         limit=args.limit,
         colour=args.colour,
         host_width=args.host_width,
+        around=args.around,
     )
     if lines:
         sys.stdout.write("\n".join(lines) + "\n")
@@ -310,7 +318,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("bash", major >= 5, f"{version or 'not found'} (5.0+ required)")
 
     fzf = shutil.which("fzf")
-    check("fzf", fzf is not None, fzf or f"not found - {deps.advice([deps.FZF])}")
+    if fzf is None:
+        check("fzf", False, f"not found - {deps.advice([deps.FZF])}")
+    else:
+        # Which keys this fzf can actually offer, not just that it is there.
+        # An fzf below 0.45 gets a working picker with no Ctrl-R cycling and no
+        # Ctrl-T timeline -- correct, silent, and impossible to tell from a bug
+        # unless something says so. Reported from a fleet running 0.73 on one
+        # machine and Debian's 0.44.1 on another.
+        said, _ = search.fzf_version()
+        shown = said or "version unknown"
+        if search.fzf_supports_transform():
+            check("fzf", True, f"{fzf}  ({shown})")
+        else:
+            floor = ".".join(str(part) for part in search.TRANSFORM_SINCE)
+            check(
+                "fzf",
+                True,
+                f"{fzf}  ({shown} - searching works; ctrl-r cycling and the"
+                f" ctrl-t timeline need {floor}+)",
+            )
 
     machine_file = store.machine_file()
     # Read before anything calls store.machine(), which would create it.
@@ -1495,6 +1522,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Passed by the picker's reload bindings so both sides lay the line out the
     # same way. Not something to type by hand, hence no help text.
     p_list.add_argument("--host-width", type=int, default=None, help=argparse.SUPPRESS)
+    p_list.add_argument(
+        "--around",
+        type=int,
+        default=None,
+        help="show the timeline either side of this row of the list, oldest first",
+    )
+    # Both passed by the picker's ctrl-t binding rather than typed.
+    p_list.add_argument("--print-anchor", action="store_true", help=argparse.SUPPRESS)
     p_list.add_argument(
         "--colour",
         "--color",

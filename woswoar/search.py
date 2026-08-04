@@ -35,9 +35,6 @@ _STAMP = itemgetter(0)
 #: One display row: when, what, how it ended, and which machine ran it.
 Row = tuple[int, str, str, str]
 
-#: Dim red for a command that failed. Dim rather than plain red so a screen of
-#: failures does not shout, and so it reads as "this one did not work" rather
-#: than as an error message woswoar is producing now.
 #: Plain red rather than the dim red this started as. Dim was the right choice
 #: while the whole line carried it -- a screen of dim red is legible where a
 #: screen of bright red is not -- but it now marks the age column alone, and
@@ -155,14 +152,68 @@ def command_from_line(line: str, host_width: int = 0) -> str:
     return make_inert(unescape(line[_PREFIX + (host_width + 2 if host_width else 0) :]))
 
 
+#: The four parallel columns a display line is built from.
+Columns = tuple[list[str], list[str], list[str], list[str]]
+
+
+def _columns_for(scope: Scope) -> tuple[cache.Cache, Columns | None]:
+    """The rows a scope is about, straight out of the cache's columns.
+
+    Split out of `lines_for` so a timeline can start from exactly the same set
+    -- asking the same question twice and getting different answers is how the
+    anchor `{n}` names would stop meaning what fzf thinks it means.
+    """
+    loaded = cache.load_columns()
+    if scope == "host":
+        return loaded, loaded.display_columns({store.machine().id})
+    if scope == "session":
+        session = os.environ.get("WOSWOAR_SESSION", "")
+        if not session:
+            # Not an error: this is what a shell without the hook loaded looks like.
+            return loaded, None
+        stamps, commands, codes, hosts = loaded.display_columns()
+        # The one column that is per entry rather than per file, so it is the
+        # one scope that cannot be answered by dropping whole files.
+        wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
+        return loaded, (
+            [stamps[i] for i in wanted],
+            [commands[i] for i in wanted],
+            [codes[i] for i in wanted],
+            [hosts[i] for i in wanted],
+        )
+    return loaded, loaded.display_columns()
+
+
+def _rows_for(columns: Columns, dedup: bool, around: int | None) -> tuple[list[Row], int]:
+    """The rows to display, and where the cursor belongs among them.
+
+    The second value is 1-based for fzf's `pos()` and is 0 when there is no
+    anchor to sit on -- which is every ordinary list, and also a timeline whose
+    anchor has gone.
+    """
+    stamps, commands, codes, hosts = columns
+    ranked = rank_rows(stamps, commands, codes, hosts, dedup=dedup)
+    if around is None:
+        return ranked, 0
+    anchor = ranked[around] if 0 <= around < len(ranked) else None
+    return _window_around(anchor, columns)
+
+
 def lines_for(
     scope: Scope,
     dedup: bool = True,
     limit: int | None = None,
     colour: bool = False,
     host_width: int | None = None,
+    around: int | None = None,
 ) -> list[str]:
     """The full pipeline: load, filter, rank, render.
+
+    With `around`, the answer is not a ranked list at all but the *timeline*
+    either side of one of its rows -- see `_window_around`. The row is named by
+    its position in the ranked list because that is what fzf can tell us: `{n}`
+    is the index of the highlighted item, and the list it indexes into is the
+    one this same function produced a moment earlier.
 
     The two columns a line is made of come straight out of the cache, without
     an `Entry` in between. On a real 54,804-command history that is 39 ms of
@@ -174,31 +225,77 @@ def lines_for(
     fetches one more column. `host` needs none: it is a property of the file,
     so the cache filters whole files out before a single row is looked at.
     """
-    loaded = cache.load_columns()
-    if scope == "host":
-        stamps, commands, codes, hosts = loaded.display_columns({store.machine().id})
-    elif scope == "session":
-        session = os.environ.get("WOSWOAR_SESSION", "")
-        if not session:
-            # Not an error: this is what a shell without the hook loaded looks like.
-            return []
-        stamps, commands, codes, hosts = loaded.display_columns()
-        # The one column that is per entry rather than per file, so it is the
-        # one scope that cannot be answered by dropping whole files.
-        wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
-        stamps = [stamps[i] for i in wanted]
-        commands = [commands[i] for i in wanted]
-        codes = [codes[i] for i in wanted]
-        hosts = [hosts[i] for i in wanted]
-    else:
-        stamps, commands, codes, hosts = loaded.display_columns()
-
-    rows = rank_rows(stamps, commands, codes, hosts, dedup=dedup)
+    loaded, columns = _columns_for(scope)
+    if columns is None:
+        return []
+    rows, _ = _rows_for(columns, dedup=dedup, around=around)
     if limit is not None:
         rows = rows[:limit]
     if host_width is None:
         host_width = host_width_for({meta.host for meta in loaded.meta.values() if meta.host})
     return render_rows(rows, colour=colour, host_width=host_width)
+
+
+#: How many commands a timeline shows either side of the one it is centred on.
+#: A screenful each way: enough that the thing you were looking for is usually
+#: already on it, few enough that the picker still opens instantly.
+TIMELINE_SPAN = 40
+
+
+def _window_around(anchor: Row | None, columns: Columns) -> tuple[list[Row], int]:
+    """Everything either side of `anchor`, oldest first.
+
+    Newest first, like every other list here. This started out reversed, on
+    the theory that a timeline should read downwards into the future -- and
+    that was wrong in use: every other screen in woswoar puts the recent thing
+    at the top, and one screen that does not is a screen you have to stop and
+    reorient on. Reported as "I think it's bad that it reverses order".
+
+    Never deduplicated, also unlike every other list. A timeline with the
+    repeats collapsed is not a timeline -- running `cargo test` four times
+    while fixing something is the shape of what happened, and it is exactly
+    what you came here to see.
+
+    An anchor that is no longer in the list gives an empty window rather than a
+    wrong one. The index comes from fzf, and a background sync can merge new
+    commands between the picker opening and the key being pressed; showing the
+    wrong point in history confidently is worse than showing none.
+    """
+    if anchor is None:
+        return [], 0
+    stamps, commands, codes, hosts = columns
+    chronological = sorted(
+        zip((int(s) for s in stamps), commands, codes, hosts, strict=True),
+        key=_STAMP,
+    )
+    try:
+        # By identity of the whole row, not by timestamp: two machines can
+        # record in the same second, and `sorted` is stable but not meaningful
+        # between them.
+        at = chronological.index(anchor)
+    except ValueError:
+        return [], 0
+    start = max(0, at - TIMELINE_SPAN)
+    window = chronological[start : at + TIMELINE_SPAN + 1]
+    # Reversed at the end rather than sorted that way, because the window is
+    # defined by what surrounds the anchor *in time* -- taking the neighbours
+    # first and the direction second keeps those two decisions apart.
+    offset = at - start
+    return window[::-1], len(window) - offset
+
+
+def anchor_position(index: int, scope: Scope, dedup: bool = True) -> int:
+    """Where fzf should put the cursor after unfolding a timeline.
+
+    Its own entry point because the answer has to reach fzf *before* the
+    reload it applies to: `transform` runs a shell command and prints the
+    actions to perform, so the position has to be known while composing
+    `reload(...)+pos(...)`, not after.
+    """
+    _, columns = _columns_for(scope)
+    if columns is None:
+        return 0
+    return _rows_for(columns, dedup=dedup, around=index)[1]
 
 
 def rank_rows(
@@ -304,6 +401,38 @@ def _self_command() -> str:
     return f"{sys.executable} -m woswoar"
 
 
+#: The fzf that gained the `transform` action, which Ctrl-R cycling and the
+#: Ctrl-T timeline are both built on.
+TRANSFORM_SINCE = (0, 45)
+
+
+def fzf_version() -> tuple[str, tuple[int, int] | None]:
+    """What `fzf --version` says, and the (major, minor) parsed out of it.
+
+    Both halves, because they answer different questions: `doctor` shows a
+    person the string fzf printed, and the gate below compares numbers. Deriving
+    one from the other at each call site is how they would come to disagree.
+
+    The version is `None` when fzf is absent or says something unparseable, and
+    that reads as "too old" everywhere -- the safe direction, since an unknown
+    *action* in a `--bind` makes fzf refuse to start, so a wrong guess costs the
+    picker entirely rather than one key.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["fzf", "--version"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", None
+    digits = out.split()[0].split(".") if out else []
+    try:
+        return out, (int(digits[0]), int(digits[1]))
+    except (IndexError, ValueError):
+        return out, None
+
+
 def fzf_supports_transform() -> bool:
     """Whether this fzf has the `transform` action, added in 0.45.
 
@@ -312,20 +441,8 @@ def fzf_supports_transform() -> bool:
     at all rather than no Ctrl-R cycling. One `fzf --version`, on a path that is
     already forking fzf.
     """
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["fzf", "--version"], capture_output=True, text=True, timeout=5, check=False
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    digits = out.strip().split()[0].split(".") if out.strip() else []
-    try:
-        major, minor = int(digits[0]), int(digits[1])
-    except (IndexError, ValueError):
-        return False
-    return (major, minor) >= (0, 45)
+    _, parsed = fzf_version()
+    return parsed is not None and parsed >= TRANSFORM_SINCE
 
 
 def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
@@ -360,14 +477,70 @@ def _header(host_width: int) -> str:
     Only with a column to filter on. On a single-machine install there is no
     machine name in the line and the hint would describe nothing.
 
-    Ctrl-R is listed only where it works: `transform` needs fzf 0.45+, and
-    advertising a key that does nothing is worse than staying quiet about it.
+    Ctrl-R and Ctrl-T are listed only where they work: both need `transform`,
+    which is fzf 0.45+, and advertising a key that does nothing is worse than
+    staying quiet about it.
+
+    Ordered by how far each takes you from an ordinary search: change what is
+    listed, then change the *kind* of list, then narrow the one you have.
     """
-    hints = ["ctrl-r cycles"] if fzf_supports_transform() else []
-    hints += ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
+    if fzf_supports_transform():
+        # Naming the scopes in the order Ctrl-R visits them is what lets the
+        # three direct keys collapse into one segment: `g`, `h` and `s` are the
+        # initials of the words right beside them, so spelling each out again
+        # was three quarters of the line saying the same thing twice.
+        #
+        # `ctrl-` in full rather than the usual `^r`, because `^` already means
+        # something else on this line: `^name` is fzf's anchor, not a key.
+        hints = ["ctrl-r global \u2192 host \u2192 session, or ctrl-g/h/s", "ctrl-t timeline"]
+    else:
+        # Neither key exists here, and with no cycle to name the scopes the
+        # three that do have to introduce themselves.
+        hints = ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
     if host_width:
         hints.append("^name one machine")
     return " | ".join(hints)
+
+
+def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
+    """Ctrl-T shows what happened either side of the highlighted command.
+
+    `{n}` is fzf's index of that item, and the list it indexes into is the one
+    `woswoar list` just produced -- so the anchor needs nothing added to the
+    line and the display format is untouched.
+
+    The scope is read back out of the prompt, exactly as `_cycle_binding` does
+    and for the same reason: fzf holds no variables. It is carried into the
+    timeline's own prompt (`woswoar (timeline host)`) so that pressing this
+    again recentres without silently changing scope, and so that ctrl-g/h/s/r
+    still read a scope out of it on the way back out.
+    """
+    reload = f"{self_cmd} list --colour{width} --scope"
+    script = (
+        'case "$FZF_PROMPT" in '
+        "*global*) s=global ;; "
+        "*host*) s=host ;; "
+        "*session*) s=session ;; "
+        "*) s=global ;; "
+        "esac; "
+        # One extra invocation, on a keypress rather than on the prompt path:
+        # `pos` has to be composed into the same action string as the `reload`
+        # it applies to, so it cannot be read out of the reload's own output.
+        f"p=$({reload} $s{dedup_flag} --around {{n}} --print-anchor); "
+        # `reload-sync`, not `reload`: a plain reload is asynchronous, so `pos`
+        # ran against the list that was still on screen and the cursor was
+        # wherever the new one happened to leave it. Reported as "it seems to
+        # jump to the bottom always and not to the selection".
+        #
+        # `clear-query` because the query that found the command is not the one
+        # you want against its neighbours -- leaving it filters the timeline
+        # down to the same match you started from, which is an empty gesture.
+        # Asked for directly: "it should clear the filter, that way it's
+        # filtering the timeline".
+        f'printf "clear-query+reload-sync({reload} $s{dedup_flag} --around {{n}})'
+        '+pos($p)+change-prompt(woswoar (timeline $s) )"'
+    )
+    return f"--bind=ctrl-t:transform:{script}"
 
 
 def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[str]:
@@ -410,6 +583,7 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
     ]
     if fzf_supports_transform():
         argv.append(_cycle_binding(self_cmd, dedup_flag, width))
+        argv.append(_timeline_binding(self_cmd, dedup_flag, width))
     for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
         argv.append(
             f"--bind={key}:reload({self_cmd} list --colour{width} --scope {target}{dedup_flag})"
