@@ -865,3 +865,127 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         self.assertIn("docker run sandbox", got)
         self.assertNotIn("docker ps", got, "another machine survived the anchor")
         self.assertNotIn("  ls", got, "the second term was ignored")
+
+
+class TestTheTimelineAroundACommand(WoswoarTestCase):
+    """Find a command, then read what happened either side of it.
+
+    Asked for as: "use fzf search to find a particular command, then press
+    ctrl-t to switch to timeline mode, the commands above and below unfold and
+    I can scroll up and down and choose the surrounding ones."
+
+    So it is one fzf session throughout -- `reload` swaps the list underneath a
+    picker that never closes, and `pos` puts the cursor back on the command that
+    was found, without which the surrounding commands unfold forty rows away
+    from where you are looking.
+    """
+
+    SESSION_CMDS: ClassVar[list[str]] = [
+        "cd ~/proj",
+        "cargo build",
+        "cargo test",
+        "vim src/lib.rs",
+        "cargo test",
+        "git add -A",
+        "git commit -m wip",
+    ]
+
+    def setUp(self) -> None:
+        super().setUp()
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            for i, cmd in enumerate(self.SESSION_CMDS):
+                entry = Entry(NOW + i * 60, MACHINE_ID, "s1", "~", 0, 1, cmd)
+                handle.write(format_line(entry) + "\n")
+
+    def ranked(self) -> list[str]:
+        return search.lines_for("global")
+
+    def row_of(self, needle: str) -> int:
+        return next(i for i, line in enumerate(self.ranked()) if needle in line)
+
+    def timeline(self, needle: str) -> list[str]:
+        return [
+            search.command_from_line(line)
+            for line in search.lines_for("global", around=self.row_of(needle))
+        ]
+
+    def test_it_shows_what_came_before_and_after(self) -> None:
+        found = self.timeline("vim")
+        self.assertEqual(found[found.index("vim src/lib.rs") - 1], "cargo test")
+        self.assertEqual(found[found.index("vim src/lib.rs") + 1], "cargo test")
+
+    def test_it_reads_oldest_first_so_scrolling_down_goes_forward(self) -> None:
+        """The opposite of every other list here, and deliberately: you find the
+        command you remember and read *down* into what you did next."""
+        self.assertEqual(self.timeline("vim"), self.SESSION_CMDS)
+
+    def test_repeats_are_not_collapsed(self) -> None:
+        """A timeline with the repeats removed is not a timeline. Running
+        `cargo test` twice while fixing something is the shape of what
+        happened, and the deduped list this was reached from shows it once."""
+        self.assertEqual(self.timeline("vim").count("cargo test"), 2)
+        listed = [search.command_from_line(line) for line in self.ranked()]
+        self.assertEqual(listed.count("cargo test"), 1)
+
+    def test_the_cursor_lands_on_the_command_that_was_found(self) -> None:
+        """`pos` is 1-based. Without it fzf resets to the top of the window and
+        the command you searched for is forty rows below the cursor."""
+        row = self.row_of("vim")
+        at = search.anchor_position(row, "global")
+        found = search.lines_for("global", around=row)
+        self.assertEqual(search.command_from_line(found[at - 1]), "vim src/lib.rs")
+
+    def test_the_anchor_sits_mid_window_once_there_is_history_either_side(self) -> None:
+        """With fewer commands than the span there is nothing above, and the
+        cursor is near the top -- which is correct, and is also why the position
+        cannot be a constant fzf could be told once."""
+        long_day = [f"cmd {i}" for i in range(search.TIMELINE_SPAN * 3)]
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-30")) as handle:
+            for i, cmd in enumerate(long_day):
+                entry = Entry(NOW + 10_000 + i * 60, MACHINE_ID, "s1", "~", 0, 1, cmd)
+                handle.write(format_line(entry) + "\n")
+        middle = self.row_of(f"cmd {search.TIMELINE_SPAN + 5}")
+        self.assertEqual(search.anchor_position(middle, "global"), search.TIMELINE_SPAN + 1)
+
+    def test_an_index_past_the_end_of_the_list_gives_nothing(self) -> None:
+        """The index comes from fzf and a background sync can merge commands
+        between the picker opening and the key being pressed. Showing the wrong
+        moment in history confidently is worse than showing none."""
+        self.assertEqual(search.lines_for("global", around=9999), [])
+        self.assertEqual(search.anchor_position(9999, "global"), 0)
+
+    def test_an_anchor_that_is_not_in_the_history_gives_nothing(self) -> None:
+        """The other way the anchor can be lost, and the one an out-of-range
+        index does not reach: a row that is *in* the ranked list but not in the
+        rows the timeline is built from.
+
+        Reached by making `rank_rows` return something the data does not
+        contain, because by construction today it cannot -- both come from the
+        same columns. That is exactly why this needs a test rather than a
+        comment: the branch is unreachable until the day the two stop agreeing,
+        and then it is the difference between an empty timeline and a
+        confidently wrong one.
+        """
+        invented = (NOW + 999_999, "never ran this", "0", MACHINE_ID)
+        with mock.patch.object(search, "rank_rows", return_value=[invented]):
+            self.assertEqual(search.lines_for("global", around=0), [])
+            self.assertEqual(search.anchor_position(0, "global"), 0)
+
+    def test_the_scope_is_kept(self) -> None:
+        """A timeline of another machine's evening is not what ctrl-t on a
+        host-scoped list means."""
+        with store.private_append(store.log_file("ffffffffffffffff", "2026-07-29")) as handle:
+            entry = Entry(NOW + 200, "ffffffffffffffff", "elsewhere", "~", 0, 1, "not mine")
+            handle.write(format_line(entry) + "\n")
+        row = next(i for i, line in enumerate(search.lines_for("host")) if "vim" in line)
+        found = search.lines_for("host", around=row)
+        self.assertNotIn("not mine", " ".join(found))
+
+    def test_the_picker_binds_it_and_says_so(self) -> None:
+        argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        binds = " ".join(a for a in argv if a.startswith("--bind="))
+        self.assertIn("ctrl-t:", binds)
+        for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload("):
+            self.assertIn(piece, binds, f"the ctrl-t binding is missing {piece}")
+        header = next(a for a in argv if a.startswith("--header="))
+        self.assertIn("ctrl-t timeline", header, "the key is bound but never mentioned")

@@ -129,12 +129,20 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    if args.print_anchor:
+        # Where fzf should park the cursor once it has unfolded the timeline.
+        # A separate invocation because `transform` composes `reload(...)` and
+        # `pos(...)` in one string, so the position has to be known before the
+        # reload it belongs to has run.
+        print(search.anchor_position(args.around or 0, args.scope, dedup=not args.no_dedup))
+        return 0
     lines = search.lines_for(
         args.scope,
         dedup=not args.no_dedup,
         limit=args.limit,
         colour=args.colour,
         host_width=args.host_width,
+        around=args.around,
     )
     if lines:
         sys.stdout.write("\n".join(lines) + "\n")
@@ -1495,6 +1503,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Passed by the picker's reload bindings so both sides lay the line out the
     # same way. Not something to type by hand, hence no help text.
     p_list.add_argument("--host-width", type=int, default=None, help=argparse.SUPPRESS)
+    p_list.add_argument(
+        "--around",
+        type=int,
+        default=None,
+        help="show the timeline either side of this row of the list, oldest first",
+    )
+    # Both passed by the picker's ctrl-t binding rather than typed.
+    p_list.add_argument("--print-anchor", action="store_true", help=argparse.SUPPRESS)
     p_list.add_argument(
         "--colour",
         "--color",
