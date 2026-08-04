@@ -245,10 +245,11 @@ TIMELINE_SPAN = 40
 def _window_around(anchor: Row | None, columns: Columns) -> tuple[list[Row], int]:
     """Everything either side of `anchor`, oldest first.
 
-    Oldest first, unlike every other list here, because that is the direction
-    the question runs: you find the command you remember and then read *down*
-    into what you did next. Reversing that would make "scroll down" mean "go
-    back in time", which is the opposite of every log anyone has ever read.
+    Newest first, like every other list here. This started out reversed, on
+    the theory that a timeline should read downwards into the future -- and
+    that was wrong in use: every other screen in woswoar puts the recent thing
+    at the top, and one screen that does not is a screen you have to stop and
+    reorient on. Reported as "I think it's bad that it reverses order".
 
     Never deduplicated, also unlike every other list. A timeline with the
     repeats collapsed is not a timeline -- running `cargo test` four times
@@ -275,7 +276,12 @@ def _window_around(anchor: Row | None, columns: Columns) -> tuple[list[Row], int
     except ValueError:
         return [], 0
     start = max(0, at - TIMELINE_SPAN)
-    return chronological[start : at + TIMELINE_SPAN + 1], at - start + 1
+    window = chronological[start : at + TIMELINE_SPAN + 1]
+    # Reversed at the end rather than sorted that way, because the window is
+    # defined by what surrounds the anchor *in time* -- taking the neighbours
+    # first and the direction second keeps those two decisions apart.
+    offset = at - start
+    return window[::-1], len(window) - offset
 
 
 def anchor_position(index: int, scope: Scope, dedup: bool = True) -> int:
@@ -487,7 +493,17 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
         # `pos` has to be composed into the same action string as the `reload`
         # it applies to, so it cannot be read out of the reload's own output.
         f"p=$({reload} $s{dedup_flag} --around {{n}} --print-anchor); "
-        f'printf "reload({reload} $s{dedup_flag} --around {{n}})'
+        # `reload-sync`, not `reload`: a plain reload is asynchronous, so `pos`
+        # ran against the list that was still on screen and the cursor was
+        # wherever the new one happened to leave it. Reported as "it seems to
+        # jump to the bottom always and not to the selection".
+        #
+        # `clear-query` because the query that found the command is not the one
+        # you want against its neighbours -- leaving it filters the timeline
+        # down to the same match you started from, which is an empty gesture.
+        # Asked for directly: "it should clear the filter, that way it's
+        # filtering the timeline".
+        f'printf "clear-query+reload-sync({reload} $s{dedup_flag} --around {{n}})'
         '+pos($p)+change-prompt(woswoar (timeline $s) )"'
     )
     return f"--bind=ctrl-t:transform:{script}"

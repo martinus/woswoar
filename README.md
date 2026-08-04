@@ -38,23 +38,24 @@ box" and `^box !docker` is "on box, but not docker".
 Half of what you want from history is not a command but the *next* one — you
 remember running the migration, and what you actually need is what you ran after
 it. Find anything, press <kbd>Ctrl</kbd>+<kbd>T</kbd>, and the list becomes the
-timeline either side of it, oldest at the top, with the cursor still on what you
-found:
+timeline either side of it, with the cursor still on what you found:
 
 ```
   woswoar (timeline global) >
-   4h  cd ~/proj
-   4h  cargo build
+   3h  git commit -m wip
+   3h  git add -A
    4h  cargo test
    4h  vim src/lib.rs          <- where you were
    4h  cargo test
-   3h  git add -A
-   3h  git commit -m wip
+   4h  cargo build
+   4h  cd ~/proj
 ```
 
-Scroll up into what led there, down into what came next, and press
-<kbd>Enter</kbd> on any of them. Repeats are kept — running `cargo test` twice
-is the shape of what happened, and the deduplicated search list hides it.
+Newest first, like every other list here. Scroll up into what came next, down
+into what led there, and press <kbd>Enter</kbd> on any of them. The search box
+is cleared, so typing now filters *the timeline* rather than repeating the search
+that got you here. Repeats are kept — running `cargo test` twice is the shape of
+what happened, and the deduplicated search list hides it.
 
 ## Quick start
 

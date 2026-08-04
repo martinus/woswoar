@@ -910,14 +910,19 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
         ]
 
     def test_it_shows_what_came_before_and_after(self) -> None:
+        """Both directions, which is the whole feature: the list you arrived
+        from could only ever show you the command itself."""
         found = self.timeline("vim")
-        self.assertEqual(found[found.index("vim src/lib.rs") - 1], "cargo test")
-        self.assertEqual(found[found.index("vim src/lib.rs") + 1], "cargo test")
+        at = found.index("vim src/lib.rs")
+        self.assertEqual(found[at + 1 :], ["cargo test", "cargo build", "cd ~/proj"])
+        self.assertEqual(found[:at], ["git commit -m wip", "git add -A", "cargo test"])
 
-    def test_it_reads_oldest_first_so_scrolling_down_goes_forward(self) -> None:
-        """The opposite of every other list here, and deliberately: you find the
-        command you remember and read *down* into what you did next."""
-        self.assertEqual(self.timeline("vim"), self.SESSION_CMDS)
+    def test_it_reads_newest_first_like_every_other_list(self) -> None:
+        """This started out reversed, on the theory that a timeline should read
+        downwards into the future. Wrong in use: every other screen here puts
+        the recent thing at the top, and one screen that does not is a screen
+        you have to stop and reorient on."""
+        self.assertEqual(self.timeline("vim"), self.SESSION_CMDS[::-1])
 
     def test_repeats_are_not_collapsed(self) -> None:
         """A timeline with the repeats removed is not a timeline. Running
@@ -990,7 +995,11 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
             argv = search._fzf_argv("global", "", dedup=True, host_width=0)
         binds = " ".join(a for a in argv if a.startswith("--bind="))
         self.assertIn("ctrl-t:", binds)
-        for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload("):
+        # `reload-sync`, not `reload`: the asynchronous one lets `pos` run
+        # against the list still on screen, which put the cursor anywhere but
+        # on what was found. `clear-query` so that typing next filters the
+        # timeline rather than re-applying the search that got you here.
+        for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload-sync(", "clear-query"):
             self.assertIn(piece, binds, f"the ctrl-t binding is missing {piece}")
         header = next(a for a in argv if a.startswith("--header="))
         self.assertIn("ctrl-t timeline", header, "the key is bound but never mentioned")
