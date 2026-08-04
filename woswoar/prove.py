@@ -222,7 +222,12 @@ def run(check: Check, info: Info) -> None:
         now = int(time.time())
         day = store.day_for(now)
         entry = Entry(
-            ts=now, host=known.id, session="prove", cwd="~", exit_code=0, duration_ms=1,
+            ts=now,
+            host=known.id,
+            session="prove",
+            cwd="~",
+            exit_code=0,
+            duration_ms=1,
             cmd=f"echo {marker}",
         )
         with store.private_append(store.log_file(known.id, day)) as handle:

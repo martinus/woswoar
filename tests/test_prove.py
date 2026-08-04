@@ -29,9 +29,7 @@ from .support import WoswoarTestCase, requires_age, requires_git, requires_ssh_k
 @requires_ssh_keygen
 class ProveTestCase(WoswoarTestCase):
     def prove(self) -> support.Ran:
-        with mock.patch.object(
-            store, "default_machine_name", return_value="canaryuser@canaryhost"
-        ):
+        with mock.patch.object(store, "default_machine_name", return_value="canaryuser@canaryhost"):
             return support.run_cli("doctor", "--prove")
 
 

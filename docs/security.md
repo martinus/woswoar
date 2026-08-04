@@ -376,7 +376,11 @@ install from your distribution.
 
 ## ✅ Guarantees pinned by tests, not by prose
 
-Claims rot. The ones that matter are asserted in CI on every push:
+Claims rot. The ones that matter are asserted in CI on every push — and the
+central one does not even ask you to trust CI: `woswoar doctor --prove` walks
+a canary command through a sandboxed install on *your* machine and shows it
+reaching the remote unreadable. [Verify it yourself](verify.md) has that and
+every other check you can run without believing anyone.
 
 **Nobody else can put history in yours**
 
