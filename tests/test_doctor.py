@@ -14,6 +14,7 @@ import shutil
 import stat
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from woswoar import __main__ as main_module
 from woswoar import crypto, store
@@ -236,3 +237,57 @@ class TestReadingThePackagedHook(unittest.TestCase):
         via_resources = (resources.files("woswoar") / "shell" / main_module.HOOK_NAME).read_bytes()
         self.assertEqual(main_module._hook_bytes(), via_resources)
         self.assertTrue(via_resources.startswith(b"# woswoar"), "that is not the hook")
+
+
+class TestDoctorReportsWhatFzfCanDo(WoswoarTestCase):
+    """Not just that fzf is there, but which keys it can offer.
+
+    An fzf below 0.45 gets a working picker with no Ctrl-R cycling and no
+    Ctrl-T timeline. That is correct and deliberate -- an unknown action in a
+    `--bind` makes fzf refuse to start, so the keys cannot be offered
+    optimistically -- but it is also silent, and indistinguishable from a bug
+    unless something says so. Reported from a fleet running 0.73 on one machine
+    and Debian's 0.44.1 on another.
+    """
+
+    def fzf_line(self, said: str, parsed: tuple[int, int] | None) -> str:
+        from woswoar import search
+
+        with (
+            mock.patch.object(search, "fzf_version", return_value=(said, parsed)),
+            mock.patch.object(
+                search,
+                "fzf_supports_transform",
+                return_value=parsed is not None and parsed >= search.TRANSFORM_SINCE,
+            ),
+        ):
+            out = support.run_cli("doctor").out
+        return next(line for line in out.splitlines() if " fzf " in line)
+
+    def test_a_new_enough_fzf_just_shows_its_version(self) -> None:
+        line = self.fzf_line("0.73.1 (Fedora)", (0, 73))
+        self.assertIn("0.73.1", line)
+        self.assertNotIn("need", line, "a capable fzf was told what it is missing")
+
+    def test_an_old_fzf_is_told_exactly_what_it_is_missing(self) -> None:
+        line = self.fzf_line("0.44.1 (debian)", (0, 44))
+        self.assertIn("0.44.1", line)
+        for named in ("ctrl-r", "ctrl-t", "0.45+"):
+            self.assertIn(named, line, f"{named} is not mentioned")
+
+    def test_an_old_fzf_is_not_reported_as_a_failure(self) -> None:
+        """Search works perfectly there. A red cross would say the machine is
+        broken, and the next one would be read as noise too."""
+        self.assertIn("[ok]", self.fzf_line("0.44.1 (debian)", (0, 44)))
+
+    def test_a_version_it_cannot_parse_does_not_go_blank(self) -> None:
+        line = self.fzf_line("", None)
+        self.assertIn("version unknown", line)
+
+    def test_a_missing_fzf_still_says_how_to_get_one(self) -> None:
+        """The other branch, and the one that is an actual problem."""
+        with mock.patch.object(shutil, "which", return_value=None):
+            out = support.run_cli("doctor").out
+        line = next(line for line in out.splitlines() if " fzf " in line)
+        self.assertIn("[FAIL]", line)
+        self.assertIn("not found", line)

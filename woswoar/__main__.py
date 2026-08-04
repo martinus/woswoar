@@ -318,7 +318,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("bash", major >= 5, f"{version or 'not found'} (5.0+ required)")
 
     fzf = shutil.which("fzf")
-    check("fzf", fzf is not None, fzf or f"not found - {deps.advice([deps.FZF])}")
+    if fzf is None:
+        check("fzf", False, f"not found - {deps.advice([deps.FZF])}")
+    else:
+        # Which keys this fzf can actually offer, not just that it is there.
+        # An fzf below 0.45 gets a working picker with no Ctrl-R cycling and no
+        # Ctrl-T timeline -- correct, silent, and impossible to tell from a bug
+        # unless something says so. Reported from a fleet running 0.73 on one
+        # machine and Debian's 0.44.1 on another.
+        said, _ = search.fzf_version()
+        shown = said or "version unknown"
+        if search.fzf_supports_transform():
+            check("fzf", True, f"{fzf}  ({shown})")
+        else:
+            floor = ".".join(str(part) for part in search.TRANSFORM_SINCE)
+            check(
+                "fzf",
+                True,
+                f"{fzf}  ({shown} - searching works; ctrl-r cycling and the"
+                f" ctrl-t timeline need {floor}+)",
+            )
 
     machine_file = store.machine_file()
     # Read before anything calls store.machine(), which would create it.

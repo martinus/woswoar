@@ -401,6 +401,38 @@ def _self_command() -> str:
     return f"{sys.executable} -m woswoar"
 
 
+#: The fzf that gained the `transform` action, which Ctrl-R cycling and the
+#: Ctrl-T timeline are both built on.
+TRANSFORM_SINCE = (0, 45)
+
+
+def fzf_version() -> tuple[str, tuple[int, int] | None]:
+    """What `fzf --version` says, and the (major, minor) parsed out of it.
+
+    Both halves, because they answer different questions: `doctor` shows a
+    person the string fzf printed, and the gate below compares numbers. Deriving
+    one from the other at each call site is how they would come to disagree.
+
+    The version is `None` when fzf is absent or says something unparseable, and
+    that reads as "too old" everywhere -- the safe direction, since an unknown
+    *action* in a `--bind` makes fzf refuse to start, so a wrong guess costs the
+    picker entirely rather than one key.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["fzf", "--version"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", None
+    digits = out.split()[0].split(".") if out else []
+    try:
+        return out, (int(digits[0]), int(digits[1]))
+    except (IndexError, ValueError):
+        return out, None
+
+
 def fzf_supports_transform() -> bool:
     """Whether this fzf has the `transform` action, added in 0.45.
 
@@ -409,20 +441,8 @@ def fzf_supports_transform() -> bool:
     at all rather than no Ctrl-R cycling. One `fzf --version`, on a path that is
     already forking fzf.
     """
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["fzf", "--version"], capture_output=True, text=True, timeout=5, check=False
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    digits = out.strip().split()[0].split(".") if out.strip() else []
-    try:
-        major, minor = int(digits[0]), int(digits[1])
-    except (IndexError, ValueError):
-        return False
-    return (major, minor) >= (0, 45)
+    _, parsed = fzf_version()
+    return parsed is not None and parsed >= TRANSFORM_SINCE
 
 
 def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:

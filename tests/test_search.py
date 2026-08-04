@@ -727,6 +727,29 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         header = next(a for a in argv if a.startswith("--header="))
         self.assertIn("ctrl-r", header, "the key is bound but never mentioned")
 
+    def test_the_version_is_reported_as_well_as_judged(self) -> None:
+        """`doctor` shows a person the string fzf printed while the gate below
+        compares numbers, so both come from one call -- deriving either from the
+        other at each call site is how the two would come to disagree."""
+        cases = [
+            ("0.73.1 (Fedora)", ("0.73.1 (Fedora)", (0, 73))),
+            ("0.44.1 (debian)", ("0.44.1 (debian)", (0, 44))),
+            ("nonsense", ("nonsense", None)),
+            ("", ("", None)),
+        ]
+        for printed, wanted in cases:
+            with self.subTest(version=printed):
+                done = subprocess.CompletedProcess([], 0, stdout=printed, stderr="")
+                with mock.patch("subprocess.run", return_value=done):
+                    self.assertEqual(search.fzf_version(), wanted)
+
+    def test_an_fzf_that_cannot_be_run_is_not_an_exception(self) -> None:
+        """It is a machine without fzf, which `doctor` reports and the picker
+        has to survive rather than crash on."""
+        with mock.patch("subprocess.run", side_effect=OSError("no such file")):
+            self.assertEqual(search.fzf_version(), ("", None))
+            self.assertFalse(search.fzf_supports_transform())
+
     def test_the_version_gate_reads_a_version(self) -> None:
         for version, wanted in (("0.44.1 (Fedora)", False), ("0.45.0", True), ("0.73.1", True)):
             with self.subTest(version=version):
