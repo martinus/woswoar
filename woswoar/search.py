@@ -23,10 +23,13 @@ from .entry import escape, make_inert, unescape
 Scope = Literal["global", "host", "session"]
 SCOPES: tuple[Scope, ...] = ("global", "host", "session")
 
-#: Every display line is ``"<4-char relative time><2 spaces><escaped command>"``.
+#: Every display line is ``"<7-char relative time><2 spaces><escaped command>"``.
 #: The prefix is a fixed width so recovering the command from what fzf prints
-#: back is an exact slice rather than a parse.
-_TIME_WIDTH = 4
+#: back is an exact slice rather than a parse. Seven fits the widest age
+#: `relative_time` can produce (``11mo29d``, ``99y11mo``); recent commands --
+#: most of any screen -- still render two or three characters and the rest is
+#: padding, so the width is only actually spent on rows old enough to need it.
+_TIME_WIDTH = 7
 _PREFIX = _TIME_WIDTH + 2
 
 #: Sort key for a row. In C, rather than a lambda.
@@ -66,6 +69,13 @@ def relative_time(ts: int, now: int | None = None) -> str:
     """Render a timestamp as an age, at most :data:`_TIME_WIDTH` characters.
 
     Computed at display time rather than stored, so it never goes stale.
+
+    Two adjacent units from hours upward -- ``3h42m``, ``12d5h``, ``6mo12d``,
+    ``1y3mo`` -- because one unit is off by up to half of itself, and a bare
+    ``6mo`` hiding a fortnight was reported as too coarse to be useful. Below
+    an hour a single unit is already within a minute, and those rows are most
+    of any screen, so they stay as narrow as they were. A second unit of zero
+    is dropped rather than written: ``3h``, not ``3h0m``.
     """
     delta = (int(time.time()) if now is None else now) - ts
     if delta < 0:
@@ -75,15 +85,28 @@ def relative_time(ts: int, now: int | None = None) -> str:
     if delta < 3600:
         return f"{delta // 60}m"
     if delta < 86400:
-        return f"{delta // 3600}h"
-    if delta < 86400 * 30:
-        return f"{delta // 86400}d"
-    if delta < 86400 * 350:
-        # Cut over before the month count could reach 12, which would be both
-        # wider than the column and sillier than saying "1y".
-        return f"{delta // (86400 * 30)}mo"
-    years = max(1, delta // (86400 * 365))
-    return f"{years}y" if years < 100 else "old"
+        big, small = divmod(delta // 60, 60)
+        units = "h", "m"
+    elif delta < 86400 * 30:
+        big, small = divmod(delta // 3600, 24)
+        units = "d", "h"
+    elif delta < 86400 * 360:
+        # Cut over exactly where the month count would reach 12, which would
+        # be both wider than the column and sillier than saying "1y".
+        big, small = divmod(delta // 86400, 30)
+        units = "mo", "d"
+    else:
+        big = max(1, delta // (86400 * 365))
+        if big >= 100:
+            return "old"
+        # Clamped: 360-364 days is short of one year but says "1y" rather than
+        # inventing a negative month, and day 364 of any year would otherwise
+        # round to a twelfth month the column has no room for.
+        small = min(11, max(0, (delta // 86400 - big * 365) // 30))
+        units = "y", "mo"
+    if small == 0:
+        return f"{big}{units[0]}"
+    return f"{big}{units[0]}{small}{units[1]}"
 
 
 #: Widest a machine label may be. Generous, because it is only ever as wide as
