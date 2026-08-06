@@ -31,25 +31,50 @@ class TestRelativeTime(unittest.TestCase):
             (60, "1m"),
             (59 * 60, "59m"),
             (3600, "1h"),
-            (23 * 3600, "23h"),
+            (3600 + 60, "1h1m"),
+            (23 * 3600 + 59 * 60, "23h59m"),
             (86400, "1d"),
-            (29 * 86400, "29d"),
+            (86400 + 3600, "1d1h"),
+            (29 * 86400 + 23 * 3600, "29d23h"),
             (30 * 86400, "1mo"),
-            (349 * 86400, "11mo"),
-            (350 * 86400, "1y"),
+            (42 * 86400, "1mo12d"),
+            (359 * 86400, "11mo29d"),
+            (360 * 86400, "1y"),
             (365 * 86400, "1y"),
-            (900 * 86400, "2y"),
+            (729 * 86400, "1y11mo"),
+            (730 * 86400, "2y"),
+            (900 * 86400, "2y5mo"),
         ]
         for delta, expected in cases:
+            with self.subTest(delta=delta):
+                self.assertEqual(search.relative_time(NOW - delta, NOW), expected)
+
+    def test_a_second_unit_of_zero_is_dropped(self) -> None:
+        # "3h", never "3h0m": the padding absorbs the difference either way,
+        # but a written zero is noise on every round-hour row.
+        for delta, expected in [(3 * 3600, "3h"), (12 * 86400, "12d"), (6 * 30 * 86400, "6mo")]:
             with self.subTest(delta=delta):
                 self.assertEqual(search.relative_time(NOW - delta, NOW), expected)
 
     def test_never_exceeds_the_column_width(self) -> None:
         # command_from_line() slices at a fixed offset, so an over-wide label
         # would silently eat the first characters of the command.
-        for delta in [0, 1, 59, 61, 3599, 90000, 86400 * 29, 86400 * 364, 86400 * 365 * 40]:
+        for delta in [
+            0,
+            1,
+            59,
+            61,
+            3599,
+            90000,
+            86400 * 29 + 86399,
+            86400 * 359,
+            86400 * 364,
+            86400 * 729,
+            86400 * 365 * 40,
+            86400 * 365 * 200,
+        ]:
             with self.subTest(delta=delta):
-                self.assertLessEqual(len(search.relative_time(NOW - delta, NOW)), 4)
+                self.assertLessEqual(len(search.relative_time(NOW - delta, NOW)), search._TIME_WIDTH)
 
     def test_clock_skew_from_another_machine_is_tolerated(self) -> None:
         self.assertEqual(search.relative_time(NOW + 500, NOW), "now")
@@ -431,7 +456,7 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
 
         def slow_lines(*args: object, **kwargs: object) -> list[str]:
             order.append("history")
-            return ["  1s  cmd 0"]
+            return ["     1s  cmd 0"]
 
         with (
             mock.patch("subprocess.Popen", Spawned),
@@ -620,8 +645,8 @@ class TestTheMachineColumn(WoswoarTestCase):
         self.record(MACHINE_ID, "git status")
         self.assertEqual(search.host_width_for({MACHINE_ID}), 0)
         (line,) = search.lines_for("global")
-        # The time column is right-aligned in four, so "now" leaves one space.
-        self.assertEqual(line, " now  git status")
+        # The time column is right-aligned in seven, so "now" leaves four.
+        self.assertEqual(line, "    now  git status")
 
     def test_two_machines_get_one(self) -> None:
         self.record(MACHINE_ID, "mine")
@@ -870,10 +895,10 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         self.assertIn(f"--header={search._header(8)}", argv)
 
     ROWS: ClassVar[list[str]] = [
-        "  2m  box       docker run sandbox",
-        "  3h  thinkpad  docker ps",
-        "  6d  box       ls",
-        "  1d  at1i-ws07 echo box",
+        "     2m  box       docker run sandbox",
+        "  3h12m  thinkpad  docker ps",
+        "   6d4h  box       ls",
+        "   1d2h  at1i-ws07 echo box",
     ]
 
     def fzf_filter(self, query: str) -> str:

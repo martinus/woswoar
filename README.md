@@ -16,9 +16,9 @@ when you need that one command from last Tuesday, on the other machine.
 
 ```
   woswoar (global) > docker
-   2m  thinkpad  docker compose up -d --build
-   3h  DT-24YYQ3 docker logs -f api
-   6d  thinkpad  docker system prune -af
+       2m  thinkpad  docker compose up -d --build
+    3h12m  DT-24YYQ3 docker logs -f api
+     6d4h  thinkpad  docker system prune -af
   ctrl-r global → host → session, or ctrl-g/h/s | ctrl-t timeline | ^name one machine
 ```
 
@@ -42,13 +42,13 @@ timeline either side of it, with the cursor still on what you found:
 
 ```
   woswoar (timeline global) >
-   3h  git commit -m wip
-   3h  git add -A
-   4h  cargo test
-   4h  vim src/lib.rs          <- where you were
-   4h  cargo test
-   4h  cargo build
-   4h  cd ~/proj
+    3h41m  git commit -m wip
+    3h44m  git add -A
+    3h58m  cargo test
+     4h2m  vim src/lib.rs          <- where you were
+    4h15m  cargo test
+    4h15m  cargo build
+    4h17m  cd ~/proj
 ```
 
 Newest first, like every other list here. Scroll up into what came next, down
