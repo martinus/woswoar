@@ -74,7 +74,9 @@ class TestRelativeTime(unittest.TestCase):
             86400 * 365 * 200,
         ]:
             with self.subTest(delta=delta):
-                self.assertLessEqual(len(search.relative_time(NOW - delta, NOW)), search._TIME_WIDTH)
+                self.assertLessEqual(
+                    len(search.relative_time(NOW - delta, NOW)), search._TIME_WIDTH
+                )
 
     def test_clock_skew_from_another_machine_is_tolerated(self) -> None:
         self.assertEqual(search.relative_time(NOW + 500, NOW), "now")
