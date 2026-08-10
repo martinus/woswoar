@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import os
+import pty
+import select
 import shutil
+import signal
+import struct
 import tempfile
+import termios
+import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Sequence
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from typing import NamedTuple
 
@@ -72,6 +80,120 @@ def run_cli(*argv: str, tty: bool = False) -> Ran:
     with redirect_stdout(out), redirect_stderr(err):
         code = main(list(argv))
     return Ran(code, out.getvalue(), err.getvalue())
+
+
+class Typed(NamedTuple):
+    """One exchange with a program running under a terminal.
+
+    ``send`` is typed at it verbatim -- control characters included, so a
+    keypress is just ``"\\x12"`` -- and then output is read until ``until``
+    shows up. Reading to a marker rather than for a fixed time is what keeps
+    this from being a sleep race: a step that never produces its marker fails
+    with the whole transcript rather than passing on an empty read.
+
+    ``until`` must be a string the program *prints*, not one the harness typed:
+    a terminal echoes what you type back at you, so waiting for your own input
+    is satisfied instantly and asserts nothing. `CLAUDE.md` rule 3, fourth
+    bullet. The trick used here and in the tests is `echo MAR''KER` -- typed
+    with the quotes, printed without.
+    """
+
+    send: str
+    until: str
+
+
+def run_in_pty(
+    argv: Sequence[str],
+    steps: Sequence[Typed],
+    *,
+    env: dict[str, str],
+    size: tuple[int, int] = (40, 120),
+    timeout: float = 30.0,
+) -> list[str]:
+    """Drive ``argv`` under a real pseudo-terminal, one exchange at a time.
+
+    Returns what the program wrote during each step, in order, so a test can
+    assert about the state of the screen *between* two keypresses -- which is
+    where "the recalled command is sitting on the prompt and has not run" lives.
+    ``timeout`` is per step, not for the run.
+
+    A pty rather than pipes because the things worth testing about a shell only
+    exist when it has a terminal: readline does no line editing without one, and
+    the Ctrl-R widget reads its picker's input from `/dev/tty`, which a pipe
+    cannot provide. `pty.fork` rather than `pty.openpty` plus `Popen` because it
+    also makes the slave the child's *controlling* terminal, and a GitHub runner
+    has none to inherit.
+
+    The window size is set explicitly and before the exec, because a pty starts
+    at 0x0 and a program that believes it has no room draws almost nothing --
+    fzf, which #152 will drive through here, renders into three lines. Readline
+    covers for it by falling back to 80x24, so no test that only runs bash could
+    notice this going missing; `TestThePtyHarness` asserts it directly instead.
+    """
+    rows, cols = size
+    pid, master = pty.fork()
+    if pid == 0:  # pragma: no cover - the child execs or dies
+        # Nothing here may raise back into the test process: after the fork
+        # there are two of those, and the second one continuing to run the suite
+        # would be a mess to even diagnose.
+        try:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            os.execvpe(argv[0], list(argv), env)
+        except BaseException:
+            pass
+        os._exit(127)
+
+    transcript: list[str] = []
+    try:
+        for index, step in enumerate(steps):
+            if step.send:
+                os.write(master, step.send.encode())
+            transcript.append(_read_until(master, step.until, timeout, index, transcript))
+        return transcript
+    finally:
+        os.close(master)
+        # SIGKILL, not SIGTERM: an interactive bash ignores SIGTERM, and a test
+        # that leaves one running holds a worker of the parallel runner forever.
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+
+
+def _read_until(fd: int, marker: str, timeout: float, index: int, before: list[str]) -> str:
+    """Read from ``fd`` until ``marker`` appears, or fail with what did appear.
+
+    An `AssertionError` rather than a `TimeoutError`, and carrying every step's
+    output rather than this one's: a terminal test that goes wrong says nothing
+    about *why* from its exception alone, and the answer is almost always
+    several steps back -- a prompt that never came, a shell that died at the
+    line before.
+    """
+    deadline = time.monotonic() + timeout
+    buffer = b""
+    needle = marker.encode()
+
+    def stalled(reason: str) -> AssertionError:
+        seen = [*before, buffer.decode("utf-8", "replace")]
+        return AssertionError(
+            f"step {index} waited for {marker!r} and {reason}. Transcript:\n" + "\n---\n".join(seen)
+        )
+
+    while needle not in buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise stalled("timed out")
+        if not select.select([fd], [], [], remaining)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            # EIO on Linux is how a pty reports that the child is gone; it is an
+            # ordinary end of stream here, not a fault of its own.
+            chunk = b""
+        if not chunk:
+            raise stalled("the program exited")
+        buffer += chunk
+    return buffer.decode("utf-8", "replace")
 
 
 def loose_paths() -> list[str]:
