@@ -45,18 +45,44 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: install age and fzf
-        # Sync tests skip themselves without age, the ranking tests without
-        # fzf, and a silently skipped suite looks exactly like a passing one.
-        # One apt-get for both: the round trip is what costs, not the packages.
+      - name: install age
+        # Sync tests skip themselves without age, and a silently skipped suite
+        # looks exactly like a passing one.
         #
         # `update` only when the direct install misses: refreshing the lists
         # costs ~10s and the runner image usually already has what age needs,
         # which on the critical path is most of the job. The fallback keeps it
         # correct on an image where that stops being true.
         run: |
-          sudo apt-get install -y -qq age fzf \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq age fzf; }
+          sudo apt-get install -y -qq age \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
+      - name: install fzf
+        # **Not apt.** ubuntu-latest ships fzf 0.44.1, which is one release
+        # below `search.TRANSFORM_SINCE` -- so on the runner woswoar correctly
+        # withholds ctrl-r cycling, the ctrl-t timeline and the ctrl-/ pane, and
+        # every test whose subject is one of those has nothing to drive. They
+        # cannot skip themselves out of it either: the `--no-skips` step below
+        # makes a skipped `test_search` fatal, deliberately.
+        #
+        # Pinned rather than "latest", so a release upstream cannot turn a green
+        # branch red overnight. Bumping it is a normal change; the floor that
+        # must hold is `search.TRANSFORM_SINCE`, asserted here so a wrong or
+        # silently-downgraded install fails loudly instead of skipping.
+        env:
+          FZF_VERSION: 0.74.2
+        run: |
+          curl -fsSL -o /tmp/fzf.tar.gz \
+            "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/fzf.tar.gz -C /usr/local/bin fzf
+          fzf --version
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from woswoar import search
+          got = search.fzf_version()[1]
+          floor = search.TRANSFORM_SINCE
+          assert got is not None and got >= floor, f'fzf {got} is below {floor}'
+          "
       - name: ssh-keygen is present
         # Signing needs it. Present on ubuntu-latest, asserted rather than
         # assumed for the same reason as bash below: a silently skipped suite

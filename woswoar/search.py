@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from operator import itemgetter
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from typing import IO
@@ -38,6 +38,11 @@ SCOPES: tuple[Scope, ...] = ("global", "host", "session", "dir")
 #: which breaks the shape of the other three.
 KEYS: dict[Scope, str] = {"global": "g", "host": "h", "session": "s", "dir": "o"}
 
+#: The key that shows the preview. fzf's own convention -- `man fzf` binds
+#: `ctrl-/` in its `change-preview-window` example -- and what it displaces is
+#: `toggle-wrap-word`, which is the thing here worth losing.
+PREVIEW_KEY = "ctrl-/"
+
 #: Every display line is ``"<7-char relative time><2 spaces><escaped command>"``.
 #: The prefix is a fixed width so recovering the command from what fzf prints
 #: back is an exact slice rather than a parse. Seven fits the widest age
@@ -50,8 +55,22 @@ _PREFIX = _TIME_WIDTH + 2
 #: Sort key for a row. In C, rather than a lambda.
 _STAMP = itemgetter(0)
 
-#: One display row: when, what, how it ended, and which machine ran it.
-Row = tuple[int, str, str, str]
+#: One row: when, what, how it ended, and which machine ran it -- and, when the
+#: preview pane asked for them, the three recorded fields there is no screen
+#: width for, appended after those four.
+#:
+#: Loosely typed because the length varies with the caller, and there is no way
+#: to say better on this floor: the shape is
+#: ``tuple[int, str, str, str, Unpack[tuple[str, ...]]]``, and `typing.Unpack` is
+#: 3.11, where `pyproject` says 3.10 and the dependency list is empty on purpose.
+#:
+#: So the invariant is prose and a test rather than a type: the first four never
+#: move, because the sort reads ``[0]``, the dedup reads ``[1]`` and
+#: `render_rows` unpacks all four. `test_show_reports_the_row_the_list_shows`
+#: pins it by asking both sides about every index of a list built from all seven,
+#: with a distinct value per field, so a swapped pair shows up as a wrong answer
+#: rather than a short list.
+Row = tuple[Any, ...]
 
 #: Plain red rather than the dim red this started as. Dim was the right choice
 #: while the whole line carried it -- a screen of dim red is legible where a
@@ -289,20 +308,29 @@ def _under(cwds: list[str], keys: tuple[str, ...]) -> list[int]:
     return [index for index, value in enumerate(cwds) if value in keys or value.startswith(below)]
 
 
-#: The four parallel columns a display line is built from.
-Columns = tuple[list[str], list[str], list[str], list[str]]
+#: The parallel columns a display line is built from -- stamps, commands, exit
+#: codes and hosts, plus whatever `Cache.display_columns` was asked to append
+#: after them. Variadic for the same reason `Row` is: the extras ride along
+#: through the sort and the dedup, and only the first four are ever displayed.
+Columns = tuple[list[str], ...]
 
 
-def _columns_for(scope: Scope) -> tuple[cache.Cache, Columns | None]:
+def _columns_for(scope: Scope, extra: bool = False) -> tuple[cache.Cache, Columns | None]:
     """The rows a scope is about, straight out of the cache's columns.
 
     Split out of `lines_for` so a timeline can start from exactly the same set
     -- asking the same question twice and getting different answers is how the
-    anchor `{n}` names would stop meaning what fzf thinks it means.
+    anchor `{n}` names would stop meaning what fzf thinks it means. `detail`
+    takes the same route for the same reason, one step further: it is handed an
+    index into a list another process rendered.
+
+    ``extra`` is passed straight through to the cache, so the preview's three
+    additional columns are narrowed by exactly the same scope logic as the four
+    below them -- rather than being fetched separately and lined up by hope.
     """
     loaded = cache.load_columns()
     if scope == "host":
-        return loaded, loaded.display_columns({store.machine().id})
+        return loaded, loaded.display_columns({store.machine().id}, extra=extra)
     if scope == "session":
         session = os.environ.get("WOSWOAR_SESSION", "")
         if not session:
@@ -312,7 +340,7 @@ def _columns_for(scope: Scope) -> tuple[cache.Cache, Columns | None]:
         # per file, so they are the scopes that cannot be answered by dropping
         # whole files the way `host` is.
         wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
-        return loaded, _gather(loaded.display_columns(), wanted)
+        return loaded, _gather(loaded.display_columns(extra=extra), wanted)
     if scope == "dir":
         # Deliberately every machine, not this one. `~/src/woswoar` on either
         # box is the same project, and asking that across machines is what
@@ -320,19 +348,24 @@ def _columns_for(scope: Scope) -> tuple[cache.Cache, Columns | None]:
         # `host` would remove the only way to ask it. Its failure mode is an
         # extra row with the machine column naming where it came from, against a
         # missing row that looks like a broken feature.
-        return loaded, _gather(loaded.display_columns(), _under(loaded.cwds(), _here()))
-    return loaded, loaded.display_columns()
+        wanted = _under(loaded.cwds(), _here())
+        return loaded, _gather(loaded.display_columns(extra=extra), wanted)
+    return loaded, loaded.display_columns(extra=extra)
 
 
 def _gather(columns: Columns, wanted: list[int]) -> Columns:
-    """The four display columns, narrowed to the rows at ``wanted``."""
-    stamps, commands, codes, hosts = columns
-    return (
-        [stamps[i] for i in wanted],
-        [commands[i] for i in wanted],
-        [codes[i] for i in wanted],
-        [hosts[i] for i in wanted],
-    )
+    """Every column, narrowed to the rows at ``wanted``."""
+    return tuple([column[i] for i in wanted] for column in columns)
+
+
+def _zipped(columns: Columns) -> list[Row]:
+    """The columns as rows, with the timestamp converted once.
+
+    One `int` per row, here, where the sort needs it -- rather than on every
+    entry of a history at parse time.
+    """
+    stamps, *rest = columns
+    return list(zip(map(int, stamps), *rest, strict=True))
 
 
 def _rows_for(columns: Columns, dedup: bool, around: int | None) -> tuple[list[Row], int]:
@@ -342,8 +375,7 @@ def _rows_for(columns: Columns, dedup: bool, around: int | None) -> tuple[list[R
     anchor to sit on -- which is every ordinary list, and also a timeline whose
     anchor has gone.
     """
-    stamps, commands, codes, hosts = columns
-    ranked = rank_rows(stamps, commands, codes, hosts, dedup=dedup)
+    ranked = rank_rows(columns, dedup=dedup)
     if around is None:
         return ranked, 0
     anchor = ranked[around] if 0 <= around < len(ranked) else None
@@ -388,6 +420,134 @@ def lines_for(
     return render_rows(rows, colour=colour, host_width=host_width)
 
 
+def _exit_label(code: str) -> str:
+    """``exit 0``, or what to say when the history never knew.
+
+    A negative code is `importer`'s "never knew": `~/.bash_history` records no
+    exit codes whatsoever, so a literal ``exit -1`` would invent a failure that
+    never happened -- the same misreading that painted a freshly imported
+    history entirely red, one screen further in.
+
+    Parsed rather than compared against the string ``"-1"``, for the reason
+    `is_failure` gives two screens up: the same bug comes back for any other
+    sentinel, and ``-01`` is the same number written differently. An
+    unparseable code is shown as it was stored, because at that point the honest
+    thing is to hand over what the file says.
+    """
+    try:
+        recorded = int(code) >= 0
+    except ValueError:
+        recorded = True
+    return f"exit {code}" if recorded else "exit not recorded"
+
+
+def _duration_label(raw: str) -> str | None:
+    """How long the command took, or ``None`` when nothing was recorded.
+
+    ``None`` rather than "0 ms": an imported history has no durations at all,
+    and a whole column of zeroes is a claim, where an absent line is the truth.
+    Unparseable is treated the same way -- a damaged field should cost this one
+    line, never the block.
+
+    At most two units, and no more precision than anyone reads off a pane they
+    opened to see where a command ran: ``87 ms``, ``1.2 s``, ``2m 3s``, ``1h 2m``.
+    """
+    try:
+        ms = int(raw)
+    except ValueError:
+        return None
+    if ms < 0:
+        return None
+    if ms < 1000:
+        return f"{ms} ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f} s"
+    minutes, seconds = divmod(ms // 1000, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _block(row: Row, now: int | None = None) -> str:
+    """The three unseen fields, plus the two the line already shows, as a block.
+
+    Nothing here neutralises anything, and that is deliberate rather than an
+    omission: every field comes out of the cache, which is the one door a peer's
+    history enters through and which applies `make_inert` on the way in --
+    `session` included, since this is what gave it a display site. `host` is the
+    exception, because it is not stored with the row at all: the name is a file
+    a peer wrote, so it goes through `host_label`.
+
+    `host_label` and not `host_labels`, which is what the display line uses.
+    The pane names one machine and has no column to fit, so it shows the whole
+    `user@host` where the line shows the abbreviation that keeps two machines
+    apart -- more, not different, and there is no host *set* here to compute the
+    abbreviation from anyway.
+
+    The command is printed as it was recorded rather than `escape`d, because
+    this is the one place with room to show it whole: the picker's line is
+    clipped at the window edge, and `--preview-window=wrap` is not.
+    """
+    ts, cmd, code, host, cwd, duration, session = row
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    age = relative_time(ts, now)
+    # "now" is what `relative_time` says for a stamp in the future, which is
+    # another machine's clock running ahead. "(now ago)" would be nonsense.
+    head = f"{when}  ({age})" if age == "now" else f"{when}  ({age} ago)"
+
+    where = [host_label(host)]
+    if session:
+        where.append(f"session {session}")
+    status = [_exit_label(code)]
+    took = _duration_label(duration)
+    if took:
+        status.append(took)
+
+    return "\n".join(
+        [
+            head,
+            " · ".join(where),
+            # An imported line has no directory at all, so the line says so
+            # rather than vanishing: a block that is four lines here and three
+            # there reads as a bug in the preview, not as a fact about the row.
+            cwd or "directory not recorded",
+            " · ".join(status),
+            "",
+            cmd,
+        ]
+    )
+
+
+def detail(
+    index: int,
+    scope: Scope,
+    dedup: bool = True,
+    around: int | None = None,
+) -> str | None:
+    """The preview block for one row of what `lines_for` would print, or ``None``.
+
+    ``index`` is fzf's `{n}`, so this has to reproduce the very list the picker
+    is showing -- which is why it takes the same `scope`, `dedup` and `around`
+    the reload that filled it was given. Get `around` wrong and the preview
+    describes a different command from the highlighted one, confidently and with
+    nothing on screen to contradict it; that is the whole hazard of this feature
+    and it is why the timeline's binding repoints the preview as well as the
+    list.
+
+    ``None`` for an index that is not there, which is the same race
+    `_window_around` guards: a background sync can merge new commands between
+    the picker opening and the cursor moving.
+    """
+    _, columns = _columns_for(scope, extra=True)
+    if columns is None:
+        return None
+    rows, _ = _rows_for(columns, dedup=dedup, around=around)
+    if not 0 <= index < len(rows):
+        return None
+    return _block(rows[index])
+
+
 #: How many commands a timeline shows either side of the one it is centred on.
 #: A screenful each way: enough that the thing you were looking for is usually
 #: already on it, few enough that the picker still opens instantly.
@@ -415,11 +575,7 @@ def _window_around(anchor: Row | None, columns: Columns) -> tuple[list[Row], int
     """
     if anchor is None:
         return [], 0
-    stamps, commands, codes, hosts = columns
-    chronological = sorted(
-        zip((int(s) for s in stamps), commands, codes, hosts, strict=True),
-        key=_STAMP,
-    )
+    chronological = sorted(_zipped(columns), key=_STAMP)
     try:
         # By identity of the whole row, not by timestamp: two machines can
         # record in the same second, and `sorted` is stable but not meaningful
@@ -450,26 +606,20 @@ def anchor_position(index: int, scope: Scope, dedup: bool = True) -> int:
     return _rows_for(columns, dedup=dedup, around=index)[1]
 
 
-def rank_rows(
-    stamps: list[str],
-    commands: list[str],
-    codes: list[str],
-    hosts: list[str],
-    dedup: bool = True,
-) -> list[Row]:
+def rank_rows(columns: Columns, dedup: bool = True) -> list[Row]:
     """Newest first, optionally collapsing repeats.
 
-    The exit status and the host ride along so the display can colour by one and
-    label by the other. Deduplication
+    Takes the whole `Columns` tuple rather than four named lists, so the
+    preview's extras are ranked by the *same* function and cannot be ordered
+    differently from what the picker shows -- and so that this reads like its
+    neighbours `_gather`, `_zipped` and `_window_around`, which all take one.
+    The exit status and the host ride along so the
+    display can colour by one and label by the other. Deduplication
     keeps the *most recent* run, so a command that failed last time is shown as
     failed even if it has succeeded a hundred times before -- which is the way
     round that helps.
     """
-    # One `int` per row, here, where the sort needs it -- rather than on every
-    # entry of a history at parse time.
-    ordered = sorted(
-        zip(map(int, stamps), commands, codes, hosts, strict=True), key=_STAMP, reverse=True
-    )
+    ordered = sorted(_zipped(columns), key=_STAMP, reverse=True)
     if not dedup:
         return ordered
 
@@ -510,6 +660,11 @@ def render_rows(
     labels = host_labels({row[3] for row in rows}) if host_width else {}
 
     out = []
+    # Unpacked, not sliced, even though a `Row` can be seven fields wide: the
+    # wide ones are built by `detail` and go to `_block`, and nothing routes
+    # them here -- `lines_for` is the only caller and it asks `_columns_for` for
+    # four. A `[:4]` that tolerated them would be a guard against a call that
+    # does not exist, and would read as if one did.
     for ts, cmd, code, host in rows:
         when = f"{relative_time(ts, now):>{_TIME_WIDTH}}"
         if colour and is_failure(code):
@@ -585,6 +740,19 @@ def fzf_version() -> tuple[str, tuple[int, int] | None]:
         return out, None
 
 
+#: What an fzf below `TRANSFORM_SINCE` silently does not get. One list, because
+#: `_fzf_argv` withholds them and `doctor` has to name them, and the way those
+#: two part company is a machine being told it is missing two keys while three
+#: are gone -- which is exactly what happened when the preview joined the gate.
+#: Written as phrases rather than key names because `doctor` reads them out in a
+#: sentence and that is the only place they are rendered.
+GATED_KEYS: tuple[str, ...] = (
+    "ctrl-r cycling",
+    "the ctrl-t timeline",
+    f"the {PREVIEW_KEY} details pane",
+)
+
+
 def fzf_supports_transform() -> bool:
     """Whether this fzf has the `transform` action, added in 0.45.
 
@@ -597,7 +765,7 @@ def fzf_supports_transform() -> bool:
     return parsed is not None and parsed >= TRANSFORM_SINCE
 
 
-def _scope_case(var: str, answer: dict[Scope, Scope]) -> str:
+def _scope_case(var: str, answer: dict[Scope, Scope], fallback: str = SCOPES[0]) -> str:
     """An ``sh`` ``case`` that reads the current scope out of fzf's prompt.
 
     fzf holds no variables, so both keys that need to know the scope read it
@@ -609,8 +777,13 @@ def _scope_case(var: str, answer: dict[Scope, Scope]) -> str:
     would have said so -- an arm that is missing looks exactly like an arm whose
     answer happens to be the default.
 
-    The catch-all stays `SCOPES[0]`, which is what an unset or unrecognised
-    prompt should degrade to.
+    The catch-all is `SCOPES[0]` for the two keys that *reload*: an unset or
+    unrecognised prompt then shows the global list, which is a list you can see
+    and whose prompt says what it is. The preview passes ``fallback=""`` instead,
+    because there the same guess is unfalsifiable -- a block describing the wrong
+    row looks exactly like a block describing the right one. `FZF_PROMPT` is
+    read here on the assumption that fzf exports it, and no version is known to
+    hang that on, so the failure has to be the visible kind.
 
     **The prompt these read must stay exactly `woswoar (<scope>) `.** The
     patterns are substring matches over the whole of it, so a prompt naming the
@@ -620,7 +793,7 @@ def _scope_case(var: str, answer: dict[Scope, Scope]) -> str:
     is written down here and pinned by a test.
     """
     arms = "".join(f"*{scope}*) {var}={answer[scope]} ;; " for scope in SCOPES)
-    return f'case "$FZF_PROMPT" in {arms}*) {var}={SCOPES[0]} ;; esac; '
+    return f'case "$FZF_PROMPT" in {arms}*) {var}={fallback} ;; esac; '
 
 
 #: Where each scope goes when Ctrl-R is pressed: on to the next, and round.
@@ -631,15 +804,148 @@ _NEXT: dict[Scope, Scope] = {
 }
 
 
+#: Hidden until asked for, and that is not a default worth revisiting: the
+#: preview forks an interpreter and reads the whole cache on every cursor move.
+#: Measured on the 52,000-command history in `tests/test_perf.py`, one render is
+#: **79 ms** against 85 ms for the whole of `woswoar list` -- it skips the render
+#: of 23,000 lines and pays for everything else, and neither term is
+#: optimisable here: one is process startup and the other is reading a 5 MB
+#: cache. That is paid *per row the cursor passes over*. fzf coalesces to the
+#: latest request, so an always-on pane degrades to visible lag under a held
+#: arrow key rather than to a queue -- but a user who never presses
+#: `PREVIEW_KEY` should pay nothing at all, and hidden is how they do.
+#:
+#: `wrap` because this is the one place with room to show a long command whole;
+#: the picker's own line is clipped at the window edge.
+PREVIEW_WINDOW = "--preview-window=hidden,down,45%,border-top,wrap"
+
+#: What the preview says when it could not tell which list it is looking at.
+#: See `_scope_case`: the alternative is a confidently wrong record.
+PREVIEW_UNKNOWN = "preview needs a newer fzf"
+
+#: fzf substitutes every `{...}` in the command it is about to run, and a
+#: `transform` *is* such a command -- so a `{n}` that is meant for the preview
+#: the transform prints has to survive that pass. `man fzf`: "you can escape a
+#: placeholder pattern by prepending a backslash". The backslash is consumed
+#: there, a bare `{n}` reaches `change-preview`, and it stays a live template
+#: that fzf re-expands on every cursor move.
+#:
+#: Measured against fzf 0.73.1 rather than taken from the manual, which
+#: documents the escape but not what becomes of it inside a transform's output:
+#: `TestThePreviewUnderARealFzf` drives a real picker through a pty and watches
+#: the pane renumber itself as the cursor moves.
+_ESCAPED_N = r"\{n}"
+
+#: Read the scope back and answer with itself. `_NEXT`'s counterpart, named for
+#: the same reason: the two callers that want "whatever is on screen, unchanged"
+#: were spelling the dict inline.
+_SAME: dict[Scope, Scope] = {scope: scope for scope in SCOPES}
+
+
+def _preview_command(
+    self_cmd: str, scope: str, dedup_flag: str, row: str = "{n}", around: str = ""
+) -> str:
+    """The command that renders one row's block into the preview pane.
+
+    ``scope`` is a literal for the four per-scope key binds, which know it up
+    front, and a shell variable `_scope_case` set for the three that cannot --
+    the `--preview` the picker opens with, and the two `transform` keys, all of
+    which have to keep meaning the right thing after a switch they did not make.
+    It arrives quoted (``"$s"``) for the first of those, because that one is a
+    bare command line where the shell would word-split an empty value; inside
+    the two `printf`s it is already inside quotes.
+
+    ``row`` is fzf's index of the highlighted item and is left as a template on
+    purpose; see `_ESCAPED_N` for the callers that have to spell it differently.
+
+    ``around`` is what makes the preview agree with a timeline. It is the same
+    flag `lines_for` takes, and for the same reason: under a timeline the list
+    fzf holds is a *window*, so `row` indexes that window and resolving it
+    against the ranked list would describe some entirely unrelated command.
+    """
+    return f"{self_cmd} list --show {row} --scope {scope}{dedup_flag}{around}"
+
+
+def _preview_binding(self_cmd: str, dedup_flag: str) -> str:
+    """The pane showing what the display line has no width for.
+
+    `cwd`, `duration_ms` and `session` are recorded, encrypted, synced and
+    cached, and until this there was no way for anyone to read them back. They
+    do not fit on the line -- it is a fixed-width prefix that `command_from_line`
+    slices rather than parses -- and a pane costs no width at all, because it
+    only ever describes the one row under the cursor.
+    """
+    show = _preview_command(self_cmd, '"$s"', dedup_flag)
+    script = (
+        _scope_case("s", _SAME, fallback="")
+        + f'if [ -n "$s" ]; then {show}; else printf "%s\\n" "{PREVIEW_UNKNOWN}"; fi'
+    )
+    return f"--preview={script}"
+
+
+def _list_command(self_cmd: str, scope: str, dedup_flag: str, width: str, around: str = "") -> str:
+    """The `woswoar list` the picker reloads itself from.
+
+    One spelling, because both sides of the picker have to lay a line out
+    identically: `command_from_line` slices at a fixed width decided when it
+    opened, so a binding that reloaded without `--colour` or with a different
+    `--host-width` would cut somebody's recalled command in the wrong place.
+    Three bindings and one key loop write this, and `--host-width` was already
+    once a flag that had to be added to each of them by hand.
+    """
+    return f"{self_cmd} list --colour{width} --scope {scope}{dedup_flag}{around}"
+
+
+def _switch_to(
+    self_cmd: str,
+    scope: str,
+    dedup_flag: str,
+    width: str,
+    row: str = "{n}",
+    preview: bool = True,
+) -> str:
+    """Every action a key needs to move the picker to one scope, in one string.
+
+    The list, the prompt and the preview are three statements of a single fact,
+    and the prompt is not decoration: `_scope_case` reads the scope back *out*
+    of it, so a key that repainted only two of the three would leave the next
+    keypress reading a scope the screen no longer shows. Emitting them together
+    is what stops them disagreeing.
+
+    The preview is included because these keys are also the way *out* of a
+    timeline, whose pane is pinned to one `--around` window; left alone it would
+    keep describing rows of a list that is no longer there -- and describing
+    them plausibly, which is the whole hazard of this feature.
+
+    ``row`` is `_ESCAPED_N` for a caller whose output fzf expands first.
+
+    ``preview`` is False on an fzf that was never offered a pane. Not only
+    because there would be nothing to repoint: `change-preview` arrived in fzf
+    0.31 and `transform` in 0.45, so a version below the gate may not know the
+    *action name* either -- and an unknown action in a `--bind` makes fzf refuse
+    to start, which costs the picker rather than the key.
+    """
+    actions = (
+        f"reload({_list_command(self_cmd, scope, dedup_flag, width)})"
+        f"+change-prompt(woswoar ({scope}) )"
+    )
+    if preview:
+        actions += f"+change-preview({_preview_command(self_cmd, scope, dedup_flag, row=row)})"
+    return actions
+
+
 def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     """Ctrl-R inside the picker moves to the next scope.
 
     The order is `SCOPES`, which is the order the header names them in.
+
+    `$n` rather than a literal, and `_ESCAPED_N` rather than `{n}`: this is the
+    same switch the four direct keys make, but composed by a shell fzf runs
+    first, so the scope is a variable and the preview's placeholder has to
+    survive that pass.
     """
-    reload = f"{self_cmd} list --colour{width} --scope"
-    script = (
-        _scope_case("n", _NEXT)
-        + f'printf "reload({reload} $n{dedup_flag})+change-prompt(woswoar ($n) )"'
+    script = _scope_case("n", _NEXT) + (
+        f'printf "{_switch_to(self_cmd, "$n", dedup_flag, width, row=_ESCAPED_N)}"'
     )
     return f"--bind=ctrl-r:transform:{script}"
 
@@ -657,12 +963,13 @@ def _header(host_width: int) -> str:
     Only with a column to filter on. On a single-machine install there is no
     machine name in the line and the hint would describe nothing.
 
-    Ctrl-R and Ctrl-T are listed only where they work: both need `transform`,
-    which is fzf 0.45+, and advertising a key that does nothing is worse than
-    staying quiet about it.
+    Ctrl-R, Ctrl-T and the preview key are listed only where they work: all
+    three ride on `transform`, which is fzf 0.45+, and advertising a key that
+    does nothing is worse than staying quiet about it.
 
     Ordered by how far each takes you from an ordinary search: change what is
-    listed, then change the *kind* of list, then narrow the one you have.
+    listed, then change the *kind* of list, then narrow the one you have, then
+    look harder at the one row you are on.
     """
     if fzf_supports_transform():
         # Naming the scopes in the order Ctrl-R visits them is what lets the
@@ -681,6 +988,10 @@ def _header(host_width: int) -> str:
         hints = [
             "ctrl-r global \u2192 host \u2192 session \u2192 dir, or ctrl-g/h/s, ctrl-o dir",
             "ctrl-t timeline",
+            # Last, because it is the only one that changes nothing about the
+            # list -- and because a key nobody presses costs nothing, which is
+            # the whole reason the pane starts hidden.
+            f"{PREVIEW_KEY} details",
         ]
     else:
         # Neither key exists here, and with no cycle to name the scopes the
@@ -706,14 +1017,24 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     carried into the timeline's own prompt (`woswoar (timeline host)`) so that
     pressing this again recentres without silently changing scope, and so that
     ctrl-g/h/s/o/r still read a scope out of it on the way back out.
+
+    The preview is repointed at the same window in the same breath, and it is
+    the one part of this that is silently wrong if forgotten: fzf would go on
+    running a preview command that resolves `{n}` against the *ranked* list
+    while the screen shows a timeline, so the pane would describe a command
+    forty rows from the highlighted one and look entirely plausible doing it.
     """
-    reload = f"{self_cmd} list --colour{width} --scope"
+    # Not `_switch_to`: every one of its three actions is different here --
+    # `reload-sync` rather than `reload`, a prompt that says `timeline`, and a
+    # preview pinned to this window. What they have in common is only the shape.
+    window = _list_command(self_cmd, "$s", dedup_flag, width, around=" --around {n}")
+    preview = _preview_command(self_cmd, "$s", dedup_flag, row=_ESCAPED_N, around=" --around {n}")
     script = (
-        _scope_case("s", {scope: scope for scope in SCOPES})
+        _scope_case("s", _SAME)
         # One extra invocation, on a keypress rather than on the prompt path:
         # `pos` has to be composed into the same action string as the `reload`
         # it applies to, so it cannot be read out of the reload's own output.
-        + f"p=$({reload} $s{dedup_flag} --around {{n}} --print-anchor); "
+        + f"p=$({window} --print-anchor); "
         # `reload-sync`, not `reload`: a plain reload is asynchronous, so `pos`
         # ran against the list that was still on screen and the cursor was
         # wherever the new one happened to leave it. Reported as "it seems to
@@ -724,8 +1045,9 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
         # down to the same match you started from, which is an empty gesture.
         # Asked for directly: "it should clear the filter, that way it's
         # filtering the timeline".
-        + f'printf "clear-query+reload-sync({reload} $s{dedup_flag} --around {{n}})'
-        '+pos($p)+change-prompt(woswoar (timeline $s) )"'
+        + f'printf "clear-query+reload-sync({window})'
+        f"+pos($p)+change-prompt(woswoar (timeline $s) )"
+        f'+change-preview({preview})"'
     )
     return f"--bind=ctrl-t:transform:{script}"
 
@@ -768,15 +1090,29 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
         f"--prompt=woswoar ({scope}) ",
         f"--header={_header(host_width)}",
     ]
-    if fzf_supports_transform():
+    # Asked once and reused, because it forks `fzf --version`.
+    transform = fzf_supports_transform()
+    if transform:
         argv.append(_cycle_binding(self_cmd, dedup_flag, width))
         argv.append(_timeline_binding(self_cmd, dedup_flag, width))
+        # The preview rides on the same gate, though nothing in it needs
+        # `transform` as such. Two reasons, and the second is the one that
+        # decides it: it reads `$FZF_PROMPT`, which no version is known to have
+        # introduced, so an fzf old enough to lack it would get the fail-closed
+        # message on every row rather than a preview -- and an unknown key name
+        # in a `--bind` makes fzf refuse to start, so offering `ctrl-/` to a
+        # version that predates it costs the picker entirely, not the key.
+        argv.append(_preview_binding(self_cmd, dedup_flag))
+        argv.append(PREVIEW_WINDOW)
+        argv.append(f"--bind={PREVIEW_KEY}:toggle-preview")
     for target in SCOPES:
-        argv.append(
-            f"--bind=ctrl-{KEYS[target]}:reload("
-            f"{self_cmd} list --colour{width} --scope {target}{dedup_flag})"
-            f"+change-prompt(woswoar ({target}) )"
-        )
+        # The same switch the cycle makes, with the scope known up front rather
+        # than read out of the prompt -- and `{n}` unescaped, because this is a
+        # plain action and not a `transform` whose command line fzf expands
+        # first. Without `transform` there is no pane to repoint, so the
+        # `change-preview` is dropped rather than pointed at nothing.
+        actions = _switch_to(self_cmd, target, dedup_flag, width, preview=transform)
+        argv.append(f"--bind=ctrl-{KEYS[target]}:{actions}")
     return argv
 
 

@@ -54,7 +54,12 @@ from .entry import Entry, parse_line
 #: branches on it -- there is no migration code and no need for any -- so the
 #: whole first field is simply compared, and a pickle, an empty file or last
 #: year's shape all fail it alike.
-CACHE_VERSION = 2
+#: 3: `parse_line` began neutralising `session` as well as `cwd` and the
+#: command, and a cache written before that holds a peer's raw bytes for a day
+#: file that may never be appended to again. The shape did not change; what a
+#: field is allowed to contain did, and there is no cheaper way to be sure no
+#: stale copy is still carrying the old answer. One cold rebuild, ~75 ms, once.
+CACHE_VERSION = 3
 _MAGIC = f"woswoar-cache-{CACHE_VERSION}"
 
 #: Field, record and file separators. See the module docstring for why these
@@ -188,8 +193,8 @@ class Cache:
         return stamps, commands
 
     def display_columns(
-        self, hosts: set[str] | None = None
-    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        self, hosts: set[str] | None = None, extra: bool = False
+    ) -> tuple[list[str], ...]:
         """Timestamps, commands, exit codes and host ids, aligned, as strings.
 
         One pass and one place. Each caller used to slice what it happened to
@@ -199,11 +204,26 @@ class Cache:
 
         ``hosts`` narrows to those machines, which costs one dict lookup per
         *file*: the host belongs to the file, not the row.
+
+        ``extra`` appends the three fields that are recorded but have no screen
+        width -- cwd, duration and session -- for the preview pane, which shows
+        one row rather than all of them. Appended rather than slotted in, so
+        every index the picker already uses keeps its meaning; and produced in
+        this same pass rather than by `cwds` and `sessions`, because those walk
+        *every* file and the four above may have been narrowed to one machine.
+        Two columns that disagree about which rows they hold would put another
+        machine's directory under this machine's command, silently.
+
+        Off by default and therefore free: Ctrl-R never asks for it, and the
+        preview is a separate process that has already paid for a cache load.
         """
         stamps: list[str] = []
         commands: list[str] = []
         codes: list[str] = []
         owners: list[str] = []
+        cwds: list[str] = []
+        durations: list[str] = []
+        sessions: list[str] = []
         for relpath, flat in self.files.items():
             host = self.meta[relpath].host
             if hosts is not None and host not in hosts:
@@ -212,11 +232,13 @@ class Cache:
             commands += flat[5::6]
             codes += flat[3::6]
             owners += [host] * (len(flat) // _FIELDS_PER_ENTRY)
+            if extra:
+                cwds += flat[2::6]
+                durations += flat[4::6]
+                sessions += flat[1::6]
+        if extra:
+            return stamps, commands, codes, owners, cwds, durations, sessions
         return stamps, commands, codes, owners
-
-    def exit_codes(self) -> list[str]:
-        """The exit status column, in the same order as `stamps_and_commands`."""
-        return [value for flat in self.files.values() for value in flat[3::6]]
 
     def sessions(self) -> list[str]:
         """The session column, in the same order as `stamps_and_commands`."""
@@ -225,12 +247,19 @@ class Cache:
     def cwds(self) -> list[str]:
         """The working-directory column, in the same order as `stamps_and_commands`.
 
-        Its own accessor rather than a fifth column on `display_columns`, which
-        every scope would then pay for to serve one of them -- 0.4 ms measured
-        over 54,600 rows -- and `cwd` is not a display column. It is comparable
-        exactly as it comes out, which is the other half of why this is cheap:
-        the cache stores what `parse_line(..., inert=True)` produced, so it is
-        already unescaped and already inert.
+        Its own accessor rather than a column `display_columns` always returns,
+        which every scope would then pay for to serve one of them -- 0.4 ms
+        measured over 54,600 rows.
+
+        It answers a different question from that method's ``extra`` copy, and
+        both are needed. This one is the *filter* input, so it must hold every
+        row in file order, from before any scope has narrowed anything; the copy
+        is what the pane displays, and has been narrowed exactly as the row it
+        is shown beside was.
+
+        Comparable exactly as it comes out, which is the other half of why this
+        is cheap: the cache stores what `parse_line(..., inert=True)` produced,
+        so it is already unescaped and already inert.
         """
         return [value for flat in self.files.values() for value in flat[2::6]]
 

@@ -71,6 +71,32 @@ symlink the hook stores the path you typed, and so does the lookup.
 `WOSWOAR_NO_BIND=1` skips the <kbd>Ctrl</kbd>+<kbd>R</kbd> binding entirely if
 you would rather keep another tool's.
 
+### The details pane
+
+Six fields are recorded per command and the list has room for two. Press
+<kbd>Ctrl</kbd>+<kbd>/</kbd> for the rest of the highlighted one:
+
+```
+2026-08-10 14:32:07  (3h12m ago)
+thinkpad · session 6a79f245-36ea53
+~/src/woswoar
+exit 0 · 1.2 s
+
+docker compose up -d --build
+```
+
+It also shows a long command whole, where the list clips it at the window edge.
+
+**It starts hidden, and that is on purpose.** Rendering it forks a fresh
+interpreter and reads the whole cache — **79 ms** on a 54,000-command history,
+against 85 ms for the entire list — and that is paid again for every row the
+cursor passes over. Visible by default it is felt as lag under a held arrow key;
+hidden, it costs nothing at all until you ask.
+
+It needs fzf 0.45+, like <kbd>Ctrl</kbd>+<kbd>R</kbd> cycling and
+<kbd>Ctrl</kbd>+<kbd>T</kbd>. On anything older the key is neither bound nor
+advertised.
+
 ## Commands that are never recorded
 
 Anything bash itself keeps out of history is invisible to woswoar, so
@@ -190,6 +216,7 @@ Measured on a real **54,943-entry** history across ~750 daily files:
 | decide whether a sync is due | **~5 µs**, 0 forks |
 | start a background sync | once per `WOSWOAR_SYNC_INTERVAL`, 2 forks, no wait |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
+| one <kbd>Ctrl</kbd>+<kbd>/</kbd> details pane, per row | **~79 ms**, and only while it is open |
 
 No index, no SQLite — a parse cache that only re-reads what changed is enough,
 and CI re-measures it on every push.

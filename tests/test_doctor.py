@@ -270,10 +270,18 @@ class TestDoctorReportsWhatFzfCanDo(WoswoarTestCase):
         self.assertNotIn("need", line, "a capable fzf was told what it is missing")
 
     def test_an_old_fzf_is_told_exactly_what_it_is_missing(self) -> None:
+        """Every key the gate withholds, spelled here by hand rather than read
+        out of `search.GATED_KEYS` -- a test that built the sentence the way the
+        code does would agree with it about a missing key. The count is asserted
+        against that tuple instead, so a fourth gated key fails here until
+        someone decides whether this line should name it."""
+        from woswoar import search
+
         line = self.fzf_line("0.44.1 (debian)", (0, 44))
         self.assertIn("0.44.1", line)
-        for named in ("ctrl-r", "ctrl-t", "0.45+"):
+        for named in ("ctrl-r", "ctrl-t", "ctrl-/", "0.45+"):
             self.assertIn(named, line, f"{named} is not mentioned")
+        self.assertEqual(len(search.GATED_KEYS), 3, "a gated key with nothing saying so")
 
     def test_an_old_fzf_is_not_reported_as_a_failure(self) -> None:
         """Search works perfectly there. A red cross would say the machine is

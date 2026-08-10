@@ -59,9 +59,19 @@ jobs:
         # tool is missing. CI installs both, this installed only age, and the
         # two therefore ran different code. That difference is what failed a
         # release after every check on the pull request was green.
+        #
+        # fzf comes from upstream rather than apt, for the reason `ci.yml`
+        # spells out: ubuntu-latest ships 0.44.1, one release below
+        # `search.TRANSFORM_SINCE`, and the tests that drive a real picker have
+        # nothing to drive on it. Keep the pin here in step with that one.
+        env:
+          FZF_VERSION: 0.74.2
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq age fzf
+          sudo apt-get update -qq && sudo apt-get install -y -qq age
           age --version
+          curl -fsSL -o /tmp/fzf.tar.gz \
+            "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/fzf.tar.gz -C /usr/local/bin fzf
           fzf --version
 
       - name: tests
