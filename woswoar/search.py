@@ -18,10 +18,25 @@ if TYPE_CHECKING:
     from typing import IO
 
 from . import cache, store
-from .entry import escape, make_inert, unescape
+from .entry import escape, home_relative, make_inert, unescape
 
-Scope = Literal["global", "host", "session"]
-SCOPES: tuple[Scope, ...] = ("global", "host", "session")
+Scope = Literal["global", "host", "session", "dir"]
+#: The order Ctrl-R visits them in, and the order the header names them. `dir`
+#: is appended rather than slotted in "by narrowing": inserting it would change
+#: what an existing user's second press does, and muscle memory is a format in
+#: the sense CLAUDE.md rule 8 means.
+SCOPES: tuple[Scope, ...] = ("global", "host", "session", "dir")
+
+#: The key that jumps straight to each scope, without the `ctrl-` prefix. One
+#: table, because the picker's `--bind` and the header that advertises it are
+#: otherwise two hand-written copies of the same fact -- and the way that fails
+#: is a header naming a key nothing binds, which nothing but a reader notices.
+#:
+#: `g`, `h` and `s` are the initials of their scopes; `o` is not, and is chosen
+#: because fzf binds nothing to `ctrl-o`. `ctrl-d` is its `delete-char/eof` and
+#: *aborts the picker* on an empty query; `alt-d` is `kill-word` and is two keys,
+#: which breaks the shape of the other three.
+KEYS: dict[Scope, str] = {"global": "g", "host": "h", "session": "s", "dir": "o"}
 
 #: Every display line is ``"<7-char relative time><2 spaces><escaped command>"``.
 #: The prefix is a fixed width so recovering the command from what fzf prints
@@ -175,6 +190,105 @@ def command_from_line(line: str, host_width: int = 0) -> str:
     return make_inert(unescape(line[_PREFIX + (host_width + 2 if host_width else 0) :]))
 
 
+def _same_directory(path: str) -> bool:
+    """Whether ``path`` names the directory this process is actually in."""
+    try:
+        return os.path.samefile(path, ".")
+    except OSError:
+        return False
+
+
+def _here() -> tuple[str, ...]:
+    """The current directory, in every form a recorded ``cwd`` might take.
+
+    Both forms, always. The tilde form is what the hook writes and what the
+    importer stores for this machine's own rows; the absolute form is what the
+    importer deliberately leaves alone for a *peer's* rows, because another
+    machine's home directory is a guess. So a history imported from two atuin
+    hosts holds ``~/src/x`` for one and ``/home/you/src/x`` for the other, and a
+    single key would silently miss half of it -- in exactly the multi-machine
+    case woswoar exists for.
+
+    `$PWD` before `os.getcwd()`, because they are different answers after a `cd`
+    through a symlink: `$PWD` is the logical path you typed, `getcwd` resolves
+    it. The hook records `$PWD`, so anything else here makes every command run
+    in a symlinked directory invisible to this scope. But `$PWD` is inherited
+    and so is whatever the parent process left there: it is believed only when
+    it is absolute *and* `stat` says it is the same directory as `.`.
+
+    Made inert because the cached `cwd` was: a directory whose name carries a
+    control byte is stored with that byte removed, and a key still carrying it
+    would never match anything.
+    """
+    try:
+        physical = os.getcwd()
+    except OSError:
+        # The directory was removed out from under this process, so there is no
+        # `.` left to check `$PWD` against and no resolved path to fall back to.
+        # `rm -rf` of the directory you are standing in, then Ctrl-R, is not
+        # exotic; a traceback there would be.
+        physical = ""
+
+    logical = os.environ.get("PWD", "")
+    trusted = os.path.isabs(logical) and (not physical or _same_directory(logical))
+    path = logical if trusted else physical
+    if not path:
+        return ()
+
+    home = os.environ.get("HOME", "")
+    tilde = make_inert(home_relative(path, home))
+    absolute = make_inert(path)
+    # Standing anywhere outside home makes the two spellings the same string,
+    # and one key is then all there is to look for. Tilde first either way:
+    # that is the one `_here_label` shows a person.
+    return (tilde,) if tilde == absolute else (tilde, absolute)
+
+
+def _here_label() -> str:
+    """How to name the current directory to a person -- as a record would spell it."""
+    keys = _here()
+    return keys[0] if keys else "this directory"
+
+
+def empty_note(scope: Scope) -> str | None:
+    """What to tell someone whose scope matched nothing, if anything.
+
+    `dir` alone. An empty `global` is a machine that has recorded nothing and
+    explains itself; an empty `dir` is indistinguishable from a broken feature,
+    and the one fact that separates them is *which* directory was searched --
+    which is exactly what the `$PWD` rule in `_here` can get wrong.
+
+    Here rather than in `__main__` because which scope owes an explanation is a
+    property of the scopes, and this module already owns the prose on this path:
+    `interactive` prints the missing-fzf report and what to run instead. What
+    stays with the caller is the part that is genuinely its own -- whether
+    anyone is looking at a terminal.
+    """
+    if scope != "dir":
+        return None
+    return f"woswoar: no commands recorded in {_here_label()} or below"
+
+
+def _under(cwds: list[str], keys: tuple[str, ...]) -> list[int]:
+    """Which rows were recorded in one of ``keys`` or below it.
+
+    Equal to a key, or below it *across a separator* -- never a bare prefix
+    test. That is the `/home/martinuscopy` trap `entry.home_relative` already
+    solves, one directory further down: without the `/`, standing in
+    `~/src/foo` also matches everything in `~/src/foobar`.
+    """
+    if "/" in keys:
+        # The root is every recorded directory, including the `~` ones -- which
+        # do not start with `/` at all, so the anchored test below would match
+        # none of them, and the prefix it built would be `//`.
+        return list(range(len(cwds)))
+    # A tuple of prefixes rather than `any(... for key in keys)`, because the
+    # generator is re-entered per row: 10.9 ms against 2.6 ms over 54,600 rows.
+    # `str.startswith` takes the tuple and does the loop in C.
+    below = tuple(f"{key}/" for key in keys)
+    return [index for index, value in enumerate(cwds) if value in keys or value.startswith(below)]
+
+
 #: The four parallel columns a display line is built from.
 Columns = tuple[list[str], list[str], list[str], list[str]]
 
@@ -194,17 +308,31 @@ def _columns_for(scope: Scope) -> tuple[cache.Cache, Columns | None]:
         if not session:
             # Not an error: this is what a shell without the hook loaded looks like.
             return loaded, None
-        stamps, commands, codes, hosts = loaded.display_columns()
-        # The one column that is per entry rather than per file, so it is the
-        # one scope that cannot be answered by dropping whole files.
+        # `session` and `dir` are the two columns that are per entry rather than
+        # per file, so they are the scopes that cannot be answered by dropping
+        # whole files the way `host` is.
         wanted = [i for i, value in enumerate(loaded.sessions()) if value == session]
-        return loaded, (
-            [stamps[i] for i in wanted],
-            [commands[i] for i in wanted],
-            [codes[i] for i in wanted],
-            [hosts[i] for i in wanted],
-        )
+        return loaded, _gather(loaded.display_columns(), wanted)
+    if scope == "dir":
+        # Deliberately every machine, not this one. `~/src/woswoar` on either
+        # box is the same project, and asking that across machines is what
+        # woswoar is for; the scopes do not compose, so a `dir` that implied
+        # `host` would remove the only way to ask it. Its failure mode is an
+        # extra row with the machine column naming where it came from, against a
+        # missing row that looks like a broken feature.
+        return loaded, _gather(loaded.display_columns(), _under(loaded.cwds(), _here()))
     return loaded, loaded.display_columns()
+
+
+def _gather(columns: Columns, wanted: list[int]) -> Columns:
+    """The four display columns, narrowed to the rows at ``wanted``."""
+    stamps, commands, codes, hosts = columns
+    return (
+        [stamps[i] for i in wanted],
+        [commands[i] for i in wanted],
+        [codes[i] for i in wanted],
+        [hosts[i] for i in wanted],
+    )
 
 
 def _rows_for(columns: Columns, dedup: bool, around: int | None) -> tuple[list[Row], int]:
@@ -244,9 +372,10 @@ def lines_for(
     displayed, and building namedtuples to hold them was most of what Ctrl-R
     waited for.
 
-    `session` is the exception -- it is per entry, not per file -- so that scope
-    fetches one more column. `host` needs none: it is a property of the file,
-    so the cache filters whole files out before a single row is looked at.
+    `session` and `dir` are the exceptions -- both filter on a column that is
+    per entry rather than per file -- so each fetches one more column of its
+    own. `host` needs none: it is a property of the file, so the cache filters
+    whole files out before a single row is looked at.
     """
     loaded, columns = _columns_for(scope)
     if columns is None:
@@ -468,21 +597,49 @@ def fzf_supports_transform() -> bool:
     return parsed is not None and parsed >= TRANSFORM_SINCE
 
 
+def _scope_case(var: str, answer: dict[Scope, Scope]) -> str:
+    """An ``sh`` ``case`` that reads the current scope out of fzf's prompt.
+
+    fzf holds no variables, so both keys that need to know the scope read it
+    back out of the prompt fzf is already showing -- which is why
+    `change-prompt` is not cosmetic. One emitter for both, because the arms are
+    exactly `SCOPES` and enumerating them by hand is how one goes missing: the
+    cycle's `session` arm was absent and *correct anyway*, falling through the
+    catch-all to `global`, right up until `dir` was appended after it. Nothing
+    would have said so -- an arm that is missing looks exactly like an arm whose
+    answer happens to be the default.
+
+    The catch-all stays `SCOPES[0]`, which is what an unset or unrecognised
+    prompt should degrade to.
+
+    **The prompt these read must stay exactly `woswoar (<scope>) `.** The
+    patterns are substring matches over the whole of it, so a prompt naming the
+    directory -- `woswoar (dir ~/src/session-manager)` -- matches `*session*`
+    first and silently answers with the wrong scope. It costs nothing to put a
+    path in a prompt and there is no error when it goes wrong, which is why it
+    is written down here and pinned by a test.
+    """
+    arms = "".join(f"*{scope}*) {var}={answer[scope]} ;; " for scope in SCOPES)
+    return f'case "$FZF_PROMPT" in {arms}*) {var}={SCOPES[0]} ;; esac; '
+
+
+#: Where each scope goes when Ctrl-R is pressed: on to the next, and round.
+#: Appending to `SCOPES` therefore extends the cycle and changes no existing
+#: step of it.
+_NEXT: dict[Scope, Scope] = {
+    scope: SCOPES[(index + 1) % len(SCOPES)] for index, scope in enumerate(SCOPES)
+}
+
+
 def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     """Ctrl-R inside the picker moves to the next scope.
 
-    fzf holds no variables, so the current scope is read back out of the prompt
-    it is already showing -- which is why `change-prompt` is not cosmetic. The
-    order matches the header: global, host, session, round again.
+    The order is `SCOPES`, which is the order the header names them in.
     """
     reload = f"{self_cmd} list --colour{width} --scope"
     script = (
-        'case "$FZF_PROMPT" in '
-        "*global*) n=host ;; "
-        "*host*) n=session ;; "
-        "*) n=global ;; "
-        "esac; "
-        f'printf "reload({reload} $n{dedup_flag})+change-prompt(woswoar ($n) )"'
+        _scope_case("n", _NEXT)
+        + f'printf "reload({reload} $n{dedup_flag})+change-prompt(woswoar ($n) )"'
     )
     return f"--bind=ctrl-r:transform:{script}"
 
@@ -509,17 +666,29 @@ def _header(host_width: int) -> str:
     """
     if fzf_supports_transform():
         # Naming the scopes in the order Ctrl-R visits them is what lets the
-        # three direct keys collapse into one segment: `g`, `h` and `s` are the
-        # initials of the words right beside them, so spelling each out again
-        # was three quarters of the line saying the same thing twice.
+        # first three direct keys collapse into one segment: `g`, `h` and `s`
+        # are the initials of the words right beside them, so spelling each out
+        # again was three quarters of the line saying the same thing twice.
+        #
+        # `ctrl-o` is the odd one out and so is spelled: `o` is not the initial
+        # of `dir`, and a reader who has to work out which key belongs to which
+        # word has lost more than the four characters this costs. Written by
+        # hand for that reason -- the compaction is editorial, and a fifth scope
+        # may well want a differently shaped sentence rather than another comma.
         #
         # `ctrl-` in full rather than the usual `^r`, because `^` already means
         # something else on this line: `^name` is fzf's anchor, not a key.
-        hints = ["ctrl-r global \u2192 host \u2192 session, or ctrl-g/h/s", "ctrl-t timeline"]
+        hints = [
+            "ctrl-r global \u2192 host \u2192 session \u2192 dir, or ctrl-g/h/s, ctrl-o dir",
+            "ctrl-t timeline",
+        ]
     else:
         # Neither key exists here, and with no cycle to name the scopes the
-        # three that do have to introduce themselves.
-        hints = ["ctrl-g global", "ctrl-h host", "ctrl-s session"]
+        # four that do have to introduce themselves. Derived from `KEYS`, unlike
+        # the sentence above: this one is a plain rendering of the bindings, and
+        # writing it out again is how a header comes to advertise a key that
+        # nothing binds.
+        hints = [f"ctrl-{KEYS[scope]} {scope}" for scope in SCOPES]
     if host_width:
         hints.append("^name one machine")
     return " | ".join(hints)
@@ -532,24 +701,19 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     `woswoar list` just produced -- so the anchor needs nothing added to the
     line and the display format is untouched.
 
-    The scope is read back out of the prompt, exactly as `_cycle_binding` does
-    and for the same reason: fzf holds no variables. It is carried into the
-    timeline's own prompt (`woswoar (timeline host)`) so that pressing this
-    again recentres without silently changing scope, and so that ctrl-g/h/s/r
-    still read a scope out of it on the way back out.
+    The scope is read back out of the prompt by the same emitter the cycle uses,
+    which here answers with the scope it found rather than the next one. It is
+    carried into the timeline's own prompt (`woswoar (timeline host)`) so that
+    pressing this again recentres without silently changing scope, and so that
+    ctrl-g/h/s/o/r still read a scope out of it on the way back out.
     """
     reload = f"{self_cmd} list --colour{width} --scope"
     script = (
-        'case "$FZF_PROMPT" in '
-        "*global*) s=global ;; "
-        "*host*) s=host ;; "
-        "*session*) s=session ;; "
-        "*) s=global ;; "
-        "esac; "
+        _scope_case("s", {scope: scope for scope in SCOPES})
         # One extra invocation, on a keypress rather than on the prompt path:
         # `pos` has to be composed into the same action string as the `reload`
         # it applies to, so it cannot be read out of the reload's own output.
-        f"p=$({reload} $s{dedup_flag} --around {{n}} --print-anchor); "
+        + f"p=$({reload} $s{dedup_flag} --around {{n}} --print-anchor); "
         # `reload-sync`, not `reload`: a plain reload is asynchronous, so `pos`
         # ran against the list that was still on screen and the cursor was
         # wherever the new one happened to leave it. Reported as "it seems to
@@ -560,7 +724,7 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
         # down to the same match you started from, which is an empty gesture.
         # Asked for directly: "it should clear the filter, that way it's
         # filtering the timeline".
-        f'printf "clear-query+reload-sync({reload} $s{dedup_flag} --around {{n}})'
+        + f'printf "clear-query+reload-sync({reload} $s{dedup_flag} --around {{n}})'
         '+pos($p)+change-prompt(woswoar (timeline $s) )"'
     )
     return f"--bind=ctrl-t:transform:{script}"
@@ -607,9 +771,10 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
     if fzf_supports_transform():
         argv.append(_cycle_binding(self_cmd, dedup_flag, width))
         argv.append(_timeline_binding(self_cmd, dedup_flag, width))
-    for key, target in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
+    for target in SCOPES:
         argv.append(
-            f"--bind={key}:reload({self_cmd} list --colour{width} --scope {target}{dedup_flag})"
+            f"--bind=ctrl-{KEYS[target]}:reload("
+            f"{self_cmd} list --colour{width} --scope {target}{dedup_flag})"
             f"+change-prompt(woswoar ({target}) )"
         )
     return argv

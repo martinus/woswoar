@@ -146,6 +146,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     )
     if lines:
         sys.stdout.write("\n".join(lines) + "\n")
+    elif sys.stdout.isatty() and (note := search.empty_note(args.scope)):
+        # Gated on **stdout** being a terminal, not stderr, which is the half of
+        # this decision that belongs here. `woswoar list | wc -l` must stay
+        # clean, and the picker's reload runs this with stdout on a pipe but
+        # stderr still on the terminal -- a note printed there would land in the
+        # middle of fzf's screen. Which scopes have anything to say is
+        # `search`'s business, not the CLI's.
+        print(note, file=sys.stderr)
     return 0
 
 
@@ -1512,8 +1520,12 @@ def build_parser() -> argparse.ArgumentParser:
         What Ctrl-R runs. The chosen command is placed on your prompt for
         editing, never executed.
 
-        Ctrl-G, Ctrl-H and Ctrl-S switch between every machine, this machine,
-        and this shell session, without leaving the picker.
+        Ctrl-G, Ctrl-H, Ctrl-S and Ctrl-O switch between every machine, this
+        machine, this shell session, and this directory and below, without
+        leaving the picker.
+
+        The directory scope spans machines on purpose: ~/src/woswoar on either
+        of your boxes is the same project.
         """,
     )
     add_scope(p_search)
@@ -1525,8 +1537,9 @@ def build_parser() -> argparse.ArgumentParser:
         "print matching lines as plain text",
         """
         Mostly internal: this is what the picker re-runs when you switch scope
-        with Ctrl-G, Ctrl-H or Ctrl-S. It is also how to read your history
-        without fzf installed, and it pipes -- `woswoar list | grep docker`.
+        with Ctrl-G, Ctrl-H, Ctrl-S or Ctrl-O. It is also how to read your
+        history without fzf installed, and it pipes --
+        `woswoar list | grep docker`.
         """,
     )
     add_scope(p_list)

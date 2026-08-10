@@ -65,6 +65,32 @@ class Entry(NamedTuple):
     cmd: str
 
 
+def home_relative(path: str, home: str) -> str:
+    """``path`` written the way a record stores it: ``~/src/woswoar`` under ``home``.
+
+    Anchored, and that is the whole subtlety. ``${PWD/#$HOME/~}`` rewrites
+    ``/home/martinuscopy`` into ``~copy`` when ``$HOME`` is ``/home/martinus``,
+    which is why the hook spells the same rule out in shell rather than using it.
+
+    Three callers have to agree on this string: the hook writes it, the importer
+    applies it to this machine's own rows, and `search`'s ``dir`` scope rebuilds
+    it to compare against. It lives here because this module is what the format
+    means -- and because `search` must not import `importer`, where it used to
+    be: `credentials` documents pulling that module onto the scope-switch path
+    as a measured cost.
+
+    An empty ``home`` leaves the path alone. That is not a guess -- it is a
+    machine whose ``$HOME`` is unset, where every path is honestly absolute.
+    """
+    if not path or not home:
+        return path
+    if path == home:
+        return "~"
+    if path.startswith(f"{home}/"):
+        return "~" + path[len(home) :]
+    return path
+
+
 def escape(value: str) -> str:
     """Make ``value`` safe to store in a tab-separated field.
 

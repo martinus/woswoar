@@ -55,6 +55,18 @@ Switch scope without leaving the picker:
 | <kbd>Ctrl</kbd>+<kbd>G</kbd> | **global** — every machine |
 | <kbd>Ctrl</kbd>+<kbd>H</kbd> | **host** — this machine |
 | <kbd>Ctrl</kbd>+<kbd>S</kbd> | **session** — this shell |
+| <kbd>Ctrl</kbd>+<kbd>O</kbd> | **dir** — this directory and below |
+
+<kbd>Ctrl</kbd>+<kbd>R</kbd> inside the picker walks the same four in that order.
+
+**`dir` spans machines, and that is deliberate.** `~/src/woswoar` on your laptop
+and on your desktop is the same project, and that cross-machine question is the
+one woswoar exists to answer — so the directory scope does *not* also narrow to
+this machine. The machine column names where each row came from. (The scopes do
+not compose, so making `dir` imply `host` would remove the only way to ask it.)
+
+It matches what was *recorded*, which is the logical path: after `cd` through a
+symlink the hook stores the path you typed, and so does the lookup.
 
 `WOSWOAR_NO_BIND=1` skips the <kbd>Ctrl</kbd>+<kbd>R</kbd> binding entirely if
 you would rather keep another tool's.

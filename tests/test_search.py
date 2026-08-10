@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -18,7 +18,7 @@ from woswoar import search, store
 from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
 
-from .support import MACHINE_ID, WoswoarTestCase, requires_fzf
+from .support import MACHINE_ID, Captured, WoswoarTestCase, requires_fzf, run_cli
 
 NOW = 1_800_000_000
 
@@ -134,6 +134,33 @@ class TestRenderRoundTrip(unittest.TestCase):
                 self.assertEqual(search.command_from_line(line), cmd)
 
 
+def recalled(scope: search.Scope) -> list[str]:
+    """Every command a scope shows, as the picker recovers them.
+
+    One width, decided once and used for both halves -- which is the rule
+    `command_from_line` exists to enforce, and the reason this is one function
+    rather than a copy per test class: the picker's reload runs in another
+    process, so a machine arriving in between must not be able to make the two
+    sides disagree and slice somebody's command in the wrong place.
+    """
+    width = search.host_width_for(set(store.host_names()))
+    return [
+        search.command_from_line(line, width) for line in search.lines_for(scope, host_width=width)
+    ]
+
+
+#: Every scope's direct key, spelled as fzf takes it. Hand-written rather than
+#: read out of `search.KEYS`: a test that derived the key the way the code does
+#: would agree with it about a wrong one. Asserted against `search.SCOPES` so a
+#: scope added there without a key fails here.
+SCOPE_KEYS: dict[str, str] = {
+    "global": "ctrl-g",
+    "host": "ctrl-h",
+    "session": "ctrl-s",
+    "dir": "ctrl-o",
+}
+
+
 class TestScope(WoswoarTestCase):
     """Driven through `lines_for`, which is the path Ctrl-R takes.
 
@@ -154,14 +181,7 @@ class TestScope(WoswoarTestCase):
         self.record(2, "mine, other shell", session="elsewhere")
         self.record(3, "another machine", host="ffffffffffffffff", session="remote")
 
-    @staticmethod
-    def commands(scope: search.Scope) -> list[str]:
-        """As the picker does it: one width, decided once, used for both."""
-        width = search.host_width_for(set(store.host_names()))
-        return [
-            search.command_from_line(line, width)
-            for line in search.lines_for(scope, host_width=width)
-        ]
+    commands = staticmethod(recalled)
 
     def test_global_keeps_everything(self) -> None:
         self.assertEqual(len(self.commands("global")), 3)
@@ -187,12 +207,22 @@ class TestFzfArgv(unittest.TestCase):
     def test_scope_keys_reload_the_right_scope(self) -> None:
         argv = search._fzf_argv("global", "", True, 0)
         binds = " ".join(a for a in argv if a.startswith("--bind="))
-        for key, scope in (("ctrl-g", "global"), ("ctrl-h", "host"), ("ctrl-s", "session")):
-            self.assertIn(f"{key}:reload(", binds)
+        self.assertEqual(sorted(SCOPE_KEYS), sorted(search.SCOPES), "a scope with no direct key")
+        for scope in search.SCOPES:
+            self.assertIn(f"{SCOPE_KEYS[scope]}:reload(", binds)
             # `--colour` too: the reload's output goes back into fzf, which was
             # started with `--ansi`, so a scope switch that dropped it would
             # silently stop marking failures.
             self.assertIn(f"list --colour --host-width 0 --scope {scope}", binds)
+
+    def test_the_dir_key_is_one_fzf_has_not_taken(self) -> None:
+        """An fzf default binding would win, so the key would do fzf's thing and
+        never woswoar's. `ctrl-d` is the one this rules out by name: it is fzf's
+        `delete-char/eof`, which *aborts the picker* on an empty query."""
+        binds = " ".join(a for a in search._fzf_argv("global", "", True, 0) if "--bind=" in a)
+        self.assertIn("ctrl-o:reload(", binds)
+        for taken in ("ctrl-a", "ctrl-b", "ctrl-d", "ctrl-e", "ctrl-f", "ctrl-k", "ctrl-u"):
+            self.assertNotIn(f"{taken}:", binds, f"{taken} is one of fzf's own")
 
     def test_no_dedup_propagates_into_the_reload_command(self) -> None:
         argv = search._fzf_argv("global", "", False, 0)
@@ -688,7 +718,7 @@ class TestTheMachineColumn(WoswoarTestCase):
 
 
 class TestCtrlRCyclesTheScope(unittest.TestCase):
-    """Ctrl-R inside the picker moves global -> host -> session -> global.
+    """Ctrl-R inside the picker moves global -> host -> session -> dir -> global.
 
     fzf holds no variables, so the binding reads the current scope back out of
     the prompt fzf is already showing. What is asserted here is that shell
@@ -713,9 +743,44 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         return out.split("--scope ", 1)[1].split(")", 1)[0].strip()
 
     def test_it_goes_round(self) -> None:
-        self.assertEqual(self.next_scope("woswoar (global) "), "host")
-        self.assertEqual(self.next_scope("woswoar (host) "), "session")
-        self.assertEqual(self.next_scope("woswoar (session) "), "global")
+        """Every scope's successor, driven off `SCOPES` so the two cannot drift.
+
+        Written out as three assertions before, which is how `session -> global`
+        stayed correct by *accident*: it was falling through the catch-all
+        rather than being decided, so the arm it needed once something followed
+        it was never missed."""
+        for index, scope in enumerate(search.SCOPES):
+            with self.subTest(scope=scope):
+                nxt = search.SCOPES[(index + 1) % len(search.SCOPES)]
+                self.assertEqual(self.next_scope(f"woswoar ({scope}) "), nxt)
+
+    def test_an_unrecognised_prompt_degrades_to_global(self) -> None:
+        """Which is what the catch-all is for, and why `session` needed an arm
+        of its own rather than keeping the fall-through it used to have."""
+        self.assertEqual(self.next_scope(""), "global")
+
+    def test_the_prompt_carries_nothing_but_the_scope(self) -> None:
+        """The `case` arms are substring matches over the *whole* prompt, so any
+        user text in it is a way to misroute the cycle. A prompt that named the
+        directory -- `woswoar (dir ~/src/session-manager)` -- reads as `session`
+        and goes to `dir` instead of round to `global`. If the matcher below is
+        ever made exact, the test that pins that misrouting is where to record
+        that this constraint has been lifted.
+
+        Asserted on the prompt fzf is actually given, and on the one the cycle
+        repaints, because those are the two places the text could get in."""
+        for scope in search.SCOPES:
+            with self.subTest(scope=scope):
+                argv = search._fzf_argv(scope, "", True, 0)
+                self.assertIn(f"--prompt=woswoar ({scope}) ", argv)
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        self.assertIn("change-prompt(woswoar ($n) )", binding)
+
+    def test_a_directory_in_the_prompt_would_misroute(self) -> None:
+        """The reason for the test above, made concrete rather than asserted
+        about in prose: this is what the substring matcher does with a path in
+        the prompt, and it is silent."""
+        self.assertEqual(self.next_scope("woswoar (dir ~/src/session-manager) "), "dir")
 
     def test_it_repaints_the_prompt_it_reads_back(self) -> None:
         """`change-prompt` is not decoration: the next press reads it."""
@@ -850,10 +915,15 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         self.assertNotIn("^name", search._header(host_width=0))
 
     def test_every_scope_is_named_and_every_key_reachable(self) -> None:
-        """The three direct keys share one segment where Ctrl-R names the
+        """The first three direct keys share one segment where Ctrl-R names the
         scopes, because `g`, `h` and `s` are the initials of the words beside
-        them -- but all three still have to be *findable*, and so does each
-        scope, or the compaction has quietly dropped one."""
+        them -- but all four still have to be *findable*, and so does each
+        scope, or the compaction has quietly dropped one.
+
+        Driven off `search.SCOPES` rather than a list written here, because a
+        scope added there and forgotten in the header is exactly the failure
+        this is for: the list used to be hardcoded, and it had already fallen
+        one behind by the time `dir` arrived."""
         for supported in (True, False):
             for width in (0, 8):
                 with (
@@ -861,9 +931,9 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
                     mock.patch.object(search, "fzf_supports_transform", return_value=supported),
                 ):
                     header = search._header(host_width=width)
-                    for scope in ("global", "host", "session"):
+                    for scope in search.SCOPES:
                         self.assertIn(scope, header, f"{scope} is not named")
-                    for key in ("g", "h", "s"):
+                        key = SCOPE_KEYS[scope].removeprefix("ctrl-")
                         self.assertRegex(header, rf"ctrl-(\w+/)*{key}\b|ctrl-{key}\b")
 
     def test_the_cycle_says_which_order_it_goes_in(self) -> None:
@@ -871,7 +941,7 @@ class TestSayingHowToFilterByMachine(WoswoarTestCase):
         only way to learn the order was to press it three times."""
         with mock.patch.object(search, "fzf_supports_transform", return_value=True):
             header = search._header(host_width=0)
-        self.assertIn("global \u2192 host \u2192 session", header)
+        self.assertIn(" \u2192 ".join(search.SCOPES), header)
 
     def test_the_timeline_comes_after_the_scopes(self) -> None:
         """Ordered by how far each takes you from an ordinary search: change
@@ -1096,3 +1166,263 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
         self.assertNotIn("ctrl-t:", binds)
         header = next(a for a in argv if a.startswith("--header="))
         self.assertNotIn("ctrl-t", header, "a key that does nothing here is named anyway")
+
+    def test_it_carries_every_scope_through(self) -> None:
+        """Ctrl-T reads the scope back out of the prompt, exactly as the cycle
+        does, so a scope with no arm of its own silently becomes `global` -- a
+        timeline of the wrong list, with no error and a prompt that says
+        `timeline dir` while showing everything.
+
+        Driven as the real `sh`, because what is under test is that snippet's
+        decision. `--print-anchor` is stubbed out of the way: this is about the
+        scope it chooses, and the anchor needs a history to look at."""
+        script = search._timeline_binding("true", "", " --host-width 0").split("transform:", 1)[1]
+        for scope in search.SCOPES:
+            with self.subTest(scope=scope):
+                out = subprocess.run(
+                    ["sh", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    env={"FZF_PROMPT": f"woswoar ({scope}) ", "PATH": "/usr/bin:/bin"},
+                    check=True,
+                ).stdout
+                self.assertIn(f"change-prompt(woswoar (timeline {scope}) )", out)
+                self.assertIn(f"--scope {scope} --around", out)
+
+
+class DirScopeCase(WoswoarTestCase):
+    """A sandbox with a home of its own, and a way to stand somewhere in it.
+
+    Shared because getting the fixture right is most of what testing `dir`
+    costs: `$HOME` is not in `store.ENV_KEYS`, so the base class does not
+    isolate it, and `os.chdir` does not touch `$PWD` -- it is the *shell* that
+    maintains that. A test that only chdir'd would exercise the `getcwd`
+    fallback while believing it exercised the `$PWD` path.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.set_env("HOME", str(self.home))
+        self.addCleanup(os.chdir, os.getcwd())
+        self.ts = NOW
+
+    def set_env(self, key: str, value: str) -> None:
+        """Set one variable for the length of this test, restoring what was."""
+        patcher = mock.patch.dict(os.environ, {key: value})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def stand_in(self, path: Path | str) -> None:
+        """Move there and set `$PWD` to the same string, the way a shell does."""
+        os.chdir(path)
+        self.set_env("PWD", str(path))
+
+    def record(self, cwd: str, cmd: str, host: str = MACHINE_ID) -> None:
+        """One command, recorded as having been run in `cwd`."""
+        self.ts += 1
+        with store.private_append(store.log_file(host, "2026-07-29")) as handle:
+            handle.write(format_line(Entry(self.ts, host, "s", cwd, 0, 0, cmd)) + "\n")
+
+    @staticmethod
+    def commands(scope: search.Scope = "dir") -> list[str]:
+        return sorted(recalled(scope))
+
+
+class TestTheDirectoryScope(DirScopeCase):
+    """`dir`: this directory and everything below it, on every machine.
+
+    Every record has carried a `cwd` since the format existed -- written by the
+    hook, escaped, encrypted, synced and parsed into the cache -- and until now
+    `search` never read it. So the scope costs no new storage and no migration;
+    what it costs is getting the comparison right, and there are four ways to
+    get it wrong that all look like a working feature.
+    """
+
+    OTHER = "ffffffffffffffff"
+
+    def test_it_keeps_this_directory_and_below(self) -> None:
+        """The sibling in the fixture is the point of the fixture: with only a
+        parent and a child recorded, a filter that kept everything would give
+        the same answer as one that worked."""
+        (self.home / "src/proj").mkdir(parents=True)
+        self.record("~/src/proj", "in the project")
+        self.record("~/src/proj/sub", "in a subdirectory")
+        self.record("~/src/other", "in a sibling")
+
+        self.stand_in(self.home / "src/proj")
+        self.assertEqual(self.commands(), ["in a subdirectory", "in the project"])
+
+    def test_a_sibling_that_starts_the_same_is_not_a_child(self) -> None:
+        """`~/src/foobar` starts with `~/src/foo` and is not underneath it. The
+        same trap `entry.home_relative` is anchored against, one directory
+        further down, and a bare `startswith` walks into both."""
+        (self.home / "src/foo").mkdir(parents=True)
+        self.record("~/src/foo", "in foo")
+        self.record("~/src/foobar", "in foobar")
+
+        self.stand_in(self.home / "src/foo")
+        self.assertEqual(self.commands(), ["in foo"])
+
+    def test_a_symlinked_directory_matches_what_the_hook_recorded(self) -> None:
+        """The hook records `$PWD`, which after a `cd` through a symlink is the
+        path you typed and not the one it resolves to. Looking the other one up
+        makes every command run in a symlinked directory invisible here.
+
+        The resolved path is a different key, and stays one: that is what was
+        recorded for commands actually typed there, and guessing that the two
+        are the same directory is a resolution this does not do.
+        """
+        real = self.home / "elsewhere/project"
+        real.mkdir(parents=True)
+        (self.home / "proj").symlink_to(real)
+        self.record("~/proj", "typed through the link")
+        self.record("~/elsewhere/project", "typed at the real path")
+
+        self.stand_in(self.home / "proj")
+        self.assertEqual(self.commands(), ["typed through the link"])
+
+    def test_a_pwd_that_is_not_this_directory_is_not_believed(self) -> None:
+        """`$PWD` is inherited, so it is whatever the parent process left there.
+        Believed only when `stat` agrees it is the directory we are in."""
+        (self.home / "here").mkdir()
+        (self.home / "there").mkdir()
+        self.record("~/here", "recorded where we stand")
+        self.record("~/there", "recorded somewhere else")
+        os.chdir(self.home / "here")
+
+        for stale in (str(self.home / "there"), "."):
+            with self.subTest(pwd=stale):
+                self.set_env("PWD", stale)
+                self.assertEqual(self.commands(), ["recorded where we stand"])
+
+    def test_it_spans_machines(self) -> None:
+        """`~/src/proj` on either of your boxes is the same project, and asking
+        that across machines is the question woswoar exists for. The scopes do
+        not compose, so a `dir` that also meant `host` would remove it."""
+        (self.home / "src/proj").mkdir(parents=True)
+        self.record("~/src/proj", "mine")
+        self.record("~/src/proj", "theirs", host=self.OTHER)
+
+        self.stand_in(self.home / "src/proj")
+        self.assertEqual(self.commands(), ["mine", "theirs"])
+
+    def test_a_peer_path_stored_absolute_is_matched_too(self) -> None:
+        """`importer` rewrites a path to `~` only for this machine's own rows --
+        another machine's home is a guess -- so an atuin import of two hosts
+        stores the same directory both ways. One key silently misses half of it,
+        in exactly the multi-machine case this scope is for."""
+        (self.home / "src/proj").mkdir(parents=True)
+        self.record("~/src/proj", "mine, stored with a tilde")
+        self.record(str(self.home / "src/proj"), "theirs, stored absolute", host=self.OTHER)
+
+        self.stand_in(self.home / "src/proj")
+        self.assertEqual(self.commands(), ["mine, stored with a tilde", "theirs, stored absolute"])
+
+    def test_the_root_directory_matches_everything(self) -> None:
+        """Every recorded directory is under `/`, including the `~` ones -- which
+        do not start with `/` at all, so the anchored prefix test matches none of
+        them and would build `//` besides."""
+        self.record("~/src", "under home")
+        self.record("/etc", "outside home")
+
+        self.stand_in("/")
+        self.assertEqual(self.commands(), ["outside home", "under home"])
+
+    def test_a_control_byte_in_the_directory_name_still_matches(self) -> None:
+        """The cache holds the `cwd` that `parse_line(..., inert=True)` produced,
+        so the byte is already gone from what is stored. A key still carrying it
+        matches nothing, and the directory quietly has no history."""
+        odd = self.home / "we\x01ird"
+        odd.mkdir()
+        self.record("~/we\x01ird", "in the odd directory")
+
+        self.stand_in(odd)
+        self.assertEqual(self.commands(), ["in the odd directory"])
+
+    def test_nothing_recorded_here_is_empty_rather_than_everything(self) -> None:
+        """The failure that looks most like success: a scope that matches
+        nothing has to return nothing, not fall back to the whole history."""
+        (self.home / "empty").mkdir()
+        self.record("~/src", "somewhere else entirely")
+
+        self.stand_in(self.home / "empty")
+        self.assertEqual(self.commands(), [])
+
+    def test_a_directory_deleted_under_us_still_answers(self) -> None:
+        """`rm -rf` of the directory you are standing in, then Ctrl-R. There is
+        no `.` left to check `$PWD` against and nothing for `os.getcwd` to
+        resolve, so `$PWD` is all that is left of where you are -- and a
+        traceback here would be a worse answer than the history it still knows."""
+        doomed = self.home / "doomed"
+        doomed.mkdir()
+        self.record("~/doomed", "run before it went")
+
+        self.stand_in(doomed)
+        doomed.rmdir()
+        self.assertEqual(self.commands(), ["run before it went"])
+
+    def test_a_directory_that_cannot_be_named_at_all_is_not_a_crash(self) -> None:
+        """The same deletion with no `$PWD` to fall back on -- which is a shell
+        that never exported one, or `env -i`. Nothing can be matched, and the
+        note that would otherwise name the directory has nothing to name."""
+        doomed = self.home / "doomed"
+        doomed.mkdir()
+        self.record("~/doomed", "run before it went")
+
+        os.chdir(doomed)
+        self.set_env("PWD", "")
+        doomed.rmdir()
+        self.assertEqual(self.commands(), [])
+        self.assertEqual(
+            search.empty_note("dir"),
+            "woswoar: no commands recorded in this directory or below",
+        )
+
+
+class TestAnEmptyDirScopeSaysWhereItLooked(DirScopeCase):
+    """An empty `global` explains itself; an empty `dir` looks like a bug.
+
+    And the one fact that tells those apart is *which* directory was searched --
+    which is exactly what the `$PWD` rule in `search._here` can get wrong. So it
+    is named, once, to a person.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.stand_in(self.home)
+
+    def test_a_terminal_is_told_which_directory_was_searched(self) -> None:
+        ran = run_cli("list", "--scope", "dir", tty=True)
+        self.assertEqual(ran.out, "")
+        self.assertIn("no commands recorded in ~ or below", ran.err)
+
+    def test_a_pipe_stays_clean(self) -> None:
+        """`woswoar list --scope dir | wc -l` has to keep counting lines."""
+        ran = run_cli("list", "--scope", "dir")
+        self.assertEqual((ran.out, ran.err), ("", ""))
+
+    def test_the_pickers_reload_is_not_written_into(self) -> None:
+        """fzf reads the reload's stdout through a pipe while leaving its stderr
+        on the terminal, so a note gated on *stderr* being a tty would land in
+        the middle of the picker. The gate is on stdout, and only these two
+        streams disagreeing can tell the difference."""
+        out, err = Captured(tty=False), Captured(tty=True)
+        with redirect_stdout(out), redirect_stderr(err):
+            main(["list", "--scope", "dir"])
+        self.assertEqual(err.getvalue(), "", "the picker's screen was written into")
+
+    def test_a_scope_that_found_something_says_nothing(self) -> None:
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            handle.write(format_line(Entry(NOW, MACHINE_ID, "s", "~", 0, 0, "here")) + "\n")
+        ran = run_cli("list", "--scope", "dir", tty=True)
+        self.assertIn("here", ran.out)
+        self.assertEqual(ran.err, "")
+
+    def test_the_other_scopes_stay_quiet_when_empty(self) -> None:
+        """An empty `global` is a machine that has recorded nothing, which needs
+        no explaining -- and `list` is a pipe target before it is a report."""
+        for scope in ("global", "host", "session"):
+            with self.subTest(scope=scope):
+                self.assertEqual(run_cli("list", "--scope", scope, tty=True).err, "")

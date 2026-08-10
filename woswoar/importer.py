@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from . import credentials, store
-from .entry import Entry, truncate
+from .entry import Entry, home_relative, truncate
 
 Kind = Literal["bash", "zsh", "atuin"]
 KINDS: tuple[Kind, ...] = ("bash", "zsh", "atuin")
@@ -310,17 +310,6 @@ def resolve_hosts(hostnames: Iterable[str]) -> dict[str, tuple[str, str]]:
     return resolved
 
 
-def _home_relative(cwd: str, home: str) -> str:
-    """Match the hook's storage convention for this machine's own paths."""
-    if not cwd or not home:
-        return cwd
-    if cwd == home:
-        return "~"
-    if cwd.startswith(f"{home}/"):
-        return "~" + cwd[len(home) :]
-    return cwd
-
-
 def _dedup_key(ts: int, cmd: str) -> tuple[int, str]:
     """The identity an entry will have *once written*.
 
@@ -418,7 +407,7 @@ def run_atuin(
                     # Only rewrite paths for this machine: another host's home
                     # directory is a guess, and a wrong ~ is worse than a long
                     # but honest absolute path.
-                    cwd=_home_relative(row.cwd, home) if host_id == own_id else row.cwd,
+                    cwd=home_relative(row.cwd, home) if host_id == own_id else row.cwd,
                     exit_code=row.exit_code,
                     duration_ms=row.duration_ms,
                     cmd=row.cmd,
