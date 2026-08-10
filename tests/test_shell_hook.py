@@ -26,7 +26,7 @@ from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
-from .support import MACHINE_ID, WoswoarTestCase
+from .support import MACHINE_ID, Typed, WoswoarTestCase, requires_bash, run_in_pty
 
 HOOK = Path(__file__).resolve().parent.parent / "woswoar" / "shell" / "woswoar.bash"
 
@@ -1333,3 +1333,129 @@ class TestTwoShellsOnOneMachine(ShellHookTestCase):
         self.run_shell("echo second_shell\n")
         sessions = {e.session for e in self.recorded()}
         self.assertEqual(len(sessions), 2, f"the two shells shared a session: {sessions}")
+
+
+@requires_bash
+class TestThePtyHarness(unittest.TestCase):
+    """One assertion about the harness, for the trap it is built to avoid.
+
+    A pty's window is 0x0 until somebody says otherwise, and a program that
+    believes it has no room draws almost nothing -- every assertion against that
+    output then passes or fails for reasons unconnected to the code under test.
+
+    It is checked here rather than left to the tests that use the harness,
+    because readline hides it: it falls back to 80x24 when the window is zero,
+    so the Ctrl-R test below stays green with `TIOCSWINSZ` removed. fzf does not
+    fall back, and #152 and #158 are built on this helper. A fixture too weak to
+    tell the two answers apart is invisible in the test's own text, which is why
+    this one is about the fixture and nothing else.
+    """
+
+    def test_the_window_size_reaches_the_child(self) -> None:
+        # Not the helper's default: a size that matched it would still pass if
+        # the ioctl were dropped and the caller's argument ignored.
+        chunks = run_in_pty(
+            ["bash", "--norc", "-i"],
+            [Typed("", "ps> "), Typed("stty size\n", "41 123")],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PS1": "ps> ", "TERM": "xterm"},
+            size=(41, 123),
+        )
+        self.assertIn("41 123", chunks[1])
+
+
+@requires_bash5
+class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
+    """The one property that keeps a recalled command from running by itself.
+
+    Every other test of the widget checks a piece of it from the outside: what
+    the picker would print, what the cycle binding decides. None of them press
+    the key, because the key does nothing without a terminal -- `bind -x` is
+    readline, and readline does no line editing on a pipe. So the claim the
+    whole feature rests on, that a selection arrives *on the prompt for editing*
+    and is never executed, was guarded by nothing at all.
+
+    Here it is driven: a real bash, a real readline, a real pty, the real hook.
+    What is stubbed is the picker itself -- the widget's contract with it is one
+    line on stdout, and fzf choosing that line needs its own test rather than a
+    share of this one.
+    """
+
+    #: What the picker hands back, and what running it would print. Two strings
+    #: on purpose. A terminal echoes what you type at it, so if the recalled
+    #: text and the executed output were spelled the same, "it did not run"
+    #: would be satisfied by the harness's own echo of the line -- `CLAUDE.md`
+    #: rule 3, fourth bullet, which is a trap this test would otherwise walk
+    #: into head first. The empty `''` is removed by the shell that runs the
+    #: line and by nothing else: `RAN''MARK` can only be the buffer on screen,
+    #: `RANMARK` can only be something having executed it.
+    SELECTION = "echo RAN''MARK"
+    IF_EXECUTED = "RANMARK"
+
+    #: Handed to bash in the environment, so the harness waits for a string it
+    #: has never typed. It doubles as the "readline is listening" signal:
+    #: readline puts the terminal into raw mode *before* it draws the prompt, so
+    #: a prompt on screen means the next keypress reaches the widget rather than
+    #: the kernel's line discipline. Typing before that was the first way this
+    #: test failed -- Ctrl-R came back as an echoed `^R` and nothing ran.
+    PROMPT = "ps> "
+
+    def picker_env(self) -> dict[str, str]:
+        """A sandbox whose `woswoar` on PATH is a fixed answer to `search`."""
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake = bin_dir / "woswoar"
+        fake.write_text(
+            "#!/bin/sh\n"
+            # Anything but `search` exits quietly. The hook reaches for
+            # `woswoar sync` too, and a stub that complained about the
+            # subcommand would put its complaint on the terminal this test
+            # reads, in the middle of the screen it is asserting about.
+            '[ "$1" = search ] || exit 0\n'
+            "printf '%s\\n' \"$WOSWOAR_TEST_SELECTION\"\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return self.shell_env(
+            {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                # Not `dumb`, which the rest of this file uses: this is the one
+                # test that wants readline to behave as it does for a person.
+                "TERM": "xterm",
+                # Bash only defaults PS1 when it is unset, so handing it in is
+                # enough -- and it means the harness never *types* the string it
+                # waits for to know the shell is up.
+                "PS1": self.PROMPT,
+                "WOSWOAR_TEST_SELECTION": self.SELECTION,
+            }
+        )
+
+    def test_the_selection_arrives_for_editing_and_does_not_run(self) -> None:
+        steps = [
+            Typed("", self.PROMPT),
+            Typed(f"source {HOOK}; echo LOAD''ED\n", "LOADED"),
+            # `LOADED` is printed while bash is still running the line; the
+            # prompt after it is what says readline has the terminal back.
+            Typed("", self.PROMPT),
+            # Ctrl-R, and then wait for the recalled text. That text is a marker
+            # the harness has not typed, so its only possible source is readline
+            # redrawing the buffer the widget just filled in.
+            Typed("\x12", self.SELECTION),
+            # Typed where the widget left the cursor, so it lands *after* the
+            # recalled command rather than in front of it, and then Enter. A
+            # READLINE_POINT of 0 would run `EXTRAecho ...` instead, and this
+            # step would time out with the transcript.
+            Typed(" EXTRA\r", f"{self.IF_EXECUTED} EXTRA"),
+        ]
+        # Named rather than indexed: the two that matter are the last two, and a
+        # step inserted above must not silently move an assertion onto the wrong
+        # screen.
+        *_, after_keypress, after_enter = run_in_pty(
+            ["bash", "--norc", "-i"], steps, env=self.picker_env()
+        )
+
+        self.assertNotIn(
+            self.IF_EXECUTED,
+            after_keypress,
+            "the keypress executed the selection instead of offering it for editing",
+        )
+        self.assertIn(f"{self.IF_EXECUTED} EXTRA", after_enter, "the edited line is what ran")
