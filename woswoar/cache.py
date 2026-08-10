@@ -222,6 +222,18 @@ class Cache:
         """The session column, in the same order as `stamps_and_commands`."""
         return [value for flat in self.files.values() for value in flat[1::6]]
 
+    def cwds(self) -> list[str]:
+        """The working-directory column, in the same order as `stamps_and_commands`.
+
+        Its own accessor rather than a fifth column on `display_columns`, which
+        every scope would then pay for to serve one of them -- 0.4 ms measured
+        over 54,600 rows -- and `cwd` is not a display column. It is comparable
+        exactly as it comes out, which is the other half of why this is cheap:
+        the cache stores what `parse_line(..., inert=True)` produced, so it is
+        already unescaped and already inert.
+        """
+        return [value for flat in self.files.values() for value in flat[2::6]]
+
 
 def _fingerprint(path: Path) -> bytes:
     try:

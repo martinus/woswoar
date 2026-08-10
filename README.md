@@ -19,14 +19,16 @@ when you need that one command from last Tuesday, on the other machine.
        2m  thinkpad  docker compose up -d --build
     3h12m  DT-24YYQ3 docker logs -f api
      6d4h  thinkpad  docker system prune -af
-  ctrl-r global → host → session, or ctrl-g/h/s | ctrl-t timeline | ^name one machine
+  ctrl-r global → host → session → dir, or ctrl-g/h/s, ctrl-o dir | ctrl-t timeline | ^name one machine
 ```
 
 The machine column appears once you have more than one, and fzf matches on it —
 so typing `thinkpad` narrows to that machine. It shows the *host* part of each
 machine's name, because that is usually what differs between your own machines.
 The age of a command that exited non-zero is red, and <kbd>Ctrl</kbd>+<kbd>R</kbd>
-again cycles global → host → session.
+again cycles global → host → session → dir — where **dir** is this directory and
+everything below it, on every machine, because `~/src/woswoar` on your laptop and
+on your desktop is the same project.
 
 **A short machine name is also an ordinary word.** If yours is `box`, typing it
 finds `sandbox` and `~/dropbox` too — so anchor it: **`^box`** matches only the
@@ -349,7 +351,7 @@ truthful. Re-running an import is idempotent.
 | `WOSWOAR_IGNORE` | extended regex of commands never to record |
 | `WOSWOAR_IGNORE_EXTRA` | extra regex joined onto the default, instead of replacing it |
 | `WOSWOAR_SYNC_INTERVAL` | seconds between background syncs; `0` turns them off (default `60`) |
-| `WOSWOAR_SCOPE` | default scope for <kbd>Ctrl</kbd>+<kbd>R</kbd> (default `global`) |
+| `WOSWOAR_SCOPE` | default scope for <kbd>Ctrl</kbd>+<kbd>R</kbd>: `global`, `host`, `session` or `dir` (default `global`) |
 | `WOSWOAR_NO_BIND` | set to skip binding <kbd>Ctrl</kbd>+<kbd>R</kbd> |
 
 ## Uninstalling

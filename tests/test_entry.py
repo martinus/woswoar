@@ -10,6 +10,7 @@ from woswoar.entry import (
     Entry,
     escape,
     format_line,
+    home_relative,
     parse_line,
     truncate,
     unescape,
@@ -142,3 +143,39 @@ class TestParsedCommandsAreBounded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHomeRelative(unittest.TestCase):
+    """The `~` rule, which three implementations now have to agree on.
+
+    The hook writes it in shell, the importer applies it to this machine's own
+    rows, and `search`'s `dir` scope rebuilds it to compare against. It moved
+    here from `importer` when the third caller arrived: `search` must not import
+    `importer`, whose weight on the scope-switch path `credentials` documents as
+    a measured cost.
+    """
+
+    HOME = "/home/martinus"
+
+    def test_the_home_directory_itself(self) -> None:
+        self.assertEqual(home_relative(self.HOME, self.HOME), "~")
+
+    def test_a_path_below_home(self) -> None:
+        self.assertEqual(home_relative(f"{self.HOME}/src/woswoar", self.HOME), "~/src/woswoar")
+
+    def test_a_sibling_that_starts_the_same_is_left_alone(self) -> None:
+        """The trap in `${PWD/#$HOME/~}`, which rewrites this to `~copy`. The
+        hook spells the rule out in shell for the same reason, and
+        `test_shell_hook.test_sibling_of_home_is_not_mangled` pins that half."""
+        self.assertEqual(home_relative("/home/martinuscopy", self.HOME), "/home/martinuscopy")
+
+    def test_a_path_outside_home(self) -> None:
+        self.assertEqual(home_relative("/etc", self.HOME), "/etc")
+
+    def test_no_home_leaves_every_path_absolute(self) -> None:
+        """A machine with `$HOME` unset, where every path is honestly absolute
+        -- not a guess to be made on its behalf."""
+        self.assertEqual(home_relative("/home/martinus/src", ""), "/home/martinus/src")
+
+    def test_an_empty_path_stays_empty(self) -> None:
+        self.assertEqual(home_relative("", self.HOME), "")
