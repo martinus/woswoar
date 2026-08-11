@@ -269,15 +269,66 @@ quintuples them.
 The trade is that a machine nobody types on never syncs, so it never *receives*
 either — a laptop left shut for a week is a week stale until the first command
 is typed. Opening a shell syncs, so in practice you are current by the time you
-have a prompt. If you would rather have a machine stay current while idle, the
-systemd timer is still there:
+have a prompt. If you would rather have a machine stay current while idle, a
+systemd timer does it. Paste the whole block:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp contrib/systemd/woswoar-sync.* ~/.config/systemd/user/
+
+cat > ~/.config/systemd/user/woswoar-sync.service <<'UNIT'
+[Unit]
+Description=woswoar shell history sync
+Documentation=https://github.com/martinus/woswoar
+# Pointless and noisy without a network; the timer will try again.
+After=network-online.target
+
+[Service]
+Type=oneshot
+# /usr/bin/env so this works wherever woswoar was installed (pipx, --user, venv)
+# without hardcoding a path into the unit.
+ExecStart=/usr/bin/env woswoar sync
+
+# Sync holds a lock and talks to a remote; if it hangs, fail rather than pile up.
+TimeoutStartSec=10min
+
+# It only ever needs its own data directory, an ssh key, and the network.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UNIT
+
+cat > ~/.config/systemd/user/woswoar-sync.timer <<'UNIT'
+[Unit]
+Description=Sync woswoar shell history periodically
+
+[Timer]
+# Wait a little after login rather than competing with everything else starting.
+OnStartupSec=2min
+# A minute, because it turns out to be nearly free -- real typing is bursty, so
+# five minutes does not carry five times less. Raise it for the bytes back.
+OnUnitActiveSec=1min
+
+# Catch up after the machine was asleep or off, rather than silently skipping.
+Persistent=true
+
+# Every machine syncing on the same wall-clock tick is how you manufacture
+# push races. A minute of jitter costs nothing and avoids them.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 systemctl --user enable --now woswoar-sync.timer
 export WOSWOAR_SYNC_INTERVAL=0   # and turn the hook's off, or you pay twice
 ```
+
+Written out in full rather than copied out of the repository, because a `pipx`
+install leaves no checkout on the machine to copy from. Put the `export` in your
+`.bashrc` as well — pasted into a shell it lasts only as long as that shell, and
+the hook reads it on every prompt.
 
 The two are safe to run together — syncs take a non-blocking lock, so whichever
 arrives second exits immediately — but there is no reason to.

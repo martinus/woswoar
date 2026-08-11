@@ -158,9 +158,9 @@ fi
 __woswoar_max=8000
 
 #: Seconds between prompt-triggered syncs; 0 turns them off entirely, which is
-#: what to set if you run the systemd timer in `contrib/systemd` instead. The
-#: two are safe together -- `sync.lock` is non-blocking, so whichever arrives
-#: second exits at once -- but running both is just paying twice.
+#: what to set if you run the systemd timer from the README instead. The two are
+#: safe together -- `sync.lock` is non-blocking, so whichever arrives second
+#: exits at once -- but running both is just paying twice.
 #:
 #: Validated rather than trusted, because it reaches `((...))`, where a value
 #: like `x[$(...)]` is not a syntax error but a command substitution. One test
