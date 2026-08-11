@@ -873,7 +873,29 @@ class TestPromptTriggeredSync(ShellHookTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.calls = self.root / "sync-calls"
+        # Outside the sandbox, which is the whole of #167. The stand-in is run
+        # by a process this class deliberately detaches and deliberately does
+        # not wait for, so it is still on its way to `execve` when the test
+        # returns and `WoswoarTestCase` starts removing `self.root`. A file
+        # created between `rmtree`'s walk of a directory and its `rmdir` of it
+        # is `OSError: Directory not empty`, reported against the sandbox root
+        # -- a red CI run on a pull request that touches none of this.
+        #
+        # Moved rather than waited for. The issue suggested a `tearDown` of
+        # `if self.fired(): self.syncs()`, and `fired()` cannot tell the hook's
+        # stamp from one a test wrote itself: on
+        # `test_a_fresh_stamp_from_another_shell_suppresses_the_sync`, which
+        # writes a stamp and asserts nothing syncs, that polls for a file that
+        # will never arrive. Measured: 0.06 s becomes 20.06 s, the whole
+        # `syncs()` timeout, on a test whose point is that it is fast.
+        #
+        # `ignore_errors` here and never on the sandbox: this directory has one
+        # writer and it is the detached stand-in, so a failure to remove it says
+        # only "it is still going", which is a thing this class arranges on
+        # purpose. A leftover in the sandbox is information and must still raise.
+        stub_root = Path(tempfile.mkdtemp(prefix="woswoar-syncstub-"))
+        self.addCleanup(shutil.rmtree, stub_root, ignore_errors=True)
+        self.calls = stub_root / "sync-calls"
         bindir = self.root / "bin"
         bindir.mkdir(exist_ok=True)
         fake = bindir / "woswoar"
@@ -943,6 +965,29 @@ class TestPromptTriggeredSync(ShellHookTestCase):
                 seen = len(lines)
             time.sleep(0.05)
         return seen
+
+    def test_the_detached_sync_writes_nowhere_the_sandbox_is_being_deleted(self) -> None:
+        """#167, stated as the invariant rather than as the race.
+
+        The failure it fixes is `OSError: Directory not empty` from
+        `WoswoarTestCase`'s own cleanup, on a test that had already passed --
+        and it needs a runner slow enough to delay the detached `execve` past
+        the end of the test. The issue records 40 serial runs, 64 concurrent
+        runs and 15 full pinned suites that never reproduced it on a developer's
+        machine; a test that tried to would be a timing race asserted with a
+        sleep, which is the flake this is removing, not the guard.
+
+        So this asserts what makes the race impossible instead: the one process
+        nobody waits for writes outside the tree that is about to be removed.
+        The shell is really run, so the path is the one a real sync really used
+        rather than whatever `setUp` last assigned.
+        """
+        self.run_shell("echo one\n")
+        self.assertEqual(self.syncs(), 1, "the stand-in never ran, so this proves nothing")
+        self.assertFalse(
+            self.calls.is_relative_to(self.root),
+            f"{self.calls} is inside the sandbox and can appear mid-rmtree",
+        )
 
     def test_a_shell_that_types_nothing_still_syncs_at_startup(self) -> None:
         """Sitting down and pressing Ctrl-R has to show current history."""
