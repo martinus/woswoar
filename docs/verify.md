@@ -128,7 +128,7 @@ reaching the address you gave `woswoar init`, and nothing else.
 
 ## 🧪 Run the guarantee suite where you can watch
 
-The tables in [security.md](security.md#-guarantees-pinned-by-tests) —
+The tables in [security.md](security.md#-guarantees-pinned-by-tests-not-by-prose) —
 forged history is refused, tampering is refused, a revoked machine stays
 revoked — are each backed by a test, and the suite runs anywhere:
 

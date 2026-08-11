@@ -1,4 +1,4 @@
-"""Instructions in the README that a reader is expected to paste and run.
+"""The parts of the documentation that can be wrong in a checkable way.
 
 Prose can be reviewed by reading it. A command block cannot: the systemd one
 told people to `cp contrib/systemd/woswoar-sync.*`, which is a path that exists
@@ -10,6 +10,9 @@ scratch `$HOME`, and a stub `systemctl` standing in for the one piece that needs
 a running system. Following the repository's habit of driving the real thing --
 the shell hook is tested against a real `bash`, sync against real `age` and
 `git`.
+
+A link is the same kind of claim and fails the same way: silently, and only for
+the reader. Two were broken when this file grew its second class.
 """
 
 from __future__ import annotations
@@ -18,8 +21,10 @@ import os
 import re
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 REPO = Path(__file__).resolve().parent.parent
 README = REPO / "README.md"
@@ -115,6 +120,102 @@ class TestTheSystemdInstructionsWork(unittest.TestCase):
         block = systemd_block()
         self.assertNotIn("contrib/", block)
         self.assertNotIn("git clone", block)
+
+
+#: Markdown inline links, `[text](target)`. Reference-style links are not used
+#: anywhere in these files, and adding the second syntax to this pattern for a
+#: form nobody writes would only make it harder to read.
+_LINK = re.compile(r"\]\(([^)\s]+)\)")
+
+#: A heading, and the text GitHub turns into its anchor.
+_HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*$", re.M)
+
+
+def slug(heading: str) -> str:
+    """The anchor GitHub gives a heading.
+
+    Lowercase, spaces to hyphens, and everything that is neither alphanumeric
+    nor a hyphen or underscore dropped -- *except* combining marks and format
+    characters, which survive. That last clause is not pedantry: `## ⚠️ What is
+    not protected` anchors at `%EF%B8%8F-what-is-not-protected`, because U+26A0
+    is a symbol and goes, while the U+FE0F variation selector welded to it is a
+    nonspacing mark and stays. A link that drops it lands nowhere, silently.
+
+    Derived from the rendered page rather than from a specification -- GitHub
+    publishes no algorithm -- and checked against every heading in `docs/`, the
+    ticks and boxes and warning signs included.
+    """
+    out = []
+    for char in heading.lower():
+        if char.isalnum() or char in "-_":
+            out.append(char)
+        elif char == " ":
+            out.append("-")
+        elif unicodedata.category(char) in ("Mn", "Cf"):
+            out.append(char)
+    return "".join(out)
+
+
+def markdown_files() -> list[Path]:
+    # Dot-directories are other tools' working space, `.github` excepted --
+    # `.pytest_cache/README.md` was being read and checked here, and a failure
+    # in somebody else's generated file is one nobody in this repository can act
+    # on. Whether the cache exists at all depends on how the suite was last run,
+    # which is not a thing a test should vary with.
+    return sorted(
+        p
+        for p in REPO.glob("**/*.md")
+        if not any(part.startswith(".") and part != ".github" for part in p.parts)
+    )
+
+
+class TestEveryDocumentLinkLandsSomewhere(unittest.TestCase):
+    """A relative link in the docs points at a file, and at a heading in it.
+
+    Both halves have been wrong here. `docs/verify.md` pointed at
+    `#-guarantees-pinned-by-tests` for a heading that ends `, not by prose`, so
+    the reader sent to "the list of things this project asserts" arrived at the
+    top of the page instead. Nothing said so: a browser given an anchor it
+    cannot find does not complain, it just does not move.
+
+    Only relative links. An external URL needs the network to check, and a test
+    that fails when GitHub is slow is worse than no test.
+    """
+
+    def links(self) -> list[tuple[Path, str]]:
+        found = []
+        for path in markdown_files():
+            for target in _LINK.findall(path.read_text(encoding="utf-8")):
+                if target.startswith(("http://", "https://", "mailto:")):
+                    continue
+                found.append((path, target))
+        return found
+
+    def test_there_are_links_to_check(self) -> None:
+        """Without this the two tests below are vacuous if the pattern rots."""
+        self.assertGreater(len(self.links()), 25)
+
+    def test_each_one_names_a_file_that_exists(self) -> None:
+        missing = []
+        for source, target in self.links():
+            path, _, _ = target.partition("#")
+            if path and not (source.parent / path).exists():
+                missing.append(f"{source.relative_to(REPO)} -> {target}")
+        self.assertEqual(missing, [])
+
+    def test_each_anchor_names_a_heading_that_exists(self) -> None:
+        broken = []
+        for source, target in self.links():
+            path, _, anchor = target.partition("#")
+            if not anchor:
+                continue
+            doc = (source.parent / path) if path else source
+            headings = {slug(h) for h in _HEADING.findall(doc.read_text(encoding="utf-8"))}
+            # Percent-encoded, because that is how a `⚠️` anchor has to be
+            # written in a link and how the two in this repository are written.
+            if anchor not in headings and unquote(anchor) not in headings:
+                broken.append(f"{source.relative_to(REPO)} -> {target}")
+        self.assertEqual(broken, [])
 
 
 if __name__ == "__main__":
