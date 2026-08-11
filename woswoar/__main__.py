@@ -129,6 +129,22 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    if args.show is not None:
+        # The preview pane, one row at a time. Ahead of everything else because
+        # it shares none of it: no display line, no width, and an empty answer
+        # is a cursor sitting past the end of a list that moved under it -- a
+        # blank pane, not a message. `--colour` it does share, and means the
+        # same thing by it.
+        block = search.detail(
+            args.show,
+            args.scope,
+            dedup=not args.no_dedup,
+            around=args.around,
+            colour=args.colour,
+        )
+        if block is not None:
+            print(block)
+        return 0
     if args.print_anchor:
         # Where fzf should park the cursor once it has unfolded the timeline.
         # A separate invocation because `transform` composes `reload(...)` and
@@ -344,21 +360,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         check("fzf", False, f"not found - {deps.advice([deps.FZF])}")
     else:
         # Which keys this fzf can actually offer, not just that it is there.
-        # An fzf below 0.45 gets a working picker with no Ctrl-R cycling and no
-        # Ctrl-T timeline -- correct, silent, and impossible to tell from a bug
-        # unless something says so. Reported from a fleet running 0.73 on one
-        # machine and Debian's 0.44.1 on another.
+        # An fzf below 0.45 gets a working picker with several keys missing --
+        # correct, silent, and impossible to tell from a bug unless something
+        # says so. Reported from a fleet running 0.73 on one machine and
+        # Debian's 0.44.1 on another.
+        #
+        # The list comes from `search.GATED_KEYS` rather than being written out
+        # here: this sentence and the bindings it describes are the same fact in
+        # two modules, and it was already wrong once -- it still named two keys
+        # after the preview pane became the third.
         said, _ = search.fzf_version()
         shown = said or "version unknown"
         if search.fzf_supports_transform():
             check("fzf", True, f"{fzf}  ({shown})")
         else:
             floor = ".".join(str(part) for part in search.TRANSFORM_SINCE)
+            missing = ", ".join(search.GATED_KEYS[:-1]) + f" and {search.GATED_KEYS[-1]}"
             check(
                 "fzf",
                 True,
-                f"{fzf}  ({shown} - searching works; ctrl-r cycling and the"
-                f" ctrl-t timeline need {floor}+)",
+                f"{fzf}  ({shown} - searching works; {missing} need {floor}+)",
             )
 
     machine_file = store.machine_file()
@@ -1526,6 +1547,9 @@ def build_parser() -> argparse.ArgumentParser:
 
         The directory scope spans machines on purpose: ~/src/woswoar on either
         of your boxes is the same project.
+
+        Ctrl-/ shows the rest of what was recorded for the highlighted command
+        -- its directory, session, exit code and duration.
         """,
     )
     add_scope(p_search)
@@ -1537,9 +1561,9 @@ def build_parser() -> argparse.ArgumentParser:
         "print matching lines as plain text",
         """
         Mostly internal: this is what the picker re-runs when you switch scope
-        with Ctrl-G, Ctrl-H, Ctrl-S or Ctrl-O. It is also how to read your
-        history without fzf installed, and it pipes --
-        `woswoar list | grep docker`.
+        with Ctrl-G, Ctrl-H, Ctrl-S or Ctrl-O, and what fills the Ctrl-/ pane.
+        It is also how to read your history without fzf installed, and it pipes
+        -- `woswoar list | grep docker`.
         """,
     )
     add_scope(p_list)
@@ -1557,6 +1581,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Both passed by the picker's ctrl-t binding rather than typed.
     p_list.add_argument("--print-anchor", action="store_true", help=argparse.SUPPRESS)
+    # The preview pane's own entry point: one row of the list this would print,
+    # as a block. fzf's interface, not a person's, so it is suppressed like the
+    # two above rather than documented.
+    p_list.add_argument("--show", type=int, default=None, help=argparse.SUPPRESS)
     p_list.add_argument(
         "--colour",
         "--color",

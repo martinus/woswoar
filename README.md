@@ -59,6 +59,31 @@ is cleared, so typing now filters *the timeline* rather than repeating the searc
 that got you here. Repeats are kept — running `cargo test` twice is the shape of
 what happened, and the deduplicated search list hides it.
 
+### See the rest of what was recorded
+
+Six fields go into every record and a list line has room for two. Press
+<kbd>Ctrl</kbd>+<kbd>/</kbd> for the other four on whichever row you are on:
+
+```
+when     2026-08-10 14:32:07  (3h12m ago)
+dir      ~/src/woswoar
+host     thinkpad
+session  6a79f245-36ea53
+exit     0
+took     1.2 s
+
+docker compose up -d --build
+```
+
+Which directory, which machine, which shell, how long it took, and the command
+in full rather than clipped at the window edge. `dir`, `host` and `session` are
+also three of the four scopes, so the pane says which key would narrow the list
+to whatever it is pointing at. A field nobody recorded says so rather than going
+missing — most of a freshly imported history.
+
+The pane starts hidden and costs nothing until you ask for it — see
+[the numbers](docs/shell-integration.md#the-details-pane).
+
 ## Quick start
 
 ```bash

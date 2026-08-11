@@ -192,8 +192,22 @@ def _read_until(fd: int, marker: str, timeout: float, index: int, before: list[s
             chunk = b""
         if not chunk:
             raise stalled("the program exited")
+        if _CURSOR_QUERY in chunk:
+            # A real terminal answers this, and a program that asks waits. fzf
+            # asks as soon as it starts, because `--height` draws an inline
+            # window and it has to know which row it is on -- so without a reply
+            # it never paints, and the failure looks like a picker that produced
+            # nothing rather than one that is still waiting for us.
+            os.write(fd, _CURSOR_REPORT)
         buffer += chunk
     return buffer.decode("utf-8", "replace")
+
+
+#: "Where is the cursor?", and an answer. Row 1 column 1 is a lie in general and
+#: exactly right here: nothing has been printed above the program under test, so
+#: it has the whole window.
+_CURSOR_QUERY = b"\x1b[6n"
+_CURSOR_REPORT = b"\x1b[1;1R"
 
 
 def loose_paths() -> list[str]:

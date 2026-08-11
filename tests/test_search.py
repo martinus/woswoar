@@ -8,6 +8,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -18,7 +19,15 @@ from woswoar import search, store
 from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
 
-from .support import MACHINE_ID, Captured, WoswoarTestCase, requires_fzf, run_cli
+from .support import (
+    MACHINE_ID,
+    Captured,
+    Typed,
+    WoswoarTestCase,
+    requires_fzf,
+    run_cli,
+    run_in_pty,
+)
 
 NOW = 1_800_000_000
 
@@ -84,7 +93,7 @@ class TestRelativeTime(unittest.TestCase):
 
 class TestRankRows(unittest.TestCase):
     @staticmethod
-    def rows(*pairs: tuple[int, str]) -> tuple[list[str], list[str], list[str], list[str]]:
+    def rows(*pairs: tuple[int, str]) -> tuple[list[str], ...]:
         """Stamps and exit codes come out of the cache as strings, so that is
         what goes in. These cases are about order, so everything succeeded."""
         return (
@@ -95,20 +104,26 @@ class TestRankRows(unittest.TestCase):
         )
 
     def test_newest_first(self) -> None:
-        stamps, commands, codes, hosts = self.rows((1, "old"), (3, "new"), (2, "mid"))
-        ranked = search.rank_rows(stamps, commands, codes, hosts)
+        ranked = search.rank_rows(self.rows((1, "old"), (3, "new"), (2, "mid")))
         self.assertEqual([cmd for _, cmd, _, _ in ranked], ["new", "mid", "old"])
 
     def test_dedup_keeps_the_most_recent_occurrence(self) -> None:
-        stamps, commands, codes, hosts = self.rows((1, "git status"), (5, "git status"), (3, "ls"))
         self.assertEqual(
-            search.rank_rows(stamps, commands, codes, hosts),
+            search.rank_rows(self.rows((1, "git status"), (5, "git status"), (3, "ls"))),
             [(5, "git status", "0", MACHINE_ID), (3, "ls", "0", MACHINE_ID)],
         )
 
     def test_dedup_can_be_disabled(self) -> None:
-        stamps, commands, codes, hosts = self.rows((1, "ls"), (2, "ls"))
-        self.assertEqual(len(search.rank_rows(stamps, commands, codes, hosts, dedup=False)), 2)
+        self.assertEqual(len(search.rank_rows(self.rows((1, "ls"), (2, "ls")), dedup=False)), 2)
+
+    def test_the_extra_columns_are_ranked_by_the_same_function(self) -> None:
+        """The preview's three ride along rather than being ordered separately,
+        which is what lets `--show n` and line `n` of the list mean one row."""
+        stamps, commands, codes, hosts = self.rows((1, "old"), (3, "new"))
+        ranked = search.rank_rows((stamps, commands, codes, hosts, ["~/first", "~/second"]))
+        self.assertEqual(
+            [(row[1], row[4]) for row in ranked], [("new", "~/second"), ("old", "~/first")]
+        )
 
 
 class TestRenderRoundTrip(unittest.TestCase):
@@ -147,6 +162,32 @@ def recalled(scope: search.Scope) -> list[str]:
     return [
         search.command_from_line(line, width) for line in search.lines_for(scope, host_width=width)
     ]
+
+
+def run_binding(binding: str, marker: str, prompt: str | None = None) -> str:
+    """Run the `sh` out of one fzf binding, with the prompt fzf would export.
+
+    Four test classes drive a binding this way -- the cycle, the timeline, the
+    preview, and the prompt-repaint check -- and what they share is not the
+    binding but the *environment*: an `$FZF_PROMPT` and nothing else, because
+    what is under test is a decision this snippet makes from that one variable.
+    One function rather than a copy per class, for the reason `recalled` above
+    is one function: the day fzf exports something else, there is one place to
+    say so.
+
+    ``prompt`` of `None` leaves `$FZF_PROMPT` unset, which is a different case
+    from empty and is the one the preview has to fail closed on.
+    """
+    env = {"PATH": "/usr/bin:/bin"}
+    if prompt is not None:
+        env["FZF_PROMPT"] = prompt
+    return subprocess.run(
+        ["sh", "-c", binding.split(marker, 1)[1]],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    ).stdout
 
 
 #: Every scope's direct key, spelled as fzf takes it. Hand-written rather than
@@ -731,15 +772,9 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
     """
 
     def next_scope(self, prompt: str) -> str:
-        binding = search._cycle_binding("woswoar", "", " --host-width 0")
-        script = binding.split("transform:", 1)[1]
-        out = subprocess.run(
-            ["sh", "-c", script],
-            capture_output=True,
-            text=True,
-            env={"FZF_PROMPT": prompt, "PATH": "/usr/bin:/bin"},
-            check=True,
-        ).stdout
+        out = run_binding(
+            search._cycle_binding("woswoar", "", " --host-width 0"), "transform:", prompt
+        )
         return out.split("--scope ", 1)[1].split(")", 1)[0].strip()
 
     def test_it_goes_round(self) -> None:
@@ -784,15 +819,11 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
 
     def test_it_repaints_the_prompt_it_reads_back(self) -> None:
         """`change-prompt` is not decoration: the next press reads it."""
-        binding = search._cycle_binding("woswoar", "", " --host-width 0")
-        script = binding.split("transform:", 1)[1]
-        out = subprocess.run(
-            ["sh", "-c", script],
-            capture_output=True,
-            text=True,
-            env={"FZF_PROMPT": "woswoar (global) ", "PATH": "/usr/bin:/bin"},
-            check=True,
-        ).stdout
+        out = run_binding(
+            search._cycle_binding("woswoar", "", " --host-width 0"),
+            "transform:",
+            "woswoar (global) ",
+        )
         self.assertIn("change-prompt(woswoar (host) )", out)
 
     def test_the_reload_keeps_the_colour_and_the_width(self) -> None:
@@ -1176,18 +1207,429 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
         Driven as the real `sh`, because what is under test is that snippet's
         decision. `--print-anchor` is stubbed out of the way: this is about the
         scope it chooses, and the anchor needs a history to look at."""
-        script = search._timeline_binding("true", "", " --host-width 0").split("transform:", 1)[1]
+        binding = search._timeline_binding("true", "", " --host-width 0")
         for scope in search.SCOPES:
             with self.subTest(scope=scope):
-                out = subprocess.run(
-                    ["sh", "-c", script],
-                    capture_output=True,
-                    text=True,
-                    env={"FZF_PROMPT": f"woswoar ({scope}) ", "PATH": "/usr/bin:/bin"},
-                    check=True,
-                ).stdout
+                out = run_binding(binding, "transform:", f"woswoar ({scope}) ")
                 self.assertIn(f"change-prompt(woswoar (timeline {scope}) )", out)
                 self.assertIn(f"--scope {scope} --around", out)
+
+
+class TestThePreviewBlock(WoswoarTestCase):
+    """`list --show N`: the three recorded fields nobody could read back.
+
+    `cwd`, `duration_ms` and `session` are recorded, encrypted, synced and
+    cached, and there is no width on the display line for any of them -- it is a
+    fixed-width prefix that `command_from_line` slices rather than parses. The
+    pane costs no width because it describes one row.
+    """
+
+    #: Sorts *before* `MACHINE_ID`, which is what makes the alignment test below
+    #: able to fail: the columns are built by walking the log files, so a peer
+    #: whose id sorts second would occupy the same indices either way.
+    PEER = "0000000000000001"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ts = NOW
+
+    def record(
+        self,
+        cmd: str,
+        cwd: str = "~/src/woswoar",
+        code: int = 0,
+        ms: int = 1234,
+        session: str = "6a79f245-36ea53",
+        host: str = MACHINE_ID,
+    ) -> None:
+        self.ts += 1
+        with store.private_append(store.log_file(host, "2026-07-29")) as handle:
+            handle.write(format_line(Entry(self.ts, host, session, cwd, code, ms, cmd)) + "\n")
+
+    def listed(self, *argv: str) -> list[str]:
+        return run_cli("list", *argv).out.splitlines()
+
+    def shown(self, index: int, *argv: str) -> str:
+        return run_cli("list", "--show", str(index), *argv).out
+
+    def fields(self, block: str) -> dict[str, str]:
+        """The pane's labelled table as a mapping, command excluded.
+
+        By name rather than by line number, which is what these tests used to do
+        -- and a line number says nothing about which field it meant, so adding
+        a row silently moved four assertions onto their neighbours.
+        """
+        table, _, _ = unstyled(block).partition("\n\n")
+        return {
+            label: rest.strip()
+            for label, _, rest in (line.partition("  ") for line in table.splitlines())
+        }
+
+    def test_show_reports_the_row_the_list_shows(self) -> None:
+        """Every index, and every field of it.
+
+        The two sides rank from the same columns, so this holds by construction
+        -- right up until a column is reordered for the preview's sake, which
+        moves nothing on a display line and is therefore invisible from the
+        picker. Each row's directory, session, status and duration are derived
+        from its position here, so a pair of columns swapped in either direction
+        shows up as the wrong value rather than as a shorter list.
+        """
+        commands = ["one", "two", "three", "four", "five"]
+        for i, cmd in enumerate(commands):
+            self.record(cmd, cwd=f"~/d{i}", code=i, ms=i + 1, session=f"sess{i}")
+
+        lines = self.listed("--scope", "global")
+        self.assertEqual(len(lines), len(commands))
+        for index, line in enumerate(lines):
+            with self.subTest(index=index):
+                cmd = search.command_from_line(line)
+                i = commands.index(cmd)
+                block = self.shown(index, "--scope", "global")
+                shows = self.fields(block)
+                self.assertEqual(block.splitlines()[-1], cmd)
+                self.assertEqual(shows["session"], f"sess{i}")
+                self.assertEqual(shows["dir"], f"~/d{i}")
+                self.assertEqual(shows["exit"], str(i))
+                self.assertEqual(shows["took"], f"{i + 1} ms")
+
+    def test_show_under_a_timeline_uses_the_window(self) -> None:
+        """After Ctrl-T the list fzf holds is the timeline *window*, so `{n}`
+        indexes that -- and the same number resolved against the ranked list is
+        a different command, silently. Repeats are what makes the two disagree:
+        the ranked list collapses them and the timeline must not."""
+        for i, cmd in enumerate(["first", "dup", "second", "dup", "third"]):
+            self.record(cmd, cwd=f"~/d{i}")
+        anchor = next(
+            i for i, line in enumerate(self.listed("--scope", "global")) if "second" in line
+        )
+
+        window = self.listed("--scope", "global", "--around", str(anchor))
+        for index, line in enumerate(window):
+            with self.subTest(index=index):
+                block = self.shown(index, "--scope", "global", "--around", str(anchor))
+                self.assertEqual(block.splitlines()[-1], search.command_from_line(line))
+
+        # Without this the fixture would pass just as happily with `--around`
+        # dropped from `--show`: it says the two lists really do answer
+        # differently at the index the loop above checked.
+        with_window = self.shown(3, "--scope", "global", "--around", str(anchor))
+        self.assertNotEqual(with_window, self.shown(3, "--scope", "global"))
+        self.assertEqual(self.fields(with_window)["dir"], "~/d1")
+
+    def test_a_cursor_past_the_end_gets_a_blank_pane_not_a_traceback(self) -> None:
+        """The index comes from fzf and a background sync can merge commands
+        between the picker opening and the cursor moving."""
+        self.record("only one")
+        self.assertEqual(self.shown(9999, "--scope", "global"), "")
+        self.assertEqual(self.shown(0, "--scope", "session"), "", "no hook, no session")
+
+    def test_the_extra_fields_belong_to_the_row_they_are_shown_with(self) -> None:
+        """The `host` scope drops whole files before a row is looked at, so the
+        four display columns can be shorter than the history. Fetching the other
+        three separately -- `Cache.cwds()` walks every file -- lines them up only
+        by luck, and the pane would then put a peer's directory under this
+        machine's command with nothing on screen to say so.
+
+        `zip(strict=True)` turns that particular slip into an exception rather
+        than a wrong answer, which is the point of it being there; this asserts
+        the answer that exception is protecting.
+        """
+        self.record("theirs", cwd="~/their-dir", host=self.PEER)
+        self.record("mine", cwd="~/my-dir")
+        block = self.shown(0, "--scope", "host")
+        self.assertEqual(block.splitlines()[-1], "mine")
+        self.assertIn("~/my-dir", block)
+        self.assertNotIn("their-dir", block)
+
+    def test_a_peers_record_cannot_drive_the_terminal(self) -> None:
+        """Every field in the block came off another machine, and the pane is a
+        new place for each of them to reach a terminal. `cwd` and `session` had
+        never been printed anywhere before this; `session` was not made inert at
+        the cache door until it was.
+        """
+        store.write_atomic(store.name_file(self.PEER), b"peer\x1b[1A\x1b[2K\n")
+        self.record(
+            "echo hi\x07",
+            cwd="~/\x1b[2K\x1b[1Aspoofed",
+            session="s1\x1b[2Kfaked",
+            host=self.PEER,
+        )
+        block = self.shown(0, "--scope", "global")
+        self.assertIn("spoofed", block, "the directory must still be shown")
+        self.assertIn("faked", block, "the session must still be shown")
+        self.assertEqual([c for c in block if c < " " and c != "\n"], [])
+
+    def test_what_was_never_recorded_says_so_rather_than_reading_as_zero(self) -> None:
+        """An imported history has no directory, no exit code and no duration,
+        and that is most of a fresh install. `exit -1` would invent a failure --
+        the same misreading that once painted every imported command red."""
+        self.record("ls -la", cwd="", code=-1, ms=-1, session="import")
+        shows = self.fields(self.shown(0, "--scope", "global"))
+        self.assertEqual(shows["dir"], "not recorded")
+        self.assertEqual(shows["exit"], "not recorded")
+        self.assertEqual(shows["took"], "not recorded")
+
+    def test_every_field_is_named_and_none_is_ever_missing(self) -> None:
+        """Reported as "hard to read, and there is no information what each line
+        means": five values run together on four lines need a reader who already
+        knows the record format, and the whole point of the pane is that nobody
+        does -- three of these fields have never been on a screen.
+
+        Named *and* always present. An imported row has no directory, no exit
+        code, no duration and no session, and the first version of this simply
+        left those lines out; a table with holes in it reads as a broken pane
+        rather than as a fact about the row, and there is nothing left to line
+        the remaining values up against.
+        """
+        self.record("ls -la", cwd="", code=-1, ms=-1, session="")
+        block = self.shown(0, "--scope", "global")
+        self.assertEqual(
+            list(self.fields(block)),
+            ["when", "dir", "host", "session", "exit", "took"],
+        )
+        self.assertEqual(self.fields(block)["session"], "not recorded")
+        # Last, and outside the table: it is the one field with no bound on its
+        # length, and the pane has a fixed number of rows.
+        self.assertEqual(block.splitlines()[-1], "ls -la")
+
+    def test_colour_is_asked_for_and_never_reaches_a_pipe(self) -> None:
+        """`--show` is a command line like any other, so `woswoar list --show 0`
+        has no more business emitting escapes unasked than `woswoar list` does.
+        The pane passes `--colour` and that is the only reason they are there."""
+        self.record("true")
+        plain = self.shown(0, "--scope", "global")
+        painted = self.shown(0, "--scope", "global", "--colour")
+        self.assertNotIn("\x1b", plain)
+        self.assertEqual(unstyled(painted), plain, "colour changed more than the colour")
+        # The label column is what the eye skips: it is the same six words on
+        # every row, where the value is the answer.
+        self.assertIn(f"{search._DIM}when", painted)
+        self.assertIn(f"{search._BOLD}true{search._RESET}", painted)
+
+    def test_the_exit_code_is_painted_green_red_or_not_at_all(self) -> None:
+        """Three answers, which is why `is_failure` cannot serve here: it has
+        two, and its unknown-is-not-failure rule is exactly what stops an
+        imported history reading as a screenful of failures. The pane still has
+        to distinguish "exited cleanly" from "nobody ever knew"."""
+        for cmd, code in (("boom", 127), ("fine", 0), ("imported", -1)):
+            self.record(cmd, code=code)
+        boom, fine, imported = (self.shown(i, "--scope", "global", "--colour") for i in (2, 1, 0))
+        self.assertIn(f"{search._FAILED}127{search._RESET}", boom)
+        self.assertIn(f"{search._OK}0{search._RESET}", fine)
+        self.assertIn(f"{search._DIM}not recorded{search._RESET}", imported)
+        self.assertNotIn(search._FAILED, imported, "an unrecorded exit code was painted a failure")
+
+    def test_a_duration_is_readable_at_every_scale(self) -> None:
+        for ms, expected in [
+            ("0", "0 ms"),
+            ("87", "87 ms"),
+            ("999", "999 ms"),
+            ("1000", "1.0 s"),
+            ("1234", "1.2 s"),
+            ("59999", "60.0 s"),
+            ("60000", "1m 0s"),
+            ("3599000", "59m 59s"),
+            ("3725000", "1h 2m"),
+        ]:
+            with self.subTest(ms=ms):
+                self.assertEqual(search._duration_label(ms), expected)
+
+    def test_a_duration_that_was_never_measured_is_left_out(self) -> None:
+        """None, not "0 ms": a whole column of zeroes is a claim, and an absent
+        line is the truth. `nonsense` stands for a damaged field, which should
+        cost this line and not the block."""
+        self.assertIsNone(search._duration_label("-1"))
+        self.assertIsNone(search._duration_label("nonsense"))
+
+
+class TestThePreviewBinding(unittest.TestCase):
+    """The `sh` the preview runs, and the actions that repoint it.
+
+    Driven as the real shell for the same reason `TestCtrlRCyclesTheScope` is:
+    the decision this snippet makes is the part that can be wrong, and it needs
+    no terminal to make it.
+    """
+
+    def preview(self, prompt: str | None, self_cmd: str = "echo RAN") -> str:
+        return run_binding(search._preview_binding(self_cmd, ""), "--preview=", prompt)
+
+    def test_the_preview_fails_closed_without_a_prompt(self) -> None:
+        """Guessing `global` is fine for a key that *reloads* -- you get a list
+        whose prompt says what it is. Here the same guess is unfalsifiable: a
+        block describing the wrong row looks exactly like one describing the
+        right row. `FZF_PROMPT` is read on the assumption fzf exports it, and no
+        version is known to have introduced it."""
+        for prompt in (None, "", "$ "):
+            with self.subTest(prompt=prompt):
+                out = self.preview(prompt)
+                self.assertEqual(out.strip(), search.PREVIEW_UNKNOWN)
+                self.assertNotIn("RAN", out, "it fell through and described some other list")
+
+    def test_it_asks_about_the_list_that_is_on_screen(self) -> None:
+        for scope in search.SCOPES:
+            with self.subTest(scope=scope):
+                out = self.preview(f"woswoar ({scope}) ")
+                self.assertEqual(out.strip(), f"RAN list --colour --show {{n}} --scope {scope}")
+
+    def argv(self) -> list[str]:
+        with mock.patch.object(search, "fzf_supports_transform", return_value=True):
+            return search._fzf_argv("global", "", dedup=True, host_width=0)
+
+    def test_the_preview_is_hidden_until_toggled(self) -> None:
+        """It forks an interpreter and reads the whole cache per cursor move.
+        Visible by default, that is felt as lag under a held arrow key; hidden,
+        a user who never presses the key pays nothing at all."""
+        argv = self.argv()
+        window = next(a for a in argv if a.startswith("--preview-window="))
+        self.assertIn("hidden", window)
+        self.assertIn(f"--bind={search.PREVIEW_KEY}:toggle-preview", argv)
+        self.assertIn(
+            f"{search.PREVIEW_KEY} details",
+            next(a for a in argv if a.startswith("--header=")),
+        )
+
+    def test_nothing_is_offered_to_an_fzf_that_may_not_have_the_pieces(self) -> None:
+        """An unknown key name in a `--bind` makes fzf refuse to start, so the
+        cost of guessing wrong about `ctrl-/` is the picker, not the key."""
+        with mock.patch.object(search, "fzf_supports_transform", return_value=False):
+            argv = search._fzf_argv("global", "", dedup=True, host_width=0)
+        self.assertNotIn("--preview", " ".join(argv))
+        self.assertNotIn(search.PREVIEW_KEY, " ".join(argv))
+
+    def test_every_key_that_changes_the_list_repoints_the_pane(self) -> None:
+        """A preview left pointing at the list it was set up for is the whole
+        hazard of this feature. Ctrl-T pins it to one `--around` window, and
+        every key that can be pressed *next* has to take it back off again --
+        including the two that reach it through a `transform`, where the `{n}`
+        meant for the pane has to survive fzf expanding the transform's own
+        command line."""
+        binds = [a for a in self.argv() if a.startswith("--bind=")]
+        for key in [f"ctrl-{search.KEYS[scope]}" for scope in search.SCOPES] + ["ctrl-r", "ctrl-t"]:
+            with self.subTest(key=key):
+                bind = next(a for a in binds if a.startswith(f"--bind={key}:"))
+                self.assertIn("change-preview(", bind)
+                self.assertIn("--show", bind)
+        timeline = next(a for a in binds if a.startswith("--bind=ctrl-t:"))
+        self.assertIn("--show \\{n} --scope $s --around {n}", timeline)
+        cycle = next(a for a in binds if a.startswith("--bind=ctrl-r:"))
+        self.assertIn("--show \\{n} --scope $n", cycle)
+        self.assertNotIn("--around", cycle, "the way out of a timeline must not stay in it")
+
+
+@requires_fzf
+class TestThePreviewUnderARealFzf(WoswoarTestCase):
+    """The pane, driven through a real fzf under a real terminal.
+
+    Every other test here asserts the strings woswoar hands fzf. This one
+    asserts what fzf does with them, and there is one step of the design nothing
+    else can reach: the `{n}` a `transform` prints for the preview has to
+    survive fzf expanding the transform's own command line first. `man fzf`
+    documents that a backslash escapes a placeholder; what becomes of that
+    escape inside a transform's *output* is written down nowhere, and the whole
+    timeline interaction rests on it.
+
+    The markers are directories, which appear only in the pane -- never on a
+    display line, and never in anything the harness types.
+    """
+
+    #: Chronological. The repeat is what makes the ranked list and the timeline
+    #: window disagree about which command index 3 is, which is the only way a
+    #: preview that ignored `--around` could be caught.
+    HISTORY: ClassVar[list[str]] = ["first", "dup", "second", "dup", "third"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            for i, cmd in enumerate(self.HISTORY):
+                entry = Entry(NOW + i * 60, MACHINE_ID, "s1", f"~/d{i}", 0, 1234, cmd)
+                handle.write(format_line(entry) + "\n")
+
+    def picker_env(self) -> dict[str, str]:
+        """A sandbox whose `woswoar` on PATH is *this* tree.
+
+        Not optional: `_self_command` prefers whatever `woswoar` it finds, and
+        on a machine with woswoar installed that is a released copy which may
+        predate `--show` entirely. The test would then pass or fail on which
+        version happens to be on the developer's PATH.
+        """
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        shim = bin_dir / "woswoar"
+        shim.write_text(
+            f'#!/bin/sh\nexec {sys.executable} -m woswoar "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        return {
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "TERM": "xterm",
+            "HOME": str(self.root),
+            "SHELL": "/bin/sh",
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+            "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
+            "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
+            "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
+        }
+
+    def drive(self, steps: list[Typed]) -> list[str]:
+        return run_in_pty([sys.executable, "-m", "woswoar", "search"], steps, env=self.picker_env())
+
+    #: Ctrl-/ and Ctrl-N as a terminal sends them. Ctrl-N is fzf's own `down`,
+    #: which under `--layout=reverse` is the next item in the list.
+    TOGGLE = "\x1f"
+    NEXT = "\x0e"
+
+    #: **The `until` markers are the assertions here.** `_read_until` loops
+    #: until its needle appears and returns the buffer it found it in, so
+    #: `assertIn(marker, that_step)` is true by construction and tests nothing --
+    #: the same shape as CLAUDE.md's "a marker asserted in a shell's stdout also
+    #: appears in the harness's echo of the line that was typed". A step that
+    #: does not see its marker stalls and raises, carrying every screen with it.
+    #: What is left for an `assert` is only what a *stall* cannot say: that
+    #: something is absent.
+    def test_the_pane_is_dark_until_the_key_and_then_follows_the_cursor(self) -> None:
+        """Reaching the last step proves the pane appeared on the key and then
+        renumbered itself, which is what says `change-preview` was handed a live
+        template rather than one row's answer frozen into it. The `assert` adds
+        the one thing the steps cannot: that it was not already there."""
+        before, _revealed, _moved = self.drive(
+            [
+                # A command on screen means fzf has drawn the list and is
+                # reading keys; asserting the *absence* of the pane before that
+                # would assert nothing at all.
+                Typed("", "third"),
+                Typed(self.TOGGLE, "~/d4"),
+                Typed(self.NEXT, "~/d3"),
+            ]
+        )
+        self.assertNotIn("~/d4", before, "the pane rendered before anyone asked for it")
+
+    def test_a_timeline_repoints_the_pane_at_its_own_window(self) -> None:
+        """Ctrl-T replaces the list with a window that keeps the repeats, so the
+        fourth row of it is `dup` at `~/d1`, where the fourth row of the ranked
+        list is `first` at `~/d0`.
+
+        Both directions are needed and neither alone is enough. Waiting for
+        `~/d1` fails on a pane that ignored `--around`, because it would be
+        showing `~/d0`; but it would also be satisfied by a pane that rendered
+        *both* at some point, so the absence of `~/d0` is asserted as well. That
+        is the answer the ranked list would have given, and seeing it here is
+        exactly the plausible-looking wrong block this feature can produce.
+        """
+        *_, moved = self.drive(
+            [
+                Typed("", "third"),
+                Typed(self.TOGGLE, "~/d4"),
+                # Down twice to `second`, which has history either side of it,
+                # then Ctrl-T to unfold it.
+                Typed(self.NEXT, "~/d3"),
+                Typed(self.NEXT, "~/d2"),
+                Typed("\x14", "~/d2"),
+                Typed(self.NEXT, "~/d1"),
+            ]
+        )
+        self.assertNotIn("~/d0", moved, "the pane answered from the ranked list, not the window")
 
 
 class DirScopeCase(WoswoarTestCase):

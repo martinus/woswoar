@@ -226,14 +226,23 @@ def parse_line(line: str, host: str, inert: bool = False) -> Entry | None:
     final line (a shell killed mid-append) or a line from a future format
     version should cost us that one entry, never the whole file.
 
-    ``inert`` applies :func:`make_inert` to the two free-text fields as they are
-    built. A flag rather than a second pass because the caller that wants it --
+    ``inert`` applies :func:`make_inert` to the three fields whose contents this
+    machine did not choose -- session, cwd and command. A flag rather than a
+    second pass because the caller that wants it --
     :mod:`woswoar.cache`, on behalf of everything that displays history -- reads
     the whole log, and rebuilding each entry afterwards measured 82ms against
     59ms for 52,000 lines. The caller that does *not* want it is
     `store.existing_keys`, which compares against commands as the importer read
     them: sanitising there would stop an already-imported entry matching itself
     and re-import the whole file.
+
+    `session` joined the other two when the preview pane started showing it. It
+    is a `<hex>-<hex>` token as *this* machine writes it, and free text as far
+    as the format is concerned -- a peer's chunk can put anything in that field,
+    and until it had a display site nothing would have noticed. Sanitising it
+    here rather than at that site is the rule `cache` states: this is the one
+    door a peer's history comes through, and a rule about remembering to clean
+    at each display had already been forgotten once before it moved here.
     """
     line = line.rstrip("\n")
     if not line:
@@ -255,7 +264,7 @@ def parse_line(line: str, host: str, inert: bool = False) -> Entry | None:
     return Entry(
         ts=ts,
         host=host,
-        session=session,
+        session=clean(session),
         cwd=clean(unescape(cwd)),
         exit_code=exit_code,
         duration_ms=duration_ms,
