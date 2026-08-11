@@ -1,0 +1,10 @@
+# A vulnerability must not arrive as a public issue, so the blank-issue escape
+# hatch is closed and the private channel is offered beside the two templates.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/martinus/woswoar/security/advisories/new
+    about: Privately, where only the maintainer can read it. Never a public issue.
+  - name: How the repository works
+    url: https://github.com/martinus/woswoar/blob/main/CONTRIBUTING.md
+    about: The preflight one-liner, and what a patch needs before it lands.

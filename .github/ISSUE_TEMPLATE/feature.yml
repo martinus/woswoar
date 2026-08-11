@@ -1,0 +1,35 @@
+name: Feature request
+description: Something you wanted woswoar to do and could not
+labels: []
+body:
+  - type: textarea
+    id: trying
+    attributes:
+      label: What were you trying to do?
+      description: |
+        The task, not the feature. What you were actually after is the thing
+        worth designing against — there is often a shorter way to it than the
+        one that comes to mind first, and it is the part nobody else can supply.
+      placeholder: |
+        I wanted the command I ran in this directory last month, but I only
+        remember roughly when, not what it was called.
+    validations:
+      required: true
+
+  - type: textarea
+    id: instead
+    attributes:
+      label: What did you do instead?
+      description: What you fell back on, and why it was not good enough.
+    validations:
+      required: false
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you had in mind, if you have something in mind
+      description: |
+        Optional, and genuinely so. A clear problem with no proposed solution is
+        a better issue than a solution with no problem behind it.
+    validations:
+      required: false
