@@ -79,6 +79,14 @@ Row = tuple[Any, ...]
 _FAILED = "\x1b[31m"
 _RESET = "\x1b[0m"
 
+#: The rest of the palette, used only by the preview pane. Green, red and dim,
+#: which is what `doctor` already paints with -- a fourth colour would be a new
+#: thing for a reader to learn, and these three already mean "fine", "not fine"
+#: and "structure, not content" everywhere else in the program.
+_OK = "\x1b[32m"
+_DIM = "\x1b[2m"
+_BOLD = "\x1b[1m"
+
 
 def is_failure(code: str) -> bool:
     """Whether a recorded exit code is a *known* failure.
@@ -420,34 +428,42 @@ def lines_for(
     return render_rows(rows, colour=colour, host_width=host_width)
 
 
-def _exit_label(code: str) -> str:
-    """``exit 0``, or what to say when the history never knew.
+def _exit_field(code: str) -> tuple[str | None, str]:
+    """What the ``exit`` row shows, and what colour it is.
 
-    A negative code is `importer`'s "never knew": `~/.bash_history` records no
-    exit codes whatsoever, so a literal ``exit -1`` would invent a failure that
-    never happened -- the same misreading that painted a freshly imported
-    history entirely red, one screen further in.
+    ``None`` is `importer`'s "never knew": `~/.bash_history` records no exit
+    codes whatsoever, so it stores -1, and a literal ``exit -1`` would invent a
+    failure that never happened -- the same misreading that painted a freshly
+    imported history entirely red, one screen further in.
 
     Parsed rather than compared against the string ``"-1"``, for the reason
     `is_failure` gives two screens up: the same bug comes back for any other
     sentinel, and ``-01`` is the same number written differently. An
-    unparseable code is shown as it was stored, because at that point the honest
-    thing is to hand over what the file says.
+    unparseable code is handed over exactly as it was stored and painted
+    nothing, because at that point the honest thing is to show what the file
+    says and claim nothing about what it means.
+
+    Three answers, so `is_failure` -- which has two, and deliberately treats
+    unknown as "not a failure" -- cannot serve: the pane distinguishes a clean
+    exit from an unknowable one, where a display line only ever asks whether to
+    paint the age red.
     """
     try:
-        recorded = int(code) >= 0
+        parsed = int(code)
     except ValueError:
-        recorded = True
-    return f"exit {code}" if recorded else "exit not recorded"
+        return code, ""
+    if parsed < 0:
+        return None, ""
+    return code, _OK if parsed == 0 else _FAILED
 
 
 def _duration_label(raw: str) -> str | None:
     """How long the command took, or ``None`` when nothing was recorded.
 
     ``None`` rather than "0 ms": an imported history has no durations at all,
-    and a whole column of zeroes is a claim, where an absent line is the truth.
-    Unparseable is treated the same way -- a damaged field should cost this one
-    line, never the block.
+    and a whole column of zeroes is a claim, where `_field`'s "not recorded" is
+    the truth. Unparseable is treated the same way -- a damaged field should
+    cost this one line, never the block.
 
     At most two units, and no more precision than anyone reads off a pane they
     opened to see where a command ran: ``87 ms``, ``1.2 s``, ``2m 3s``, ``1h 2m``.
@@ -469,7 +485,34 @@ def _duration_label(raw: str) -> str | None:
     return f"{hours}h {minutes}m"
 
 
-def _block(row: Row, now: int | None = None) -> str:
+#: Wide enough for ``session``, which is the longest label. The names are the
+#: picker's own -- `host`, `session` and `dir` are three of its four scopes -- so
+#: the pane says which key would narrow the list to the thing it is pointing at.
+_LABEL_WIDTH = 7
+
+
+def _field(label: str, value: str | None, colour: bool, tint: str = "") -> str:
+    """One ``label  value`` row of the pane's table.
+
+    Every label is always present, including the ones with nothing to say. The
+    first version left those lines out and read as a bug in the preview rather
+    than as a fact about the row -- a block that is six lines here and three
+    there gives a reader nothing to scan against, and "not recorded" is an
+    answer where a missing line is a question. An imported history has no
+    directory, no exit code, no duration and no session, so on a fresh import
+    that is four of the six.
+
+    The label is dim rather than the value bright: it is the same six words on
+    every row, so it should be the part the eye skips.
+    """
+    if value is None:
+        value, tint = "not recorded", _DIM
+    if not colour:
+        return f"{label:<{_LABEL_WIDTH}}  {value}"
+    return f"{_DIM}{label:<{_LABEL_WIDTH}}{_RESET}  {tint}{value}{_RESET if tint else ''}"
+
+
+def _block(row: Row, now: int | None = None, colour: bool = False) -> str:
     """The three unseen fields, plus the two the line already shows, as a block.
 
     Nothing here neutralises anything, and that is deliberate rather than an
@@ -487,34 +530,39 @@ def _block(row: Row, now: int | None = None) -> str:
 
     The command is printed as it was recorded rather than `escape`d, because
     this is the one place with room to show it whole: the picker's line is
-    clipped at the window edge, and `--preview-window=wrap` is not.
+    clipped at the window edge, and `--preview-window=wrap` is not. It goes
+    *last*, and below the table rather than in it: last because it is the one
+    field with no bound on its length, and a pane is a fixed number of rows --
+    put it first and a `find` invocation with forty arguments pushes everything
+    the pane exists to show off the bottom. Below the table because a value that
+    wraps cannot sit in a label column; fzf continues a wrapped line at column
+    zero.
+
+    With `colour`, the labels are dim, the exit code is green or red, and the
+    command is bold. Safe for the same reason `render_rows` is: `make_inert` has
+    already taken every C0 byte, ESC among them, off everything that came out of
+    the cache, so nothing a peer published can add escapes of its own. `host` is
+    the exception and `host_label` is why it is not one.
     """
     ts, cmd, code, host, cwd, duration, session = row
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
     age = relative_time(ts, now)
     # "now" is what `relative_time` says for a stamp in the future, which is
     # another machine's clock running ahead. "(now ago)" would be nonsense.
-    head = f"{when}  ({age})" if age == "now" else f"{when}  ({age} ago)"
-
-    where = [host_label(host)]
-    if session:
-        where.append(f"session {session}")
-    status = [_exit_label(code)]
-    took = _duration_label(duration)
-    if took:
-        status.append(took)
+    ago = f"({age})" if age == "now" else f"({age} ago)"
+    stamp = f"{when}  {_DIM}{ago}{_RESET}" if colour else f"{when}  {ago}"
+    shown, tint = _exit_field(code)
 
     return "\n".join(
         [
-            head,
-            " · ".join(where),
-            # An imported line has no directory at all, so the line says so
-            # rather than vanishing: a block that is four lines here and three
-            # there reads as a bug in the preview, not as a fact about the row.
-            cwd or "directory not recorded",
-            " · ".join(status),
+            _field("when", stamp, colour),
+            _field("dir", cwd or None, colour),
+            _field("host", host_label(host), colour),
+            _field("session", session or None, colour),
+            _field("exit", shown, colour, tint),
+            _field("took", _duration_label(duration), colour),
             "",
-            cmd,
+            f"{_BOLD}{cmd}{_RESET}" if colour else cmd,
         ]
     )
 
@@ -524,6 +572,7 @@ def detail(
     scope: Scope,
     dedup: bool = True,
     around: int | None = None,
+    colour: bool = False,
 ) -> str | None:
     """The preview block for one row of what `lines_for` would print, or ``None``.
 
@@ -545,7 +594,7 @@ def detail(
     rows, _ = _rows_for(columns, dedup=dedup, around=around)
     if not 0 <= index < len(rows):
         return None
-    return _block(rows[index])
+    return _block(rows[index], colour=colour)
 
 
 #: How many commands a timeline shows either side of the one it is centred on.
@@ -862,8 +911,13 @@ def _preview_command(
     flag `lines_for` takes, and for the same reason: under a timeline the list
     fzf holds is a *window*, so `row` indexes that window and resolving it
     against the ranked list would describe some entirely unrelated command.
+
+    ``--colour`` is the same flag the display line is rendered with, meaning the
+    same thing: a terminal is watching. It is passed rather than assumed because
+    `--show` is a command line like any other, and `woswoar list --show 0 | cat`
+    should no more contain escapes than `woswoar list` does.
     """
-    return f"{self_cmd} list --show {row} --scope {scope}{dedup_flag}{around}"
+    return f"{self_cmd} list --colour --show {row} --scope {scope}{dedup_flag}{around}"
 
 
 def _preview_binding(self_cmd: str, dedup_flag: str) -> str:
@@ -1063,8 +1117,12 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
 
     argv = [
         "fzf",
-        # Safe here and only here: `render_rows` writes the escapes and
-        # `make_inert` guarantees no command can contain any of its own.
+        # Safe here and only here: `render_rows` and `_block` write the escapes
+        # and `make_inert` guarantees no command can contain any of its own.
+        # It covers the pane as well as the list -- verified against a real fzf
+        # rather than assumed, since the manual describes this flag in terms of
+        # the input stream: dim and bold both arrive at the terminal, re-emitted
+        # by fzf as its own SGR.
         "--ansi",
         "--height=60%",
         "--layout=reverse",

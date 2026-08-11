@@ -77,15 +77,28 @@ Six fields are recorded per command and the list has room for two. Press
 <kbd>Ctrl</kbd>+<kbd>/</kbd> for the rest of the highlighted one:
 
 ```
-2026-08-10 14:32:07  (3h12m ago)
-thinkpad · session 6a79f245-36ea53
-~/src/woswoar
-exit 0 · 1.2 s
+when     2026-08-10 14:32:07  (3h12m ago)
+dir      ~/src/woswoar
+host     thinkpad
+session  6a79f245-36ea53
+exit     0
+took     1.2 s
 
 docker compose up -d --build
 ```
 
-It also shows a long command whole, where the list clips it at the window edge.
+Every field is named, and one that was never recorded says `not recorded`
+instead of vanishing — an imported history has no directory, no exit code, no
+duration and no session, so a table with holes in it would be most of a fresh
+install. The labels are `dir`, `host` and `session` because those are also three
+of the four scopes: the pane names the key that would narrow the list to what it
+is describing.
+
+The exit code is green when it is zero and red when it is not; a code nobody
+recorded is neither, for the same reason the list does not paint an imported
+history red. The command comes last and outside the table — it is the one field
+with no bound on its length, and the pane has a fixed number of rows. It is also
+shown whole here, where the list clips it at the window edge.
 
 **It starts hidden, and that is on purpose.** Rendering it forks a fresh
 interpreter and reads the whole cache — **79 ms** on a 54,000-command history,

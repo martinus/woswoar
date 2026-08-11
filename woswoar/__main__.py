@@ -131,10 +131,17 @@ def cmd_install(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     if args.show is not None:
         # The preview pane, one row at a time. Ahead of everything else because
-        # it shares none of it: no display line, no width, no colour, and an
-        # empty answer is a cursor sitting past the end of a list that moved
-        # under it -- a blank pane, not a message.
-        block = search.detail(args.show, args.scope, dedup=not args.no_dedup, around=args.around)
+        # it shares none of it: no display line, no width, and an empty answer
+        # is a cursor sitting past the end of a list that moved under it -- a
+        # blank pane, not a message. `--colour` it does share, and means the
+        # same thing by it.
+        block = search.detail(
+            args.show,
+            args.scope,
+            dedup=not args.no_dedup,
+            around=args.around,
+            colour=args.colour,
+        )
         if block is not None:
             print(block)
         return 0

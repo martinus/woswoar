@@ -1252,6 +1252,19 @@ class TestThePreviewBlock(WoswoarTestCase):
     def shown(self, index: int, *argv: str) -> str:
         return run_cli("list", "--show", str(index), *argv).out
 
+    def fields(self, block: str) -> dict[str, str]:
+        """The pane's labelled table as a mapping, command excluded.
+
+        By name rather than by line number, which is what these tests used to do
+        -- and a line number says nothing about which field it meant, so adding
+        a row silently moved four assertions onto their neighbours.
+        """
+        table, _, _ = unstyled(block).partition("\n\n")
+        return {
+            label: rest.strip()
+            for label, _, rest in (line.partition("  ") for line in table.splitlines())
+        }
+
     def test_show_reports_the_row_the_list_shows(self) -> None:
         """Every index, and every field of it.
 
@@ -1272,11 +1285,13 @@ class TestThePreviewBlock(WoswoarTestCase):
             with self.subTest(index=index):
                 cmd = search.command_from_line(line)
                 i = commands.index(cmd)
-                block = self.shown(index, "--scope", "global").splitlines()
-                self.assertEqual(block[-1], cmd)
-                self.assertIn(f"session sess{i}", block[1])
-                self.assertEqual(block[2], f"~/d{i}")
-                self.assertEqual(block[3], f"exit {i} · {i + 1} ms")
+                block = self.shown(index, "--scope", "global")
+                shows = self.fields(block)
+                self.assertEqual(block.splitlines()[-1], cmd)
+                self.assertEqual(shows["session"], f"sess{i}")
+                self.assertEqual(shows["dir"], f"~/d{i}")
+                self.assertEqual(shows["exit"], str(i))
+                self.assertEqual(shows["took"], f"{i + 1} ms")
 
     def test_show_under_a_timeline_uses_the_window(self) -> None:
         """After Ctrl-T the list fzf holds is the timeline *window*, so `{n}`
@@ -1300,7 +1315,7 @@ class TestThePreviewBlock(WoswoarTestCase):
         # differently at the index the loop above checked.
         with_window = self.shown(3, "--scope", "global", "--around", str(anchor))
         self.assertNotEqual(with_window, self.shown(3, "--scope", "global"))
-        self.assertEqual(with_window.splitlines()[2], "~/d1")
+        self.assertEqual(self.fields(with_window)["dir"], "~/d1")
 
     def test_a_cursor_past_the_end_gets_a_blank_pane_not_a_traceback(self) -> None:
         """The index comes from fzf and a background sync can merge commands
@@ -1350,9 +1365,60 @@ class TestThePreviewBlock(WoswoarTestCase):
         and that is most of a fresh install. `exit -1` would invent a failure --
         the same misreading that once painted every imported command red."""
         self.record("ls -la", cwd="", code=-1, ms=-1, session="import")
-        block = self.shown(0, "--scope", "global").splitlines()
-        self.assertEqual(block[2], "directory not recorded")
-        self.assertEqual(block[3], "exit not recorded")
+        shows = self.fields(self.shown(0, "--scope", "global"))
+        self.assertEqual(shows["dir"], "not recorded")
+        self.assertEqual(shows["exit"], "not recorded")
+        self.assertEqual(shows["took"], "not recorded")
+
+    def test_every_field_is_named_and_none_is_ever_missing(self) -> None:
+        """Reported as "hard to read, and there is no information what each line
+        means": five values run together on four lines need a reader who already
+        knows the record format, and the whole point of the pane is that nobody
+        does -- three of these fields have never been on a screen.
+
+        Named *and* always present. An imported row has no directory, no exit
+        code, no duration and no session, and the first version of this simply
+        left those lines out; a table with holes in it reads as a broken pane
+        rather than as a fact about the row, and there is nothing left to line
+        the remaining values up against.
+        """
+        self.record("ls -la", cwd="", code=-1, ms=-1, session="")
+        block = self.shown(0, "--scope", "global")
+        self.assertEqual(
+            list(self.fields(block)),
+            ["when", "dir", "host", "session", "exit", "took"],
+        )
+        self.assertEqual(self.fields(block)["session"], "not recorded")
+        # Last, and outside the table: it is the one field with no bound on its
+        # length, and the pane has a fixed number of rows.
+        self.assertEqual(block.splitlines()[-1], "ls -la")
+
+    def test_colour_is_asked_for_and_never_reaches_a_pipe(self) -> None:
+        """`--show` is a command line like any other, so `woswoar list --show 0`
+        has no more business emitting escapes unasked than `woswoar list` does.
+        The pane passes `--colour` and that is the only reason they are there."""
+        self.record("true")
+        plain = self.shown(0, "--scope", "global")
+        painted = self.shown(0, "--scope", "global", "--colour")
+        self.assertNotIn("\x1b", plain)
+        self.assertEqual(unstyled(painted), plain, "colour changed more than the colour")
+        # The label column is what the eye skips: it is the same six words on
+        # every row, where the value is the answer.
+        self.assertIn(f"{search._DIM}when", painted)
+        self.assertIn(f"{search._BOLD}true{search._RESET}", painted)
+
+    def test_the_exit_code_is_painted_green_red_or_not_at_all(self) -> None:
+        """Three answers, which is why `is_failure` cannot serve here: it has
+        two, and its unknown-is-not-failure rule is exactly what stops an
+        imported history reading as a screenful of failures. The pane still has
+        to distinguish "exited cleanly" from "nobody ever knew"."""
+        for cmd, code in (("boom", 127), ("fine", 0), ("imported", -1)):
+            self.record(cmd, code=code)
+        boom, fine, imported = (self.shown(i, "--scope", "global", "--colour") for i in (2, 1, 0))
+        self.assertIn(f"{search._FAILED}127{search._RESET}", boom)
+        self.assertIn(f"{search._OK}0{search._RESET}", fine)
+        self.assertIn(f"{search._DIM}not recorded{search._RESET}", imported)
+        self.assertNotIn(search._FAILED, imported, "an unrecorded exit code was painted a failure")
 
     def test_a_duration_is_readable_at_every_scale(self) -> None:
         for ms, expected in [
@@ -1404,7 +1470,7 @@ class TestThePreviewBinding(unittest.TestCase):
         for scope in search.SCOPES:
             with self.subTest(scope=scope):
                 out = self.preview(f"woswoar ({scope}) ")
-                self.assertEqual(out.strip(), f"RAN list --show {{n}} --scope {scope}")
+                self.assertEqual(out.strip(), f"RAN list --colour --show {{n}} --scope {scope}")
 
     def argv(self) -> list[str]:
         with mock.patch.object(search, "fzf_supports_transform", return_value=True):
