@@ -90,7 +90,13 @@ jobs:
           # A wheel or sdist filename has to encode the version, so the normal
           # artefacts cannot serve that; a PEP 508 direct reference supplies the
           # project name instead, which is what makes the arbitrary name legal.
-          cp dist/woswoar-*.tar.gz dist/woswoar.tar.gz
+          #
+          # Beside `dist/` rather than in it, and that is load-bearing now: the
+          # PyPI upload takes a whole directory, and a filename without a
+          # version in it is not a distribution name PyPI will accept. One
+          # stray file would fail the publish of an otherwise good release.
+          mkdir -p alias
+          cp dist/woswoar-*.tar.gz alias/woswoar.tar.gz
 
       - name: attest what was built
         # Binds each artefact to this repository, this workflow file and this
@@ -103,7 +109,31 @@ jobs:
         # Before `publish`, so nothing unattested is ever offered for download.
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/*
+          subject-path: |
+            dist/*
+            alias/*
+
+      - name: publish to PyPI
+        # Trusted Publishing (OIDC), not an API token, and not a preference:
+        # `docs/security.md` claims a supply chain with no long-lived secret in
+        # it, and a token in repository secrets is a credential that can be
+        # stolen and used to publish a release nobody tagged. The run proves who
+        # it is with the same short-lived identity that signs the attestation
+        # above -- which is why `id-token: write` is already at the top of this
+        # file. PyPI is told which repository and which *workflow file* to
+        # trust, so a publish from anywhere else is refused rather than believed.
+        #
+        # Here rather than after the GitHub release, because this is the only
+        # irreversible step in the file: a version number can be yanked but
+        # never reused. Everything downstream of it can be re-run.
+        #
+        # `skip-existing` is what makes that re-run work. If `gh release create`
+        # or the `stable` push fails, the fix is to re-run the job -- and
+        # without this it would die on "file already exists" at the one step
+        # that had actually succeeded.
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
       - name: publish the release
         env:
@@ -112,7 +142,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
-            dist/*
+            dist/* alias/woswoar.tar.gz
 
       - name: move stable to this release
         # The install line in the README is `@stable`, so this is what makes it
