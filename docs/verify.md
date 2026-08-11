@@ -174,11 +174,13 @@ cleanly. It rules out the quieter failures — an asset replaced after
 publication, or a tarball built on somebody's compromised laptop rather than
 in the audited workflow.
 
-The install line in the README tracks `stable`, a branch the release workflow
-fast-forwards — convenient, and it means whoever controls the GitHub
+The install line in the README is `pipx install woswoar`, which takes the
+latest release from PyPI — uploaded by that same workflow over Trusted
+Publishing, so no long-lived token exists that could publish a release
+nobody tagged. Convenient, and it still means whoever controls the GitHub
 repository controls what your next upgrade installs. If that is a trade you
 do not want, pin the exact commit you audited; a full commit hash is a handle
-nobody can quietly move:
+nobody can quietly move, where a version number is one somebody else chooses:
 
 ```sh
 pipx install --force "git+https://github.com/martinus/woswoar.git@<full 40-character sha>"

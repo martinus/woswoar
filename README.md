@@ -87,7 +87,7 @@ The pane starts hidden and costs nothing until you ask for it — see
 ## Quick start
 
 ```bash
-pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
+pipx install woswoar
 woswoar
 ```
 
@@ -118,29 +118,42 @@ Open a new shell, press <kbd>Ctrl</kbd>+<kbd>R</kbd>. That is the whole thing on
 one machine.
 
 > [!TIP]
-> **The same line upgrades an existing install** — run it again whenever you want
-> the latest release. The shell hook is a copy rather than the packaged file, but
-> it brings itself up to date on the next background sync, so there is nothing
-> else to run; open a new shell to pick it up. `stable` tracks the most recent
-> tag, so the command never changes and you never edit a version number on five
-> machines. Swap `@stable` for `@main` to track the tip, or `@v0.7.2` to pin
-> exactly.
+> **`pipx upgrade woswoar` for the next release.** The shell hook is a copy
+> rather than the packaged file, but it brings itself up to date on the next
+> background sync, so there is nothing else to run; open a new shell to pick it
+> up.
 >
 > **Coming from 0.6.x or earlier, run `woswoar install` once.** Those versions
 > had no background sync, so there is nothing running that could notice.
 > `woswoar` and `woswoar doctor` both say so if it is skipped.
->
-> If `--force` fails with **"A virtual environment already exists"**, your pipx
-> is using `uv` as its backend and cannot reuse the old venv. Either
-> `UV_VENV_CLEAR=1 pipx install --force …`, or the version that always works:
->
-> ```bash
-> pipx uninstall woswoar
-> pipx install "git+https://github.com/martinus/woswoar.git@stable"
-> ```
->
-> Neither touches your history: it lives in `~/.local/share/woswoar`, not in the
-> venv.
+
+<details>
+<summary>Installed from the git URL before woswoar was on PyPI?</summary>
+
+`pipx upgrade` keeps whatever a package was installed *from*, so an install made
+with `git+https://…` goes on cloning the repository rather than moving to PyPI.
+Switch it over once:
+
+```bash
+pipx install --force woswoar
+```
+
+If that fails with **"A virtual environment already exists"**, your pipx is using
+`uv` as its backend and cannot reuse the old venv. Then:
+
+```bash
+pipx uninstall woswoar
+pipx install woswoar
+```
+
+Neither touches your history: it lives in `~/.local/share/woswoar`, not in the
+venv.
+
+To track the tip instead of releases, the git URL is still there —
+`pipx install "git+https://github.com/martinus/woswoar.git@main"`, or `@stable`
+for the most recent tag, or `@v0.9.0` to pin exactly. That form needs `git` on
+the machine; `pipx install woswoar` does not.
+</details>
 
 **Needs:** bash 5.0+ (Linux) · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
@@ -164,7 +177,7 @@ on a NAS, a folder on a USB stick). You do that once, ever.
 Then on **every** machine, first or fifth, the same two lines:
 
 ```bash
-pipx install --force "git+https://github.com/martinus/woswoar.git@stable"
+pipx install woswoar
 woswoar                          # paste the repository URL when it asks
 ```
 
@@ -534,10 +547,17 @@ git tag v0.2.0 && git push origin v0.2.0
 
 Everything after that is automatic. `.github/workflows/release.yml` refuses the
 tag unless it matches `__version__` and sits on `main`, re-runs the whole suite
-at that exact commit, builds the sdist and wheel, publishes a GitHub release
-with generated notes, and fast-forwards `stable` — which is what the install
-command tracks. The `stable` push is not forced, so tagging an older commit
-fails loudly rather than moving everyone backwards.
+at that exact commit, builds the sdist and wheel, attests both, uploads them to
+PyPI over Trusted Publishing — no token, an identity minted for that one run —
+publishes a GitHub release with generated notes, and fast-forwards `stable`,
+which is what the `git+https://…@stable` form tracks. The `stable` push is not
+forced, so tagging an older commit fails loudly rather than moving everyone
+backwards.
+
+PyPI is the one step that cannot be undone: a version can be yanked but never
+reused. It runs before the GitHub release for that reason, and
+`.github/workflows/publish-testpypi.yml` is the rehearsal, run by hand against
+TestPyPI whenever the packaging changes.
 
 </details>
 
