@@ -42,9 +42,10 @@ so <kbd>Ctrl</kbd>+<kbd>T</kbd> turns whatever you found into
 | 🔐 **Encrypted end to end** | commands, paths, hostnames — nothing readable reaches the remote |
 | 🧩 **No server, no database** | a git repo and plain text files you can `grep` |
 | 📦 **Zero Python dependencies** | standard library only — nothing to audit but this repo |
-| ⚡ **~150 µs per command, zero forks** | the hook is pure bash; Python never runs on your prompt |
+| ⚡ **~150 µs per command, zero forks** | the hook is pure shell — bash or zsh; Python never runs on your prompt |
 | 🔎 **fzf as the UI** | the fuzzy finder you already know, not a bespoke TUI |
 | 🚚 **Imports what you have** | bash, zsh and atuin histories, idempotently |
+| 🐚 **Records from bash and zsh** | one history per machine, whichever shell you are standing in |
 | 🧱 **~4300 lines of implementation** | small enough to read in an afternoon |
 | 🐤 **Verifiable on your machine** | `woswoar doctor --prove` demonstrates, not asserts — see [verify it yourself](docs/verify.md) |
 
@@ -65,7 +66,7 @@ one machine. `woswoar` on its own is the only command you have to remember: it
 sets up when there is nothing installed, and afterwards says where this machine
 stands and names the one command to run next, if there is one.
 
-**Needs:** bash 5.0+ (Linux) · Python 3.10+ ·
+**Needs:** bash 5.0+ or zsh 5.0+ (Linux) · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
 [age](https://github.com/FiloSottile/age) and git *(sync only)* — but **not `age`
 as a snap**, which costs about 250 ms per call against 2 ms and turns a `sync`
@@ -115,13 +116,14 @@ among them.
 ## How it works
 
 ```
-bash hook  ──►  plaintext TSV logs  ──►  parse cache  ──►  scope filter  ──►  fzf
+shell hook  ──►  plaintext TSV logs  ──►  parse cache  ──►  scope filter  ──►  fzf
                         │
                         └──►  age-encrypted chunks  ──►  git  ──►  remote
 ```
 
-The hot path is a fork-free bash hook using bash 5 builtins that appends one
-escaped line to a per-day TSV file. Nothing else touches your prompt. Everything
+The hot path is a fork-free shell hook — one for bash built on bash 5 builtins,
+one for zsh built on zsh's — that appends one escaped line to a per-day TSV
+file. Both write into the same per-machine history. Nothing else touches your prompt. Everything
 expensive — parsing, caching, encrypting, git — happens when you search, or when
 the timer fires.
 
@@ -132,7 +134,7 @@ the timer fires.
 | 🔎 [**Searching your history**](docs/searching.md) | the machine column, `^name`, the <kbd>Ctrl</kbd>+<kbd>T</kbd> timeline, the details pane |
 | 📦 [**Installing, upgrading, uninstalling**](docs/install.md) | the first run, `pipx` upgrades, importing atuin, and removing every part of it again |
 | 🔄 [**Adding another machine**](docs/sync.md) | enrolment, `accept`/`grant`/`trust`, background sync, a systemd timer |
-| 🐚 [**Living in your shell**](docs/shell-integration.md) | what it does to your bash, how it coexists with ble.sh, atuin and prompt frameworks, what <kbd>Ctrl</kbd>+<kbd>R</kbd> costs, and what is never recorded |
+| 🐚 [**Living in your shell**](docs/shell-integration.md) | bash and zsh, how it coexists with ble.sh, atuin and prompt frameworks, what <kbd>Ctrl</kbd>+<kbd>R</kbd> costs, and what is never recorded |
 | 🔐 [**Security model**](docs/security.md) | threat model, guarantees, limits |
 | 🐤 [**Verify it yourself**](docs/verify.md) | checks you run on your own machine, none of which ask you to believe a document |
 | 📖 [**Reference**](docs/reference.md) | every command and environment variable |

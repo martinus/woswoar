@@ -200,7 +200,7 @@ class TestAHookLeftBehindByAnUpgrade(WoswoarTestCase):
     """
 
     def hook(self) -> Path:
-        path = store.data_dir() / main_module.HOOK_NAME
+        path = store.data_dir() / main_module.HOOKS["bash"]
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -224,6 +224,62 @@ class TestAHookLeftBehindByAnUpgrade(WoswoarTestCase):
         self.assertNotIn("older than this woswoar", out)
 
 
+class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
+    """One version line per shell woswoar is responsible for -- and only those.
+
+    Reporting every shell woswoar *could* support would fail a perfectly good
+    bash-only machine for not having zsh installed, which is a red `doctor` with
+    nothing to fix.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self._saved = {key: os.environ.get(key) for key in ("HOME", "SHELL")}
+        self.addCleanup(self._restore)
+        os.environ["HOME"] = str(self.home)
+        os.environ["SHELL"] = "/bin/bash"
+
+    def _restore(self) -> None:
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_a_bash_only_machine_is_not_asked_about_zsh(self) -> None:
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        out = support.run_cli("doctor").out
+        self.assertRegex(out, r"\] bash ")
+        self.assertNotIn("] zsh ", out)
+
+    def test_doctor_checks_the_zsh_version_when_zsh_is_installed(self) -> None:
+        """The version floor exists because the hook enforces one and switches
+        itself off below it -- silently, from the user's side. This is what says
+        so before they find out."""
+        (self.home / ".zshrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        out = support.run_cli("doctor").out
+        self.assertRegex(out, r"\] zsh +\S+ \(5\.0\+ required\)")
+
+    def test_each_installed_shell_gets_its_own_rcfile_line(self) -> None:
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        (self.home / ".zshrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        out = support.run_cli("doctor").out
+        self.assertIn(f"{self.home}/.bashrc sources the hook", out)
+        self.assertIn(f"{self.home}/.zshrc sources the hook", out)
+
+    def test_a_machine_with_nothing_installed_still_reports_a_shell(self) -> None:
+        """`installed_shells()` is empty before the first `install`, and a doctor
+        that then printed no shell line at all would be least useful exactly when
+        someone is trying to find out what is wrong."""
+        out = support.run_cli("doctor").out
+        self.assertRegex(out, r"\] bash ")
+
+
 class TestReadingThePackagedHook(unittest.TestCase):
     def test_the_fast_path_and_the_fallback_agree(self) -> None:
         """`_hook_bytes` reads the file beside the module and only falls back to
@@ -234,8 +290,10 @@ class TestReadingThePackagedHook(unittest.TestCase):
         """
         from importlib import resources
 
-        via_resources = (resources.files("woswoar") / "shell" / main_module.HOOK_NAME).read_bytes()
-        self.assertEqual(main_module._hook_bytes(), via_resources)
+        via_resources = (
+            resources.files("woswoar") / "shell" / main_module.HOOKS["bash"]
+        ).read_bytes()
+        self.assertEqual(main_module._hook_bytes("bash"), via_resources)
         self.assertTrue(via_resources.startswith(b"# woswoar"), "that is not the hook")
 
 

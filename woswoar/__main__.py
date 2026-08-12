@@ -27,13 +27,71 @@ _GRANT_REMEDY = (
     "then sync here again. Nothing is lost in the meantime."
 )
 
-HOOK_NAME = "woswoar.bash"
+#: The hook each shell sources, and the file each shell reads at the start of an
+#: interactive session. Two hooks rather than one that branches: the bash one is
+#: built on bash 5 builtins and the zsh one on zsh's, and the interesting half of
+#: either is what its shell does *not* offer.
+#:
+#: Ordered, because it decides the order things are printed and installed in, and
+#: a report whose lines move around between runs is harder to diff than it needs
+#: to be.
+HOOKS = {"bash": "woswoar.bash", "zsh": "woswoar.zsh"}
+RCFILES = {"bash": ".bashrc", "zsh": ".zshrc"}
+
+#: What each shell must be able to do, and how to ask it. bash 5 for
+#: $EPOCHSECONDS and $EPOCHREALTIME; zsh 5 for `zsh/datetime` and
+#: `add-zsh-hook`. Each hook enforces its own floor and switches itself off
+#: below it -- this is how `doctor` says the same thing before you find out.
+_VERSION_QUERY = {
+    "bash": "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}",
+    "zsh": "echo $ZSH_VERSION",
+}
+_VERSION_FLOOR = 5
+
 _BEGIN = "# >>> woswoar >>>"
 _END = "# <<< woswoar <<<"
 _BLOCK = re.compile(re.escape(_BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
 
 
-def _hook_bytes() -> bytes:
+def rcfile_for(shell: str) -> Path:
+    return Path.home() / RCFILES[shell]
+
+
+def installed_shells() -> list[str]:
+    """Every shell this machine has a hook copied for.
+
+    The hooks in the data directory, not what is on PATH and not what
+    `.bashrc` says: `install` writing the file is what makes a shell one woswoar
+    is responsible for, and it is the same fact `_refresh_hook` acts on.
+    """
+    return [shell for shell in HOOKS if (store.data_dir() / HOOKS[shell]).is_file()]
+
+
+def detect_shells() -> list[str]:
+    """The shells `install` writes to when nobody said which.
+
+    **Every shell whose rc file already exists**, which is the rule that decides
+    the two things this must not do. It must not need a flag from someone who
+    uses both shells -- `install` already edits `.bashrc` without being asked,
+    so an existing `.zshrc` is no different. And it must not *create* a
+    `~/.zshrc` for someone who has never run zsh, which is what "already exists"
+    is doing here and why this is not simply "write both".
+
+    `$SHELL` is the fallback and deliberately not the detector: it names the
+    login shell, and someone whose login shell is zsh but who works in bash
+    would get the hook in the shell they are not typing into. It only decides
+    the case where there is no rc file to go on at all -- a container, a fresh
+    account -- and there bash is the last resort, because it is the shell whose
+    hook has been shipped longest.
+    """
+    present = [shell for shell in HOOKS if rcfile_for(shell).is_file()]
+    if present:
+        return present
+    login = Path(os.environ.get("SHELL", "")).name
+    return [login] if login in HOOKS else ["bash"]
+
+
+def _hook_bytes(shell: str) -> bytes:
     """The hook as this version ships it.
 
     The bytes rather than a path, which is what replaced an `as_file` dance
@@ -52,13 +110,13 @@ def _hook_bytes() -> bytes:
     a filesystem at all, wheel or editable. The fallback is for a zipapp, where
     `__file__` is a path inside the archive and nothing can open it.
     """
-    beside = Path(__file__).resolve().parent / "shell" / HOOK_NAME
+    beside = Path(__file__).resolve().parent / "shell" / HOOKS[shell]
     if beside.is_file():
         return beside.read_bytes()
 
     from importlib import resources
 
-    return (resources.files("woswoar") / "shell" / HOOK_NAME).read_bytes()
+    return (resources.files("woswoar") / "shell" / HOOKS[shell]).read_bytes()
 
 
 def portable_hook_path(target: Path) -> str:
@@ -80,26 +138,46 @@ def portable_hook_path(target: Path) -> str:
         return str(target)
 
 
-def cmd_install(args: argparse.Namespace) -> int:
-    """Set up machine identity, install the hook, and wire up .bashrc."""
-    machine = store.machine()
-    store.private_dir(store.data_dir())
-    target = store.data_dir() / HOOK_NAME
-    target.write_bytes(_hook_bytes())
-    # After the copy, not before: `write_bytes` creates at the ambient umask, so
-    # hardening first would leave the one file install itself writes as the one
-    # file its own migration missed. This is also what re-tightens a tree from
-    # a woswoar that predated owner-only directories -- `install` is the
-    # command people re-run to upgrade.
-    store.harden()
+def shells_from(args: argparse.Namespace) -> list[str]:
+    """Which shells this invocation is about.
 
-    print(f"machine : {machine.name} ({machine.id})")
-    print(f"logs    : {store.logs_dir()}")
-    print(f"hook    : {target}")
+    `--shell` wins outright. Otherwise `--rcfile` decides, because a file named
+    `.zshrc` is not an ambiguous thing to be handed: taking the *detected* shell
+    there would let someone with a `.bashrc` beside it get the bash hook sourced
+    from their zsh startup file, which loads nothing and says nothing. When the
+    name settles nothing either -- `--rcfile /tmp/rc` -- detection has the only
+    other opinion available.
+    """
+    choice = getattr(args, "shell", None) or "auto"
+    rcfile = getattr(args, "rcfile", None)
+    if rcfile and choice == "both":
+        # Refused rather than resolved, because both resolutions are wrong and
+        # one of them is silent: writing two blocks into one file leaves only
+        # the second, since each replaces the marked block the last one wrote --
+        # so `--rcfile ~/.bashrc --shell both` would end with a `.bashrc`
+        # sourcing the *zsh* hook.
+        raise WoswoarError(
+            "--rcfile names one file, so it cannot be combined with --shell both.\n"
+            "Run install once per shell, or drop --rcfile to use each shell's own rc file."
+        )
+    if choice in HOOKS:
+        return [choice]
+    if choice == "both":
+        return list(HOOKS)
+    if rcfile:
+        named = [shell for shell, name in RCFILES.items() if Path(rcfile).name == name]
+        return named or detect_shells()[:1]
+    return detect_shells()
 
-    rcfile = Path(args.rcfile).expanduser() if args.rcfile else Path.home() / ".bashrc"
+
+def _write_block(rcfile: Path, target: Path) -> str:
+    """Put the sourced line into ``rcfile``, and say what that did.
+
+    Creating the file when it is absent is correct *here* and only here: a
+    caller has already decided this shell is one to install for, either by
+    detection -- which needs the file to exist -- or because it was named.
+    """
     block = f'{_BEGIN}\nsource "{portable_hook_path(target)}"\n{_END}\n'
-
     existing = rcfile.read_text(encoding="utf-8") if rcfile.is_file() else ""
     if _BLOCK.search(existing):
         updated = _BLOCK.sub(block, existing)
@@ -110,12 +188,50 @@ def cmd_install(args: argparse.Namespace) -> int:
         action = "added"
 
     if updated == existing:
-        print(f"rcfile  : {rcfile} (already current)")
-    else:
-        rcfile.write_text(updated, encoding="utf-8")
-        print(f"rcfile  : {rcfile} ({action})")
+        return "already current"
+    rcfile.write_text(updated, encoding="utf-8")
+    return action
 
-    print("\nOpen a new shell, or run:  source", target)
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Set up machine identity, install each shell's hook, and wire up its rcfile."""
+    machine = store.machine()
+    store.private_dir(store.data_dir())
+
+    shells = shells_from(args)
+    targets = {}
+    for shell in shells:
+        target = store.data_dir() / HOOKS[shell]
+        target.write_bytes(_hook_bytes(shell))
+        targets[shell] = target
+    # After the copies, not before: `write_bytes` creates at the ambient umask,
+    # so hardening first would leave the files install itself writes as the ones
+    # its own migration missed. This is also what re-tightens a tree from a
+    # woswoar that predated owner-only directories -- `install` is the command
+    # people re-run to upgrade.
+    store.harden()
+
+    print(f"machine : {machine.name} ({machine.id})")
+    print(f"logs    : {store.logs_dir()}")
+    for shell, target in targets.items():
+        print(f"hook    : {target}" + (f"  ({shell})" if len(shells) > 1 else ""))
+
+    # One `--rcfile` cannot mean two files, and `shells_from` has already
+    # reduced to a single shell when it was given.
+    override = Path(args.rcfile).expanduser() if getattr(args, "rcfile", None) else None
+    for shell, target in targets.items():
+        rcfile = override if override is not None else rcfile_for(shell)
+        print(f"rcfile  : {rcfile} ({_write_block(rcfile, target)})")
+
+    # One line per shell, never `source a b`: a second word there is not a
+    # second file to read, it is `$1` for the first one. The pair only ever
+    # differ by which shell you are standing in, so each is offered on its own.
+    if len(targets) == 1:
+        print("\nOpen a new shell, or run:  source", *targets.values())
+    else:
+        print("\nOpen a new shell. To pick it up in one already open:")
+        for shell, target in targets.items():
+            print(f"    source {target}   # in {shell}")
 
     # The moment someone finds out, so the moment to say it. Recording works
     # without any of these, which is why this warns rather than fails -- but
@@ -307,7 +423,6 @@ def _markers(stream: object | None = None) -> dict[str, str]:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
-    import subprocess
 
     from . import crypto, deps, sync
 
@@ -338,22 +453,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
         return 0 if ok else 1
 
-    bash = shutil.which("bash")
-    version = ""
-    if bash:
-        try:
-            out = subprocess.run(
-                [bash, "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            version = out.stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            version = ""
-    major = int(version.split(".")[0]) if version and version[0].isdigit() else 0
-    check("bash", major >= 5, f"{version or 'not found'} (5.0+ required)")
+    # The shells this machine has hooks for, or -- on one that has not run
+    # `install` yet -- the ones it would get if it did. Reporting on every shell
+    # woswoar *could* support instead would fail a perfectly good bash-only
+    # machine for not having zsh.
+    for shell in installed_shells() or detect_shells():
+        version = _shell_version(shell)
+        major = int(version.split(".")[0]) if version and version[0].isdigit() else 0
+        check(
+            shell,
+            major >= _VERSION_FLOOR,
+            f"{version or 'not found'} ({_VERSION_FLOOR}.0+ required)",
+        )
 
     fzf = shutil.which("fzf")
     if fzf is None:
@@ -387,21 +498,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     has_machine = machine_file.is_file()
     check("machine", has_machine, str(machine_file))
 
-    hook = store.data_dir() / HOOK_NAME
-    if _hook_is_stale():
-        # `install` copies the hook into the data directory rather than sourcing
-        # it out of the package, so upgrading woswoar leaves the old shell code
-        # running -- and nothing said so. That was survivable while the hook only
-        # recorded; syncing lives in it now, so a machine that never re-ran
-        # `install` silently keeps whatever sync arrangement it had.
-        check("hook", False, f"{hook} is older than this woswoar - run 'woswoar install'")
-    else:
-        check("hook", hook.is_file(), str(hook))
+    # `install` copies each hook into the data directory rather than sourcing it
+    # out of the package, so upgrading woswoar leaves the old shell code running
+    # -- and nothing said so. That was survivable while the hook only recorded;
+    # syncing lives in it now, so a machine that never re-ran `install` silently
+    # keeps whatever sync arrangement it had.
+    stale = _stale_hooks()
+    present = installed_shells()
+    if not present:
+        check("hook", False, f"no hook installed in {store.data_dir()}")
+    for shell in present:
+        hook = store.data_dir() / HOOKS[shell]
+        if shell in stale:
+            check("hook", False, f"{hook} is older than this woswoar - run 'woswoar install'")
+        else:
+            check("hook", True, str(hook))
 
-    rcfile = Path.home() / ".bashrc"
-    sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
-    detail = "sources the hook" if sourced else "has no woswoar block"
-    check("bashrc", sourced, f"{rcfile} {detail}")
+    # One line per rc file, and per *installed* shell rather than per rc file
+    # that exists: a `.zshrc` on a machine woswoar was only ever installed into
+    # bash for is not a problem, and reporting it as one would send someone
+    # looking for a block that is correctly absent.
+    for shell in present or detect_shells():
+        rcfile = rcfile_for(shell)
+        sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
+        detail = "sources the hook" if sourced else "has no woswoar block"
+        check(RCFILES[shell].lstrip("."), sourced, f"{rcfile} {detail}")
 
     # Not just "is age on PATH". A sandboxed age -- snap, flatpak, anything
     # confined -- answers `--version` perfectly and then cannot open a key,
@@ -869,14 +990,51 @@ def cmd_grant(args: argparse.Namespace) -> int:
     return 0
 
 
-def _hook_is_stale() -> bool:
-    """Whether the installed hook is some older woswoar's copy of it.
+def _shell_version(shell: str) -> str:
+    """What ``shell`` reports as its version, or "" if it cannot be asked.
 
-    False for a missing hook: that is a different problem with a different fix,
-    and `doctor` already has a line for it.
+    Asked of the binary rather than read from a package manager, because the
+    thing that matters is the one that will source the hook. Every failure --
+    not on PATH, refuses to start, times out -- collapses to "" and is reported
+    as "not found": from `doctor`'s side those are one situation, and the
+    remedy for all of them is to install the shell.
     """
-    hook = store.data_dir() / HOOK_NAME
-    return hook.is_file() and hook.read_bytes() != _hook_bytes()
+    import shutil
+    import subprocess
+
+    binary = shutil.which(shell)
+    if not binary:
+        return ""
+    try:
+        out = subprocess.run(
+            [binary, "-c", _VERSION_QUERY[shell]],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def _stale_hooks() -> list[str]:
+    """Every *installed* shell whose hook is some older woswoar's copy of it.
+
+    Installed, so a missing hook is never stale: that is a different problem
+    with a different fix, and `doctor` already has a line for it. It is also the
+    whole of what keeps `_refresh_hook` from planting a zsh hook on a machine
+    that has never asked for one.
+    """
+    return [
+        shell
+        for shell in installed_shells()
+        if (store.data_dir() / HOOKS[shell]).read_bytes() != _hook_bytes(shell)
+    ]
+
+
+def _hook_is_stale() -> bool:
+    return bool(_stale_hooks())
 
 
 def _refresh_hook() -> bool:
@@ -897,25 +1055,34 @@ def _refresh_hook() -> bool:
     the packaged file's mode as an exposure, because its permission walk uses
     `stat`, which follows links.
 
-    Only ever *re*-writes. A machine with no hook at all has not run `install`,
-    its `.bashrc` sources nothing, and writing a file it does not reference
-    would be a confusing way to say so.
+    Only ever *re*-writes, and now that there are two hooks that rule is
+    load-bearing rather than tidy. This runs unattended, from a background sync
+    a prompt started. A version of it that *created* would put a `woswoar.zsh`
+    on a bash-only machine at the first sync after an upgrade -- a file nothing
+    sources, that nobody asked for, from a command nobody ran. `_stale_hooks`
+    only ever names hooks that are already there, and
+    `test_a_refresh_never_creates_a_second_hook` is what holds that.
     """
-    if not _hook_is_stale():
-        return False
-    hook = store.data_dir() / HOOK_NAME
-    # The mode was set when `install` created it and `write_bytes` truncates
-    # rather than recreates, so it survives -- and the hook is public code
-    # anyway. Failure is not fatal: a read-only data directory is a real
-    # situation and it must not stop the sync this command exists for.
-    try:
-        hook.write_bytes(_hook_bytes())
-    except OSError:
+    refreshed = []
+    for shell in _stale_hooks():
+        hook = store.data_dir() / HOOKS[shell]
+        # The mode was set when `install` created it and `write_bytes` truncates
+        # rather than recreates, so it survives -- and the hook is public code
+        # anyway. Failure is not fatal: a read-only data directory is a real
+        # situation and it must not stop the sync this command exists for. Per
+        # hook, so one unwritable file does not stop the other being fixed.
+        try:
+            hook.write_bytes(_hook_bytes(shell))
+        except OSError:
+            continue
+        refreshed.append(hook)
+    if not refreshed:
         return False
     # Shells already running keep the code they sourced, exactly as they do
     # after a hand-run `install`. New ones get this. Nothing to do about the
     # difference, and nothing anyone needs to do.
-    print(f"updated the shell hook at {hook} to {__version__}")
+    for hook in refreshed:
+        print(f"updated the shell hook at {hook} to {__version__}")
     return True
 
 
@@ -1151,7 +1318,7 @@ def _untouched() -> bool:
     """
     from . import sync
 
-    if (store.data_dir() / HOOK_NAME).is_file() or sync.is_repo():
+    if installed_shells() or sync.is_repo():
         return False
     return not any(store.iter_log_files())
 
@@ -1178,7 +1345,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     if _untouched():
         print("Nothing installed here yet -- setting up.\n")
-        return cmd_setup(argparse.Namespace(rcfile=None))
+        return cmd_setup(argparse.Namespace(rcfile=None, shell=None))
 
     loaded = cache.load_columns()
     stamps, _ = loaded.stamps_and_commands()
@@ -1281,13 +1448,33 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("     everything woswoar needs is installed")
 
     print("\n2/4  Shell hook")
-    cmd_install(argparse.Namespace(rcfile=args.rcfile))
+    # Named before it is written, because it is now more than one file and the
+    # rule that chose them is not obvious from the output alone.
+    chosen = shells_from(args)
+    print(f"     {' and '.join(chosen)} -- {_why_those_shells(args, chosen)}")
+    cmd_install(argparse.Namespace(rcfile=args.rcfile, shell=getattr(args, "shell", None)))
 
     print("\n3/4  Existing history")
     _offer_imports()
 
     print("\n4/4  Sync with your other machines")
     return _offer_remote(args)
+
+
+def _why_those_shells(args: argparse.Namespace, chosen: list[str]) -> str:
+    """One clause saying which rule picked `chosen`, for `setup`'s step 2.
+
+    Worth a line because the answer differs per machine and the wrong one is
+    silent: a hook written into the shell you do not use looks exactly like a
+    hook that works.
+    """
+    if getattr(args, "shell", None) and args.shell != "auto":
+        return f"--shell {args.shell}"
+    if getattr(args, "rcfile", None):
+        return f"from the name of {Path(args.rcfile).name}"
+    if any(rcfile_for(shell).is_file() for shell in chosen):
+        return "found " + " and ".join(f"~/{RCFILES[shell]}" for shell in chosen)
+    return f"no rc file here, so $SHELL ({os.environ.get('SHELL', 'unset')})"
 
 
 def _offer_imports() -> None:
@@ -1660,21 +1847,39 @@ def build_parser() -> argparse.ArgumentParser:
         instead rather than choosing for you.
         """,
     )
-    p_setup.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
+    p_setup.add_argument("--rcfile", help="file to modify (default: the rc file of each shell)")
+    p_setup.add_argument(
+        "--shell",
+        choices=["auto", *HOOKS, "both"],
+        default="auto",
+        help="which shell(s) to install for (default: auto -- every shell whose "
+        "rc file already exists, never creating one)",
+    )
     p_setup.set_defaults(func=cmd_setup)
 
     p_install = sub(
         "install",
-        "install the shell hook into .bashrc",
+        "install the shell hook into your rc file(s)",
         """
-        Copies the bash hook and adds a marked block to your rcfile. Safe to
+        Copies each shell's hook and adds a marked block to its rc file. Safe to
         re-run: the block is replaced rather than repeated, which is also how
         to upgrade the hook after installing a new woswoar.
+
+        By default it installs for every shell whose rc file already exists --
+        and it never creates one, so a machine that has never run zsh does not
+        acquire a ~/.zshrc. With neither rc file present it follows $SHELL.
 
         Reports any missing tool (fzf, age, git) and the command to install it.
         """,
     )
-    p_install.add_argument("--rcfile", help="file to modify (default: ~/.bashrc)")
+    p_install.add_argument("--rcfile", help="file to modify (default: the rc file of each shell)")
+    p_install.add_argument(
+        "--shell",
+        choices=["auto", *HOOKS, "both"],
+        default="auto",
+        help="which shell(s) to install for (default: auto -- every shell whose "
+        "rc file already exists, never creating one)",
+    )
     p_install.set_defaults(func=cmd_install)
 
     p_stats = sub(

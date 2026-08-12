@@ -32,6 +32,7 @@ requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
 requires_bash = unittest.skipUnless(shutil.which("bash"), "bash required")
+requires_zsh = unittest.skipUnless(shutil.which("zsh"), "zsh required")
 requires_fzf = unittest.skipUnless(shutil.which("fzf"), "fzf required")
 
 

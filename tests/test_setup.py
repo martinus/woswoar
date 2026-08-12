@@ -236,7 +236,7 @@ class TestTheBareCommandOnAFreshMachine(SetupTestCase):
     def test_a_hook_alone_is_enough_to_be_reported_on_instead(self) -> None:
         """Someone who ran `install` and nothing else has set something up, and
         running `setup` at them would answer a question they did not ask."""
-        hook = Path(os.environ["WOSWOAR_DIR"]) / main_module.HOOK_NAME
+        hook = Path(os.environ["WOSWOAR_DIR"]) / main_module.HOOKS["bash"]
         hook.parent.mkdir(parents=True, exist_ok=True)
         hook.write_text("#", encoding="utf-8")
 
