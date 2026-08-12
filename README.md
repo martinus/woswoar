@@ -12,15 +12,16 @@
 *Austrian for "Was war?"* — "what was it again?" — which is exactly what you ask
 when you need that one command from last Tuesday, on the other machine.
 
-</div>
+<!-- Absolute, not `docs/demo.gif`: this file is also the PyPI project page, and
+     PyPI resolves a relative image against pypi.org, where it is a broken icon.
+     `tests/test_demo.py` checks the URL against the file it names. -->
+<img alt="Ctrl-R searching one history from three machines: a docker command found on all of them, narrowed to this machine and then to this directory, the timeline unfolded around a hit, and the chosen command landing on the prompt unexecuted" src="https://raw.githubusercontent.com/martinus/woswoar/main/docs/demo.gif" width="900">
 
-```
-  woswoar (global) > docker
-       2m  thinkpad  docker compose up -d --build
-    3h12m  DT-24YYQ3 docker logs -f api
-     6d4h  thinkpad  docker system prune -af
-  ctrl-r global → host → session → dir, or ctrl-g/h/s, ctrl-o dir | ctrl-t timeline | ^name one machine
-```
+<sub>Re-record it with `tools/demo/record.sh` — the
+[tape](tools/demo/demo.tape) is checked in, the history in it is
+[generated](tools/demo/seed.py), and nobody's real commands are on screen.</sub>
+
+</div>
 
 ## What it is
 
