@@ -177,15 +177,19 @@ asserts under `strace`. There is no case for optimising this further.
 
 Everything else uses builtins: `$EPOCHSECONDS` for the timestamp,
 `printf -v day '%(%F)T' -1` for the filename, `$EPOCHREALTIME` for millisecond
-durations, `${var//x/y}` for escaping. `mkdir -p` runs once at shell startup,
-not per command — the directory is stable across midnight, only the filename
-rolls.
+durations, `${var//x/y}` for escaping. `mkdir -p` runs **once per day per
+machine**, on the first command that records after midnight, and is skipped by a
+`stat` on every shell and every command after it — it used to run twice in every
+terminal, which is #183.
 
 The result is verified rather than asserted: CI runs the hook under `strace` with
-3 commands and with 30, and requires the clone count to be *identical*. Not zero
-— startup legitimately forks for `mkdir` and two `trap -p` subshells, one to see
-whether the EXIT trap is free and one to read any prior DEBUG trap — but flat,
-which is the property that actually matters.
+3 commands and with 30, and requires the clone count to be *identical*. Flat, not
+zero, which is the property that actually matters. A warm zsh shell does reach
+zero; a warm bash shell forks four times at startup, and all four are bash's own
+apparatus rather than the record path — two `trap -p` subshells (one to see
+whether the EXIT trap is free, one to read any prior DEBUG trap), the subshell
+that creates the scratch file under `umask 077`, and the `rm` in the EXIT trap
+that removes it again.
 
 ### Sharing the shell with everything else
 

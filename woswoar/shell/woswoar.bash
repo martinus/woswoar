@@ -48,17 +48,40 @@ fi
 
 __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 
-# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p`
-# would otherwise honour the ambient umask, which is 022 almost everywhere, and
-# these files hold more than ~/.bash_history does -- which bash creates 0600.
-#
-# Only creation happens here. Re-tightening a tree from an older woswoar is
-# `woswoar install`'s job: a recursive chmod is proportional to the number of
-# days recorded, and this runs on every interactive shell.
 #: Per-shell scratch, kept out of the data directory's root so that a file left
 #: behind by a shell whose EXIT trap was already taken is contained and obvious.
 __woswoar_run=$__woswoar_dir/run
-(umask 077 && mkdir -p "$__woswoar_logdir" "$__woswoar_run") 2>/dev/null || return 0
+
+# 077 so it is owner-only from the moment it exists: `mkdir -p` would otherwise
+# honour the ambient umask, which is 022 almost everywhere. Guarded on the
+# directory being absent, because `mkdir` is not a builtin -- so this is a fork
+# *and* an exec, and it used to be paid by every terminal for a directory that
+# was already there.
+#
+# The log directory is deliberately *not* made here any more. Nothing at startup
+# writes into it; `__woswoar_record` makes it on the day's first command, under
+# the same umask, in a subshell it was already forking. `run/` is different --
+# the scratch file below needs it before any command runs.
+[[ -d $__woswoar_run ]] || (umask 077 && mkdir -p "$__woswoar_run") 2>/dev/null || return 0
+
+# The day whose log file is known to exist, which is what `__woswoar_record`
+# consults before paying for a subshell. Set here when it is already true, and
+# left empty otherwise.
+#
+# **A stat instead of a fork.** `__woswoar_today` started empty, so the
+# once-a-day branch was unsatisfied in every shell and remade the log directory
+# at the first command -- while the comment above it said it cost once a day.
+# Together with the `mkdir` this line replaces, that was two forks and two execs
+# per terminal. Measured over 100 shells: 6.3 ms per bash shell to 4.3 ms. See
+# #183.
+#
+# Creating the file here was tried first and is worse. It would make a log file
+# for a shell that records nothing -- and `logs/` holding a file is precisely
+# how `search` knows whether to say "nothing recorded yet" rather than opening
+# an empty picker you have to escape out of. Deciding on a `stat` leaves that
+# meaning intact.
+printf -v __woswoar_today '%(%F)T' -1 # local time, matching store.day_for()
+[[ -e $__woswoar_logdir/$__woswoar_today.tsv ]] || __woswoar_today=
 
 # Scratch file for capturing `history 1`, always in a directory only this user
 # can write. $TMPDIR and /tmp are never used: the name is just a pid, so in a
@@ -199,8 +222,6 @@ __woswoar_next_sync=0
 __woswoar_start=
 __woswoar_status=
 __woswoar_lastnum=
-#: The day whose log file is known to exist already. See __woswoar_precmd.
-__woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.
@@ -357,16 +378,20 @@ __woswoar_record() {
         # umask. `>>` rather than `>` so a day already underway is never
         # truncated, which also removes the need to test for existence first.
         #
-        # In a subshell, so the caller's umask is untouched no matter what: the
-        # fork happens once per day, not once per command, and the guard above
-        # keeps it off the hot path entirely. Saving and restoring the umask
-        # inline instead would be fork-free, but reading it costs a fork at
-        # startup anyway and a failed read would leave this *setting* the user's
-        # umask to a guess -- loosening it, in the one case it must not.
-        # `mkdir -p` as well, because the directory is otherwise only made when
-        # the shell starts, and a shell outlives a lot. Delete the data
-        # directory -- an uninstall, a home moved, a work machine's cleanup --
-        # and every command in every open shell writes into nothing until each
+        # In a subshell, so the caller's umask is untouched no matter what, and
+        # once per day per machine rather than once per shell -- startup answers
+        # the same question with a `stat` and pre-sets `__woswoar_today` when the
+        # file is already there. It used to start empty, so this fired at the
+        # first command of every shell as well, while the comment here said
+        # otherwise (#183). Saving and restoring the umask inline instead would
+        # be fork-free, but reading it costs a fork at startup anyway and a
+        # failed read would leave this *setting* the user's umask to a guess --
+        # loosening it, in the one case it must not.
+        #
+        # `mkdir -p` as well, and this is now the *only* place that makes the log
+        # directory -- startup no longer does. A shell outlives a lot: delete the
+        # data directory -- an uninstall, a home moved, a work machine's cleanup
+        # -- and every command in every open shell writes into nothing until each
         # of them is restarted. Once a day, in the subshell that was already
         # being forked, is the cheapest place to notice.
         (umask 077 && mkdir -p "$__woswoar_logdir" && : >>"$__woswoar_logdir/$day.tsv") \
