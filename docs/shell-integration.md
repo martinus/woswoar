@@ -237,14 +237,14 @@ and CI re-measures it on every push.
 <details>
 <summary>Where those 105 ms go</summary>
 
-| | cumulative |
-|---|---|
-| Python interpreter start | 8.8 ms |
-| importing woswoar | 29 ms |
-| building the argparse parser | 36 ms |
-| loading the cache (deserialising 55k entries) | 67 ms |
-| filter, sort, dedup, render | 87 ms |
-| writing 1.5 MB to fzf | 105 ms |
+| | this step | cumulative |
+|---|---|---|
+| Python interpreter start | 8.8 ms | 8.8 ms |
+| importing woswoar | 20.2 ms | 29 ms |
+| building the argparse parser | 7 ms | 36 ms |
+| loading the cache (deserialising 55k entries) | 31 ms | 67 ms |
+| filter, sort, dedup, render | 20 ms | 87 ms |
+| writing 1.5 MB to fzf | 18 ms | 105 ms |
 
 Roughly half is fixed Python startup and half is proportional to history size.
 Micro-optimising it was measured and did not help: the costs are structural, and
