@@ -113,7 +113,30 @@ fi
 
 # Only claim the EXIT trap if nothing else owns it; clobbering a user's trap
 # would be a far worse bug than leaving one scratch file behind.
-if [[ -z $(trap -p EXIT) ]]; then
+#
+# Through the scratch file rather than `$(trap -p EXIT)`, which is a fork --
+# measured at 331us against 12us for the redirect plus the read, because bash
+# turns `$(<file)` into an open rather than a subshell. That was ~10% of the
+# ~3.4ms this hook costs a shell, spent before the first prompt. See #190.
+#
+# Safe here because the file was created and truncated three lines up, so it is
+# ours, empty and writable, and a redirect that failed anyway would leave it
+# empty -- which claims the trap, exactly as a substitution that could not fork
+# already did. What is left in it does not survive: `__woswoar_record` truncates
+# it with `history 1` before anything reads it.
+#
+# Deliberately *not* done to the `trap -p DEBUG` in `__woswoar_boot`, which is
+# the same fork at the same price. That spec reaches an `eval`, and #24's threat
+# model has a stranger owning this file whenever XDG_RUNTIME_DIR names a
+# directory they can write: today that costs them reading your commands, and
+# routing eval's input back through the file would make it running your code.
+#
+# `2>/dev/null` ahead of the redirect rather than after it, which is not a
+# style choice: redirections are applied left to right, so stderr has to be
+# gone *before* the one that can fail, or bash announces the failure on the
+# terminal at every shell startup. The substitution this replaces was silent.
+trap -p EXIT 2>/dev/null >"$__woswoar_scratch"
+if [[ -z $(<"$__woswoar_scratch") ]]; then
     # shellcheck disable=SC2064  # expand the path now, not at exit
     trap "rm -f -- '$__woswoar_scratch'" EXIT
 fi

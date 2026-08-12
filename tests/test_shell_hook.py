@@ -984,9 +984,11 @@ class CloneScalingMixin(SharedShellTestBase):
         self.assertEqual(few, many, f"{few} stamp reads for 3 commands, {many} for 30")
 
     def test_clone_count_does_not_scale_with_commands(self) -> None:
-        # Not "zero forks": startup legitimately runs mkdir, and bash two
-        # `trap -p` subshells besides. What matters is that the per-command path
-        # adds nothing, so the count must be identical for 3 and for 30 commands.
+        # Not "zero forks": startup legitimately runs mkdir, and bash a
+        # `$(trap -p DEBUG)` subshell besides. What matters is that the
+        # per-command path adds nothing, so the count must be identical for 3
+        # and for 30 commands. `TestForkFree.STARTUP_FORKS` is what pins the
+        # startup ones; nothing here can see them.
         self.warm_up()
         few = self.clone_count(3, self.NO_SYNC)
         many = self.clone_count(30, self.NO_SYNC)
@@ -1001,6 +1003,41 @@ class CloneScalingMixin(SharedShellTestBase):
 @unittest.skipUnless(shutil.which("strace"), "strace required")
 class TestForkFree(CloneScalingMixin, ShellHookTestCase):
     """The bash-specific half: which PROMPT_COMMAND shapes can leave a fork behind."""
+
+    #: Every fork a warm bash shell is still allowed, named. A count is the only
+    #: way to pin #190 -- the substitution it removed was at *startup*, so every
+    #: other test in this class, which compares 3 commands against 30, passes
+    #: with the fix reverted.
+    #:
+    #: Named rather than a bare `3` because the number on its own says nothing
+    #: about which fork came back, and this assertion is meant to be read by
+    #: whoever it fails on. If a fourth is ever genuinely wanted, this list is
+    #: where the argument for it goes.
+    STARTUP_FORKS: ClassVar[tuple[str, ...]] = (
+        "the `(umask 077 && : >...)` subshell that creates the scratch file",
+        "the `$(trap -p DEBUG)` in the boot string, once at the first prompt",
+        "the `rm` the EXIT trap runs when the shell ends",
+    )
+
+    def test_startup_does_not_fork_to_read_the_exit_trap(self) -> None:
+        """#190: `$(trap -p EXIT)` was 331us of the ~3.4ms the hook costs a shell.
+
+        Both scratch-file branches, because the redirect writes to a file whose
+        directory is chosen by the branch above it -- a fallback that landed
+        somewhere unwritable would fail the redirect, and the fork this counts
+        would come back as a different bug.
+        """
+        self.warm_up()
+        allowed = len(self.STARTUP_FORKS)
+        detail = "".join(f"\n  - {reason}" for reason in self.STARTUP_FORKS)
+        for label, extra in (("runtime dir", {}), ("fallback", {"XDG_RUNTIME_DIR": ""})):
+            with self.subTest(scratch=label):
+                count = self.clone_count(3, {**self.NO_SYNC, **extra})
+                self.assertEqual(
+                    count,
+                    allowed,
+                    f"{label}: {count} forks in a warm shell, not {allowed}:{detail}",
+                )
 
     def test_neither_scratch_file_branch_forks_per_command(self) -> None:
         # `CloneScalingMixin` already makes the bare claim for both shells; this
