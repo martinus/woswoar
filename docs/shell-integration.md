@@ -4,9 +4,10 @@ woswoar is never the only thing hooked into a real `.bashrc`, and it runs on
 every prompt. Both of those constrain it more than anything else in the design.
 
 There are two hooks, and `woswoar install` wires up whichever ones apply — it
-writes to **every shell whose rc file already exists**, and never creates one.
-So a machine with a `~/.bashrc` and a `~/.zshrc` records from both, into one
-history; a machine with only the first is untouched by the second.
+writes to **every shell whose rc file already exists**, and never adds a shell
+you were not already using. So a machine with a `~/.bashrc` and a `~/.zshrc`
+records from both, into one history; a machine with only the first is untouched
+by the second.
 
 Everything below is about the bash hook unless it says otherwise. [The zsh
 section](#zsh) covers what is genuinely different, and it is almost all about
@@ -152,12 +153,23 @@ rcfile  : ~/.bashrc (added)
 rcfile  : ~/.zshrc (added)
 ```
 
-**It never creates an rc file.** A machine that has never run zsh does not
-acquire a `~/.zshrc` because you installed woswoar — that would be a startup
-file zsh now reads, put there by a command about something else. If you are
-about to start using zsh, `woswoar install --shell both` says so out loud and
-creates it. `--shell bash`, `--shell zsh` and `--rcfile` all still name one
-thing exactly.
+**It never acquires a second shell for you.** A machine that has a `~/.bashrc`
+and has never run zsh does not come out of `install` with a `~/.zshrc` — that
+would be a startup file zsh now reads, put there by a command about something
+else. If you are about to start using zsh, `woswoar install --shell both` says
+so out loud and creates it. `--shell bash`, `--shell zsh` and `--rcfile` all
+still name one thing exactly.
+
+The one file it does create is on the path where there is nothing to find at
+all: with **no** rc file for either shell, `install` follows `$SHELL` and writes
+that one, creating it. A fresh container or a brand-new account has no rc file
+by definition, and an `install` that reported success having written nowhere
+would be worse than a `.zshrc` you can see in the output:
+
+```console
+$ HOME=$(mktemp -d) SHELL=/usr/bin/zsh woswoar install | grep rcfile
+rcfile  : /tmp/tmp.132qiShODE/.zshrc (added)
+```
 
 Everything else is shared: the same machine id, the same
 `logs/hosts/<id>/<day>.tsv`, the same sync. A machine that runs both shells
