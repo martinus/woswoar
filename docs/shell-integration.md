@@ -3,10 +3,14 @@
 woswoar is never the only thing hooked into a real `.bashrc`, and it runs on
 every prompt. Both of those constrain it more than anything else in the design.
 
-There are two hooks: `woswoar.bash`, which `woswoar install` wires up, and
-`woswoar.zsh`, which for now you [source by hand](#zsh). Everything below is
-about the bash one unless it says otherwise; the zsh section covers what is
-genuinely different, and it is almost all about *not* recording.
+There are two hooks, and `woswoar install` wires up whichever ones apply — it
+writes to **every shell whose rc file already exists**, and never creates one.
+So a machine with a `~/.bashrc` and a `~/.zshrc` records from both, into one
+history; a machine with only the first is untouched by the second.
+
+Everything below is about the bash hook unless it says otherwise. [The zsh
+section](#zsh) covers what is genuinely different, and it is almost all about
+*not* recording.
 
 ## Your normal bash is untouched
 
@@ -117,34 +121,41 @@ advertised.
 
 ## zsh
 
-**`woswoar install` does not know about zsh yet.** It writes `woswoar.bash` into
-`~/.local/share/woswoar/` and edits `.bashrc`; the zsh hook ships inside the
-package and stays there. So both the copy and the `.zshrc` line are yours to
-make, and the hook is the one file `woswoar` does not keep up to date for you —
-after `pip install -U woswoar`, repeat the copy.
+`woswoar install` writes `~/.zshrc` if you have one, exactly as it writes
+`~/.bashrc`. Nothing else to do; `woswoar doctor` reports the zsh version, the
+hook and the rc file on their own lines.
 
-Add it **last** in `~/.zshrc`:
-
-```zsh
-source "$(python3 -c 'import pathlib, woswoar
-print(pathlib.Path(woswoar.__file__).parent / "shell" / "woswoar.zsh")')"
+```console
+$ woswoar install
+machine : martin@laptop (60c0326a864478a1)
+logs    : ~/.local/share/woswoar/logs
+hook    : ~/.local/share/woswoar/woswoar.bash  (bash)
+hook    : ~/.local/share/woswoar/woswoar.zsh  (zsh)
+rcfile  : ~/.bashrc (added)
+rcfile  : ~/.zshrc (added)
 ```
 
-That sources it straight out of the package, so an upgrade is picked up by the
-next shell and there is nothing to keep in step — at the cost of a Python start
-in your `.zshrc`. If that matters, copy the file to
-`~/.local/share/woswoar/woswoar.zsh` and source the copy instead, and remember
-that `woswoar doctor` does not check that copy for staleness the way it checks
-the bash one.
+**It never creates an rc file.** A machine that has never run zsh does not
+acquire a `~/.zshrc` because you installed woswoar — that would be a startup
+file zsh now reads, put there by a command about something else. If you are
+about to start using zsh, `woswoar install --shell both` says so out loud and
+creates it. `--shell bash`, `--shell zsh` and `--rcfile` all still name one
+thing exactly.
 
 Everything else is shared: the same machine id, the same
 `logs/hosts/<id>/<day>.tsv`, the same sync. A machine that runs both shells
 records into one history and every <kbd>Ctrl</kbd>+<kbd>R</kbd> in either sees
 the other's commands, with nothing to exchange in between.
 
-**Last, because whoever binds <kbd>Ctrl</kbd>+<kbd>R</kbd> last wins.** Oh My
-Zsh, Prezto and atuin all bind it when they load. `WOSWOAR_NO_BIND=1` keeps
-theirs instead.
+> [!IMPORTANT]
+> **Upgrading woswoar does not add a shell.** The background sync refreshes the
+> hooks that are installed and deliberately creates none — so if you had woswoar
+> on bash and have since started using zsh, run `woswoar install` once. Nothing
+> else needs it.
+
+**Put the woswoar block last in `~/.zshrc`** if you move it, because whoever
+binds <kbd>Ctrl</kbd>+<kbd>R</kbd> last wins: Oh My Zsh, Prezto and atuin all
+bind it when they load. `WOSWOAR_NO_BIND=1` keeps theirs instead.
 
 Needs **zsh 5.0+**. The hook says so and switches itself off on anything older
 rather than half-working.

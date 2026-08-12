@@ -16,8 +16,9 @@ it again.
 `woswoar install` checks for these and prints the install command for your
 distribution. `woswoar doctor` diagnoses anything else that looks wrong.
 
-There is a **zsh 5.0+** hook too, but `install` does not wire it up — see
-[Living in your shell](shell-integration.md#zsh) for the one line it takes.
+**bash and zsh both work.** `install` writes to every shell whose rc file
+already exists, and never creates one — see
+[Living in your shell](shell-integration.md#zsh).
 
 > [!WARNING]
 > **Do not install `age` as a snap.** It works, and it starts a sandbox on every
@@ -54,10 +55,15 @@ yourself: `install`, `import`, `init`.
 ## Upgrading
 
 > [!TIP]
-> **`pipx upgrade woswoar` for the next release.** The shell hook is a copy
-> rather than the packaged file, but it brings itself up to date on the next
-> background sync, so there is nothing else to run; open a new shell to pick it
-> up.
+> **`pipx upgrade woswoar` for the next release.** The shell hooks are copies
+> rather than the packaged files, but they bring themselves up to date on the
+> next background sync, so there is nothing else to run; open a new shell to
+> pick it up.
+>
+> **Started using a second shell since you installed?** Run `woswoar install`
+> once. The background refresh updates the hooks that are there and deliberately
+> creates none, so a shell woswoar has never been installed for stays that way
+> until you say otherwise.
 >
 > **Coming from 0.6.x or earlier, run `woswoar install` once.** Those versions
 > had no background sync, so there is nothing running that could notice.
@@ -120,9 +126,11 @@ order, and each is independent:
 systemctl --user disable --now woswoar-sync.timer
 rm -f ~/.config/systemd/user/woswoar-sync.{service,timer}
 
-# 2. Remove the hook from your shell. `woswoar install` wrote a marked block;
-#    delete the three lines between the markers, or:
-sed -i '/# >>> woswoar >>>/,/# <<< woswoar <<</d' ~/.bashrc
+# 2. Remove the hook from your shell(s). `woswoar install` wrote a marked block
+#    into each rc file it touched; delete the three lines between the markers, or:
+for rc in ~/.bashrc ~/.zshrc; do
+    [ -f "$rc" ] && sed -i '/# >>> woswoar >>>/,/# <<< woswoar <<</d' "$rc"
+done
 
 # 3. Remove the program.
 pipx uninstall woswoar

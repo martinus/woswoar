@@ -25,7 +25,7 @@ from typing import Any, ClassVar
 from unittest import mock
 
 from woswoar import cache, crypto, progress, prove, search, store, sync
-from woswoar.__main__ import _GRANT_REMEDY, HOOK_NAME, main
+from woswoar.__main__ import _GRANT_REMEDY, HOOKS, main
 from woswoar.__main__ import _hook_bytes as main_hook_bytes
 from woswoar.entry import Entry, format_line
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
@@ -5437,7 +5437,7 @@ class TestAHookLeftBehindByAnUpgradeIsSurfaced(SyncTestCase):
 
     def stale(self, alpha: Fake) -> None:
         with alpha.active():
-            hook = store.data_dir() / HOOK_NAME
+            hook = store.data_dir() / HOOKS["bash"]
             hook.parent.mkdir(parents=True, exist_ok=True)
             hook.write_text("# woswoar, but from last year\n", encoding="utf-8")
 
@@ -5479,14 +5479,14 @@ class TestTheHookKeepsItselfUpToDate(SyncTestCase):
     def install(self, alpha: Fake) -> Path:
         self.run_cli(alpha, "install", "--rcfile", str(self.root / "bashrc"))
         with alpha.active():
-            return store.data_dir() / HOOK_NAME
+            return store.data_dir() / HOOKS["bash"]
 
     def test_a_stale_hook_is_brought_up_to_date_by_a_sync(self) -> None:
         alpha = self.machine("alpha")
         hook = self.install(alpha)
         hook.write_text("# woswoar, but from last year\n", encoding="utf-8")
         self.run_cli(alpha, "sync")
-        self.assertEqual(hook.read_bytes(), main_hook_bytes())
+        self.assertEqual(hook.read_bytes(), main_hook_bytes("bash"))
 
     def test_the_bare_command_stops_reporting_it_afterwards(self) -> None:
         """The report and the repair have to agree, or somebody is told to run
@@ -5503,7 +5503,7 @@ class TestTheHookKeepsItselfUpToDate(SyncTestCase):
         file nothing references would be a confusing way to say that."""
         alpha = self.machine("alpha")
         with alpha.active():
-            hook = store.data_dir() / HOOK_NAME
+            hook = store.data_dir() / HOOKS["bash"]
             self.assertFalse(hook.exists(), "precondition: no hook installed")
         self.run_cli(alpha, "sync")
         with alpha.active():
@@ -5521,7 +5521,7 @@ class TestTheHookKeepsItselfUpToDate(SyncTestCase):
 
         with mock.patch.object(sync, "export", boom):
             self.assertEqual(self.run_cli(alpha, "sync").code, 1)
-        self.assertEqual(hook.read_bytes(), main_hook_bytes())
+        self.assertEqual(hook.read_bytes(), main_hook_bytes("bash"))
 
     def test_a_current_hook_is_left_exactly_alone(self) -> None:
         """Rewriting an identical file once a minute is a pointless write, and

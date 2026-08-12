@@ -90,6 +90,14 @@ jobs:
           floor = search.TRANSFORM_SINCE
           assert got is not None and got >= floor, f'fzf {got} is below {floor}'
           "
+      - name: install zsh
+        # `tests.test_install` drives a real zsh through the line `install`
+        # wrote into a real `.zshrc`, and skips itself without one -- which is
+        # the silently-green shape the `--no-skips` step below exists to catch.
+        run: |
+          sudo apt-get install -y -qq zsh \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+          zsh --version
       - name: ssh-keygen is present
         # Signing needs it. Present on ubuntu-latest, asserted rather than
         # assumed for the same reason as bash below: a silently skipped suite
@@ -114,6 +122,10 @@ jobs:
       # above, so here a skip means the install stopped working -- and a green
       # run that ranked nothing at all is exactly the failure worth catching.
       - run: python -m tools.run_tests --only tests.test_search --no-skips
+      # Same reason: the install suite reaches for bash *and* zsh to prove the
+      # rc line it wrote is one the shell actually loads. Both are installed
+      # above, so here a skip means one of them stopped working.
+      - run: python -m tools.run_tests --only tests.test_install --no-skips
 
   hook:
     # Called on every prompt, so the hook gets its own job: the fork-scaling
@@ -239,6 +251,29 @@ jobs:
           echo ci-end-to-end-marker
           EOF
           woswoar list --scope global | grep -q 'ci-end-to-end-marker'
+
+      - name: zsh gets the same treatment, from a $HOME that has a .zshrc
+        # The detection rule decides which files a real `install` writes on a
+        # real home directory, and it is the one thing here that no unit test
+        # can prove about the *packaged* program. `.zshrc` only: that also says
+        # `install` did not go looking for bash on a machine without a .bashrc.
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y -qq zsh \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+          export HOME="$(mktemp -d)"
+          touch "$HOME/.zshrc"
+
+          woswoar install
+          test -f "$HOME/.local/share/woswoar/woswoar.zsh"
+          grep -q 'woswoar' "$HOME/.zshrc"
+          test ! -e "$HOME/.bashrc"
+
+          zsh -f -i <<'EOF'
+          source "$HOME/.zshrc"
+          echo ci-zsh-end-to-end-marker
+          EOF
+          woswoar list --scope global | grep -q 'ci-zsh-end-to-end-marker'
 
           # doctor exits non-zero on a broken install; fzf is absent here, so
           # only check that it runs and reports.
