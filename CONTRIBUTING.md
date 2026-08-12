@@ -92,6 +92,21 @@ reach for the wrong fix is doing the main thing.
 Nothing is merged without the maintainer saying so, including by the maintainer's
 own agents.
 
+## Re-recording the demo
+
+`docs/demo.gif` is generated, not captured by hand:
+
+```sh
+tools/demo/record.sh          # rebuilds the sandbox, records, shrinks, writes docs/demo.gif
+```
+
+It needs [VHS](https://github.com/charmbracelet/vhs), `ttyd`, `ffmpeg` and
+`gifsicle`. [`tools/demo/demo.tape`](tools/demo/demo.tape) is the screenplay and
+[`tools/demo/seed.py`](tools/demo/seed.py) builds the history it searches — a
+throwaway `$HOME` with 54,000 generated commands from three machines, so nobody's
+real history is ever on screen. Change the picker, re-run the script; that is the
+whole reason the tape is checked in rather than the recording alone.
+
 ## Cutting a release
 
 The version lives in `woswoar/__init__.py` and nowhere else — `pyproject.toml`
