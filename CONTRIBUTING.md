@@ -15,14 +15,26 @@ ruff check . && ruff format --check . && mypy woswoar tests tools \
   && python -m tools.run_tests
 ```
 
-`python -m tools.run_tests` is the parallel runner. `python -m unittest discover
--s . -t . -p 'test_*.py'` runs the same tests serially and takes about three
-times as long.
-
 There is nothing to install for woswoar itself — it is standard library only,
 and the dependency list is empty on purpose. The tools above are the `dev`
 extra: `pip install -e '.[dev]'`. The suite also drives real `age`, real `git`,
 a real `bash` and a real `fzf`, and it will tell you which one is missing.
+
+```bash
+python -m tools.run_tests                               # 301 tests, sharded, ~6s
+python -m unittest discover -s . -t . -p 'test_*.py'    # the same suite, serially
+WOSWOAR_BENCH=1 python -m unittest tests.test_perf      # latency on 52k entries
+```
+
+The suite is about 88% subprocess wait — it drives real `age`, `git` and
+`ssh-keygen` rather than mocking them — so sharding it across processes takes it
+from ~19s to ~6s. Both commands run the same tests; the runner additionally
+fails if any test it discovered never reported back, which is a way a parallel
+run can be green that a serial one cannot.
+
+CI runs lint, tests on Python 3.10/3.12/3.14, the shell-hook and fork-free
+checks, a two-machine end-to-end sync against real `age` and real `git`,
+immutability and repo-growth assertions, and an install smoke test.
 
 ## Every fix needs a test that fails when the fix is reverted
 
@@ -79,6 +91,31 @@ reach for the wrong fix is doing the main thing.
 
 Nothing is merged without the maintainer saying so, including by the maintainer's
 own agents.
+
+## Cutting a release
+
+The version lives in `woswoar/__init__.py` and nowhere else — `pyproject.toml`
+reads it from there, so the two cannot disagree.
+
+```bash
+# 1. bump __version__, open a PR, merge it (main is protected)
+# 2. tag the merged commit:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Everything after that is automatic. `.github/workflows/release.yml` refuses the
+tag unless it matches `__version__` and sits on `main`, re-runs the whole suite
+at that exact commit, builds the sdist and wheel, attests both, uploads them to
+PyPI over Trusted Publishing — no token, an identity minted for that one run —
+publishes a GitHub release with generated notes, and fast-forwards `stable`,
+which is what the `git+https://…@stable` form tracks. The `stable` push is not
+forced, so tagging an older commit fails loudly rather than moving everyone
+backwards.
+
+PyPI is the one step that cannot be undone: a version can be yanked but never
+reused. It runs before the GitHub release for that reason, and
+`.github/workflows/publish-testpypi.yml` is the rehearsal, run by hand against
+TestPyPI whenever the packaging changes.
 
 ## Security
 
