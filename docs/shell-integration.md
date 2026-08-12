@@ -389,12 +389,18 @@ the comment above it said otherwise. Measured over 100 shells: zsh 9.2 ms → 3.
 ms, bash 7.3 ms → 5.3 ms, against 1.8 ms and 1.9 ms for the same shell with no
 hook at all.
 
-**A warm zsh shell reaches zero forks. A warm bash shell forks four times**, and
-none of them is the record path: two `trap -p` subshells — one to see whether the
-EXIT trap is free, one to read any prior DEBUG trap — the subshell that creates
-the scratch file under `umask 077`, and the `rm` in the EXIT trap that removes it
-again. That is the price of `history 1` capture, and it is why the bash column
-above is higher.
+**A warm zsh shell reaches zero forks. A warm bash shell forks three times**, and
+none of them is the record path: a `$(trap -p DEBUG)` subshell to read any prior
+DEBUG trap, the subshell that creates the scratch file under `umask 077`, and the
+`rm` in the EXIT trap that removes it again. That is the price of `history 1`
+capture, and it is why the bash column above is higher.
+
+It was four until #190: asking whether the EXIT trap was already owned cost a
+second `trap -p` subshell, ~330 µs of a shell, where writing the answer to the
+scratch file and reading it back with `$(<file)` — which bash compiles into an
+open, not a subshell — costs ~12 µs. The DEBUG one is left alone on purpose,
+because its output reaches an `eval` and the scratch file is exactly what a
+stranger owns in issue #24's threat model.
 
 No index, no SQLite — a parse cache that only re-reads what changed is enough,
 and CI re-measures it on every push.
