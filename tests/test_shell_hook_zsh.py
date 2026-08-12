@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from woswoar import search
 
-from .support import MACHINE_ID, requires_bash5, requires_zsh5
+from .support import MACHINE_ID, Typed, requires_bash5, requires_zsh5, run_in_pty
 from .test_shell_hook import (
     BASH_HOOK,
     ZSH_HOOK,
@@ -37,6 +37,7 @@ from .test_shell_hook import (
     CtrlROnThePromptMixin,
     DefaultIgnorePatternMixin,
     EscapeParityMixin,
+    PickerStubMixin,
     PromptSyncMixin,
     RecordingIsPrivateMixin,
     ShellHookTestCase,
@@ -564,6 +565,73 @@ class TestCtrlRLandsOnThePrompt(CtrlROnThePromptMixin, ZshHookTestCase):
         the documentation now points zsh users at it too."""
         out = self.run_shell("bindkey '^R'\n", env_extra={"WOSWOAR_NO_BIND": "1", "TERM": "xterm"})
         self.assertNotIn("__woswoar_widget", out)
+
+
+@requires_zsh5
+class TestTheGhostSuggestionIsTakenDown(PickerStubMixin, ZshHookTestCase):
+    """#192: a recalled command must not be drawn with somebody else's ghost on it.
+
+    zsh-autosuggestions parks its suggestion in `$POSTDISPLAY`, which zle draws
+    after the cursor and which survives a widget that does not clear it. So
+    replacing `$BUFFER` from the picker left the tail of the *previous* line's
+    suggestion glued to the recalled one -- `echo PICKEDbait` on screen.
+
+    **The add-on is not installed to test this**, and that is a choice worth
+    stating. It was driven against a real zsh-autosuggestions 85919cd by hand,
+    which is what established the symptom and, more usefully, that the remedy
+    the docs used to print does not work. What CI needs from that is the
+    mechanism, and the mechanism is `$POSTDISPLAY` -- a zle parameter, not
+    anything of the add-on's. Making CI clone two third-party zsh projects to
+    reach the same assertion buys a slower, more fragile job and no more
+    coverage, which is the trade #192 asked whoever did this to make and say.
+
+    A stand-in that only *sets* the parameter is also a stronger fixture than
+    the add-on: the real one fetches asynchronously, so a suggestion is present
+    when the key is pressed only if the fetch has landed, and a test whose
+    fixture is a race passes for the wrong reason on a loaded runner.
+    """
+
+    #: Written by `_ghost` and by nothing else. Spelled with the `GHO''ST`
+    #: split so the literal never appears in what the harness types: a terminal
+    #: echoes its input, so a marker the test typed cannot witness anything.
+    #: `CLAUDE.md` rule 3, fourth bullet.
+    BAIT = "GHOST"
+
+    #: `_read_until` stops at its marker, so a marker *before* the value reads
+    #: back an empty string no matter what the value is -- which is a test that
+    #: passes either way. It goes last, after the closing bracket.
+    PROBE = (
+        "_ghost() { POSTDISPLAY=GHO''ST }\n"
+        # The `EN''D` split has to sit *outside* the double quotes: inside them
+        # `''` is two literal apostrophes, and the marker the harness waits for
+        # would be a string the shell never prints.
+        "_read() { print -r -- \"PD<$POSTDISPLAY>\"EN''D; zle -R }\n"
+        "zle -N _ghost\n"
+        "zle -N _read\n"
+        "bindkey '^N' _ghost\n"
+        "bindkey '^P' _read\n"
+    )
+
+    def test_a_stale_suggestion_does_not_survive_the_recall(self) -> None:
+        steps = [
+            Typed("", self.PROMPT),
+            Typed(f"source {self.HOOK}; echo LOAD''ED\n", "LOADED"),
+            Typed("", self.PROMPT),
+            Typed(f"{self.PROBE}echo PROB''ED\n", "PROBED"),
+            Typed("", self.PROMPT),
+            # Ctrl-N parks the ghost, Ctrl-P reads it back. Reading it *before*
+            # the recall is what stops this passing on a shell where the
+            # parameter was never set: "empty afterwards" is the assertion, and
+            # it is satisfied trivially by a fixture that produced no ghost.
+            Typed("\x0e\x10", "END"),
+            Typed("\x12", self.SELECTION),
+            Typed("\x10", "END"),
+        ]
+        *_, before, _recall, after = run_in_pty(
+            self.INTERPRETER, steps, env=self.picker_env(), timeout=30.0
+        )
+        self.assertIn(f"PD<{self.BAIT}>", before, "no ghost was parked, so this proves nothing")
+        self.assertIn("PD<>", after, f"the ghost survived the recall: {after!r}")
 
 
 if __name__ == "__main__":

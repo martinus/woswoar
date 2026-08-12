@@ -472,6 +472,26 @@ __woswoar_widget() {
     [[ -n $selection ]] || return 0
     BUFFER=$selection
     CURSOR=${#BUFFER}
+
+    # Ghost text an autosuggestion add-on parked after the cursor described the
+    # line that *was* here, so replacing $BUFFER makes it stale -- and nothing
+    # else takes it down. The recalled command is then drawn with the tail of
+    # somebody else's suggestion glued to it: `echo PICKEDbait`, observed
+    # against zsh-autosuggestions 85919cd with zsh 5.9.
+    #
+    # Cleared here rather than left to the add-on, and rather than to the
+    # `ZSH_AUTOSUGGEST_CLEAR_WIDGETS+=(__woswoar_widget)` that
+    # `docs/shell-integration.md` used to advise, because that remedy cannot
+    # work: `_zsh_autosuggest_bind_widgets` skips every widget matching `_*`,
+    # and that pattern is hard-coded in its local `ignore_widgets` rather than
+    # taken from the configurable `ZSH_AUTOSUGGEST_IGNORE_WIDGETS`. A name
+    # beginning with `_` is therefore unreachable from a user's .zshrc, in any
+    # order. Driven both ways; see `TestTheGhostSuggestionIsTakenDown`.
+    #
+    # A plain assignment, so it costs nothing and needs no add-on installed:
+    # POSTDISPLAY is zle's own parameter, empty in a shell that has none.
+    POSTDISPLAY=
+
     # The picker drew over the screen; without this the prompt is left where it
     # was and the recalled line appears under the picker's wreckage.
     zle reset-prompt

@@ -239,16 +239,24 @@ keeps working. zsh hands each `precmd` entry your real `$?`, so an
 exit-code-colouring prompt downstream is unaffected — none of the
 `PROMPT_COMMAND` apparatus the bash hook needs exists here.
 
-Two known rough edges, neither of them verified against an install of the thing
-in question:
+Both of the following were driven against a real install, on zsh 5.9 (#192):
 
-- **zsh-autosuggestions** wraps the widgets it knows about, and one defined
-  after it loads is not among them, so the ghost suggestion may linger after
-  <kbd>Ctrl</kbd>+<kbd>R</kbd>. The remedy is
-  `ZSH_AUTOSUGGEST_CLEAR_WIDGETS+=(__woswoar_widget)`.
+- **zsh-autosuggestions** needs nothing from you. Its ghost suggestion used to
+  linger after <kbd>Ctrl</kbd>+<kbd>R</kbd> — the recalled line was drawn as
+  `echo PICKEDbait`, with the tail of the previous line's suggestion still on
+  it — because the suggestion lives in `$POSTDISPLAY` and survives a widget that
+  does not clear it. The hook now clears it when it replaces your line. This
+  page used to advise `ZSH_AUTOSUGGEST_CLEAR_WIDGETS+=(__woswoar_widget)`;
+  **that never worked**, in any position in your `.zshrc`, because the add-on
+  refuses to wrap any widget whose name begins with `_` and that rule is
+  hard-coded rather than read from `ZSH_AUTOSUGGEST_IGNORE_WIDGETS`. Delete the
+  line if you added it.
 - **Powerlevel10k's instant prompt** captures output written before the first
   prompt and warns about it. The hook prints at load time in exactly one case —
-  the machine has no identity yet, so run `woswoar install`.
+  the machine has no identity yet, so run `woswoar install`. Confirmed: with no
+  `~/.config/woswoar/machine`, the second and every later shell shows p10k's
+  "console output produced during zsh initialization" warning with woswoar's
+  line under it. Once `install` has run, the hook is silent and so is p10k.
 
 ### macOS
 
