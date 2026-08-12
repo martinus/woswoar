@@ -101,6 +101,11 @@ what state this repository is in, run `woswoar doctor`.
 #: is an unordered set of public keys, and keeping both sides is always right.
 GITATTRIBUTES_CONTENT = f"{RECIPIENTS} merge=union\n*{_CHUNK_SUFFIX} -diff -merge -text\n"
 
+#: Finder's per-directory metadata file, by name in the one place that owns the
+#: layout. It turns up in `logs/` and in the history checkout alike, so both the
+#: privacy walk and the repository's ignore rules are talking about this string.
+_FINDER_METADATA = ".DS_Store"
+
 #: What must never be committed, whoever is browsing the checkout. Finder writes
 #: a `.DS_Store` into any directory it is asked to display, and this is a git
 #: working tree that lives under the user's home -- so one arrives the first time
@@ -111,17 +116,11 @@ GITATTRIBUTES_CONTENT = f"{RECIPIENTS} merge=union\n*{_CHUNK_SUFFIX} -diff -merg
 #: about it then produce a binary conflict on the rebase that `sync` does, in a
 #: file no part of woswoar knows anything about. `.gitattributes` cannot express
 #: this -- it marks how a tracked file is treated, not whether it is tracked --
-#: so it is a second file, compared and rewritten the same way for the same
-#: reason: its content is load-bearing.
+#: so it is a second file.
 #:
 #: The chunk suffix is deliberately *not* here. A chunk that no signed manifest
 #: accounts for is a thing woswoar reports; a chunk git silently ignores is one
 #: nobody ever sees.
-#: Finder's per-directory metadata file, by name in the one place that owns the
-#: layout. It turns up in `logs/` and in the history checkout alike, so both the
-#: privacy walk and the repository's `.gitignore` are talking about this string.
-_FINDER_METADATA = ".DS_Store"
-
 GITIGNORE_CONTENT = f"{_FINDER_METADATA}\n"
 
 

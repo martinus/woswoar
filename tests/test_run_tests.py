@@ -143,11 +143,6 @@ class TestPacking(unittest.TestCase):
         self.assertTrue(run_tests.selects("tests.test_sync.TestX", "tests.test_sync"))
         self.assertFalse(run_tests.selects("tests.test_sync_chunks.TestX", "tests.test_sync"))
 
-    def test_exclusion_is_anchored_the_same_way(self) -> None:
-        patterns = ["tests.test_sync"]
-        self.assertTrue(run_tests.excluded("tests.test_sync.TestX", patterns))
-        self.assertFalse(run_tests.excluded("tests.test_sync_chunks.TestX", patterns))
-
 
 class TestExclusionKeepsTheRestUnderNoSkips(unittest.TestCase):
     """The macOS case: one class cannot run there, and the guard must survive it.
@@ -177,6 +172,20 @@ class TestExclusionKeepsTheRestUnderNoSkips(unittest.TestCase):
             code, text = run_main("--jobs", "2", "--exclude", "zz_fixture_0.TestGone")
         self.assertEqual(code, 1)
         self.assertIn("no test class matches --exclude", text)
+
+    def test_one_stale_pattern_beside_a_live_one_is_still_fatal(self) -> None:
+        """The shape the caller actually uses: the macOS job passes two.
+
+        Asking only whether the *set* shrank cannot see this -- the live pattern
+        shrinks it -- so a single-pattern test passes against a check that lets a
+        rename go by silently. This is the case that distinguishes them.
+        """
+        with fixture(PASSES, SKIPS) as classes:
+            code, text = run_main(
+                "--jobs", "2", "--exclude", classes[1], "--exclude", "zz_fixture_0.TestGone"
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("TestGone", text)
 
 
 class TestABatchThatDies(unittest.TestCase):

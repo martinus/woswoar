@@ -85,18 +85,6 @@ def selects(name: str, only: str) -> bool:
     return name == only or name.startswith(only + ".")
 
 
-def excluded(name: str, patterns: list[str]) -> bool:
-    """Is the class `name` one of `patterns`, or inside one of them?
-
-    Same anchoring as `selects`, and it exists for the same policy: `--no-skips`
-    is what stops a job going green having measured nothing, so a suite with one
-    unrunnable class has to be able to drop *that class* rather than give up the
-    guard for the whole module. macOS is the case -- `TestForkFree` counts forks
-    with `strace`, which does not exist there.
-    """
-    return any(selects(name, pattern) for pattern in patterns)
-
-
 def pack(classes: dict[str, list[str]], bins: int) -> list[list[str]]:
     """Spread classes over batches, largest first onto the lightest batch.
 
@@ -170,8 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="MODULE_OR_CLASS",
-        help="skip this module or class entirely; repeatable. For a suite that cannot "
-        "run somewhere, so the rest of it can keep --no-skips",
+        help="skip this module or class entirely; repeatable, and each pattern must "
+        "match. For a suite that cannot run somewhere, so the rest keeps --no-skips",
     )
     parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     parser.add_argument("--out", help=argparse.SUPPRESS)
@@ -187,14 +175,16 @@ def main(argv: list[str] | None = None) -> int:
         if not classes:
             print(f"::error::no test class matches {args.only!r}")
             return 1
-    if args.exclude:
-        kept = {name: ids for name, ids in classes.items() if not excluded(name, args.exclude)}
-        # An exclusion that matches nothing is a rename nobody noticed, and it
-        # would silently stop excluding -- which for the one job that needs this
-        # means a red build somewhere with no `strace`. Fatal rather than
-        # ignored, for the same reason `--only` matching nothing is.
+    # One pattern at a time, and each has to match something. Checking only
+    # that the *set* shrank would let a renamed class stop being excluded as
+    # long as any other pattern still matched -- and the job that needs this
+    # passes two, so that is the likely case rather than the exotic one. What it
+    # would cost is a red build on the platform the tool is missing from, which
+    # is precisely what naming the class was meant to avoid.
+    for pattern in args.exclude:
+        kept = {name: ids for name, ids in classes.items() if not selects(name, pattern)}
         if len(kept) == len(classes):
-            print(f"::error::no test class matches --exclude {args.exclude!r}")
+            print(f"::error::no test class matches --exclude {pattern!r}")
             return 1
         classes = kept
     expected = {tid for ids in classes.values() for tid in ids}

@@ -376,7 +376,7 @@ jobs:
         # pins rather than assumes -- the same check the Linux `test` job makes,
         # because "brew's fzf is new enough" is a fact that can stop being true.
         run: |
-          brew install age fzf
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install age fzf
           age --version && fzf --version && zsh --version
           python -c "
           import sys
@@ -386,13 +386,26 @@ jobs:
           floor = search.TRANSFORM_SINCE
           assert got is not None and got >= floor, f'fzf {got} is below {floor}'
           "
-      - run: python -m tools.run_tests
-      # `--no-skips` per module, exactly as on Linux. The two exclusions are the
-      # whole of what macOS cannot do, and each is named:
+      # The four modules below are re-run immediately afterwards under
+      # `--no-skips`, so running them here as well is 79% of this job's work
+      # done twice -- `test_sync` alone is 75 s of the suite's 95 s. Measured:
+      # 11.8 s to 8.3 s wall, 174 s to 96 s of CPU, on a runner with three cores
+      # to absorb it. Nothing is lost; every exclusion here reappears below
+      # under a strictly stronger flag.
+      - run: |
+          python -m tools.run_tests \
+            --exclude tests.test_shell_hook_zsh \
+            --exclude tests.test_search \
+            --exclude tests.test_sync \
+            --exclude tests.test_install
+      # `--no-skips` per module, exactly as on Linux. What macOS cannot do is
+      # named rather than waved through:
       #
-      #  * `tests.test_shell_hook` is the *bash* hook, and macOS ships bash 3.2.
-      #    The suite skips itself wholesale there, correctly -- bash on macOS is
-      #    out of scope, not broken.
+      #  * `tests.test_shell_hook`, the *bash* hook, gets no `--no-skips` step
+      #    at all: macOS ships bash 3.2, every class in it is `@requires_bash5`,
+      #    and the whole module therefore skips itself. Correct -- bash on macOS
+      #    is out of scope, not broken -- and worth saying plainly, because it
+      #    is the one suite here running without that guard.
       #  * `TestForkFree` counts clones with `strace`, which does not exist on
       #    macOS; `dtruss` needs SIP disabled. Fork-freedom is therefore proven
       #    on Linux only, and `docs/install.md` says so rather than leaving it to
@@ -401,8 +414,12 @@ jobs:
       #    it needs a bash woswoar records from -- and the one here is 3.2. It
       #    skips itself correctly; the exclusion is so that skipping is not
       #    fatal *for this class alone* while staying fatal for the rest.
+      # No `--jobs 1` here, unlike the Linux `hook` job: that serialisation is
+      # for counting forks under strace, and the class that does it is excluded
+      # on the next line. Inheriting the flag would cost 65% for a measurement
+      # this step does not make.
       - run: |
-          python -m tools.run_tests --only tests.test_shell_hook_zsh --jobs 1 --no-skips \
+          python -m tools.run_tests --only tests.test_shell_hook_zsh --no-skips \
             --exclude tests.test_shell_hook_zsh.TestForkFree \
             --exclude tests.test_shell_hook_zsh.TestAZshAndABashShellShareOneHistory
       - run: python -m tools.run_tests --only tests.test_search --no-skips
@@ -433,4 +450,8 @@ jobs:
           EOF
           woswoar list --scope global | grep -q 'macos-end-to-end-marker'
 
-          woswoar doctor || true
+          # Not `|| true`, which the Linux job needs because fzf is absent
+          # there. Everything doctor checks is installed here, so a non-zero
+          # exit is a regression on the platform this job exists to cover, and
+          # masking it would leave the line asserting nothing.
+          woswoar doctor

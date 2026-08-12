@@ -55,6 +55,26 @@ def bash_major() -> int:
 
 
 requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
+
+
+def zsh_major() -> int:
+    """The major version of the `zsh` on PATH, or 0 if there is none.
+
+    Beside `bash_major` for the same reason it is here rather than in the hook
+    suite: any test that drives a real zsh has to say which zsh, because the
+    hook refuses below 5 and a test that only asked for `zsh` would fail rather
+    than skip.
+    """
+    zsh = shutil.which("zsh")
+    if not zsh:
+        return 0
+    out = subprocess.run(
+        [zsh, "-f", "-c", "echo ${ZSH_VERSION%%.*}"], capture_output=True, text=True, check=False
+    )
+    return int(out.stdout.strip() or 0)
+
+
+requires_zsh5 = unittest.skipUnless(zsh_major() >= 5, "zsh 5.0+ required")
 requires_fzf = unittest.skipUnless(shutil.which("fzf"), "fzf required")
 
 

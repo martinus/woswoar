@@ -34,14 +34,14 @@ class Tool(NamedTuple):
         return dict(self.packages).get(family, self.name)
 
 
-#: fzf is listed first because it is the one whose absence breaks the feature
-#: people install woswoar for. age and git matter only once you sync.
 #: The family macOS reports itself as, so the one non-Linux platform woswoar
 #: supports is a key in the same table as the rest rather than a branch beside
 #: it. `/etc/os-release` does not exist there, so `family` reaches for
-#: `sys.platform` instead -- see below.
+#: `sys.platform` instead.
 DARWIN = "darwin"
 
+#: fzf is listed first because it is the one whose absence breaks the feature
+#: people install woswoar for. age and git matter only once you sync.
 FZF = Tool("fzf", "the Ctrl-R picker")
 AGE = Tool("age", "encrypting history before it is synced")
 GIT = Tool("git", "moving encrypted history between machines")
@@ -116,7 +116,7 @@ def family(path: Path | None = None) -> str:
     ``ID_LIKE`` is consulted after ``ID`` so derivatives are covered without
     naming each one: Linux Mint reports ``ID=linuxmint ID_LIKE=ubuntu``.
     """
-    if path is None and sys.platform == "darwin":
+    if path is None and sys.platform == DARWIN:
         return DARWIN
     release = _os_release(path)
     candidates = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]

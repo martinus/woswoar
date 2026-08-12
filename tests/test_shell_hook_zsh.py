@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from woswoar import search
 
-from .support import MACHINE_ID, requires_bash5
+from .support import MACHINE_ID, requires_bash5, requires_zsh5
 from .test_shell_hook import (
     BASH_HOOK,
     ZSH_HOOK,
@@ -41,19 +41,6 @@ from .test_shell_hook import (
     RecordingIsPrivateMixin,
     ShellHookTestCase,
 )
-
-
-def zsh_major() -> int:
-    zsh = shutil.which("zsh")
-    if not zsh:
-        return 0
-    out = subprocess.run(
-        [zsh, "-f", "-c", "echo ${ZSH_VERSION%%.*}"], capture_output=True, text=True, check=False
-    )
-    return int(out.stdout.strip() or 0)
-
-
-requires_zsh5 = unittest.skipUnless(zsh_major() >= 5, "zsh 5.0+ required")
 
 
 class ZshHookTestCase(ShellHookTestCase):

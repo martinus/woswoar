@@ -449,10 +449,13 @@ Being straight about the limits is part of the security story:
 > - **Local history is plaintext.** `~/.local/share/woswoar/logs/` holds your
 >   commands unencrypted. woswoar's own directories are created `0700` and its
 >   files `0600` — the same as `~/.bash_history` — and `woswoar doctor` fails if
->   anything under them is readable by another user. The encrypted `history/`
->   checkout is excluded from that walk: it is ciphertext, and the directory
->   above it is owner-only. All of which only keeps out other accounts on the
->   same machine. Encryption protects the *synced copy*,
+>   anything under them is readable by another user. Two things are excluded
+>   from that walk, both deliberately: the encrypted `history/` checkout, which
+>   is ciphertext under an owner-only directory, and `.DS_Store`, which is
+>   Finder's file rather than woswoar's — it holds no command, and macOS
+>   recreates it at the ambient umask the moment you open the folder again, so
+>   reporting it would be a failure nobody can clear. All of which only keeps
+>   out other accounts on the same machine. Encryption protects the *synced copy*,
 >   not your disk. Use full-disk encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
 >   when they synced, and roughly how many commands you ran per day. Not *which*

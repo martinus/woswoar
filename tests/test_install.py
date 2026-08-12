@@ -24,7 +24,7 @@ from .support import (
     make_entry,
     requires_bash,
     requires_bash5,
-    requires_zsh,
+    requires_zsh5,
 )
 
 
@@ -390,13 +390,15 @@ class TestAFinderVisitDoesNotDisturbTheLogs(WoswoarTestCase):
 
 
 @requires_bash5
-@requires_zsh
+@requires_zsh5
 class TestBothShellsRecordIntoOneHistory(WoswoarTestCase):
     """`install`, then a real bash and a real zsh, then one host directory.
 
-    bash **5**, not merely bash: macOS ships 3.2, which is below the hook's floor
-    and correctly refuses to load, so this would fail there rather than skip --
-    and "bash on macOS is out of scope" is a design decision, not a defect.
+    Both gates name a *version*, not merely a binary: each hook refuses below 5
+    and switches itself off, so a test asking only for `bash` or `zsh` fails
+    there rather than skipping -- and says "the two shells disagree" about one
+    that was never recording. macOS is where that stops being hypothetical: it
+    ships bash 3.2, and bash on macOS is out of scope by design, not broken.
 
     Everything upstream of this is asserted in pieces -- which rc file was
     written, which hook was copied. This is the piece nobody can assert from a

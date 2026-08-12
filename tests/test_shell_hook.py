@@ -1626,14 +1626,6 @@ class CtrlROnThePromptMixin(SharedShellTestBase):
                 # in is enough -- and it means the harness never *types* the
                 # string it waits for to know the shell is up.
                 "PS1": self.PROMPT,
-                # Nothing here is about syncing, and leaving it on costs a race:
-                # the hook writes its stamp from a subshell it detaches and
-                # nobody waits for, so a file can land in the sandbox between
-                # `rmtree`'s walk of a directory and its `rmdir` of it. That is
-                # #167 again, reached from the widget -- `OSError: Directory not
-                # empty` on a test that had already passed. Seen on macOS, where
-                # the pty child takes longer to die; latent on Linux.
-                "WOSWOAR_SYNC_INTERVAL": "0",
                 "WOSWOAR_TEST_SELECTION": self.SELECTION,
             }
         )
