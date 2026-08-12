@@ -130,7 +130,12 @@ fi
 # model has a stranger owning this file whenever XDG_RUNTIME_DIR names a
 # directory they can write: today that costs them reading your commands, and
 # routing eval's input back through the file would make it running your code.
-trap -p EXIT >"$__woswoar_scratch"
+#
+# `2>/dev/null` ahead of the redirect rather than after it, which is not a
+# style choice: redirections are applied left to right, so stderr has to be
+# gone *before* the one that can fail, or bash announces the failure on the
+# terminal at every shell startup. The substitution this replaces was silent.
+trap -p EXIT 2>/dev/null >"$__woswoar_scratch"
 if [[ -z $(<"$__woswoar_scratch") ]]; then
     # shellcheck disable=SC2064  # expand the path now, not at exit
     trap "rm -f -- '$__woswoar_scratch'" EXIT
