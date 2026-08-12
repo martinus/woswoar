@@ -5651,3 +5651,268 @@ class TestTheStatusLineOnAMachineThatCannotReadYet(SyncTestCase):
 
         out = self.run_cli(newcomer).out
         self.assertNotIn("sealed", out, "a readable name was read as unreadable")
+
+
+class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
+    """`history/FORMAT`, and the migration it exists to make possible.
+
+    The marker is worth nothing on the day it lands and everything on the day a
+    layout changes -- and by then it cannot be added, because the machines that
+    would have to be migrated are running versions that never wrote it. So what
+    is pinned here is the part that has to be right *now*: every repo acquires
+    it without anyone running anything, an unmarked repo keeps working, and a
+    repo from the future is refused rather than half-written.
+    """
+
+    def marker(self, fake: Fake) -> str:
+        with fake.active():
+            path = store.format_file()
+            return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def publish_marker(self, fake: Fake, content: str | None) -> None:
+        """Put ``content`` in the repo's marker -- or remove it, for ``None`` --
+        and push, so every machine's next fetch sees it.
+
+        `sync.run` first, because every `self.machine(...)` pushes as it enrols:
+        a hand-made commit on top of a stale tree is rejected by the remote
+        rather than tested. Pushed rather than left local because each of the
+        checks under test reads what the *fetch* brought, so a marker only this
+        machine can see would prove nothing about the others.
+        """
+        with fake.active():
+            sync.run()
+            if content is None:
+                store.format_file().unlink()
+                sync.git("rm", "--quiet", "--cached", store.FORMAT)
+            else:
+                store.write_atomic(store.format_file(), content.encode("utf-8"))
+                sync.git("add", store.FORMAT)
+            sync.git("commit", "--quiet", "-m", "the marker, as another version left it")
+            sync.git("push", "--quiet", "origin", "HEAD")
+        self.assertEqual(self.marker(fake), content or "", "the fixture did not take")
+
+    def strip_marker(self, fake: Fake) -> None:
+        """The repository as it was before the marker existed."""
+        self.publish_marker(fake, None)
+
+    def mark_future(self, fake: Fake) -> None:
+        """A layout this woswoar does not know, as a newer one would write it."""
+        self.publish_marker(fake, store.format_content(store.REPO_FORMAT + 1))
+
+    def test_a_new_repo_records_its_format(self) -> None:
+        alpha = self.machine("alpha")
+        self.assertEqual(self.marker(alpha), store.FORMAT_CONTENT)
+
+    def test_an_existing_repo_acquires_the_marker_on_sync(self) -> None:
+        """The migration itself: a repository written before the marker existed
+        gains it on the next ordinary sync, and the file is *committed* and
+        pushed rather than left in the working tree for a later export to sweep
+        up -- which on a machine that records nothing would be never.
+        """
+        alpha = self.machine("alpha")
+        self.strip_marker(alpha)
+
+        with alpha.active():
+            # Nothing recorded since, so there is nothing to export: the marker
+            # has to be enough on its own to make this run commit and push.
+            sync.run()
+
+        self.assertEqual(self.marker(alpha), store.FORMAT_CONTENT)
+        self.assertIn(
+            store.FORMAT, self.git_in_repo(alpha, "ls-tree", "--name-only", "HEAD").split()
+        )
+        self.assertIn(
+            store.FORMAT,
+            self.git_in_repo(alpha, "ls-tree", "--name-only", "origin/HEAD").split(),
+            "the marker never reached the remote, so no other machine sees it",
+        )
+
+    def test_an_absent_marker_is_not_a_failure(self) -> None:
+        """An older repository is this shape, so it goes on working: a full
+        two-machine exchange against a repo whose marker has been removed, and
+        whose removal is on the remote before either machine syncs again."""
+        # `history_across_days` is alpha with history, beta enrolled after it,
+        # and the `grant` in between that re-seals the day keys to whoever is in
+        # recipients.txt by then.
+        alpha, beta = self.history_across_days(days=1, per_day=1)
+        self.accept_everyone(beta)
+        self.strip_marker(alpha)
+
+        with beta.active():
+            report = sync.run()
+            # Inside `active()`: `commands()` reads the *ambient* environment,
+            # so asking outside it answers with the developer's own history --
+            # a test that passes or fails on what someone typed today.
+            merged = beta.commands()
+
+        self.assertEqual(merged, {"day 0 command 0"})
+        self.assertEqual(report.lines_imported, 1)
+
+    def test_a_sync_refuses_a_newer_repo_format(self) -> None:
+        """A repo written by a woswoar this one does not understand stops the
+        run before it exports or merges anything. Not only the merge: this
+        machine publishing into a layout it cannot read would be permanent,
+        because nothing in the repo is ever rewritten."""
+        alpha, beta = self.history_across_days(days=1, per_day=1)
+        self.accept_everyone(beta)
+        self.mark_future(alpha)
+
+        with beta.active():
+            beta.record("2023-11-15", 1_700_100_001, "beta was here")
+            with self.assertRaises(sync.SyncError) as caught:
+                sync.run()
+            # Nothing merged, and nothing published either.
+            self.assertEqual(beta.commands(), {"beta was here"}, "alpha's history was merged")
+            self.assertEqual(
+                list(store.iter_chunks(beta.id)), [], "it published into a repo it cannot read"
+            )
+
+        message = str(caught.exception)
+        self.assertIn(str(store.REPO_FORMAT + 1), message, message)
+        self.assertIn(str(store.REPO_FORMAT), message, message)
+
+    def test_content_that_does_not_parse_is_not_a_wedge(self) -> None:
+        """Anyone who can push can write this file, so garbage in it must not be
+        able to stop every machine syncing. It reads as "no marker", which is
+        the same answer as an old repo -- unlike a legible higher number, which
+        a newer woswoar wrote on purpose.
+
+        The superscript is not decoration. `"\u00b2".isdigit()` is True and
+        `int("\u00b2")` raises, so a version check written with `isdigit`
+        crashes every sync on four bytes anyone with push access can write --
+        which is this test's whole subject, and `b"gibberish"` alone never
+        reaches it.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for junk in (
+                b"gibberish\n",
+                b"woswoar-repo-\n",
+                b"woswoar-repo-two\n",
+                "woswoar-repo-\u00b2\n".encode(),
+            ):
+                store.write_atomic(store.format_file(), junk)
+                self.assertIsNone(store.repo_format(), junk.decode(errors="replace"))
+                # Not just the parse: the whole sync path has to survive it.
+                sync.run()
+
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            report = sync.run()
+
+        self.assertEqual(report.chunks_written, 1)
+
+    def test_two_machines_writing_the_marker_do_not_conflict(self) -> None:
+        """Both sides create the file from a state where neither has it, and a
+        real rebase over a real bare remote has to absorb that.
+
+        This is why the file is written only when absent and never rewritten to
+        match: two machines on different versions taking turns overwriting one
+        line would conflict on every sync, forever.
+        """
+        alpha = self.machine("alpha")
+        beta = self.machine("beta")
+        self.strip_marker(alpha)
+        with beta.active():
+            # Beta's own tree back to the same state, without syncing -- a fetch
+            # here would be one machine learning about the other, which is the
+            # thing this test needs not to have happened yet.
+            sync.git("fetch", "--quiet", "origin")
+            sync.git("reset", "--hard", "--quiet", "origin/HEAD")
+            self.assertFalse(store.format_file().is_file(), "the fixture still has the marker")
+
+            # Committed locally and deliberately not pushed, so alpha's marker
+            # lands on the remote first and beta's arrives on top of it.
+            beta.record("2023-11-14", 1_700_000_002, "beta was here")
+            sync.run(push=False)
+
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "alpha was here")
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        for machine in (alpha, beta):
+            self.assertEqual(self.marker(machine), store.FORMAT_CONTENT)
+            self.assertNotIn(
+                "<<<<<<<",
+                self.marker(machine),
+                "git three-way merged a file that should never have needed one",
+            )
+
+    def test_joining_a_newer_repo_is_refused_before_anything_is_enrolled(self) -> None:
+        """`init` is the one that matters most: a machine that enrols publishes
+        a key, a signer and a sealed name into a layout it cannot read, and
+        nothing in this repository is ever rewritten."""
+        alpha = self.machine("alpha")
+        self.mark_future(alpha)
+        with alpha.active():
+            before = store.recipients_file().read_text(encoding="utf-8")
+
+        with self.assertRaises(sync.SyncError):
+            self.machine("beta")
+
+        with alpha.active():
+            sync.git("fetch", "--quiet", "origin")
+            sync.git("reset", "--hard", "--quiet", "origin/HEAD")
+            self.assertEqual(
+                store.recipients_file().read_text(encoding="utf-8"),
+                before,
+                "the newcomer enrolled into a repo it had already been told to refuse",
+            )
+
+    def test_grant_refuses_a_newer_repo_format(self) -> None:
+        """`grant` rewrites every sealed key file, which is a larger write than
+        a sync makes -- so it is gated on the same question."""
+        alpha, beta = self.history_across_days(days=1, per_day=1)
+        self.accept_everyone(beta)
+        self.mark_future(alpha)
+
+        with alpha.active():
+            sealed = store.day_key(alpha.id, "2023-11-14").read_bytes()
+            with self.assertRaises(sync.SyncError):
+                sync.grant()
+            self.assertEqual(
+                store.day_key(alpha.id, "2023-11-14").read_bytes(),
+                sealed,
+                "the day key was re-sealed into a repo this version cannot read",
+            )
+
+    def test_compact_refuses_a_newer_repo_format(self) -> None:
+        """The only routine operation that deletes files, so the last place this
+        can be allowed to run blind. It never fetches, so the check reads the
+        local checkout -- which is what a fetch left there."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            for i in range(3):
+                alpha.record("2023-11-14", 1_700_000_001 + i, f"command {i}")
+                sync.run()
+            chunks = len(list(store.iter_chunks(alpha.id)))
+        self.assertGreater(chunks, 1, "nothing to compact, so the fixture proves nothing")
+        self.mark_future(alpha)
+
+        with alpha.active():
+            with self.assertRaises(sync.SyncError):
+                sync.compact(before="2023-11-15")
+            self.assertEqual(
+                len(list(store.iter_chunks(alpha.id))), chunks, "chunks were deleted anyway"
+            )
+
+    def test_doctor_reports_the_format_the_repo_is(self) -> None:
+        """The marker is a file nobody would think to `cat`, and a working sync
+        never mentions it. `doctor` is where it becomes visible."""
+        alpha = self.machine("alpha")
+        self.assertRegex(
+            self.run_cli(alpha, "doctor").out, rf"\[ok\] repo format\s+{store.REPO_FORMAT}\b"
+        )
+
+    def test_doctor_says_what_a_refused_repo_needs(self) -> None:
+        """The same judgement `sync` refuses on, rendered rather than re-derived
+        -- a doctor that reported the old rule after the rule changed would be
+        worse than one that said nothing."""
+        alpha = self.machine("alpha")
+        self.mark_future(alpha)
+
+        out = self.run_cli(alpha, "doctor").out
+        self.assertRegex(out, r"\[FAIL\] repo format")
+        self.assertIn(str(store.REPO_FORMAT + 1), out)
+        self.assertIn("upgrade woswoar", out)

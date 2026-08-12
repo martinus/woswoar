@@ -456,7 +456,11 @@ Being straight about the limits is part of the security story:
 >   not your disk. Use full-disk encryption for that.
 > - **Metadata leaks.** Anyone with the repo can see how many machines you have,
 >   when they synced, and roughly how many commands you ran per day. Not *which*
->   machines: no username or hostname is committed.
+>   machines: no username or hostname is committed. Two files in the repo are
+>   plaintext on purpose and neither adds to that: `recipients.txt` holds
+>   *public* keys, and `FORMAT` holds the layout version — which the directory
+>   listing already shows, and which a machine has to read before it knows where
+>   the keys are.
 > - **Trust on first use.** Cloning pins whatever machines the repository shows
 >   at that moment. A machine planted *before* you clone is accepted; one that
 >   appears afterwards is refused until you say otherwise. `woswoar init` prints

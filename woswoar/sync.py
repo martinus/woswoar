@@ -1978,6 +1978,15 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # append-only.
         in_sync = _fetch_and_rebase(repo) if remote else False
 
+        # Straight after the fetch, so what is checked is what the remote says
+        # rather than what this machine last wrote, and before anything is
+        # exported, committed or merged.
+        require_known_repo_format()
+        # An existing repository acquires its marker here rather than through
+        # `init`, which nobody runs twice. This is the migration, and it costs
+        # one `is_file` on every idle sync.
+        marked = write_repo_format()
+
         # Before anything is trusted, and only ever subtracting -- see
         # `apply_withdrawals`.
         apply_withdrawals(state, report)
@@ -2015,7 +2024,18 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # old chunks it signed -- and `grant`, `revoke` and `init` still sweep
         # the tree unconditionally, which is also what catches a
         # `recipients.txt` edited by hand.
-        committed = _commit() if published or exported else False
+        # `marked` joins the other two for the same reason they are here: the
+        # marker is a write into the working tree, so the run that makes it is
+        # the run that has to stage it. Left out, it would sit unstaged until
+        # some unrelated export swept it up -- which on a machine that records
+        # nothing is never.
+        #
+        # A run that dies between writing it and committing leaves it unstaged
+        # and the next run says `marked` is False, because the file is there.
+        # Benign in the same way `publish_signer`'s equivalent is: the marker
+        # waits for the next export, `grant`, `revoke` or `init`, all of which
+        # sweep the tree unconditionally -- and every peer writes it too.
+        committed = _commit() if published or exported or marked else False
 
         if remote:
             # `push` contacts the remote even with nothing to send, which is the
@@ -2319,6 +2339,12 @@ def initialise(
     if publishing:
         _fetch_and_rebase(repo)
 
+    # Before enrolling, not after: joining a repository whose layout this
+    # version cannot read would publish a key and a name into it, and nothing
+    # in the repo is ever rewritten. The message says to upgrade, which is the
+    # whole of the fix.
+    require_known_repo_format()
+
     if _write_repo_metadata(known, chosen):
         _commit()
 
@@ -2347,6 +2373,62 @@ def initialise(
     return known, chosen, pinned
 
 
+def write_repo_format() -> bool:
+    """Write the layout marker if the repo has none. Says whether it wrote.
+
+    Only when absent, and never rewritten to match: a repo that says something
+    *older* is still this shape, and a repo that says something newer has
+    already been refused by `require_known_repo_format` before anything reaches
+    here. Rewriting it would also give two machines on different versions a file
+    to take turns overwriting, which is the failure `store.README_CONTENT`
+    describes for prose and which matters more for a version.
+    """
+    if store.format_file().is_file():
+        return False
+    store.write_atomic(store.format_file(), store.FORMAT_CONTENT.encode("utf-8"))
+    return True
+
+
+def repo_format_status() -> IdentityStatus:
+    """Whether this machine may write to the repository as it stands.
+
+    Beside `signing_status` and `trust_status` for the reason their docstrings
+    give: the judgement is stated once and is testable, rather than derived
+    inline in the CLI. `doctor` renders it and `require_known_repo_format`
+    refuses on it, so the rule and its wording cannot drift apart -- which they
+    would the first time this version understands two formats rather than one.
+
+    The detail names both numbers, because the fix is "upgrade this machine" and
+    neither is visible anywhere else.
+    """
+    found = store.repo_format()
+    if found is None:
+        return IdentityStatus(True, f"{store.REPO_FORMAT} - unmarked, the next sync records it")
+    if found > store.REPO_FORMAT:
+        return IdentityStatus(
+            False,
+            f"repo is format {found}, this woswoar understands {store.REPO_FORMAT}"
+            " - upgrade woswoar here ('pipx upgrade woswoar'); until then nothing"
+            " is published or merged",
+        )
+    return IdentityStatus(True, str(found))
+
+
+def require_known_repo_format() -> None:
+    """Refuse a repository written by a woswoar newer than this one.
+
+    Read after the fetch and before anything is exported or merged, so the
+    answer is the *remote's* view and a refusal leaves the local history exactly
+    as it was. Refusing the whole operation rather than only the merge is
+    deliberate: publishing into a layout this version does not understand is how
+    one machine writes what the new shape cannot account for, and the
+    append-only repo makes that permanent.
+    """
+    status = repo_format_status()
+    if not status.ok:
+        raise SyncError(f"refusing to write to this history repo: {status.detail}")
+
+
 def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     """Ensure this machine is enrolled. Returns whether anything changed."""
     changed = False
@@ -2362,6 +2444,9 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     readme = store.history_dir() / store.README
     if not readme.is_file():
         store.write_atomic(readme, store.README_CONTENT.encode("utf-8"))
+        changed = True
+
+    if write_repo_format():
         changed = True
 
     recipient = crypto.recipient_for(identity).strip()
@@ -2710,6 +2795,10 @@ def _access_change() -> Iterator[_AccessChange]:
     with lock():
         if remote:
             _fetch_and_rebase(repo)
+        # `grant` and `revoke` rewrite every sealed key file in the repo, which
+        # is a bigger write than `sync` makes -- so the version gate belongs
+        # here too, and after the fetch for the same reason.
+        require_known_repo_format()
         yield _AccessChange(identity, known, remote)
         _commit()
         if remote:
@@ -2973,6 +3062,12 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
     known = store.machine()
 
     with lock():
+        # The only routine operation that *deletes* files, so it is the last
+        # place to run against a layout this version does not understand. No
+        # fetch to be after: `compact` touches this host's own chunks and never
+        # goes to the remote, so the local checkout is the only view there is.
+        require_known_repo_format()
+
         verify_key = signing_public()
         by_day: dict[str, list[store.Chunk]] = {}
         for chunk in store.iter_chunks(known.id):

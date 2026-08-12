@@ -32,6 +32,36 @@ _NAME_FILE = ".name"
 RECIPIENTS = "recipients.txt"
 GITATTRIBUTES = ".gitattributes"
 README = "README.md"
+FORMAT = "FORMAT"
+
+#: The layout of the *repository* -- `recipients.txt`, `hosts/<id>/keys/`,
+#: `manifests/`, `<day>/<ts>-<rand>.age`. Every other format woswoar owns already
+#: says which one it is: the cache carries `woswoar-cache-2`, a manifest carries
+#: `woswoar-manifest-v1` inside the bytes it signs. The repo was the exception,
+#: and it is the one an upgrade cannot be retrofitted onto later -- a machine
+#: still running the old version would not write the marker, so by the time a
+#: layout change needs one it is too late by definition.
+#:
+#: Deliberately not `woswoar.__version__`. The program version moved sixteen
+#: times in a fortnight and this has moved zero times; coupling them means a
+#: meaningless bump on every release and no signal on the one release where it
+#: matters.
+REPO_FORMAT = 1
+_FORMAT_PREFIX = "woswoar-repo-"
+
+
+def format_content(version: int = REPO_FORMAT) -> str:
+    """What the marker says for ``version``. The one place the prefix is spelt.
+
+    Takes a version because the tests need to write one this build does not
+    understand, and hand-typing `woswoar-repo-2` there would put a second copy
+    of the prefix outside this module -- where it would go on parsing after a
+    rename, as `None`, and quietly stop testing the refusal.
+    """
+    return f"{_FORMAT_PREFIX}{version}\n"
+
+
+FORMAT_CONTENT = format_content()
 
 #: What a stranger finding the repository sees first, and what its owner sees in
 #: three years having forgotten what it was. Deliberately says nothing about
@@ -488,6 +518,52 @@ def history_dir() -> Path:
 
 def recipients_file() -> Path:
     return history_dir() / RECIPIENTS
+
+
+def format_file() -> Path:
+    """Which shape this repository is, in plaintext at its root.
+
+    Plaintext, and it has to be: a machine reads this *before* it knows how to
+    find the day keys, so a version of it sealed to a key is a fact you can only
+    learn by already understanding the layout it describes.
+
+    It says nothing an observer could not get from the directory listing anyway
+    -- `docs/security.md` has always put the shape and size of the repository
+    outside what encryption hides.
+    """
+    return history_dir() / FORMAT
+
+
+def repo_format() -> int | None:
+    """The version the repository claims, or ``None`` when nothing legible does.
+
+    ``None`` is "the shape that predates the marker", which is this shape -- so
+    an absent file reads as compatible and every existing installation goes on
+    working untouched. That is the whole migration.
+
+    Unreadable *content* answers ``None`` too, rather than refusing. The file
+    sits in a repository anyone with push access can write, so treating garbage
+    as a fatal disagreement would hand any of them a way to stop every machine
+    syncing by writing four bytes -- while a legible number is a statement made
+    deliberately by a newer woswoar, and is worth stopping for. `State.load`
+    degrades the same way, for the same reason.
+    """
+    try:
+        text = format_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith(_FORMAT_PREFIX):
+        return None
+    try:
+        return int(text[len(_FORMAT_PREFIX) :])
+    except ValueError:
+        # `int` in a `try`, and not `str.isdigit` before it: those are different
+        # questions, and the gap between them is this function's whole promise.
+        # `"²".isdigit()` is True and `int("²")` raises, so a marker holding
+        # `woswoar-repo-²` crashed every sync with an unhandled ValueError --
+        # four bytes, writable by anyone with push access, exactly the wedge the
+        # docstring above says cannot happen.
+        return None
 
 
 def state_file() -> Path:
