@@ -1690,24 +1690,19 @@ class TestThePtyHarness(unittest.TestCase):
         self.assertIn("41 123", chunks[1])
 
 
-class CtrlROnThePromptMixin(SharedShellTestBase):
-    """The one property that keeps a recalled command from running by itself.
+class PickerStubMixin(SharedShellTestBase):
+    """A shell under a pty whose `woswoar search` is a fixed answer.
 
-    Every other test of the widget checks a piece of it from the outside: what
-    the picker would print, what the cycle binding decides. None of them press
-    the key, because the key does nothing without a terminal -- readline does no
-    line editing on a pipe, and neither does zle. So the claim the whole feature
-    rests on, that a selection arrives *on the prompt for editing* and is never
-    executed, was guarded by nothing at all.
+    The fixture only, with no test of its own, because more than one claim
+    needs a real line editor with a stubbed picker behind it -- `CtrlR`'s "the
+    selection does not run" below, and the zsh suite's "a stale ghost
+    suggestion does not survive the recall". Kept apart from the first of those
+    so the second does not inherit and re-run it under another class's name,
+    which makes a failure report name the wrong test.
 
-    Here it is driven: a real shell, a real line editor, a real pty, the real
-    hook. What is stubbed is the picker itself -- the widget's contract with it
-    is one line on stdout, and fzf choosing that line needs its own test rather
-    than a share of this one.
-
-    Shared between the two suites because none of it is shell-specific once the
-    interpreter and the hook are class attributes: `bind -x` and `zle -N` differ,
-    but what they must *do* does not.
+    What is stubbed is the picker itself: the widget's contract with it is one
+    line on stdout, and fzf choosing that line needs its own test rather than a
+    share of these.
     """
 
     #: What the picker hands back, and what running it would print. Two strings
@@ -1748,8 +1743,8 @@ class CtrlROnThePromptMixin(SharedShellTestBase):
         return self.shell_env(
             {
                 "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-                # Not `dumb`, which the rest of this file uses: this is the one
-                # test that wants readline to behave as it does for a person.
+                # Not `dumb`, which the rest of this file uses: these are the
+                # tests that want readline to behave as it does for a person.
                 "TERM": "xterm",
                 # Both shells default PS1 only when it is unset, so handing it
                 # in is enough -- and it means the harness never *types* the
@@ -1758,6 +1753,25 @@ class CtrlROnThePromptMixin(SharedShellTestBase):
                 "WOSWOAR_TEST_SELECTION": self.SELECTION,
             }
         )
+
+
+class CtrlROnThePromptMixin(PickerStubMixin):
+    """The one property that keeps a recalled command from running by itself.
+
+    Every other test of the widget checks a piece of it from the outside: what
+    the picker would print, what the cycle binding decides. None of them press
+    the key, because the key does nothing without a terminal -- readline does no
+    line editing on a pipe, and neither does zle. So the claim the whole feature
+    rests on, that a selection arrives *on the prompt for editing* and is never
+    executed, was guarded by nothing at all.
+
+    Here it is driven: a real shell, a real line editor, a real pty, the real
+    hook.
+
+    Shared between the two suites because none of it is shell-specific once the
+    interpreter and the hook are class attributes: `bind -x` and `zle -N` differ,
+    but what they must *do* does not.
+    """
 
     def test_the_selection_arrives_for_editing_and_does_not_run(self) -> None:
         steps = [
