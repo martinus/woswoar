@@ -185,11 +185,19 @@ terminal, which is #183.
 The result is verified rather than asserted: CI runs the hook under `strace` with
 3 commands and with 30, and requires the clone count to be *identical*. Flat, not
 zero, which is the property that actually matters. A warm zsh shell does reach
-zero; a warm bash shell forks four times at startup, and all four are bash's own
-apparatus rather than the record path — two `trap -p` subshells (one to see
-whether the EXIT trap is free, one to read any prior DEBUG trap), the subshell
-that creates the scratch file under `umask 077`, and the `rm` in the EXIT trap
-that removes it again.
+zero; a warm bash shell forks three times at startup, and all three are bash's own
+apparatus rather than the record path — a `$(trap -p DEBUG)` to read any prior
+DEBUG trap, the subshell that creates the scratch file under `umask 077`, and the
+`rm` in the EXIT trap that removes it again. The count is asserted, not only its
+flatness, because #190's fork was at startup and a flat count cannot see one.
+
+There were four until #190. The fourth asked whether the EXIT trap was free, and
+now writes `trap -p EXIT` to the scratch file and reads it back — bash compiles
+`$(<file)` into an open rather than a subshell, which is ~330 µs a shell. The
+DEBUG one stays: its output reaches an `eval`, and issue #24's threat model has a
+stranger owning the scratch file whenever `XDG_RUNTIME_DIR` names a directory
+they can write. That costs them your commands today, and would cost you code
+execution if `eval`'s input came off the same disk.
 
 ### Sharing the shell with everything else
 
