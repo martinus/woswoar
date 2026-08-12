@@ -85,6 +85,18 @@ def selects(name: str, only: str) -> bool:
     return name == only or name.startswith(only + ".")
 
 
+def excluded(name: str, patterns: list[str]) -> bool:
+    """Is the class `name` one of `patterns`, or inside one of them?
+
+    Same anchoring as `selects`, and it exists for the same policy: `--no-skips`
+    is what stops a job going green having measured nothing, so a suite with one
+    unrunnable class has to be able to drop *that class* rather than give up the
+    guard for the whole module. macOS is the case -- `TestForkFree` counts forks
+    with `strace`, which does not exist there.
+    """
+    return any(selects(name, pattern) for pattern in patterns)
+
+
 def pack(classes: dict[str, list[str]], bins: int) -> list[list[str]]:
     """Spread classes over batches, largest first onto the lightest batch.
 
@@ -153,6 +165,14 @@ def main(argv: list[str] | None = None) -> int:
         help="treat a skipped test as a failure, for jobs that install every optional tool",
     )
     parser.add_argument("--only", default="", help="run only this module or class")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="MODULE_OR_CLASS",
+        help="skip this module or class entirely; repeatable. For a suite that cannot "
+        "run somewhere, so the rest of it can keep --no-skips",
+    )
     parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     parser.add_argument("--out", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -167,6 +187,16 @@ def main(argv: list[str] | None = None) -> int:
         if not classes:
             print(f"::error::no test class matches {args.only!r}")
             return 1
+    if args.exclude:
+        kept = {name: ids for name, ids in classes.items() if not excluded(name, args.exclude)}
+        # An exclusion that matches nothing is a rename nobody noticed, and it
+        # would silently stop excluding -- which for the one job that needs this
+        # means a red build somewhere with no `strace`. Fatal rather than
+        # ignored, for the same reason `--only` matching nothing is.
+        if len(kept) == len(classes):
+            print(f"::error::no test class matches --exclude {args.exclude!r}")
+            return 1
+        classes = kept
     expected = {tid for ids in classes.values() for tid in ids}
 
     # Twice the CPUs, because the work is subprocess wait rather than CPU:

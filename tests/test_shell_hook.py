@@ -33,7 +33,14 @@ from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
-from .support import MACHINE_ID, Typed, WoswoarTestCase, requires_bash, run_in_pty
+from .support import (
+    MACHINE_ID,
+    Typed,
+    WoswoarTestCase,
+    requires_bash,
+    requires_bash5,
+    run_in_pty,
+)
 
 SHELL_DIR = Path(__file__).resolve().parent.parent / "woswoar" / "shell"
 BASH_HOOK = SHELL_DIR / "woswoar.bash"
@@ -61,19 +68,6 @@ ESCAPE_CORPUS = [
     "*?[]{}",
     "x" * 5000,
 ]
-
-
-def bash_major() -> int:
-    bash = shutil.which("bash")
-    if not bash:
-        return 0
-    out = subprocess.run(
-        [bash, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=False
-    )
-    return int(out.stdout.strip() or 0)
-
-
-requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 
 
 class ShellHookTestCase(WoswoarTestCase):
@@ -1632,6 +1626,14 @@ class CtrlROnThePromptMixin(SharedShellTestBase):
                 # in is enough -- and it means the harness never *types* the
                 # string it waits for to know the shell is up.
                 "PS1": self.PROMPT,
+                # Nothing here is about syncing, and leaving it on costs a race:
+                # the hook writes its stamp from a subshell it detaches and
+                # nobody waits for, so a file can land in the sandbox between
+                # `rmtree`'s walk of a directory and its `rmdir` of it. That is
+                # #167 again, reached from the widget -- `OSError: Directory not
+                # empty` on a test that had already passed. Seen on macOS, where
+                # the pty child takes longer to die; latent on Linux.
+                "WOSWOAR_SYNC_INTERVAL": "0",
                 "WOSWOAR_TEST_SELECTION": self.SELECTION,
             }
         )

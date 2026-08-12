@@ -10,6 +10,7 @@ import select
 import shutil
 import signal
 import struct
+import subprocess
 import tempfile
 import termios
 import time
@@ -33,6 +34,27 @@ requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
 requires_bash = unittest.skipUnless(shutil.which("bash"), "bash required")
 requires_zsh = unittest.skipUnless(shutil.which("zsh"), "zsh required")
+
+
+def bash_major() -> int:
+    """The major version of the `bash` on PATH, or 0 if there is none.
+
+    Here rather than in the hook suite because it is not only that suite's
+    question any more: macOS ships bash 3.2, so *any* test that drives a real
+    bash has to say so or it fails there rather than skipping. `requires_bash`
+    on its own is not enough -- macOS has a bash, just not one woswoar records
+    from.
+    """
+    bash = shutil.which("bash")
+    if not bash:
+        return 0
+    out = subprocess.run(
+        [bash, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=False
+    )
+    return int(out.stdout.strip() or 0)
+
+
+requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 requires_fzf = unittest.skipUnless(shutil.which("fzf"), "fzf required")
 
 
@@ -274,7 +296,16 @@ class WoswoarTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="woswoar-test-")
-        self.root = Path(self._tmp.name)
+        # Resolved, which is a no-op on Linux and load-bearing on macOS: there
+        # `$TMPDIR` is `/var/folders/...` and `/var` is a symlink to
+        # `/private/var`. So a sandbox `$HOME` spelled `/var/...` and an
+        # `os.getcwd()` inside it spelled `/private/var/...` are the same
+        # directory under two names -- and `search`'s `dir` scope, which
+        # deliberately treats a symlinked path and its target as *different*
+        # keys, then finds nothing. That is correct behaviour meeting a fixture
+        # that did not mean to exercise it, and it cost two failures on the
+        # first macOS run.
+        self.root = Path(self._tmp.name).resolve()
         self.addCleanup(self._tmp.cleanup)
 
         self._saved = {key: os.environ.get(key) for key in ENV_KEYS}

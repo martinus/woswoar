@@ -9,6 +9,7 @@ that report a missing tool can all say the same thing.
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -35,6 +36,12 @@ class Tool(NamedTuple):
 
 #: fzf is listed first because it is the one whose absence breaks the feature
 #: people install woswoar for. age and git matter only once you sync.
+#: The family macOS reports itself as, so the one non-Linux platform woswoar
+#: supports is a key in the same table as the rest rather than a branch beside
+#: it. `/etc/os-release` does not exist there, so `family` reaches for
+#: `sys.platform` instead -- see below.
+DARWIN = "darwin"
+
 FZF = Tool("fzf", "the Ctrl-R picker")
 AGE = Tool("age", "encrypting history before it is synced")
 GIT = Tool("git", "moving encrypted history between machines")
@@ -42,6 +49,10 @@ SSH_KEYGEN = Tool(
     "ssh-keygen",
     "signing history, so machines can tell which one wrote it",
     packages=(
+        # macOS ships it, so this is only ever reached on one where somebody
+        # removed it -- but `brew install ssh-keygen` is not a command, and this
+        # module's whole rule is that a printed fix has to work.
+        (DARWIN, "openssh"),
         ("fedora", "openssh-clients"),
         ("rhel", "openssh-clients"),
         ("centos", "openssh-clients"),
@@ -56,6 +67,7 @@ TOOLS = (FZF, AGE, GIT, SSH_KEYGEN)
 #: short: printing a confidently wrong command for a distro nobody tested is
 #: worse than admitting we do not know, which is what the fallback does.
 _INSTALLERS = {
+    DARWIN: "brew install",
     "fedora": "sudo dnf install",
     "rhel": "sudo dnf install",
     "centos": "sudo dnf install",
@@ -87,11 +99,25 @@ def _os_release(path: Path | None = None) -> dict[str, str]:
 
 
 def family(path: Path | None = None) -> str:
-    """This machine's distro family, or ``""`` if it is not one we know.
+    """This machine's platform family, or ``""`` if it is not one we know.
+
+    macOS by `sys.platform` rather than by a file: there is no `/etc/os-release`
+    there, so the Linux path below would fall through to the "install with your
+    package manager" fallback -- honest, and useless to somebody one
+    `brew install` away from a working install.
+
+    **Only when nobody named a file.** `path` is how the tests ask "what would
+    this machine's `/etc/os-release` mean", and a `sys.platform` check in front
+    of it answers a different question -- which is not theoretical: the first
+    version of this line was written that way and turned nine `TestInstaller`
+    cases red the moment the suite ran on a Mac, because every one of them hands
+    in a fixture. The parameter is the question; the platform is the default.
 
     ``ID_LIKE`` is consulted after ``ID`` so derivatives are covered without
     naming each one: Linux Mint reports ``ID=linuxmint ID_LIKE=ubuntu``.
     """
+    if path is None and sys.platform == "darwin":
+        return DARWIN
     release = _os_release(path)
     candidates = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]
     for candidate in candidates:

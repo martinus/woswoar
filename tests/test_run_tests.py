@@ -143,6 +143,41 @@ class TestPacking(unittest.TestCase):
         self.assertTrue(run_tests.selects("tests.test_sync.TestX", "tests.test_sync"))
         self.assertFalse(run_tests.selects("tests.test_sync_chunks.TestX", "tests.test_sync"))
 
+    def test_exclusion_is_anchored_the_same_way(self) -> None:
+        patterns = ["tests.test_sync"]
+        self.assertTrue(run_tests.excluded("tests.test_sync.TestX", patterns))
+        self.assertFalse(run_tests.excluded("tests.test_sync_chunks.TestX", patterns))
+
+
+class TestExclusionKeepsTheRestUnderNoSkips(unittest.TestCase):
+    """The macOS case: one class cannot run there, and the guard must survive it.
+
+    `strace` does not exist on macOS, so `TestForkFree` cannot run -- and
+    dropping `--no-skips` for the whole module to accommodate it is exactly the
+    silently-green suite that flag exists to prevent.
+    """
+
+    def test_an_excluded_class_does_not_run_and_does_not_count_as_a_skip(self) -> None:
+        with fixture(PASSES, SKIPS) as classes:
+            code, text = run_main("--jobs", "2", "--no-skips", "--exclude", classes[1])
+        self.assertEqual(code, 0, text)
+        self.assertIn("Ran 1 test", text)
+
+    def test_without_the_exclusion_the_same_run_is_red(self) -> None:
+        """Otherwise the test above passes against an `--exclude` that does
+        nothing, because the class it names never skipped."""
+        with fixture(PASSES, SKIPS):
+            code, _ = run_main("--jobs", "2", "--no-skips")
+        self.assertEqual(code, 1)
+
+    def test_an_exclusion_that_matches_nothing_is_fatal(self) -> None:
+        """A renamed class would otherwise stop being excluded silently, and the
+        job that needs it is the one running where the tool is absent."""
+        with fixture(PASSES):
+            code, text = run_main("--jobs", "2", "--exclude", "zz_fixture_0.TestGone")
+        self.assertEqual(code, 1)
+        self.assertIn("no test class matches --exclude", text)
+
 
 class TestABatchThatDies(unittest.TestCase):
     """The failure a serial runner cannot have: a worker that never reports."""

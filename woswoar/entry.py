@@ -39,6 +39,14 @@ from typing import NamedTuple
 #: interleave regardless of size -- this cap exists to keep one runaway paste
 #: from bloating a day file, and to stay well-behaved on filesystems (NFS) that
 #: make no such promise.
+#:
+#: The Linux claim is deliberately not widened to APFS. It very likely holds
+#: there too, but "very likely" is not what a claim like this is for, and no
+#: written guarantee was found -- so macOS is one of the filesystems the second
+#: half of that sentence covers rather than the first. What it costs if it does
+#: not hold is bounded and known: `parse_line` returns None for a torn line, so
+#: an interleave loses one entry rather than corrupting the file, and every
+#: other line in it still reads.
 MAX_CMD_CHARS = 8000
 
 TRUNCATION_MARKER = "...[truncated]"

@@ -471,6 +471,98 @@ class TestTwoMachines(SyncTestCase):
             self.assertEqual(recall("host"), ["from beta"])
 
 
+class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
+    """`.DS_Store` in the history checkout (#160).
+
+    Finder writes one into any directory it is asked to display, and the history
+    repo is a git working tree under the user's home -- so one arrives the first
+    time anybody looks at their history in a file manager. `sync` stages with
+    `git add -A`, so without a `.gitignore` it is committed and pushed, and two
+    machines whose Finders disagree about it produce a binary conflict on the
+    rebase `sync` does.
+
+    Written by hand here rather than by a Mac: that is the point. This has to be
+    pinned by the Linux suite or it regresses the moment nobody is testing on a
+    Mac -- which today is everybody.
+    """
+
+    def litter(self, fake: Fake, *relative: str) -> list[Path]:
+        """Put a `.DS_Store` in each of ``relative``, as Finder would."""
+        made = []
+        with fake.active():
+            for rel in relative:
+                path = store.history_dir() / rel / ".DS_Store"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"\x00\x00\x00\x01Bud1")
+                made.append(path)
+        return made
+
+    def test_the_repo_carries_a_gitignore_for_it(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            text = (store.history_dir() / store.GITIGNORE).read_text(encoding="utf-8")
+        self.assertIn(".DS_Store", text)
+
+    def test_a_sync_neither_stages_it_nor_fails(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+        # Beside real chunks, in the directory a person would actually open --
+        # a repo of nothing but `.DS_Store` cannot tell an ignore rule from an
+        # empty commit.
+        self.litter(alpha, "", f"hosts/{alpha.id}", f"hosts/{alpha.id}/2023-11-14")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_002, "git commit")
+            report = sync.run()
+        # It pushed, so the commit that carried the second chunk really was made
+        # -- a run that quietly did nothing would also have staged no `.DS_Store`.
+        self.assertTrue(report.pushed, "the sync did not get as far as pushing")
+        self.assertEqual(report.chunks_written, 1)
+
+        tracked = self.git_in_repo(alpha, "ls-files").split()
+        self.assertTrue(tracked, "nothing is tracked, so this asserts nothing")
+        self.assertEqual(
+            [name for name in tracked if ".DS_Store" in name], [], "Finder's file was committed"
+        )
+
+    def test_a_peer_still_reads_the_history_beside_it(self) -> None:
+        """The claim that matters: the day is merged and verified, not merely
+        that nothing crashed."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "secret-marker-command")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+            sync.run()
+        self.litter(alpha, f"hosts/{alpha.id}/2023-11-14")
+        with alpha.active():
+            sync.run()
+
+        self.accept_everyone(beta)
+        with beta.active():
+            sync.run()
+            self.assertIn(
+                "secret-marker-command",
+                {entry.cmd for entry in cache.load_entries()},
+                "the day did not merge past Finder's file",
+            )
+
+    def test_it_is_not_mistaken_for_a_chunk_nobody_signed(self) -> None:
+        """A file in a day directory that no manifest lists is exactly what
+        `unlisted_chunks` exists to report. It must report *chunks*, not
+        everything -- or the first Finder visit reads as tampering."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+        self.litter(alpha, f"hosts/{alpha.id}/2023-11-14")
+        with alpha.active():
+            self.assertEqual(sync.unlisted_chunks(), [])
+
+
 class TestImmutability(SyncTestCase):
     """The invariant the whole storage design rests on."""
 

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from woswoar import deps
 from woswoar.__main__ import main
@@ -45,6 +46,36 @@ class TestInstaller(unittest.TestCase):
     def test_id_wins_over_id_like(self) -> None:
         path = self.release("ID=fedora\nID_LIKE=debian\n")
         self.assertEqual(deps.installer(path), "sudo dnf install")
+
+    def test_brew_is_offered_on_darwin(self) -> None:
+        """macOS has no `/etc/os-release`, so without a `sys.platform` branch the
+        advice degrades to "install with your package manager" -- honest, and
+        useless to somebody one `brew install` away from a working install.
+
+        Patched, because `sys.platform` is the platform this process is running
+        on and no fixture can make it say otherwise.
+        """
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(deps.installer(), "brew install")
+            self.assertEqual(deps.advice([deps.AGE, deps.FZF]), "brew install age fzf")
+
+    def test_a_named_os_release_is_answered_even_on_a_mac(self) -> None:
+        """`path` is the question; the platform is only the default.
+
+        Every other case in this class hands in a fixture, so a `sys.platform`
+        check in front of the file read answers something else entirely -- and
+        turns all nine of them red the moment the suite runs on a Mac, which is
+        how this was found rather than reasoned.
+        """
+        path = self.release("ID=fedora\n")
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(deps.installer(path), "sudo dnf install")
+
+    def test_ssh_keygen_names_a_formula_that_exists(self) -> None:
+        """`brew install ssh-keygen` is not a command. This module's rule is that
+        a printed fix has to work, which is the whole reason `packages` exists."""
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(deps.advice([deps.SSH_KEYGEN]), "brew install openssh")
 
     def test_quotes_are_stripped(self) -> None:
         self.assertEqual(deps.installer(self.release('ID="fedora"\n')), "sudo dnf install")

@@ -2433,11 +2433,18 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     """Ensure this machine is enrolled. Returns whether anything changed."""
     changed = False
 
-    attrs = store.history_dir() / store.GITATTRIBUTES
-    current = attrs.read_text(encoding="utf-8") if attrs.is_file() else ""
-    if current != store.GITATTRIBUTES_CONTENT:
-        store.write_atomic(attrs, store.GITATTRIBUTES_CONTENT.encode("utf-8"))
-        changed = True
+    # Both compared and rewritten rather than written once, because both hold
+    # content woswoar depends on rather than prose -- see `store.README_CONTENT`
+    # for the file where that argument comes out the other way.
+    for name, content in (
+        (store.GITATTRIBUTES, store.GITATTRIBUTES_CONTENT),
+        (store.GITIGNORE, store.GITIGNORE_CONTENT),
+    ):
+        path = store.history_dir() / name
+        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if current != content:
+            store.write_atomic(path, content.encode("utf-8"))
+            changed = True
 
     # Only when absent -- see `store.README_CONTENT` for why it is not compared
     # and rewritten the way `.gitattributes` is.

@@ -69,8 +69,10 @@ _BOILERPLATE = (
     sync.COMMIT_MESSAGE,
     store.README_CONTENT,
     store.GITATTRIBUTES_CONTENT,
+    store.GITIGNORE_CONTENT,
     store.README,
     store.GITATTRIBUTES,
+    store.GITIGNORE,
     store.RECIPIENTS,
     # The repo-layout names, from the module that owns them: tree objects
     # spell out every directory and file name under `hosts/`.

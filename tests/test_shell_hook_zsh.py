@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from woswoar import search
 
-from .support import MACHINE_ID
+from .support import MACHINE_ID, requires_bash5
 from .test_shell_hook import (
     BASH_HOOK,
     ZSH_HOOK,
@@ -409,8 +409,14 @@ class TestALostLogDirectory(ZshHookTestCase):
 
 
 @requires_zsh5
+@requires_bash5
 class TestAZshAndABashShellShareOneHistory(ZshHookTestCase):
     """One machine id, one host directory, one day file -- whichever shell wrote it.
+
+    Needs bash **5**, not merely bash. macOS has a bash and it is 3.2, which the
+    hook refuses -- so without this gate the class fails there instead of
+    skipping, and says "the two shells disagree" about a shell that was never
+    recording in the first place.
 
     This is the case a user reaches by adding zsh to a machine that already runs
     the bash hook, and it needs nothing to be exchanged: both append to the same

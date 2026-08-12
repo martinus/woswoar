@@ -10,7 +10,7 @@ one machine; [adding a second](sync.md) is two more lines. This page is the rest
 of it — what the first run does, how to upgrade, and how to remove every part of
 it again.
 
-**Needs:** bash 5.0+ (Linux) · Python 3.10+ ·
+**Needs:** bash 5.0+ or zsh 5.0+ · Linux or macOS · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
 [age](https://github.com/FiloSottile/age) and git *(sync only)*.
 `woswoar install` checks for these and prints the install command for your
@@ -19,6 +19,33 @@ distribution. `woswoar doctor` diagnoses anything else that looks wrong.
 **bash and zsh both work.** `install` writes to every shell whose rc file
 already exists, and never creates one — see
 [Living in your shell](shell-integration.md#zsh).
+
+### macOS
+
+woswoar works, through **zsh**. macOS still ships bash 3.2, which is below the
+hook's floor and correctly refuses to load; the zsh hook is the way in, and zsh
+is the default shell there anyway.
+
+Two things to know before you start:
+
+```bash
+brew install age fzf       # git and zsh are already there
+```
+
+**The system `python3` is 3.9 and woswoar needs 3.10+.** This is the first wall
+you will hit, and `pipx install woswoar` will simply refuse. `brew install
+python@3.12` (or [uv](https://docs.astral.sh/uv/)) first, and make sure the
+`pipx` you use is that one's.
+
+woswoar keeps its data in `~/.local/share/woswoar`, `~/.config/woswoar` and
+`~/.cache/woswoar` on macOS too, rather than in `~/Library`. That is deliberate:
+the paths are the same on every machine, which is what a dotfiles repo shared
+between a Mac and a Linux box needs.
+
+One property is weaker there, stated plainly rather than left to be assumed:
+**the hook's fork-freedom is verified by CI on Linux only.** macOS has no
+`strace`, and `dtruss` needs SIP disabled. The hook file is the same on both
+platforms, so what is unverified is the platform, not the code.
 
 > [!WARNING]
 > **Do not install `age` as a snap.** It works, and it starts a sandbox on every
