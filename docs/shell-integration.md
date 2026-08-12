@@ -346,21 +346,26 @@ Measured on a real **54,943-entry** history across ~750 daily files:
 |---|---|
 | record a command | **~150 µs**, 0 forks |
 | decide whether a sync is due | **~5 µs**, 0 forks |
-| open a shell | **~1.5 ms** on zsh, **~3.2 ms** on bash — no `mkdir`, see below |
+| open a shell | adds **~1.3 ms** on zsh (0 forks), **~3.4 ms** on bash (4) — see below |
 | start a background sync | once per `WOSWOAR_SYNC_INTERVAL`, 2 forks, no wait |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd>, whole process | **~105 ms** |
 | one <kbd>Ctrl</kbd>+<kbd>/</kbd> details pane, per row | **~79 ms**, and only while it is open |
 
-**Opening a shell forks nothing, after the first one of the day.** That first
-shell creates the day's log file, which costs one `mkdir` — and every shell
-after it finds the file already there and skips the whole step. Until #183 both
-of these were paid by *every* shell, twice over: once at startup and once again
-at the first command, because the once-a-day guard started out unsatisfied.
-Measured over 100 shells, zsh went from 9.2 ms to 3.2 ms and bash from 7.4 ms to
-5.3 ms, against 1.7 ms and 2.0 ms for the same shell with no hook at all. bash's
-floor is higher because it legitimately forks twice more at startup — a
-`trap -p` to see whether the EXIT trap is free, and one to read any prior DEBUG
-trap.
+**`mkdir` runs once a day, not once a shell.** The first command that records
+after midnight makes that day's log directory and file; every shell and every
+command after it decides on a `stat` that there is nothing to do. Until #183
+that was two forks *and* two execs in every terminal — one at startup, one more
+at the first command, because the once-a-day guard started out unsatisfied while
+the comment above it said otherwise. Measured over 100 shells: zsh 9.2 ms → 3.2
+ms, bash 7.3 ms → 5.3 ms, against 1.8 ms and 1.9 ms for the same shell with no
+hook at all.
+
+**A warm zsh shell reaches zero forks. A warm bash shell forks four times**, and
+none of them is the record path: two `trap -p` subshells — one to see whether the
+EXIT trap is free, one to read any prior DEBUG trap — the subshell that creates
+the scratch file under `umask 077`, and the `rm` in the EXIT trap that removes it
+again. That is the price of `history 1` capture, and it is why the bash column
+above is higher.
 
 No index, no SQLite — a parse cache that only re-reads what changed is enough,
 and CI re-measures it on every push.

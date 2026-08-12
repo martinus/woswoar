@@ -875,28 +875,43 @@ class CloneScalingMixin(SharedShellTestBase):
     NO_SYNC: ClassVar[dict[str, str]] = {"WOSWOAR_SYNC_INTERVAL": "0"}
 
     def warm_up(self) -> None:
-        """Put the sandbox in the state every shell but the first of a day is in.
+        """Put the sandbox in the state every shell but the day's first is in.
 
-        Since #183 the *first* shell of a day creates that day's log file, and
-        every one after it therefore forks nothing at startup. Two measurements
-        taken either side of that differ in their startup work rather than in
-        their per-command work, which is not what any of these tests is about --
-        and it is what made four of them fail when #183 landed, all reporting
-        "the record path forks" about a fork that happened before the first
-        prompt.
+        Since #183 the once-a-day subshell is skipped when today's log file is
+        already there, so the shell that *creates* it pays a fork the ones after
+        it do not. Two measurements taken either side of that differ in their
+        startup work rather than in their per-command work, which is not what
+        any of these tests is about -- and it is what made four of them fail
+        when #183 landed, all reporting "the record path forks" about a fork
+        that happened once, before the measurement they were comparing.
+
+        A command, not an empty shell: the file is made by recording, and a
+        shell that records nothing deliberately leaves `logs/` untouched. And
+        `run_shell` rather than `clone_count`, because no number here is read --
+        straceing a shell to throw the count away costs 20 ms a call.
         """
-        self.clone_count(0, self.NO_SYNC)
+        self.run_shell("echo warm-up\n", self.NO_SYNC)
 
-    def mkdir_execs(self, env_extra: dict[str, str] | None = None) -> int:
-        """How many times one shell's startup ran `mkdir`.
+    def mkdir_execs(self, script: str, env_extra: dict[str, str] | None = None) -> int:
+        """How many times one shell ran `mkdir` **on the log directory**.
 
         Counted by `execve` rather than by clones: `mkdir` is not a builtin in
         either shell, so it is a fork *and* an exec, and naming the program is
         what makes a failure say which fork came back.
+
+        Named by its argument too, and that is not fussiness: bash also makes
+        `run/` at startup, with its own guard and its own test. Counting every
+        `mkdir` let a hook that pre-set `__woswoar_today` unconditionally -- and
+        so skipped the branch that gets the day file's mode right -- pass this,
+        because the cold shell still forked once for `run/`.
         """
         proc = subprocess.run(
-            ["strace", "-f", "-e", "trace=execve", *self.INTERPRETER],
-            input=self.shell_input(""),
+            # `-s 200`, because strace truncates a string argument at 32
+            # characters by default -- and a sandbox path is longer than that,
+            # so the directory this is counting would be cut off exactly where
+            # the name it matches on begins.
+            ["strace", "-s", "200", "-f", "-e", "trace=execve", *self.INTERPRETER],
+            input=self.shell_input(script),
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.DEVNULL,
@@ -905,25 +920,30 @@ class CloneScalingMixin(SharedShellTestBase):
             timeout=120,
         )
         return sum(
-            1 for line in proc.stderr.splitlines() if 'execve("/' in line and "mkdir" in line
+            1
+            for line in proc.stderr.splitlines()
+            if 'execve("/' in line and "mkdir" in line and str(store.logs_dir()) in line
         )
 
     def test_a_shell_forks_no_mkdir_once_the_day_file_is_there(self) -> None:
-        """#183: two `mkdir` forks in every interactive shell, for a directory
+        """#183: two `mkdir` forks in every interactive shell, for directories
         that already existed.
 
         One at startup, one at the first recorded command -- `__woswoar_today`
-        began empty, so the once-a-day branch fired once per *shell* as well,
-        and the comment above it said otherwise. Measured over 100 shells:
-        8.9 ms each down to 3.1 ms.
+        began empty, so the once-a-day branch was unsatisfied in every shell as
+        well, while the comment above it said it cost once a day. Both are now
+        decided by a `stat`. Measured over 100 shells: 8.1 ms per zsh shell to
+        2.7 ms, and 6.3 ms per bash shell to 4.3 ms.
 
         The cold count is asserted too, and is what stops this passing against a
-        hook that stopped creating the directory at all: something has to make
-        it the first time.
+        hook that stopped making the directory at all: something has to create
+        it the first time, and it is still a fork when it does.
         """
-        cold = self.mkdir_execs(self.NO_SYNC)
+        cold = self.mkdir_execs("echo cold\n", self.NO_SYNC)
         self.assertGreater(cold, 0, "nothing created the log directory, so this proves nothing")
-        self.assertEqual(self.mkdir_execs(self.NO_SYNC), 0, "a warm shell still forks mkdir")
+        self.assertEqual(
+            self.mkdir_execs("echo warm\n", self.NO_SYNC), 0, "a warm shell still forks mkdir"
+        )
 
     def stamp_opens(self, command_count: int) -> int:
         """How many times the shell opened the sync stamp across the run.
@@ -1371,48 +1391,39 @@ class RecordingIsPrivateMixin(SharedShellTestBase):
     """
 
     def test_the_day_file_is_owner_only_under_a_stock_umask(self) -> None:
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
         self.run_shell("echo hello\n")
+        # The recording is asserted, not just the file: since #183 the hook
+        # decides on a `stat` whether the day file exists, and a hook that had
+        # stopped recording would leave the same empty `logs/` as one that never
+        # started -- which this loop would then walk zero times and pass.
+        self.assertEqual(self.commands(), ["echo hello"])
         files = sorted(self.logdir().parent.rglob("*.tsv"))
         self.assertTrue(files, "nothing was recorded")
         for path in files:
             self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
 
-    def test_a_shell_that_records_nothing_still_creates_the_day_file_owner_only(self) -> None:
-        """The constraint #183's fix has to respect.
+    def test_a_shell_that_records_nothing_leaves_no_log_file(self) -> None:
+        """`logs/` holding a file has to go on meaning "something was recorded".
 
-        Since #183 the day file is created at *startup*, so that
-        `__woswoar_today` can be pre-set and the once-a-day fork stops firing
-        once per shell. Pre-setting it without creating the file would skip the
-        branch that gets the mode right, and the first append would then make it
-        under the ambient umask -- 0644, which is the hole this class exists to
-        close, reopened by a performance change.
+        `search` decides between "nothing recorded yet" and opening fzf on that
+        exact question (`woswoar/search.py`, the `iter_log_files` guard), so a
+        hook that touched the day file at startup would make the first Ctrl-R
+        after `woswoar install` an empty picker to escape out of, on the one
+        path where woswoar has nothing to show and has just told the user to
+        press that key.
 
-        The shell types nothing, which is the case that distinguishes them: the
-        file exists because startup made it, not because a command did.
+        That is not hypothetical: creating the file at startup is how #183 was
+        first fixed here, and this is the test that says why it is not.
         """
-        previous = os.umask(0o022)
-        self.addCleanup(os.umask, previous)
         self.run_shell("")
-        files = sorted(self.logdir().parent.rglob("*.tsv"))
-        self.assertTrue(files, "startup created no day file")
-        for path in files:
-            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
-
-    def test_a_shell_whose_data_directory_is_gone_creates_it_privately(self) -> None:
-        """The same claim, from the state a fresh install is in.
-
-        `WoswoarTestCase` leaves `$WOSWOAR_DIR` absent until something makes it,
-        so this is the first-shell-ever path -- the one that still forks, and the
-        one where getting the mode wrong is permanent for that day.
-        """
-        previous = os.umask(0o022)
-        self.addCleanup(os.umask, previous)
-        shutil.rmtree(Path(os.environ["WOSWOAR_DIR"]), ignore_errors=True)
-        self.run_shell("echo hello\n")
-        self.assertEqual(self.commands(), ["echo hello"])
-        self.assertEqual(self.logdir().stat().st_mode & 0o077, 0, "the directory is reachable")
-        for path in sorted(self.logdir().rglob("*.tsv")):
-            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
+        self.assertEqual(sorted(self.logdir().parent.rglob("*.tsv")), [])
+        # The consequence, asserted where it is felt rather than only where it
+        # is caused. `interactive` returns None without starting fzf on exactly
+        # this state; a real shell having run is what the file-level assertion
+        # above cannot say on its own.
+        self.assertIsNone(search.interactive("global"), "Ctrl-R would open an empty picker")
 
     def test_the_hook_agrees_with_store_about_what_private_means(self) -> None:
         """The hook is copied verbatim, so it cannot import the constants.

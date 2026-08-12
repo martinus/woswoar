@@ -67,37 +67,27 @@ fi
 
 __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 
-# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p` and
-# the append below would otherwise honour the ambient umask, which is 022 almost
-# everywhere, and these files hold more than ~/.zsh_history does -- which zsh
-# creates 0600.
+# The day whose log file is known to exist, which is what `__woswoar_record`
+# consults before paying for a subshell. Set here when it is already true, and
+# left empty otherwise.
 #
-# Only creation happens here. Re-tightening a tree from an older woswoar is
-# `woswoar install`'s job: a recursive chmod is proportional to the number of
-# days recorded, and this runs on every interactive shell.
+# **Two stats instead of two forks.** `mkdir` is not a builtin in either shell,
+# so the subshell that used to stand here was a fork *and* an exec, on a path
+# whose whole design claim is that it does not fork -- and it ran in every
+# terminal, for a directory that existed. Worse, `__woswoar_today` started
+# empty, so `__woswoar_record`'s once-a-day branch was unsatisfied too and paid
+# the same fork again at the first command of every shell. The comment above it
+# said it cost once a day. Measured over 100 shells: 8.1 ms per zsh shell to
+# 2.7 ms, and two `mkdir` execs to none. See #183.
 #
-# **The guard is the point.** `mkdir` is not a builtin in either shell, so this
-# subshell is a fork *and* an exec, on a path whose whole design claim is that
-# it does not fork -- and today's log file existing is already proof that its
-# directory does. So every shell but the first of each day does nothing here.
-#
-# Creating the *file* rather than only the directory is what earns the second
-# half: `__woswoar_today` can then be set, and `__woswoar_record`'s once-a-day
-# branch -- which starts out unsatisfied and so fires at the first command of
-# every shell -- is already satisfied. That was the same fork again, and the
-# comment above it claimed it was paid once a day. Measured over 100 shells:
-# 8.9 ms per shell to 3.1 ms, and two `mkdir` execs to none. See #183.
-#
-# `__woswoar_today` is set *only* on the far side of that branch, never
-# unconditionally: it means "the file for this day is known to exist", and a
-# shell that asserted it without checking would skip the once-a-day branch and
-# let the first append create the file under the ambient umask -- 0644, the one
-# hole this section exists to close.
+# Creating anything here was tried first and is worse. It would make a log file
+# for a shell that records nothing -- and `logs/` holding a file is precisely
+# how `search` knows whether to say "nothing recorded yet" rather than opening
+# an empty picker you have to escape out of. Deciding on a `stat` leaves that
+# meaning intact: the file is still made by the code that records, under the
+# umask that gets its mode right, and this only asks whether that has happened.
 strftime -s __woswoar_today '%F' $EPOCHSECONDS # local time, matching store.day_for()
-if [[ ! -e $__woswoar_logdir/$__woswoar_today.tsv ]]; then
-    (umask 077 && mkdir -p "$__woswoar_logdir" \
-        && : >>| "$__woswoar_logdir/$__woswoar_today.tsv") 2>/dev/null || return 0
-fi
+[[ -e $__woswoar_logdir/$__woswoar_today.tsv ]] || __woswoar_today=
 
 # Identifies this shell for `--scope session`. Start second plus pid, both in
 # hex, exactly as woswoar.bash builds it -- a bash started inside a zsh
@@ -352,22 +342,21 @@ __woswoar_record() {
     # rather than testing the file every time: this runs on every command, and
     # the answer changes once a day.
     #
-    # In a subshell, so the caller's umask is untouched no matter what. What it
-    # costs is once per shell *and* then once per day: `__woswoar_today` starts
-    # empty, so this branch also fires at the first recorded command of every
-    # shell, duplicating the `mkdir -p` that startup has just run. Measured at
-    # ~5.4 ms of the 6.8 ms this hook adds to a shell that otherwise starts in
-    # 1.25 ms -- and woswoar.bash pays exactly the same twice, so it is filed
-    # (#183) rather than fixed in one shell here. It is off the per-command
-    # path, which is what this file's fork-count tests are about.
+    # In a subshell, so the caller's umask is untouched no matter what, and once
+    # per day per machine rather than once per shell -- startup answers the same
+    # question with a `stat` and pre-sets `__woswoar_today` when the file is
+    # already there. It used to start empty, so this fired at the first command
+    # of every shell as well, and the comment here said otherwise (#183).
     #
-    # zsh has a fork-free alternative -- `zmodload -F zsh/files b:chmod` makes
-    # chmod a builtin -- but the mode still has to be right at creation, so it
-    # would trade one fork for a module load in every shell. Kept as bash has it.
+    # zsh has a fork-free alternative -- `zmodload -F zsh/files b:mkdir b:chmod`
+    # makes both builtins -- and it is a worse trade now than it looked: a module
+    # load in every shell, to remove a fork that happens once a day.
     #
-    # `mkdir -p` as well, because the directory is otherwise only made when the
-    # shell starts, and a shell outlives a lot: an uninstall, a home moved, a
-    # work machine's cleanup. Once a day is the cheapest place to notice.
+    # `mkdir -p` as well, and this is now the *only* place that makes
+    # the log directory -- startup no longer does. A shell outlives a lot: delete
+    # the data directory, and every command in every open shell writes into
+    # nothing until each of them is restarted. Once a day, in the subshell that
+    # was already being forked, is the cheapest place to notice.
     if [[ $day != "$__woswoar_today" ]]; then
         __woswoar_today=$day
         (umask 077 && mkdir -p "$__woswoar_logdir" && : >>| "$__woswoar_logdir/$day.tsv") \
