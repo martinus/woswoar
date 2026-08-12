@@ -67,6 +67,13 @@ Switch scope without leaving the picker:
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | **dir** — this directory and below |
 
 <kbd>Ctrl</kbd>+<kbd>R</kbd> inside the picker walks the same four in that order.
+The prompt says which one you are in — and for `dir` it says *which* directory,
+`woswoar (dir ~/src/woswoar)`, because the word on its own does not answer the
+question you switched scope to ask. A long path is cut from the left, keeping
+the end that identifies it. A path spelled with anything beyond letters, digits
+and `._-/~ ` is left off entirely rather than escaped — the label crosses fzf's
+action parser and a shell on its way to the screen, and going quiet there costs
+you only what every earlier release showed anyway.
 
 **`dir` spans machines, and that is deliberate.** `~/src/woswoar` on your laptop
 and on your desktop is the same project, and that cross-machine question is the

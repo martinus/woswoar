@@ -794,28 +794,37 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         of its own rather than keeping the fall-through it used to have."""
         self.assertEqual(self.next_scope(""), "global")
 
-    def test_the_prompt_carries_nothing_but_the_scope(self) -> None:
-        """The `case` arms are substring matches over the *whole* prompt, so any
-        user text in it is a way to misroute the cycle. A prompt that named the
-        directory -- `woswoar (dir ~/src/session-manager)` -- reads as `session`
-        and goes to `dir` instead of round to `global`. If the matcher below is
-        ever made exact, the test that pins that misrouting is where to record
-        that this constraint has been lifted.
+    def test_the_prompt_starts_with_the_scope(self) -> None:
+        """The prompt is where the scope is *kept* -- fzf has no variables, so
+        the cycle and the preview read it back out of `$FZF_PROMPT`. What the
+        arms require is the prefix; anything after it is free, which is what
+        lets `dir` name its directory.
 
-        Asserted on the prompt fzf is actually given, and on the one the cycle
-        repaints, because those are the two places the text could get in."""
+        Asserted on the prompt fzf is given and on the one the cycle repaints,
+        because those are the two places it is written.
+        """
         for scope in search.SCOPES:
             with self.subTest(scope=scope):
                 argv = search._fzf_argv(scope, "", True, 0)
-                self.assertIn(f"--prompt=woswoar ({scope}) ", argv)
+                prompt = next(a for a in argv if a.startswith("--prompt="))
+                self.assertTrue(prompt.startswith(f"--prompt=woswoar ({scope}"), prompt)
         binding = search._cycle_binding("woswoar", "", " --host-width 0")
-        self.assertIn("change-prompt(woswoar ($n) )", binding)
+        self.assertIn("change-prompt(woswoar (", binding)
 
-    def test_a_directory_in_the_prompt_would_misroute(self) -> None:
-        """The reason for the test above, made concrete rather than asserted
-        about in prose: this is what the substring matcher does with a path in
-        the prompt, and it is silent."""
-        self.assertEqual(self.next_scope("woswoar (dir ~/src/session-manager) "), "dir")
+    def test_every_scope_name_still_survives_a_path_that_names_another(self) -> None:
+        """The constraint that used to live here, lifted -- and generalised.
+
+        A single test used to pin the *misrouting*: `woswoar (dir
+        ~/src/session-manager)` read as `session` under the substring arms and
+        went to `dir` instead of round to `global`, silently, while showing the
+        right list. That case is `(dir, session)` in the grid below; every other
+        pair is the same hazard for a scope nobody thought to try.
+        """
+        for scope in search.SCOPES:
+            for other in search.SCOPES:
+                with self.subTest(scope=scope, path=other):
+                    prompt = f"woswoar ({scope} ~/src/{other}-manager) "
+                    self.assertEqual(self.next_scope(prompt), search._NEXT[scope])
 
     def test_it_repaints_the_prompt_it_reads_back(self) -> None:
         """`change-prompt` is not decoration: the next press reads it."""
@@ -1214,6 +1223,30 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
                 self.assertIn(f"change-prompt(woswoar (timeline {scope}) )", out)
                 self.assertIn(f"--scope {scope} --around", out)
 
+    def test_the_prompt_it_paints_is_one_it_can_read_back(self) -> None:
+        """The round trip, which the test above only ever walks one way.
+
+        It feeds `woswoar ({scope}) ` in and asserts `woswoar (timeline {scope}) `
+        comes out -- and nothing then fed *that* back. So when the scope arms
+        were anchored to `woswoar (<scope>`, the timeline's own prompt stopped
+        matching any of them and every key pressed inside a timeline fell to
+        `global`: Ctrl-T recentred against a list nobody asked for, which is the
+        failure this binding carries the scope in its prompt to prevent.
+
+        Both keys, because both read it: the timeline stays where it is, and the
+        cycle moves on from the scope the timeline is showing.
+        """
+        timeline = search._timeline_binding("true", "", " --host-width 0")
+        cycle = search._cycle_binding("woswoar", "", " --host-width 0")
+        for scope in search.SCOPES:
+            with self.subTest(scope=scope):
+                painted = f"woswoar (timeline {scope}) "
+                self.assertIn(
+                    f"--scope {scope} --around", run_binding(timeline, "transform:", painted)
+                )
+                out = run_binding(cycle, "transform:", painted)
+                self.assertIn(f"--scope {search._NEXT[scope]})", out)
+
 
 class TestThePreviewBlock(WoswoarTestCase):
     """`list --show N`: the three recorded fields nobody could read back.
@@ -1518,6 +1551,77 @@ class TestThePreviewBinding(unittest.TestCase):
 
 
 @requires_fzf
+class TestTheDirectoryPromptUnderARealFzf(WoswoarTestCase):
+    """The label on screen, and still the right scope after it.
+
+    Every other test of this asserts the strings woswoar hands fzf. The two
+    things only a real one can answer are whether it paints a prompt with a path
+    in it, and whether the `case` that reads that prompt back still lands on
+    `dir` -- which is the failure the old substring matcher had, and it was
+    silent: the list stayed right while the *next* keypress went somewhere else.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.root / "home"
+        # `session-manager`, not `proj`, and that is the whole fixture: a path
+        # with no scope name in it answers `global` under the old substring arms
+        # too, so this test passed against them -- verified by running it with
+        # the old `_scope_case` restored. The name is what makes step three
+        # distinguish anchored arms from substring ones.
+        (self.home / "src/session-manager").mkdir(parents=True)
+        with store.private_append(store.log_file(MACHINE_ID, "2026-07-29")) as handle:
+            for i, cmd in enumerate(["in-proj-one", "in-proj-two"]):
+                entry = Entry(NOW + i, MACHINE_ID, "s1", "~/src/session-manager", 0, 1, cmd)
+                handle.write(format_line(entry) + "\n")
+
+    def picker_env(self) -> dict[str, str]:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        shim = bin_dir / "woswoar"
+        shim.write_text(f'#!/bin/sh\nexec {sys.executable} -m woswoar "$@"\n', encoding="utf-8")
+        shim.chmod(0o755)
+        return {
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "TERM": "xterm",
+            "HOME": str(self.home),
+            "PWD": str(self.home / "src/session-manager"),
+            "SHELL": "/bin/sh",
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+            "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
+            "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
+            "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
+        }
+
+    def test_the_prompt_shows_the_directory_and_still_cycles_out_of_dir(self) -> None:
+        """Two presses, and the markers are the assertions.
+
+        `~/src/proj` in the prompt can only have come from fzf painting it --
+        the harness never types it. Then Ctrl-R once more: with the substring
+        matcher this prompt read as `session` and went to `dir`, so arriving at
+        `global` is what says the anchoring works through a real fzf and not
+        only in a unit test.
+        """
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.home / "src/session-manager")
+
+        steps = [
+            Typed("", "in-proj-one"),
+            # Ctrl-O is the direct key for `dir`; the label is what it paints.
+            Typed("\x0f", "woswoar (dir ~/src/session-manager)"),
+            # And round: dir -> global, which is only reachable if the prompt
+            # just painted was read back as `dir`.
+            Typed("\x12", "woswoar (global)"),
+        ]
+        run_in_pty(
+            [sys.executable, "-m", "woswoar", "search", "--scope", "global"],
+            steps,
+            env=self.picker_env(),
+        )
+
+
+@requires_fzf
 class TestThePreviewUnderARealFzf(WoswoarTestCase):
     """The pane, driven through a real fzf under a real terminal.
 
@@ -1670,6 +1774,142 @@ class DirScopeCase(WoswoarTestCase):
     @staticmethod
     def commands(scope: search.Scope = "dir") -> list[str]:
         return sorted(recalled(scope))
+
+
+class TestTheDirectoryInThePrompt(DirScopeCase):
+    """`woswoar (dir)` said which scope you were in and not which directory.
+
+    Asked for directly: "is it possible to show the actual directory instead of
+    `dir`?" It was not, quite: the prompt is where fzf keeps the scope, the arms
+    that read it back were substring matches, and a path is user text. Anchoring
+    them is what made it possible, and this class is the other half -- what the
+    label may say, and what it declines to say.
+    """
+
+    def test_it_names_the_directory_you_are_standing_in(self) -> None:
+        self.stand_in(self.home)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~) ")
+
+        (self.home / "src/woswoar").mkdir(parents=True)
+        self.stand_in(self.home / "src/woswoar")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/woswoar) ")
+
+    def test_no_other_scope_gains_a_label(self) -> None:
+        """There is nothing for them to add: `global` is every machine, `host`
+        is this one, `session` is this shell. Only `dir` answers a question the
+        word itself does not."""
+        self.stand_in(self.home)
+        for scope in ("global", "host", "session"):
+            with self.subTest(scope=scope):
+                self.assertEqual(search._prompt_for(scope), f"woswoar ({scope}) ")
+
+    def test_a_long_path_is_cut_from_the_left(self) -> None:
+        """The prompt and the query share a line, and the tail is the part that
+        identifies a directory -- `~/src/very/deep/...` says nothing that
+        `.../deep/thing` does not say better."""
+        deep = self.home / "one/two/three/four/five/six/seven/eight"
+        deep.mkdir(parents=True)
+        self.stand_in(deep)
+
+        prompt = search._prompt_for("dir")
+        self.assertLessEqual(len(prompt), len("woswoar (dir ) ") + search._PROMPT_LABEL_MAX)
+        # `_ELLIPSIS`, the same one-column character `_clip` uses on the machine
+        # column -- three dots would spend two more of the columns this constant
+        # exists to save.
+        self.assertIn(search._ELLIPSIS, prompt)
+        self.assertIn("eight", prompt, "the end of the path is what it had to keep")
+
+    def test_a_path_either_parser_would_read_is_not_shown_at_all(self) -> None:
+        """The label crosses two languages, and the guard has to survive both.
+
+        fzf parses `change-prompt(...)` out of an action string, so `)` ends the
+        argument and `+` starts the next action. The cycle key repaints from
+        inside a `printf "..."` that fzf hands to the shell, so `"`, `$`, a
+        backtick and a backslash are the shell's -- and `%` is printf's, which
+        an earlier denylist here missed: it renamed `~/50%-off` to `~/500ff`
+        silently, and truncated the action string outright for a name ending in
+        `%`.
+
+        Driven per character, because one example passes against a guard that
+        happens to catch that one -- which is how the four-character denylist
+        this replaced looked correct.
+        """
+        for hostile in ('"', "$", "`", "\\", "%", ")", "(", "+", ";", "&", "'", "*"):
+            with self.subTest(char=hostile):
+                awkward = self.home / f"a{hostile}b"
+                awkward.mkdir()
+                self.stand_in(awkward)
+                self.assertEqual(search._prompt_for("dir"), "woswoar (dir) ")
+
+    def test_an_ordinary_path_in_any_script_is_shown(self) -> None:
+        """Otherwise the guard above passes by rejecting everything.
+
+        Letters and digits are asked of `str.isalnum`, not of ASCII: a home
+        directory is a person's name as often as not.
+        """
+        for name in ("src/proj", "üni-cödé", "日本語", "a_b.c-d", "v1.2"):
+            with self.subTest(name=name):
+                ordinary = self.home / name
+                ordinary.mkdir(parents=True)
+                self.stand_in(ordinary)
+                self.assertEqual(search._prompt_for("dir"), f"woswoar (dir ~/{name}) ")
+
+    def test_a_directory_that_could_smuggle_an_fzf_action_is_refused(self) -> None:
+        """The one that is not a display bug.
+
+        `change-prompt(<label>)` is parsed by fzf, and `+` separates actions --
+        so a directory whose name closes the paren and opens `execute-silent`
+        is a command fzf would run when the prompt is repainted. Nothing but
+        the width cap stood between that and a shell, and a width cap is a
+        taste constant.
+        """
+        payload = "x)+execute-silent(touch pwned)+change-prompt(z"
+        smuggler = self.home / payload
+        smuggler.mkdir()
+        self.stand_in(smuggler)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir) ")
+        self.assertNotIn("execute-silent", search._cycle_binding("woswoar", "", " --host-width 0"))
+
+    def test_the_cycle_repaints_the_same_prompt_the_direct_key_paints(self) -> None:
+        """Landing on `dir` two ways must leave the same string on screen, or
+        the next keypress reads a different scope from each.
+
+        Through a real `sh`, not by matching the emitted source. This assertion
+        used to be two `assertIn`s over the generated script -- a mirror of the
+        f-string that produced it, which cannot see what the shell then does
+        with it. `%` is what it could not see: `$p` is expanded into *printf's
+        format*, so `~/src/100%done` was repainted as `~/src/1000one` while the
+        direct key painted it correctly.
+        """
+        (self.home / "src/proj").mkdir(parents=True)
+        self.stand_in(self.home / "src/proj")
+
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        out = run_binding(binding, "transform:", "woswoar (session) ")
+        painted = out.split("change-prompt(", 1)[1].split(")+change-preview", 1)[0]
+        self.assertEqual(painted, search._prompt_for("dir"))
+
+    def test_a_directory_that_is_gone_is_not_named_in_prose(self) -> None:
+        """`_here_label` answers "this directory" when there is nothing to name,
+        which is right for a sentence and wrong for a slot that means a path --
+        `woswoar (dir this directory)` reads as a directory called that."""
+        gone = self.home / "gone"
+        gone.mkdir()
+        self.stand_in(gone)
+        gone.rmdir()
+        self.set_env("PWD", "")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir) ")
+
+    def test_the_label_it_shows_is_the_one_the_empty_note_names(self) -> None:
+        """Two sentences about the same directory, and they were written apart:
+        "no commands recorded in X or below" and the prompt. A person who sees
+        both must not be told two different things."""
+        (self.home / "src/proj").mkdir(parents=True)
+        self.stand_in(self.home / "src/proj")
+        note = search.empty_note("dir")
+        assert note is not None
+        self.assertIn("~/src/proj", note)
+        self.assertIn("~/src/proj", search._prompt_for("dir"))
 
 
 class TestTheDirectoryScope(DirScopeCase):

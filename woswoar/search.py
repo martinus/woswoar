@@ -198,11 +198,17 @@ def host_labels(hosts: set[str]) -> dict[str, str]:
     return {host: _clip(label) for host, label in chosen.items()}
 
 
-def _clip(label: str) -> str:
-    """Trim to `_HOST_WIDTH`, keeping the end -- see `_ELLIPSIS`."""
-    if len(label) <= _HOST_WIDTH:
+def _clip(label: str, width: int = _HOST_WIDTH) -> str:
+    """Trim to ``width``, keeping the end -- see `_ELLIPSIS`.
+
+    The default is the machine column, which is where this started. The prompt's
+    directory label wants the same operation at a different width, and for the
+    same reason: what identifies a machine and what identifies a directory are
+    both at the end.
+    """
+    if len(label) <= width:
         return label
-    return _ELLIPSIS + label[-(_HOST_WIDTH - 1) :]
+    return _ELLIPSIS + label[-(width - 1) :]
 
 
 def command_from_line(line: str, host_width: int = 0) -> str:
@@ -275,6 +281,69 @@ def _here_label() -> str:
     """How to name the current directory to a person -- as a record would spell it."""
     keys = _here()
     return keys[0] if keys else "this directory"
+
+
+#: How much of the prompt a directory may take. The prompt and the query share
+#: one line, so every character here is one fewer to type in.
+_PROMPT_LABEL_MAX = 28
+
+#: What a directory may be spelled with to reach the prompt: letters and digits
+#: in any script, and the six punctuation marks a path is actually made of.
+#:
+#: An allowlist, and that is the whole point. The label passes through two
+#: languages on its way to the screen, and a denylist has to be right about
+#: both: fzf parses `change-prompt(...)` out of an action string, where `)` ends
+#: the argument and `+` starts the next action -- so a directory called
+#: `x)+execute-silent(...)` is a command fzf would run -- and the cycle key
+#: repaints from inside a `printf "..."` that fzf hands to the shell, where `"`,
+#: `$`, a backtick and a backslash are the shell's and `%` is printf's. The
+#: first version of this was a denylist of four characters. It missed `%`, which
+#: silently renamed `~/50%-off` to `~/500ff` and truncated the action string
+#: outright for a name ending in `%`, and it missed the fzf layer entirely.
+#:
+#: Deciding what may pass is a fact about paths; deciding what may not is a fact
+#: about two parsers, and only one of those stays true when fzf gains a feature.
+_PROMPT_SAFE_PUNCTUATION = frozenset("._-/~ ")
+
+
+def _prompt_label() -> str:
+    """The current directory, as the prompt should show it -- or "" for silence.
+
+    Silence rather than escaping when the path is spelled with anything else:
+    falling back to `woswoar (dir)`, which is what every release before this one
+    showed for every directory, costs the person with a `(` in a directory name
+    nothing they had. Escaping through two parsers to gain them a label is the
+    trade the other way round, and the layer that would get it wrong runs on
+    every keypress.
+
+    Cut from the left, because `.../woswoar/tests` says which directory it is
+    and `~/src/very/deep/...` does not.
+    """
+    # `_here()` rather than `_here_label()`, which answers "this directory" when
+    # there is none -- a sentence, in a slot the rest of this reads as a path.
+    # An empty tuple is that case, and silence is the right answer to it.
+    keys = _here()
+    label = keys[0] if keys else ""
+    if not label or any(
+        not char.isalnum() and char not in _PROMPT_SAFE_PUNCTUATION for char in label
+    ):
+        return ""
+    return _clip(label, _PROMPT_LABEL_MAX)
+
+
+def _prompt_for(scope: Scope) -> str:
+    """The prompt fzf shows for ``scope``, which is also where the scope is kept.
+
+    fzf holds no variables, so `_scope_case` reads the scope back out of this
+    string -- which is why every place that repaints it goes through here or
+    matches the grammar that function documents. `_timeline_binding` is the one
+    that does the latter: it prepends `timeline `, and the arms name both.
+    """
+    if scope == "dir":
+        label = _prompt_label()
+        if label:
+            return f"woswoar (dir {label}) "
+    return f"woswoar ({scope}) "
 
 
 def empty_note(scope: Scope) -> str | None:
@@ -834,14 +903,25 @@ def _scope_case(var: str, answer: dict[Scope, Scope], fallback: str = SCOPES[0])
     read here on the assumption that fzf exports it, and no version is known to
     hang that on, so the failure has to be the visible kind.
 
-    **The prompt these read must stay exactly `woswoar (<scope>) `.** The
-    patterns are substring matches over the whole of it, so a prompt naming the
-    directory -- `woswoar (dir ~/src/session-manager)` -- matches `*session*`
-    first and silently answers with the wrong scope. It costs nothing to put a
-    path in a prompt and there is no error when it goes wrong, which is why it
-    is written down here and pinned by a test.
+    **A prompt is `woswoar (<scope>` or `woswoar (timeline <scope>`, and may say
+    anything after that.** The arms were substring matches over the whole prompt
+    until the `dir` scope started naming its directory:
+    `woswoar (dir ~/src/session-manager)` matched `*session*` first and silently
+    answered with the wrong scope -- no error, and the *list* stayed right, so
+    only the next keypress went elsewhere.
+
+    Anchoring lifts that, because no scope name is a prefix of another and a
+    path can only ever follow the scope word. Both spellings are named, and the
+    second is not optional: `_timeline_binding` paints `woswoar (timeline host)`,
+    which the old `*host*` matched by accident. Leaving it out sent every key
+    pressed inside a timeline to `global` -- including Ctrl-T itself, which
+    would then recentre against a list nobody asked for, which is the exact
+    failure that binding carries the scope in its prompt to prevent.
     """
-    arms = "".join(f"*{scope}*) {var}={answer[scope]} ;; " for scope in SCOPES)
+    arms = "".join(
+        f'"woswoar ({scope}"*|"woswoar (timeline {scope}"*) {var}={answer[scope]} ;; '
+        for scope in SCOPES
+    )
     return f'case "$FZF_PROMPT" in {arms}*) {var}={fallback} ;; esac; '
 
 
@@ -955,6 +1035,7 @@ def _switch_to(
     scope: str,
     dedup_flag: str,
     width: str,
+    prompt: str,
     row: str = "{n}",
     preview: bool = True,
 ) -> str:
@@ -973,16 +1054,18 @@ def _switch_to(
 
     ``row`` is `_ESCAPED_N` for a caller whose output fzf expands first.
 
+    ``prompt`` is required rather than derived, because ``scope`` is not always
+    a name: the cycle key passes `$n`, a shell variable, and the prompt it wants
+    painted is `$p`. Asking the caller for both is what lets this function stay
+    ignorant of which it has -- and there is no default to be wrong about.
+
     ``preview`` is False on an fzf that was never offered a pane. Not only
     because there would be nothing to repoint: `change-preview` arrived in fzf
     0.31 and `transform` in 0.45, so a version below the gate may not know the
     *action name* either -- and an unknown action in a `--bind` makes fzf refuse
     to start, which costs the picker rather than the key.
     """
-    actions = (
-        f"reload({_list_command(self_cmd, scope, dedup_flag, width)})"
-        f"+change-prompt(woswoar ({scope}) )"
-    )
+    actions = f"reload({_list_command(self_cmd, scope, dedup_flag, width)})+change-prompt({prompt})"
     if preview:
         actions += f"+change-preview({_preview_command(self_cmd, scope, dedup_flag, row=row)})"
     return actions
@@ -997,10 +1080,19 @@ def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     same switch the four direct keys make, but composed by a shell fzf runs
     first, so the scope is a variable and the preview's placeholder has to
     survive that pass.
+
+    The prompt is a second variable for the same reason. `_prompt_for` cannot be
+    asked here what to paint, because which scope this lands on is not known
+    until the shell has run -- so the one scope with anything to add supplies its
+    arm, and every other falls through to its own name. Landing on `dir` by
+    cycling and by pressing Ctrl-O must show the same prompt, or the next press
+    reads a different scope from each.
     """
-    script = _scope_case("n", _NEXT) + (
-        f'printf "{_switch_to(self_cmd, "$n", dedup_flag, width, row=_ESCAPED_N)}"'
-    )
+    label = _prompt_label()
+    arm = f'case "$n" in dir) p="dir {label}" ;; *) p=$n ;; esac; ' if label else ""
+    prompt = "woswoar ($p) " if label else "woswoar ($n) "
+    switch = _switch_to(self_cmd, "$n", dedup_flag, width, prompt, row=_ESCAPED_N)
+    script = _scope_case("n", _NEXT) + arm + f'printf "{switch}"'
     return f"--bind=ctrl-r:transform:{script}"
 
 
@@ -1145,7 +1237,7 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
         # with the offsets otherwise identical. `index` is what the intent was.
         "--tiebreak=index",
         f"--query={query}",
-        f"--prompt=woswoar ({scope}) ",
+        f"--prompt={_prompt_for(scope)}",
         f"--header={_header(host_width)}",
     ]
     # Asked once and reused, because it forks `fzf --version`.
@@ -1169,7 +1261,9 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
         # plain action and not a `transform` whose command line fzf expands
         # first. Without `transform` there is no pane to repoint, so the
         # `change-preview` is dropped rather than pointed at nothing.
-        actions = _switch_to(self_cmd, target, dedup_flag, width, preview=transform)
+        actions = _switch_to(
+            self_cmd, target, dedup_flag, width, _prompt_for(target), preview=transform
+        )
         argv.append(f"--bind=ctrl-{KEYS[target]}:{actions}")
     return argv
 
