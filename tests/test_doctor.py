@@ -258,11 +258,18 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
     def test_doctor_checks_the_zsh_version_when_zsh_is_installed(self) -> None:
         """The version floor exists because the hook enforces one and switches
         itself off below it -- silently, from the user's side. This is what says
-        so before they find out."""
+        so before they find out.
+
+        What is asserted is the *line*, not that this machine has a zsh: the
+        version reads `not found` where there is none, and reporting the floor
+        beside it is exactly as useful there. Requiring a non-space run made this depend
+        on the runner instead, which passed in CI -- where `ci.yml` installs zsh
+        -- and failed the v0.10.0 release, whose workflow did not.
+        """
         (self.home / ".zshrc").write_text("", encoding="utf-8")
         support.run_cli("install")
         out = support.run_cli("doctor").out
-        self.assertRegex(out, r"\] zsh +\S+ \(5\.0\+ required\)")
+        self.assertRegex(out, r"\] zsh +.+ \(5\.0\+ required\)")
 
     def test_each_installed_shell_gets_its_own_rcfile_line(self) -> None:
         (self.home / ".bashrc").write_text("", encoding="utf-8")

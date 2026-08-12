@@ -50,7 +50,7 @@ jobs:
             exit 1
           fi
 
-      - name: install age and fzf
+      - name: install age, fzf and zsh
         # The sync suite skips itself without age, and a skipped suite is green
         # -- so prove age is here rather than assume the install worked.
         #
@@ -60,6 +60,14 @@ jobs:
         # two therefore ran different code. That difference is what failed a
         # release after every check on the pull request was green.
         #
+        # **And then it happened again**, with zsh, on the release this line was
+        # added for. `ci.yml` grew a zsh install when the hook landed; this file
+        # did not, so `doctor` reported "zsh not found" here and nowhere else,
+        # and v0.10.0 failed at `tests` with every check on both pull requests
+        # green. Whatever `ci.yml`'s `test` job installs, this has to install --
+        # it runs the same suite, and the suite is the thing that decides
+        # whether a release is cut.
+        #
         # fzf comes from upstream rather than apt, for the reason `ci.yml`
         # spells out: ubuntu-latest ships 0.44.1, one release below
         # `search.TRANSFORM_SINCE`, and the tests that drive a real picker have
@@ -67,8 +75,9 @@ jobs:
         env:
           FZF_VERSION: 0.74.2
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          sudo apt-get update -qq && sudo apt-get install -y -qq age zsh
           age --version
+          zsh --version
           curl -fsSL -o /tmp/fzf.tar.gz \
             "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz"
           sudo tar -xzf /tmp/fzf.tar.gz -C /usr/local/bin fzf
