@@ -1,9 +1,9 @@
 """The on-disk record format.
 
-This module is the single source of truth for how a history line looks. The bash
-hook in ``woswoar/shell/woswoar.bash`` reimplements :func:`escape` in pure shell
-so that recording stays fork-free; ``tests/test_shell_hook.py`` pins the two
-implementations together by driving the real hook and parsing its output here.
+This module is the single source of truth for how a history line looks. Both
+shell hooks under ``woswoar/shell/`` reimplement :func:`escape` in pure shell so
+that recording stays fork-free; ``tests/test_shell_hook.py`` pins every one of
+them to this one, by driving the real hook and parsing its output here.
 
 Format v1, six tab-separated fields, command last::
 

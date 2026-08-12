@@ -5,6 +5,13 @@ that recording never forks. That duplication is deliberate but fragile, so these
 tests drive the *real* hook in a *real* bash and parse the result with the
 *real* Python parser. If the two implementations ever disagree, this is where it
 shows up.
+
+There is a second hook now, ``woswoar.zsh``, and a third copy of the same
+claims would be a third thing to drift. So the parts that are about *woswoar*
+rather than about bash -- the escape corpus, the two mirrored constants, the
+default ignore pattern, the fork-scaling measurement -- live here as mixins
+parameterised by ``(INTERPRETER, HOOK)``, and ``tests/test_shell_hook_zsh.py``
+subclasses them for zsh. One corpus, one set of assertions, two shells.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
@@ -28,7 +35,9 @@ from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unesc
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
 from .support import MACHINE_ID, Typed, WoswoarTestCase, requires_bash, run_in_pty
 
-HOOK = Path(__file__).resolve().parent.parent / "woswoar" / "shell" / "woswoar.bash"
+SHELL_DIR = Path(__file__).resolve().parent.parent / "woswoar" / "shell"
+BASH_HOOK = SHELL_DIR / "woswoar.bash"
+ZSH_HOOK = SHELL_DIR / "woswoar.zsh"
 
 #: Inputs the two escape implementations must agree on. Command arguments cannot
 #: carry a NUL byte, so that one case is out of reach here and is covered by the
@@ -68,6 +77,17 @@ requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 
 
 class ShellHookTestCase(WoswoarTestCase):
+    #: How to start an interactive shell that reads its commands from stdin, and
+    #: which hook that shell sources. Overridden wholesale by the zsh suite --
+    #: everything below is written in terms of these two.
+    INTERPRETER: ClassVar[list[str]] = ["bash", "--norc", "-i"]
+    HOOK: ClassVar[Path] = BASH_HOOK
+
+    #: Typed ahead of everything else, including ``before``. Empty for bash,
+    #: which draws no prompt at all when its stdin is a pipe; zsh does, and needs
+    #: a line to turn it off before any output a test reads. See the zsh suite.
+    PREAMBLE: ClassVar[str] = ""
+
     def runtime_dir(self) -> Path:
         """Where XDG_RUNTIME_DIR points for these runs."""
         return self.root / "run"
@@ -88,13 +108,27 @@ class ShellHookTestCase(WoswoarTestCase):
         env.update(extra or {})
         return env
 
+    def shell_input(self, script: str, before: str = "") -> str:
+        """What gets typed at the shell: preamble, ``before``, the hook, ``script``.
+
+        One place, because two callers already assemble it -- `run_shell` and
+        `CloneScalingMixin.clone_count` -- and a third spelling of "how a
+        ~/.bashrc is shaped" is a way for the fork count to be measured against
+        a shell the behaviour tests never run.
+        """
+        return (
+            f"{self.PREAMBLE}{textwrap.dedent(before)}\n"
+            f"source {self.HOOK}\n"
+            f"{textwrap.dedent(script)}"
+        )
+
     def run_shell(
         self,
         script: str,
         env_extra: dict[str, str] | None = None,
         before: str = "",
     ) -> str:
-        """Run ``script`` line by line in an interactive bash with the hook loaded.
+        """Run ``script`` line by line in an interactive shell with the hook loaded.
 
         ``before`` runs *ahead of* the hook, which is how a real ~/.bashrc looks:
         the interesting bugs are all about what else already owns PROMPT_COMMAND
@@ -102,8 +136,8 @@ class ShellHookTestCase(WoswoarTestCase):
         so a test can assert the other tool still ran.
         """
         result = subprocess.run(
-            ["bash", "--norc", "-i"],
-            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{textwrap.dedent(script)}",
+            self.INTERPRETER,
+            input=self.shell_input(script, before),
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.PIPE,
@@ -139,26 +173,69 @@ class ShellHookTestCase(WoswoarTestCase):
         """Recorded entries indexed by command, for asserting on metadata."""
         return {e.cmd: e for e in self.recorded()}
 
+    def raw_logs(self) -> str:
+        """Every byte the hook wrote, unparsed.
 
-@requires_bash5
-class TestCapture(ShellHookTestCase):
+        The assertion of choice for anything about a command that must *not* be
+        recorded. `commands()` goes through the parser and the cache, either of
+        which could drop a line for its own reasons -- so "the secret is not in
+        `commands()`" is a weaker claim than the one that matters, which is that
+        it is nowhere on disk.
+        """
+        return "".join(
+            path.read_text(encoding="utf-8") for path in sorted(store.logs_dir().rglob("*.tsv"))
+        )
+
+    def logdir(self) -> Path:
+        """Where this machine's days are written.
+
+        `store`'s idea of the path, not a second copy of it: the layout under
+        `logs/` is rule 8 territory, and a test that spells it out by hand is one
+        more place to remember.
+        """
+        return store.host_dir(MACHINE_ID)
+
+
+#: Bases for the classes shared with the zsh suite. `object` at runtime, so that
+#: unittest's loader -- which collects every TestCase subclass in a module,
+#: whatever it is called -- does not also run each mixin as an extra,
+#: unparameterised copy of the bash suite. The real base is restored for mypy,
+#: which otherwise cannot see `assertEqual` or `run_shell` on `self`. Making the
+#: mixin skip itself instead is not available: CI runs the hook job with
+#: `--no-skips`, deliberately.
+if TYPE_CHECKING:
+    SharedTestBase = unittest.TestCase
+    SharedShellTestBase = ShellHookTestCase
+else:
+    SharedTestBase = object
+    SharedShellTestBase = object
+
+
+class CaptureMixin(SharedShellTestBase):
+    """What either hook must record, and what it must record *about* a command.
+
+    Every claim here was written twice before it was written once: these bodies
+    were byte-identical in the two suites, which is the shape that lets a new
+    metadata column or a changed cwd rule be covered for one shell and silently
+    not for the other. What stays behind in each suite is what the two shells
+    genuinely disagree about -- how a multi-line command reads, where the exit
+    status comes from, whether `$2` exists to be got wrong.
+    """
+
     def test_records_a_plain_command(self) -> None:
         self.run_shell("echo hello\n")
         self.assertEqual(self.commands(), ["echo hello"])
 
     def test_records_the_whole_compound_line(self) -> None:
-        # $BASH_COMMAND would report only "true a" here. Capturing the full line
-        # is the entire reason the hook reads from `history` instead.
+        # $BASH_COMMAND would report only "true a" here, which is the entire
+        # reason the bash hook reads from `history` instead; zsh's preexec is
+        # handed the line outright. Two mechanisms, one claim.
         self.run_shell("true a && true b\n")
         self.assertEqual(self.commands(), ["true a && true b"])
 
     def test_records_a_pipeline_in_full(self) -> None:
         self.run_shell("echo x | cat\n")
         self.assertEqual(self.commands(), ["echo x | cat"])
-
-    def test_records_a_multiline_loop_as_one_entry(self) -> None:
-        self.run_shell("for i in 1 2; do\ntrue $i\ndone\n")
-        self.assertEqual(self.commands(), ["for i in 1 2; do true $i; done"])
 
     def test_blank_lines_record_nothing(self) -> None:
         self.run_shell("\n\n\necho only-this\n\n")
@@ -174,7 +251,8 @@ class TestCapture(ShellHookTestCase):
 
     def test_session_id_is_compact_and_hex(self) -> None:
         # Repeated on every line, so its size is not cosmetic. <second>-<pid>,
-        # both hex.
+        # both hex -- and lower case, which zsh's `[##16]` does not give for
+        # free.
         self.run_shell("echo hello\n")
         session = self.recorded()[0].session
         self.assertRegex(session, r"^[0-9a-f]+-[0-9a-f]+$")
@@ -222,12 +300,24 @@ class TestCapture(ShellHookTestCase):
         self.assertLess(entry.duration_ms, 30_000)
 
     def test_duration_survives_a_comma_decimal_locale(self) -> None:
-        # $EPOCHREALTIME honours LC_NUMERIC, so it reads "1785321992,048777"
-        # under a de_AT locale. Splitting on "." alone silently yields garbage.
+        # bash's $EPOCHREALTIME honours LC_NUMERIC, so it reads
+        # "1785321992,048777" under a de_AT locale and splitting on "." alone
+        # silently yields garbage. zsh's does not -- but both hooks tolerate the
+        # comma, and a bound on the duration is what says so.
         self.run_shell("sleep 0.3\n", env_extra={"LC_NUMERIC": "de_AT.UTF-8"})
         entry = self.recorded()[0]
         self.assertGreaterEqual(entry.duration_ms, 250)
         self.assertLess(entry.duration_ms, 30_000)
+
+
+@requires_bash5
+class TestCapture(CaptureMixin, ShellHookTestCase):
+    def test_records_a_multiline_loop_as_one_entry(self) -> None:
+        """Per-shell on purpose: bash reads the line back out of `history`, which
+        joins it with semicolons, where zsh is handed the buffer as typed. Both
+        are faithful, so the zsh suite states its own expectation."""
+        self.run_shell("for i in 1 2; do\ntrue $i\ndone\n")
+        self.assertEqual(self.commands(), ["for i in 1 2; do true $i; done"])
 
 
 @requires_bash5
@@ -472,8 +562,7 @@ class TestCoexistence(ShellHookTestCase):
         self.assertEqual(self.commands(), ["echo only-this"])
 
 
-@requires_bash5
-class TestEscapeParity(unittest.TestCase):
+class EscapeParityMixin(SharedTestBase):
     """The drift guard.
 
     Calls the hook's ``__woswoar_escape`` directly rather than going through an
@@ -482,7 +571,16 @@ class TestEscapeParity(unittest.TestCase):
     tab before the command even runs (a real terminal, where readline handles
     bracketed paste, does not). Testing the function directly exercises the
     thing that can actually drift.
+
+    Parameterised over ``(NONINTERACTIVE, HOOK)`` so that both hooks are checked
+    against **one** corpus and one set of assertions. A second copy of
+    ``ESCAPE_CORPUS`` for zsh would be exactly the thing this class's own
+    argument says not to have.
     """
+
+    #: How to run a scrap of shell with ``$1`` set: ``[*argv, script, "$0", value]``.
+    NONINTERACTIVE: ClassVar[list[str]] = ["bash", "--norc", "-c"]
+    HOOK: ClassVar[Path] = BASH_HOOK
 
     _extracted: Path
     _tmpdir: tempfile.TemporaryDirectory[str]
@@ -492,23 +590,23 @@ class TestEscapeParity(unittest.TestCase):
         # Lift the function out of the real hook rather than copying it here --
         # a copy would be one more thing that can drift. The hook itself cannot
         # be sourced non-interactively; it returns early by design.
-        source = HOOK.read_text(encoding="utf-8")
+        source = cls.HOOK.read_text(encoding="utf-8")
         match = re.search(r"^__woswoar_escape\(\) \{\n.*?^\}$", source, re.MULTILINE | re.DOTALL)
-        assert match is not None, "__woswoar_escape not found in the hook"
+        assert match is not None, f"__woswoar_escape not found in {cls.HOOK.name}"
         cls._tmpdir = tempfile.TemporaryDirectory(prefix="woswoar-escape-")
-        cls._extracted = Path(cls._tmpdir.name) / "escape.bash"
+        cls._extracted = Path(cls._tmpdir.name) / "escape.sh"
         cls._extracted.write_text(match.group(0) + "\n", encoding="utf-8")
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls._tmpdir.cleanup()
 
-    def escape_in_bash(self, value: str) -> str:
+    def escape_in_shell(self, value: str) -> str:
         script = (
             f'source "{self._extracted}"; __woswoar_escape "$1"; printf %s "$__woswoar_escaped"'
         )
         out = subprocess.run(
-            ["bash", "--norc", "-c", script, "bash", value],
+            [*self.NONINTERACTIVE, script, "shell", value],
             capture_output=True,
             text=True,
             check=True,
@@ -518,20 +616,25 @@ class TestEscapeParity(unittest.TestCase):
     def test_matches_python_escape(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                self.assertEqual(self.escape_in_bash(value), escape(value))
+                self.assertEqual(self.escape_in_shell(value), escape(value))
 
-    def test_python_can_unescape_what_bash_produced(self) -> None:
+    def test_python_can_unescape_what_the_shell_produced(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                self.assertEqual(unescape(self.escape_in_bash(value)), value)
+                self.assertEqual(unescape(self.escape_in_shell(value)), value)
 
-    def test_bash_output_is_always_single_line(self) -> None:
+    def test_shell_output_is_always_single_line(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                encoded = self.escape_in_bash(value)
+                encoded = self.escape_in_shell(value)
                 self.assertNotIn("\n", encoded)
                 self.assertNotIn("\t", encoded)
                 self.assertNotIn("\r", encoded)
+
+
+@requires_bash5
+class TestBashEscapeParity(EscapeParityMixin, unittest.TestCase):
+    pass
 
 
 @requires_bash5
@@ -626,25 +729,35 @@ class TestFiltering(ShellHookTestCase):
         self.assertLess(micros, 1_000_000, "the ignore pattern went superlinear again")
 
 
-@requires_bash5
-class TestTheDefaultIgnorePattern(ShellHookTestCase):
+class DefaultIgnorePatternMixin(SharedShellTestBase):
     """What the shipped pattern does and does not catch.
 
-    Evaluated by the same bash that will run it, against the value the hook
+    Evaluated by the same shell that will run it, against the value the hook
     actually sets -- not against a copy in this file, which could drift from the
     hook and keep passing. One shell tests the whole corpus, because starting a
-    bash per command would cost more than the rest of the suite.
+    shell per command would cost more than the rest of the suite.
+
+    Run against **both** hooks, for exactly the reason above: the pattern is a
+    string in two files, `[[ =~ ]]` is a different implementation in each shell,
+    and a rule that catches `PGPASSWORD=` in bash and not in zsh is a secret
+    published to a git repository. `TestTheIgnorePatternIsSharedByBothShells`
+    pins the two strings together; this pins what each shell does with it.
     """
 
     def classify(self, commands: list[str]) -> dict[str, bool]:
-        """Ask a real bash which of `commands` the default pattern matches."""
+        """Ask a real shell which of `commands` the default pattern matches."""
+        # Through `set --` rather than a named array: bash indexes from 0 and
+        # zsh from 1, `${!a[@]}` is bash-only, and one loop that means the same
+        # thing in both shells is worth more here than the array was.
         array = " ".join(shlex.quote(command) for command in commands)
         out = self.run_shell(
-            f"__corpus=({array})\n"
+            f"set -- {array}\n"
             'printf "PATTERN %s\\n" "${#WOSWOAR_IGNORE}"\n'
-            'for i in "${!__corpus[@]}"; do\n'
-            '  [[ ${__corpus[i]} =~ $WOSWOAR_IGNORE ]] && printf "MATCH %s\\n" "$i" '
-            '|| printf "KEEP %s\\n" "$i"\n'
+            "__i=0\n"
+            'for __c in "$@"; do\n'
+            '  [[ $__c =~ $WOSWOAR_IGNORE ]] && printf "MATCH %s\\n" "$__i" '
+            '|| printf "KEEP %s\\n" "$__i"\n'
+            "  __i=$((__i + 1))\n"
             "done\n"
         )
 
@@ -685,39 +798,52 @@ class TestTheDefaultIgnorePattern(ShellHookTestCase):
 
 
 @requires_bash5
-class TestConstantParity(unittest.TestCase):
+class TestTheBashDefaultIgnorePattern(DefaultIgnorePatternMixin, ShellHookTestCase):
+    pass
+
+
+class ConstantParityMixin(SharedTestBase):
     """The hook hardcodes values that live in Python; pin them together.
 
     ``escape`` has its own parity test. These two constants were mirrored into
     the hook with only a comment to keep them honest, so changing
-    ``MAX_CMD_CHARS`` in Python would silently leave bash truncating at the old
-    length with the old marker, and CI would stay green.
+    ``MAX_CMD_CHARS`` in Python would silently leave the shell truncating at the
+    old length with the old marker, and CI would stay green. There are two hooks
+    now, so each carries its own copy and each needs pinning.
     """
+
+    HOOK: ClassVar[Path] = BASH_HOOK
 
     source: str
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.source = HOOK.read_text(encoding="utf-8")
+        cls.source = cls.HOOK.read_text(encoding="utf-8")
 
     def test_truncation_length_matches(self) -> None:
         match = re.search(r"^__woswoar_max=(\d+)$", self.source, re.MULTILINE)
-        assert match is not None, "__woswoar_max not found in the hook"
+        assert match is not None, f"__woswoar_max not found in {self.HOOK.name}"
         self.assertEqual(int(match.group(1)), MAX_CMD_CHARS)
 
     def test_truncation_marker_matches(self) -> None:
         self.assertIn(f"'{TRUNCATION_MARKER}'", self.source)
 
+
+@requires_bash5
+class TestConstantParity(ConstantParityMixin, unittest.TestCase):
     def test_hook_requires_the_documented_bash_version(self) -> None:
         # doctor reports "5.0+ required" independently; make sure the gate the
         # hook actually enforces is the same one.
         self.assertIn("BASH_VERSINFO[0] < 5", self.source)
 
 
-@requires_bash5
-@unittest.skipUnless(shutil.which("strace"), "strace required")
-class TestForkFree(ShellHookTestCase):
-    """Recording runs on every prompt, so its cost must not scale with usage."""
+class CloneScalingMixin(SharedShellTestBase):
+    """Recording runs on every prompt, so its cost must not scale with usage.
+
+    The measurement, and the one assertion that is the same claim for either
+    shell. Everything bash-specific about forking -- the boot string, the shapes
+    of PROMPT_COMMAND that can leave it behind -- stays in `TestForkFree`.
+    """
 
     def clone_count(
         self,
@@ -727,8 +853,8 @@ class TestForkFree(ShellHookTestCase):
     ) -> int:
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
-            ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", "bash", "--norc", "-i"],
-            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{script}",
+            ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", *self.INTERPRETER],
+            input=self.shell_input(script, before),
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.DEVNULL,
@@ -757,7 +883,8 @@ class TestForkFree(ShellHookTestCase):
     def stamp_opens(self, command_count: int) -> int:
         """How many times the shell opened the sync stamp across the run.
 
-        The fork count cannot see this: skipping the `__woswoar_next_sync` memo
+        Both hooks carry the `__woswoar_next_sync` memo, so both are measured
+        here. The fork count cannot see it: skipping the memo
         adds a file open per prompt, not a fork, so the clone-count assertions
         stay green while every command grows a syscall. Counted the same way and
         for the same reason -- a per-command cost has to be pinned by something
@@ -765,8 +892,8 @@ class TestForkFree(ShellHookTestCase):
         """
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
-            ["strace", "-f", "-e", "trace=openat", "bash", "--norc", "-i"],
-            input=f"source {HOOK}\n{script}",
+            ["strace", "-f", "-e", "trace=openat", *self.INTERPRETER],
+            input=self.shell_input(script),
             text=True,
             env=self.shell_env(),
             stdout=subprocess.DEVNULL,
@@ -792,15 +919,31 @@ class TestForkFree(ShellHookTestCase):
         self.assertEqual(few, many, f"{few} stamp reads for 3 commands, {many} for 30")
 
     def test_clone_count_does_not_scale_with_commands(self) -> None:
-        # Not "zero forks": startup legitimately runs mkdir and two `trap -p`
-        # subshells -- one to see whether the EXIT trap is free, one at the first
-        # prompt to read any prior DEBUG trap. What matters is that the
-        # per-command path adds nothing, so the count must be identical for 3 and
-        # for 30 commands. That also pins the boot string removing itself: were
-        # it left in PROMPT_COMMAND, its substitution would fork every time.
+        # Not "zero forks": startup legitimately runs mkdir, and bash two
+        # `trap -p` subshells besides. What matters is that the per-command path
+        # adds nothing, so the count must be identical for 3 and for 30 commands.
+        few = self.clone_count(3, self.NO_SYNC)
+        many = self.clone_count(30, self.NO_SYNC)
+        self.assertEqual(
+            few,
+            many,
+            f"record path forks: {few} clones for 3 commands, {many} for 30",
+        )
+
+
+@requires_bash5
+@unittest.skipUnless(shutil.which("strace"), "strace required")
+class TestForkFree(CloneScalingMixin, ShellHookTestCase):
+    """The bash-specific half: which PROMPT_COMMAND shapes can leave a fork behind."""
+
+    def test_neither_scratch_file_branch_forks_per_command(self) -> None:
+        # `CloneScalingMixin` already makes the bare claim for both shells; this
+        # is the half only bash has. The scratch file's directory is chosen at
+        # startup, and a fork added to either branch would be paid on every
+        # command of that shell.
         #
-        # Both scratch-file branches, because they are chosen at startup and a
-        # fork added to either would be paid on every command of that shell.
+        # It also pins the boot string removing itself: were it left in
+        # PROMPT_COMMAND, its substitution would fork at every prompt.
         for label, extra in (("runtime dir", {}), ("fallback", {"XDG_RUNTIME_DIR": ""})):
             with self.subTest(scratch=label):
                 env = {**self.NO_SYNC, **extra}
@@ -858,17 +1001,21 @@ class TestForkFree(ShellHookTestCase):
                 self.assertEqual(few, many, f"{label}: {few} clones for 3 commands, {many} for 30")
 
 
-@requires_bash5
-class TestPromptTriggeredSync(ShellHookTestCase):
+class PromptSyncMixin(SharedShellTestBase):
     """Syncing from the prompt instead of a systemd timer (#134).
 
-    Driven with a real bash and a stand-in `woswoar` on PATH that records that
+    Driven with a real shell and a stand-in `woswoar` on PATH that records that
     it was called, because what is under test is the shell's decision -- when to
     fire, when to stay quiet, and that the prompt never waits for the answer.
 
     Time is never slept on. Every "the interval has passed" case is set up by
     writing the stamp file, so nothing here can become slow or flaky on a loaded
     runner.
+
+    The fixture and the three claims that are about the *decision* rather than
+    about a shell's syntax are shared, so the reasoning below -- why the stub
+    sleeps three seconds, why it lives outside the sandbox -- is written once and
+    cannot be dropped from a copy.
     """
 
     def setUp(self) -> None:
@@ -966,6 +1113,41 @@ class TestPromptTriggeredSync(ShellHookTestCase):
             time.sleep(0.05)
         return seen
 
+    def test_it_syncs_once_per_interval_not_once_per_command(self) -> None:
+        """The whole cost argument in #134 rests on this number."""
+        self.run_shell("".join(f"echo cmd{i}\n" for i in range(30)))
+        self.assertEqual(self.syncs(), 1)
+
+    def test_the_stamp_is_owner_only(self) -> None:
+        """It is written by the shell, so `>` alone would create it 0644 and
+        `doctor` would report an exposure in woswoar's own data directory."""
+        self.run_shell("")
+        self.syncs()
+        self.assertTrue(self.stamp.exists(), "no stamp was written")
+        self.assertEqual(self.stamp.stat().st_mode & 0o077, 0)
+
+    def test_the_sync_never_enters_the_shells_job_table(self) -> None:
+        """A plain `&` would print `[1] 1234` and later `[1]+ Done` at the
+        prompt, once a minute for the life of the shell.
+
+        Asserted through `jobs` rather than by looking for `[1]` in the output,
+        because bash only prints those notifications when job control is on and
+        a shell reading a pipe has it off -- so the notification itself is
+        invisible to this harness and a test looking for it passes against a
+        bare `&`. Job *table* membership is the same fact and is observable
+        here. The stand-in sleeps, so the job is still running when `jobs` asks.
+        """
+        out = self.run_shell("echo marker\njobs\n")
+        self.assertIn("marker", out, "precondition: the shell ran at all")
+        self.assertNotIn("woswoar sync", out, "the sync is a job of this shell")
+
+
+@requires_bash5
+class TestPromptTriggeredSync(PromptSyncMixin, ShellHookTestCase):
+    """The cases whose answer is spelled in bash: what `((...))` does with a
+    value that is not a number, and what it prints when it refuses.
+    """
+
     def test_the_detached_sync_writes_nowhere_the_sandbox_is_being_deleted(self) -> None:
         """#167, stated as the invariant rather than as the race.
 
@@ -992,11 +1174,6 @@ class TestPromptTriggeredSync(ShellHookTestCase):
     def test_a_shell_that_types_nothing_still_syncs_at_startup(self) -> None:
         """Sitting down and pressing Ctrl-R has to show current history."""
         self.run_shell("")
-        self.assertEqual(self.syncs(), 1)
-
-    def test_it_syncs_once_per_interval_not_once_per_command(self) -> None:
-        """The whole cost argument in #134 rests on this number."""
-        self.run_shell("".join(f"echo cmd{i}\n" for i in range(30)))
         self.assertEqual(self.syncs(), 1)
 
     def test_a_fresh_stamp_from_another_shell_suppresses_the_sync(self) -> None:
@@ -1115,29 +1292,6 @@ class TestPromptTriggeredSync(ShellHookTestCase):
                     "an unreadable stamp was believed rather than replaced",
                 )
 
-    def test_the_stamp_is_owner_only(self) -> None:
-        """It is written by the shell, so `>` alone would create it 0644 and
-        `doctor` would report an exposure in woswoar's own data directory."""
-        self.run_shell("")
-        self.syncs()
-        self.assertTrue(self.stamp.exists(), "no stamp was written")
-        self.assertEqual(self.stamp.stat().st_mode & 0o077, 0)
-
-    def test_the_sync_never_enters_the_shells_job_table(self) -> None:
-        """A plain `&` would print `[1] 1234` and later `[1]+ Done` at the
-        prompt, once a minute for the life of the shell.
-
-        Asserted through `jobs` rather than by looking for `[1]` in the output,
-        because bash only prints those notifications when job control is on and
-        a shell reading a pipe has it off -- so the notification itself is
-        invisible to this harness and a test looking for it passes against a
-        bare `&`. Job *table* membership is the same fact and is observable
-        here. The stand-in sleeps, so the job is still running when `jobs` asks.
-        """
-        out = self.run_shell("echo marker\njobs\n")
-        self.assertIn("marker", out, "precondition: the shell ran at all")
-        self.assertNotIn("woswoar sync", out, "the sync is a job of this shell")
-
     def test_junk_in_the_stamp_does_not_reach_shell_arithmetic(self) -> None:
         """Bash evaluates array subscripts inside `((...))`, so a value read
         from a file and handed straight to arithmetic executes what is in it.
@@ -1158,17 +1312,18 @@ class TestPromptTriggeredSync(ShellHookTestCase):
         self.assertFalse(canary.exists(), "the stamp's contents were executed")
 
 
-@requires_bash5
-class TestRecordingIsPrivate(ShellHookTestCase):
+class RecordingIsPrivateMixin(SharedShellTestBase):
     """The hook creates the log file, so the hook is where its mode is decided.
 
     Python never touches that file on the recording path, so a fix in `store`
-    alone would not have covered the case this exists for.
+    alone would not have covered the case this exists for -- and a hook the
+    parity test below does not read is a hook that can be left behind when
+    `store.DIR_MODE` changes. It reads `self.HOOK`, so every hook is covered.
     """
 
     def test_the_day_file_is_owner_only_under_a_stock_umask(self) -> None:
         self.run_shell("echo hello\n")
-        files = list((Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts").rglob("*.tsv"))
+        files = sorted(self.logdir().parent.rglob("*.tsv"))
         self.assertTrue(files, "nothing was recorded")
         for path in files:
             self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
@@ -1180,16 +1335,20 @@ class TestRecordingIsPrivate(ShellHookTestCase):
         being left behind, which is the direction that silently reopens the
         hole this class exists for.
         """
-        source = HOOK.read_text(encoding="utf-8")
+        source = self.HOOK.read_text(encoding="utf-8")
         self.assertIn("umask 077", source)
         self.assertEqual(store.DIR_MODE, 0o700)
         self.assertEqual(store.FILE_MODE, 0o600)
 
+
+@requires_bash5
+class TestRecordingIsPrivate(RecordingIsPrivateMixin, ShellHookTestCase):
     def test_the_hook_leaves_the_shell_umask_alone(self) -> None:
         """It drops to 077 to create the file; it must put it back.
 
         Otherwise every file the user creates afterwards would silently become
-        0600 -- a surprising thing for a history tool to do to a shell.
+        0600 -- a surprising thing for a history tool to do to a shell. Not
+        shared: bash's `umask` prints `0022` and zsh's prints `022`.
         """
         out = self.run_shell("echo start\numask\n")
         self.assertIn("0022", out)
@@ -1408,21 +1567,24 @@ class TestThePtyHarness(unittest.TestCase):
         self.assertIn("41 123", chunks[1])
 
 
-@requires_bash5
-class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
+class CtrlROnThePromptMixin(SharedShellTestBase):
     """The one property that keeps a recalled command from running by itself.
 
     Every other test of the widget checks a piece of it from the outside: what
     the picker would print, what the cycle binding decides. None of them press
-    the key, because the key does nothing without a terminal -- `bind -x` is
-    readline, and readline does no line editing on a pipe. So the claim the
-    whole feature rests on, that a selection arrives *on the prompt for editing*
-    and is never executed, was guarded by nothing at all.
+    the key, because the key does nothing without a terminal -- readline does no
+    line editing on a pipe, and neither does zle. So the claim the whole feature
+    rests on, that a selection arrives *on the prompt for editing* and is never
+    executed, was guarded by nothing at all.
 
-    Here it is driven: a real bash, a real readline, a real pty, the real hook.
-    What is stubbed is the picker itself -- the widget's contract with it is one
-    line on stdout, and fzf choosing that line needs its own test rather than a
-    share of this one.
+    Here it is driven: a real shell, a real line editor, a real pty, the real
+    hook. What is stubbed is the picker itself -- the widget's contract with it
+    is one line on stdout, and fzf choosing that line needs its own test rather
+    than a share of this one.
+
+    Shared between the two suites because none of it is shell-specific once the
+    interpreter and the hook are class attributes: `bind -x` and `zle -N` differ,
+    but what they must *do* does not.
     """
 
     #: What the picker hands back, and what running it would print. Two strings
@@ -1436,7 +1598,7 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
     SELECTION = "echo RAN''MARK"
     IF_EXECUTED = "RANMARK"
 
-    #: Handed to bash in the environment, so the harness waits for a string it
+    #: Handed to the shell in the environment, so the harness waits for a string it
     #: has never typed. It doubles as the "readline is listening" signal:
     #: readline puts the terminal into raw mode *before* it draws the prompt, so
     #: a prompt on screen means the next keypress reaches the widget rather than
@@ -1466,9 +1628,9 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
                 # Not `dumb`, which the rest of this file uses: this is the one
                 # test that wants readline to behave as it does for a person.
                 "TERM": "xterm",
-                # Bash only defaults PS1 when it is unset, so handing it in is
-                # enough -- and it means the harness never *types* the string it
-                # waits for to know the shell is up.
+                # Both shells default PS1 only when it is unset, so handing it
+                # in is enough -- and it means the harness never *types* the
+                # string it waits for to know the shell is up.
                 "PS1": self.PROMPT,
                 "WOSWOAR_TEST_SELECTION": self.SELECTION,
             }
@@ -1477,9 +1639,9 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
     def test_the_selection_arrives_for_editing_and_does_not_run(self) -> None:
         steps = [
             Typed("", self.PROMPT),
-            Typed(f"source {HOOK}; echo LOAD''ED\n", "LOADED"),
-            # `LOADED` is printed while bash is still running the line; the
-            # prompt after it is what says readline has the terminal back.
+            Typed(f"source {self.HOOK}; echo LOAD''ED\n", "LOADED"),
+            # `LOADED` is printed while the shell is still running the line; the
+            # prompt after it is what says the line editor has the terminal back.
             Typed("", self.PROMPT),
             # Ctrl-R, and then wait for the recalled text. That text is a marker
             # the harness has not typed, so its only possible source is readline
@@ -1487,16 +1649,15 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
             Typed("\x12", self.SELECTION),
             # Typed where the widget left the cursor, so it lands *after* the
             # recalled command rather than in front of it, and then Enter. A
-            # READLINE_POINT of 0 would run `EXTRAecho ...` instead, and this
-            # step would time out with the transcript.
+            # cursor position of 0 -- READLINE_POINT under bash, CURSOR under
+            # zsh -- would run `EXTRAecho ...` instead, and this step would time
+            # out with the transcript.
             Typed(" EXTRA\r", f"{self.IF_EXECUTED} EXTRA"),
         ]
         # Named rather than indexed: the two that matter are the last two, and a
         # step inserted above must not silently move an assertion onto the wrong
         # screen.
-        *_, after_keypress, after_enter = run_in_pty(
-            ["bash", "--norc", "-i"], steps, env=self.picker_env()
-        )
+        *_, after_keypress, after_enter = run_in_pty(self.INTERPRETER, steps, env=self.picker_env())
 
         self.assertNotIn(
             self.IF_EXECUTED,
@@ -1504,3 +1665,8 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
             "the keypress executed the selection instead of offering it for editing",
         )
         self.assertIn(f"{self.IF_EXECUTED} EXTRA", after_enter, "the edited line is what ran")
+
+
+@requires_bash5
+class TestCtrlRLandsOnThePrompt(CtrlROnThePromptMixin, ShellHookTestCase):
+    pass

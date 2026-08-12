@@ -1,10 +1,12 @@
 """Recognise credential-shaped commands, for the paths that are not the hook.
 
-The bash hook carries its own copy of these rules, as one POSIX ERE in
-``woswoar/shell/woswoar.bash``. It has to: it runs on every prompt, must not
-fork, and cannot call Python. This module is for ``woswoar import``, which reads
-history recorded long before woswoar existed -- years of it, filtered by nothing
-at all.
+Each shell hook under ``woswoar/shell/`` carries its own copy of these rules, as
+one POSIX ERE. It has to: it runs on every prompt, must not fork, and cannot
+call Python. ``tests/test_credentials.py`` holds every hook against
+``_SHARED``, so a rule can never be added to one shell alone.
+
+This module is for ``woswoar import``, which reads history recorded long before
+woswoar existed -- years of it, filtered by nothing at all.
 
 Two things are different here, both because an importer has no per-prompt
 budget to spend:

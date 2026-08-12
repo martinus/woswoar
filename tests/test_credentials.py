@@ -196,7 +196,10 @@ class TestTheUsersOwnPattern(unittest.TestCase):
             credentials.user_pattern()
 
 
-HOOK = Path(__file__).resolve().parent.parent / "woswoar" / "shell" / "woswoar.bash"
+#: Every hook that carries a copy of the rules. There are two shells now, and
+#: a rule added to one of them is a rule the other silently does not apply --
+#: which for a *credential* filter is a secret published to a git repository.
+HOOKS = sorted((Path(__file__).resolve().parent.parent / "woswoar" / "shell").glob("woswoar.*"))
 
 
 def as_posix_ere(pattern: str) -> str:
@@ -224,27 +227,35 @@ class TestParityWithTheHook(unittest.TestCase):
     duplicated logic.
     """
 
-    def hook_pattern(self) -> str:
-        source = HOOK.read_text(encoding="utf-8")
+    def hook_pattern(self, hook: Path) -> str:
+        source = hook.read_text(encoding="utf-8")
         match = re.search(r'^: "\$\{WOSWOAR_IGNORE=(.*)\}"$', source, re.MULTILINE)
-        assert match is not None, "the hook's default WOSWOAR_IGNORE was not found"
-        # `\$` is the bash escaping of the regex anchor, not part of the pattern.
+        assert match is not None, f"{hook.name} ships no default WOSWOAR_IGNORE"
+        # `\$` is the shell escaping of the regex anchor, not part of the pattern.
         return match.group(1).replace("\\$", "$")
 
-    def test_the_hook_ships_exactly_the_shared_rules(self) -> None:
-        self.assertEqual(
-            self.hook_pattern(),
-            "|".join(as_posix_ere(rule) for rule in credentials._SHARED),
-            "woswoar/shell/woswoar.bash and credentials._SHARED have diverged; "
-            "a rule added to one must be added to the other",
-        )
+    def test_there_are_hooks_to_check(self) -> None:
+        """Otherwise a rename under `woswoar/shell/` empties the glob and the two
+        tests below pass having compared nothing."""
+        self.assertEqual([hook.name for hook in HOOKS], ["woswoar.bash", "woswoar.zsh"], str(HOOKS))
+
+    def test_every_hook_ships_exactly_the_shared_rules(self) -> None:
+        expected = "|".join(as_posix_ere(rule) for rule in credentials._SHARED)
+        for hook in HOOKS:
+            with self.subTest(hook=hook.name):
+                self.assertEqual(
+                    self.hook_pattern(hook),
+                    expected,
+                    f"woswoar/shell/{hook.name} and credentials._SHARED have diverged; "
+                    "a rule added to one must be added to all of them",
+                )
 
     def test_the_import_only_rules_are_deliberately_not_in_the_hook(self) -> None:
         """They are the ones the prompt path cannot afford; that is the design."""
-        hook = self.hook_pattern()
-        for rule in credentials._IMPORT_ONLY + credentials._TOKENS:
-            with self.subTest(rule=rule):
-                self.assertNotIn(as_posix_ere(rule), hook)
+        for hook in HOOKS:
+            for rule in credentials._IMPORT_ONLY + credentials._TOKENS:
+                with self.subTest(hook=hook.name, rule=rule):
+                    self.assertNotIn(as_posix_ere(rule), self.hook_pattern(hook))
 
 
 class TestTheRulesAreReadable(unittest.TestCase):
