@@ -67,14 +67,37 @@ fi
 
 __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 
-# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p`
-# would otherwise honour the ambient umask, which is 022 almost everywhere, and
-# these files hold more than ~/.zsh_history does -- which zsh creates 0600.
+# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p` and
+# the append below would otherwise honour the ambient umask, which is 022 almost
+# everywhere, and these files hold more than ~/.zsh_history does -- which zsh
+# creates 0600.
 #
 # Only creation happens here. Re-tightening a tree from an older woswoar is
 # `woswoar install`'s job: a recursive chmod is proportional to the number of
 # days recorded, and this runs on every interactive shell.
-(umask 077 && mkdir -p "$__woswoar_logdir") 2>/dev/null || return 0
+#
+# **The guard is the point.** `mkdir` is not a builtin in either shell, so this
+# subshell is a fork *and* an exec, on a path whose whole design claim is that
+# it does not fork -- and today's log file existing is already proof that its
+# directory does. So every shell but the first of each day does nothing here.
+#
+# Creating the *file* rather than only the directory is what earns the second
+# half: `__woswoar_today` can then be set, and `__woswoar_record`'s once-a-day
+# branch -- which starts out unsatisfied and so fires at the first command of
+# every shell -- is already satisfied. That was the same fork again, and the
+# comment above it claimed it was paid once a day. Measured over 100 shells:
+# 8.9 ms per shell to 3.1 ms, and two `mkdir` execs to none. See #183.
+#
+# `__woswoar_today` is set *only* on the far side of that branch, never
+# unconditionally: it means "the file for this day is known to exist", and a
+# shell that asserted it without checking would skip the once-a-day branch and
+# let the first append create the file under the ambient umask -- 0644, the one
+# hole this section exists to close.
+strftime -s __woswoar_today '%F' $EPOCHSECONDS # local time, matching store.day_for()
+if [[ ! -e $__woswoar_logdir/$__woswoar_today.tsv ]]; then
+    (umask 077 && mkdir -p "$__woswoar_logdir" \
+        && : >>| "$__woswoar_logdir/$__woswoar_today.tsv") 2>/dev/null || return 0
+fi
 
 # Identifies this shell for `--scope session`. Start second plus pid, both in
 # hex, exactly as woswoar.bash builds it -- a bash started inside a zsh
@@ -159,8 +182,6 @@ typeset -gi __woswoar_start=0
 #: still in zsh's history, so a repeat of the command before it is not a
 #: duplicate.
 __woswoar_last=
-#: The day whose log file is known to exist already. See __woswoar_record.
-__woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.

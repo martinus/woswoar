@@ -874,6 +874,57 @@ class CloneScalingMixin(SharedShellTestBase):
     #: pins them with a stamp file rather than with a clock.
     NO_SYNC: ClassVar[dict[str, str]] = {"WOSWOAR_SYNC_INTERVAL": "0"}
 
+    def warm_up(self) -> None:
+        """Put the sandbox in the state every shell but the first of a day is in.
+
+        Since #183 the *first* shell of a day creates that day's log file, and
+        every one after it therefore forks nothing at startup. Two measurements
+        taken either side of that differ in their startup work rather than in
+        their per-command work, which is not what any of these tests is about --
+        and it is what made four of them fail when #183 landed, all reporting
+        "the record path forks" about a fork that happened before the first
+        prompt.
+        """
+        self.clone_count(0, self.NO_SYNC)
+
+    def mkdir_execs(self, env_extra: dict[str, str] | None = None) -> int:
+        """How many times one shell's startup ran `mkdir`.
+
+        Counted by `execve` rather than by clones: `mkdir` is not a builtin in
+        either shell, so it is a fork *and* an exec, and naming the program is
+        what makes a failure say which fork came back.
+        """
+        proc = subprocess.run(
+            ["strace", "-f", "-e", "trace=execve", *self.INTERPRETER],
+            input=self.shell_input(""),
+            text=True,
+            env=self.shell_env(env_extra),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
+        return sum(
+            1 for line in proc.stderr.splitlines() if 'execve("/' in line and "mkdir" in line
+        )
+
+    def test_a_shell_forks_no_mkdir_once_the_day_file_is_there(self) -> None:
+        """#183: two `mkdir` forks in every interactive shell, for a directory
+        that already existed.
+
+        One at startup, one at the first recorded command -- `__woswoar_today`
+        began empty, so the once-a-day branch fired once per *shell* as well,
+        and the comment above it said otherwise. Measured over 100 shells:
+        8.9 ms each down to 3.1 ms.
+
+        The cold count is asserted too, and is what stops this passing against a
+        hook that stopped creating the directory at all: something has to make
+        it the first time.
+        """
+        cold = self.mkdir_execs(self.NO_SYNC)
+        self.assertGreater(cold, 0, "nothing created the log directory, so this proves nothing")
+        self.assertEqual(self.mkdir_execs(self.NO_SYNC), 0, "a warm shell still forks mkdir")
+
     def stamp_opens(self, command_count: int) -> int:
         """How many times the shell opened the sync stamp across the run.
 
@@ -916,6 +967,7 @@ class CloneScalingMixin(SharedShellTestBase):
         # Not "zero forks": startup legitimately runs mkdir, and bash two
         # `trap -p` subshells besides. What matters is that the per-command path
         # adds nothing, so the count must be identical for 3 and for 30 commands.
+        self.warm_up()
         few = self.clone_count(3, self.NO_SYNC)
         many = self.clone_count(30, self.NO_SYNC)
         self.assertEqual(
@@ -938,6 +990,7 @@ class TestForkFree(CloneScalingMixin, ShellHookTestCase):
         #
         # It also pins the boot string removing itself: were it left in
         # PROMPT_COMMAND, its substitution would fork at every prompt.
+        self.warm_up()
         for label, extra in (("runtime dir", {}), ("fallback", {"XDG_RUNTIME_DIR": ""})):
             with self.subTest(scratch=label):
                 env = {**self.NO_SYNC, **extra}
@@ -960,6 +1013,7 @@ class TestForkFree(CloneScalingMixin, ShellHookTestCase):
         equality rather than a tolerance.
         """
         (store.history_dir() / ".git").mkdir(parents=True, exist_ok=True)
+        self.warm_up()
         counts = []
         for count in (3, 30):
             store.sync_stamp_file().write_text(f"{int(time.time())}\n", encoding="utf-8")
@@ -988,6 +1042,7 @@ class TestForkFree(CloneScalingMixin, ShellHookTestCase):
         prompt for the life of the shell. The bare-shell case above never
         exercises a miss, because there is nothing else in the variable.
         """
+        self.warm_up()
         for label, before in self.SHAPES.items():
             with self.subTest(shape=label):
                 few = self.clone_count(3, self.NO_SYNC, before=before)
@@ -1322,6 +1377,43 @@ class RecordingIsPrivateMixin(SharedShellTestBase):
         for path in files:
             self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
 
+    def test_a_shell_that_records_nothing_still_creates_the_day_file_owner_only(self) -> None:
+        """The constraint #183's fix has to respect.
+
+        Since #183 the day file is created at *startup*, so that
+        `__woswoar_today` can be pre-set and the once-a-day fork stops firing
+        once per shell. Pre-setting it without creating the file would skip the
+        branch that gets the mode right, and the first append would then make it
+        under the ambient umask -- 0644, which is the hole this class exists to
+        close, reopened by a performance change.
+
+        The shell types nothing, which is the case that distinguishes them: the
+        file exists because startup made it, not because a command did.
+        """
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        self.run_shell("")
+        files = sorted(self.logdir().parent.rglob("*.tsv"))
+        self.assertTrue(files, "startup created no day file")
+        for path in files:
+            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
+
+    def test_a_shell_whose_data_directory_is_gone_creates_it_privately(self) -> None:
+        """The same claim, from the state a fresh install is in.
+
+        `WoswoarTestCase` leaves `$WOSWOAR_DIR` absent until something makes it,
+        so this is the first-shell-ever path -- the one that still forks, and the
+        one where getting the mode wrong is permanent for that day.
+        """
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        shutil.rmtree(Path(os.environ["WOSWOAR_DIR"]), ignore_errors=True)
+        self.run_shell("echo hello\n")
+        self.assertEqual(self.commands(), ["echo hello"])
+        self.assertEqual(self.logdir().stat().st_mode & 0o077, 0, "the directory is reachable")
+        for path in sorted(self.logdir().rglob("*.tsv")):
+            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
+
     def test_the_hook_agrees_with_store_about_what_private_means(self) -> None:
         """The hook is copied verbatim, so it cannot import the constants.
 
@@ -1406,6 +1498,32 @@ class TestTheScratchFileIsPrivate(ShellHookTestCase):
 
         self.run_shell("echo still-recording\n", env_extra=env)
         self.assertIn("echo still-recording", self.commands())
+
+    def test_a_second_shell_remakes_the_run_directory_if_it_is_gone(self) -> None:
+        """The half of #183's startup test that is not about the log file.
+
+        Since #183 startup skips its `mkdir` when today's log file is already
+        there -- and that file says nothing about `run/`, which is where the
+        scratch file goes when there is no runtime directory. A shell that
+        skipped the step because the *log* existed would find no `run/`, fail to
+        create its scratch file, and record nothing at all.
+
+        The fixture has to be a day whose file already exists *and* a missing
+        `run/`: with both absent -- which is every other test here, starting from
+        an empty sandbox -- the step runs regardless and the guard is invisible.
+        """
+        self.run_shell("echo first\n", env_extra=self.HOSTILE)
+        self.assertIn("echo first", self.commands())
+
+        run_dir = Path(os.environ["WOSWOAR_DIR"]) / "run"
+        shutil.rmtree(run_dir)
+        self.assertTrue(
+            list(self.logdir().glob("*.tsv")), "today's log is gone too, so this proves nothing"
+        )
+
+        self.run_shell("echo second\n", env_extra=self.HOSTILE)
+        self.assertIn("echo second", self.commands(), "the second shell recorded nothing")
+        self.assertEqual(run_dir.stat().st_mode & 0o077, 0, "it came back world-readable")
 
     def test_the_file_and_its_directory_are_owner_only(self) -> None:
         """Stats from Python, not `stat -c`, which is GNU-only.

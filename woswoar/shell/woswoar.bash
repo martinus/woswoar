@@ -48,17 +48,45 @@ fi
 
 __woswoar_logdir=$__woswoar_dir/logs/hosts/$__woswoar_id
 
-# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p`
-# would otherwise honour the ambient umask, which is 022 almost everywhere, and
-# these files hold more than ~/.bash_history does -- which bash creates 0600.
+#: Per-shell scratch, kept out of the data directory's root so that a file left
+#: behind by a shell whose EXIT trap was already taken is contained and obvious.
+__woswoar_run=$__woswoar_dir/run
+
+# 077 so the whole chain is owner-only from the moment it exists. `mkdir -p` and
+# the append below would otherwise honour the ambient umask, which is 022 almost
+# everywhere, and these files hold more than ~/.bash_history does -- which bash
+# creates 0600.
 #
 # Only creation happens here. Re-tightening a tree from an older woswoar is
 # `woswoar install`'s job: a recursive chmod is proportional to the number of
 # days recorded, and this runs on every interactive shell.
-#: Per-shell scratch, kept out of the data directory's root so that a file left
-#: behind by a shell whose EXIT trap was already taken is contained and obvious.
-__woswoar_run=$__woswoar_dir/run
-(umask 077 && mkdir -p "$__woswoar_logdir" "$__woswoar_run") 2>/dev/null || return 0
+#
+# **The guard is the point.** `mkdir` is not a builtin, so this subshell is a
+# fork *and* an exec, on a path whose whole design claim is that it does not
+# fork -- and today's log file existing is already proof that its directory
+# does. So every shell but the first of each day does nothing here.
+#
+# Creating the *file* rather than only the directory is what earns the second
+# half: `__woswoar_today` can then be set, and `__woswoar_record`'s once-a-day
+# branch -- which starts out unsatisfied and so fires at the first command of
+# every shell -- is already satisfied. That was the same fork again, and the
+# comment above it claimed it was paid once a day. See #183.
+#
+# `$__woswoar_run` is tested too, and not folded into the day-file test: it is
+# where the scratch file goes when there is no runtime directory, and a shell
+# that skipped making it because today's log happened to exist would fall
+# through to `return 0` below and record nothing.
+#
+# `__woswoar_today` is set *only* on the far side of that branch, never
+# unconditionally: it means "the file for this day is known to exist", and a
+# shell that asserted it without checking would skip the once-a-day branch and
+# let the first append create the file under the ambient umask -- 0644, the one
+# hole this section exists to close.
+printf -v __woswoar_today '%(%F)T' -1 # local time, matching store.day_for()
+if [[ ! -e $__woswoar_logdir/$__woswoar_today.tsv || ! -d $__woswoar_run ]]; then
+    (umask 077 && mkdir -p "$__woswoar_logdir" "$__woswoar_run" \
+        && : >>"$__woswoar_logdir/$__woswoar_today.tsv") 2>/dev/null || return 0
+fi
 
 # Scratch file for capturing `history 1`, always in a directory only this user
 # can write. $TMPDIR and /tmp are never used: the name is just a pid, so in a
@@ -199,8 +227,6 @@ __woswoar_next_sync=0
 __woswoar_start=
 __woswoar_status=
 __woswoar_lastnum=
-#: The day whose log file is known to exist already. See __woswoar_precmd.
-__woswoar_today=
 
 # ---------------------------------------------------------------------------
 # Hot path. Builtins only below this line.
