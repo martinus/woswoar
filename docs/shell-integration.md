@@ -3,6 +3,11 @@
 woswoar is never the only thing hooked into a real `.bashrc`, and it runs on
 every prompt. Both of those constrain it more than anything else in the design.
 
+There are two hooks: `woswoar.bash`, which `woswoar install` wires up, and
+`woswoar.zsh`, which for now you [source by hand](#zsh). Everything below is
+about the bash one unless it says otherwise; the zsh section covers what is
+genuinely different, and it is almost all about *not* recording.
+
 ## Your normal bash is untouched
 
 **Up-arrow and `~/.bash_history` still work exactly as before.** woswoar never
@@ -110,11 +115,102 @@ It needs fzf 0.45+, like <kbd>Ctrl</kbd>+<kbd>R</kbd> cycling and
 <kbd>Ctrl</kbd>+<kbd>T</kbd>. On anything older the key is neither bound nor
 advertised.
 
+## zsh
+
+Add the hook **last** in `~/.zshrc`:
+
+```zsh
+source ~/.local/share/woswoar/woswoar.zsh
+```
+
+`woswoar install` does not write that line yet — it installs the bash hook and
+edits `.bashrc` — so for now this one line is yours to add. Everything else is
+shared: the same machine id, the same `logs/hosts/<id>/<day>.tsv`, the same
+sync. A machine that runs both shells records into one history and every
+<kbd>Ctrl</kbd>+<kbd>R</kbd> in either sees the other's commands, with nothing
+to exchange in between.
+
+**Last, because whoever binds <kbd>Ctrl</kbd>+<kbd>R</kbd> last wins.** Oh My
+Zsh, Prezto and atuin all bind it when they load. `WOSWOAR_NO_BIND=1` keeps
+theirs instead.
+
+Needs **zsh 5.0+**. The hook says so and switches itself off on anything older
+rather than half-working.
+
+### What zsh records that bash does not
+
+A multi-line command keeps its **newlines**. bash reads the line back out of
+`history`, which joins it with semicolons; zsh hands the hook the buffer you
+typed. Both are faithful to their shell. In the picker such a command shows a
+visible `\n`, which is deliberate — see the note in `entry.make_inert`.
+
+### The history rules are reimplemented, not inherited
+
+This is the one place the zsh hook is *less* elegant than the bash one, and it
+is worth knowing about rather than glossing.
+
+The bash hook never decides what to skip: it checks whether bash's history
+number moved, so `HISTCONTROL`, `ignoredups` and `HISTIGNORE` apply for free and
+there is only ever one set of rules. zsh offers no equivalent signal. `preexec`
+fires for every line, including the ones zsh has already thrown away; `$HISTCMD`
+moves *backwards* over one of those, so watching it would drop the next real
+command as well; and `$history` still holds a space-prefixed command at the
+moment the hook runs, so reading that would publish exactly what you hid.
+
+So the hook applies the rules itself. Mirrored:
+
+| setting | what the hook does |
+|---|---|
+| `HIST_IGNORE_SPACE` | skips a line that starts with whitespace |
+| `HIST_IGNORE_DUPS`, `HIST_IGNORE_ALL_DUPS` | skips a line identical to the one before it |
+| `HISTORY_IGNORE` | skips a line matching the pattern, in your `EXTENDED_GLOB` dialect |
+
+**Not** mirrored, in the same spirit as the list of what `$WOSWOAR_IGNORE` does
+not catch: `HIST_NO_STORE`, `HIST_SAVE_NO_DUPS`, `HIST_EXPIRE_DUPS_FIRST` and
+`HIST_REDUCE_BLANKS`. A command those would keep out of `~/.zsh_history` is
+still recorded by woswoar. The first three are about pruning a fixed-size
+history file, which a log that only appends does not have; the fourth
+reformats rather than drops. If you rely on one of them to keep something out
+of a synced file, use `WOSWOAR_IGNORE_EXTRA` instead, which both shells and
+`woswoar import` honour.
+
+`HIST_IGNORE_SPACE` is the one that matters most, and it is the one with the
+most tests: a leading space is how people keep a secret out of history, and a
+miss here is not merely recorded but encrypted, pushed and pulled onto every
+other machine.
+
+### Coexistence
+
+`precmd` and `preexec` are lists in zsh, so nothing has to be chained or
+restored: the hook registers with `add-zsh-hook` and every other participant
+keeps working. zsh hands each `precmd` entry your real `$?`, so an
+exit-code-colouring prompt downstream is unaffected — none of the
+`PROMPT_COMMAND` apparatus the bash hook needs exists here.
+
+Two known rough edges, neither of them verified against an install of the thing
+in question:
+
+- **zsh-autosuggestions** wraps the widgets it knows about, and one defined
+  after it loads is not among them, so the ghost suggestion may linger after
+  <kbd>Ctrl</kbd>+<kbd>R</kbd>. The remedy is
+  `ZSH_AUTOSUGGEST_CLEAR_WIDGETS+=(__woswoar_widget)`.
+- **Powerlevel10k's instant prompt** captures output written before the first
+  prompt and warns about it. The hook prints at load time in exactly one case —
+  the machine has no identity yet, so run `woswoar install`.
+
+### macOS
+
+Still unsupported, and zsh does not change that on its own. The hook's central
+claim is that it does not fork on the per-command path, and CI proves that with
+`strace`, which macOS does not have. That is a separate piece of work.
+
 ## Commands that are never recorded
 
 Anything bash itself keeps out of history is invisible to woswoar, so
 `HISTCONTROL=ignorespace` (a leading space) and `HISTIGNORE` work exactly as they
-already do — a command bash declines to store is never seen here.
+already do — a command bash declines to store is never seen here. Under zsh the
+same three rules apply but are [reimplemented rather than
+inherited](#the-history-rules-are-reimplemented-not-inherited).
 
 On top of that, `$WOSWOAR_IGNORE` is an extended regex matched against every
 command, and anything it matches is dropped before it reaches a file that gets

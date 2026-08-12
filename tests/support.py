@@ -144,11 +144,19 @@ def run_in_pty(
         os._exit(127)
 
     transcript: list[str] = []
+    # Whatever arrived *after* the previous step's marker. A single `os.read`
+    # takes up to 64 KiB, so a shell that prints its output and redraws its
+    # prompt quickly enough delivers both in one chunk -- and a step waiting for
+    # that prompt would then wait for something it had already been handed, until
+    # the timeout. It is a load-dependent flake: rare on an idle machine, and
+    # reproducible under the parallel runner.
+    carry = b""
     try:
         for index, step in enumerate(steps):
             if step.send:
                 os.write(master, step.send.encode())
-            transcript.append(_read_until(master, step.until, timeout, index, transcript))
+            seen, carry = _read_until(master, step.until, timeout, index, transcript, carry)
+            transcript.append(seen)
         return transcript
     finally:
         os.close(master)
@@ -159,8 +167,14 @@ def run_in_pty(
         os.waitpid(pid, 0)
 
 
-def _read_until(fd: int, marker: str, timeout: float, index: int, before: list[str]) -> str:
+def _read_until(
+    fd: int, marker: str, timeout: float, index: int, before: list[str], carry: bytes = b""
+) -> tuple[str, bytes]:
     """Read from ``fd`` until ``marker`` appears, or fail with what did appear.
+
+    Returns what was read up to and including the marker, and whatever came
+    after it -- which the caller hands back as ``carry`` on the next step, so
+    that output the marker shared a read with is not thrown away.
 
     An `AssertionError` rather than a `TimeoutError`, and carrying every step's
     output rather than this one's: a terminal test that goes wrong says nothing
@@ -169,7 +183,7 @@ def _read_until(fd: int, marker: str, timeout: float, index: int, before: list[s
     line before.
     """
     deadline = time.monotonic() + timeout
-    buffer = b""
+    buffer = carry
     needle = marker.encode()
 
     def stalled(reason: str) -> AssertionError:
@@ -200,7 +214,8 @@ def _read_until(fd: int, marker: str, timeout: float, index: int, before: list[s
             # nothing rather than one that is still waiting for us.
             os.write(fd, _CURSOR_REPORT)
         buffer += chunk
-    return buffer.decode("utf-8", "replace")
+    cut = buffer.index(needle) + len(needle)
+    return buffer[:cut].decode("utf-8", "replace"), buffer[cut:]
 
 
 #: "Where is the cursor?", and an answer. Row 1 column 1 is a lie in general and

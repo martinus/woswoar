@@ -33,6 +33,13 @@ jobs:
       - run: ruff format --check .
       - run: mypy woswoar tests tools
       - run: shellcheck --shell=bash woswoar/shell/woswoar.bash
+      # shellcheck has no zsh mode -- it refuses the dialect outright rather
+      # than checking what it can -- so the zsh hook gets the only static check
+      # zsh itself offers. Said here rather than left as a silent gap: `zsh -n`
+      # is a parse, not a lint, and nothing below this line is checking the zsh
+      # hook for the class of thing shellcheck finds in the bash one.
+      - run: sudo apt-get install -y -qq zsh || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+      - run: zsh -n woswoar/shell/woswoar.zsh
 
   test:
     runs-on: ubuntu-latest
@@ -117,18 +124,27 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: install strace and locales
+      - name: install strace, zsh and locales
+        # zsh is not on ubuntu-latest by default, and the zsh suite skips itself
+        # without it -- which under `--no-skips` below is fatal rather than a
+        # green run that measured nothing. That is the property this job exists
+        # for, so it stays that way.
         run: |
-          sudo apt-get install -y -qq strace locales \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq strace locales; }
+          sudo apt-get install -y -qq strace zsh locales \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq strace zsh locales; }
           # The comma-decimal test needs a locale where $EPOCHREALTIME uses ","
           sudo locale-gen de_AT.UTF-8
+          zsh --version
       # --jobs 1 on purpose: this job counts forks under strace, and the whole
       # point of it is a measurement that concurrent load has no say in. The
       # runner is used anyway for --no-skips -- strace and bash 5 are installed
       # here, so a skip means one of them stopped working, not that the test is
       # inapplicable.
       - run: python -m tools.run_tests --only tests.test_shell_hook --jobs 1 --no-skips
+      # A second invocation rather than one over both: `--only` selects by
+      # module or class prefix, and `tests.test_shell_hook` does not prefix
+      # `tests.test_shell_hook_zsh` -- the dot is what separates them.
+      - run: python -m tools.run_tests --only tests.test_shell_hook_zsh --jobs 1 --no-skips
 
   sync:
     # Two machines exchanging encrypted history through a bare repo, plus the

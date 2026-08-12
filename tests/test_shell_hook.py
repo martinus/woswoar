@@ -5,6 +5,13 @@ that recording never forks. That duplication is deliberate but fragile, so these
 tests drive the *real* hook in a *real* bash and parse the result with the
 *real* Python parser. If the two implementations ever disagree, this is where it
 shows up.
+
+There is a second hook now, ``woswoar.zsh``, and a third copy of the same
+claims would be a third thing to drift. So the parts that are about *woswoar*
+rather than about bash -- the escape corpus, the two mirrored constants, the
+default ignore pattern, the fork-scaling measurement -- live here as mixins
+parameterised by ``(INTERPRETER, HOOK)``, and ``tests/test_shell_hook_zsh.py``
+subclasses them for zsh. One corpus, one set of assertions, two shells.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
@@ -28,7 +35,9 @@ from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unesc
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
 from .support import MACHINE_ID, Typed, WoswoarTestCase, requires_bash, run_in_pty
 
-HOOK = Path(__file__).resolve().parent.parent / "woswoar" / "shell" / "woswoar.bash"
+SHELL_DIR = Path(__file__).resolve().parent.parent / "woswoar" / "shell"
+BASH_HOOK = SHELL_DIR / "woswoar.bash"
+ZSH_HOOK = SHELL_DIR / "woswoar.zsh"
 
 #: Inputs the two escape implementations must agree on. Command arguments cannot
 #: carry a NUL byte, so that one case is out of reach here and is covered by the
@@ -68,6 +77,17 @@ requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 
 
 class ShellHookTestCase(WoswoarTestCase):
+    #: How to start an interactive shell that reads its commands from stdin, and
+    #: which hook that shell sources. Overridden wholesale by the zsh suite --
+    #: everything below is written in terms of these two.
+    INTERPRETER: ClassVar[list[str]] = ["bash", "--norc", "-i"]
+    HOOK: ClassVar[Path] = BASH_HOOK
+
+    #: Typed ahead of everything else, including ``before``. Empty for bash,
+    #: which draws no prompt at all when its stdin is a pipe; zsh does, and needs
+    #: a line to turn it off before any output a test reads. See the zsh suite.
+    PREAMBLE: ClassVar[str] = ""
+
     def runtime_dir(self) -> Path:
         """Where XDG_RUNTIME_DIR points for these runs."""
         return self.root / "run"
@@ -94,7 +114,7 @@ class ShellHookTestCase(WoswoarTestCase):
         env_extra: dict[str, str] | None = None,
         before: str = "",
     ) -> str:
-        """Run ``script`` line by line in an interactive bash with the hook loaded.
+        """Run ``script`` line by line in an interactive shell with the hook loaded.
 
         ``before`` runs *ahead of* the hook, which is how a real ~/.bashrc looks:
         the interesting bugs are all about what else already owns PROMPT_COMMAND
@@ -102,8 +122,9 @@ class ShellHookTestCase(WoswoarTestCase):
         so a test can assert the other tool still ran.
         """
         result = subprocess.run(
-            ["bash", "--norc", "-i"],
-            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{textwrap.dedent(script)}",
+            self.INTERPRETER,
+            input=f"{self.PREAMBLE}{textwrap.dedent(before)}\nsource {self.HOOK}\n"
+            f"{textwrap.dedent(script)}",
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.PIPE,
@@ -138,6 +159,21 @@ class ShellHookTestCase(WoswoarTestCase):
     def by_cmd(self) -> dict[str, Entry]:
         """Recorded entries indexed by command, for asserting on metadata."""
         return {e.cmd: e for e in self.recorded()}
+
+
+#: Bases for the classes shared with the zsh suite. `object` at runtime, so that
+#: unittest's loader -- which collects every TestCase subclass in a module,
+#: whatever it is called -- does not also run each mixin as an extra,
+#: unparameterised copy of the bash suite. The real base is restored for mypy,
+#: which otherwise cannot see `assertEqual` or `run_shell` on `self`. Making the
+#: mixin skip itself instead is not available: CI runs the hook job with
+#: `--no-skips`, deliberately.
+if TYPE_CHECKING:
+    SharedTestBase = unittest.TestCase
+    SharedShellTestBase = ShellHookTestCase
+else:
+    SharedTestBase = object
+    SharedShellTestBase = object
 
 
 @requires_bash5
@@ -472,8 +508,7 @@ class TestCoexistence(ShellHookTestCase):
         self.assertEqual(self.commands(), ["echo only-this"])
 
 
-@requires_bash5
-class TestEscapeParity(unittest.TestCase):
+class EscapeParityMixin(SharedTestBase):
     """The drift guard.
 
     Calls the hook's ``__woswoar_escape`` directly rather than going through an
@@ -482,7 +517,16 @@ class TestEscapeParity(unittest.TestCase):
     tab before the command even runs (a real terminal, where readline handles
     bracketed paste, does not). Testing the function directly exercises the
     thing that can actually drift.
+
+    Parameterised over ``(NONINTERACTIVE, HOOK)`` so that both hooks are checked
+    against **one** corpus and one set of assertions. A second copy of
+    ``ESCAPE_CORPUS`` for zsh would be exactly the thing this class's own
+    argument says not to have.
     """
+
+    #: How to run a scrap of shell with ``$1`` set: ``[*argv, script, "$0", value]``.
+    NONINTERACTIVE: ClassVar[list[str]] = ["bash", "--norc", "-c"]
+    HOOK: ClassVar[Path] = BASH_HOOK
 
     _extracted: Path
     _tmpdir: tempfile.TemporaryDirectory[str]
@@ -492,23 +536,23 @@ class TestEscapeParity(unittest.TestCase):
         # Lift the function out of the real hook rather than copying it here --
         # a copy would be one more thing that can drift. The hook itself cannot
         # be sourced non-interactively; it returns early by design.
-        source = HOOK.read_text(encoding="utf-8")
+        source = cls.HOOK.read_text(encoding="utf-8")
         match = re.search(r"^__woswoar_escape\(\) \{\n.*?^\}$", source, re.MULTILINE | re.DOTALL)
-        assert match is not None, "__woswoar_escape not found in the hook"
+        assert match is not None, f"__woswoar_escape not found in {cls.HOOK.name}"
         cls._tmpdir = tempfile.TemporaryDirectory(prefix="woswoar-escape-")
-        cls._extracted = Path(cls._tmpdir.name) / "escape.bash"
+        cls._extracted = Path(cls._tmpdir.name) / "escape.sh"
         cls._extracted.write_text(match.group(0) + "\n", encoding="utf-8")
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls._tmpdir.cleanup()
 
-    def escape_in_bash(self, value: str) -> str:
+    def escape_in_shell(self, value: str) -> str:
         script = (
             f'source "{self._extracted}"; __woswoar_escape "$1"; printf %s "$__woswoar_escaped"'
         )
         out = subprocess.run(
-            ["bash", "--norc", "-c", script, "bash", value],
+            [*self.NONINTERACTIVE, script, "shell", value],
             capture_output=True,
             text=True,
             check=True,
@@ -518,20 +562,25 @@ class TestEscapeParity(unittest.TestCase):
     def test_matches_python_escape(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                self.assertEqual(self.escape_in_bash(value), escape(value))
+                self.assertEqual(self.escape_in_shell(value), escape(value))
 
-    def test_python_can_unescape_what_bash_produced(self) -> None:
+    def test_python_can_unescape_what_the_shell_produced(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                self.assertEqual(unescape(self.escape_in_bash(value)), value)
+                self.assertEqual(unescape(self.escape_in_shell(value)), value)
 
-    def test_bash_output_is_always_single_line(self) -> None:
+    def test_shell_output_is_always_single_line(self) -> None:
         for value in ESCAPE_CORPUS:
             with self.subTest(value=value):
-                encoded = self.escape_in_bash(value)
+                encoded = self.escape_in_shell(value)
                 self.assertNotIn("\n", encoded)
                 self.assertNotIn("\t", encoded)
                 self.assertNotIn("\r", encoded)
+
+
+@requires_bash5
+class TestBashEscapeParity(EscapeParityMixin, unittest.TestCase):
+    pass
 
 
 @requires_bash5
@@ -626,25 +675,35 @@ class TestFiltering(ShellHookTestCase):
         self.assertLess(micros, 1_000_000, "the ignore pattern went superlinear again")
 
 
-@requires_bash5
-class TestTheDefaultIgnorePattern(ShellHookTestCase):
+class DefaultIgnorePatternMixin(SharedShellTestBase):
     """What the shipped pattern does and does not catch.
 
-    Evaluated by the same bash that will run it, against the value the hook
+    Evaluated by the same shell that will run it, against the value the hook
     actually sets -- not against a copy in this file, which could drift from the
     hook and keep passing. One shell tests the whole corpus, because starting a
-    bash per command would cost more than the rest of the suite.
+    shell per command would cost more than the rest of the suite.
+
+    Run against **both** hooks, for exactly the reason above: the pattern is a
+    string in two files, `[[ =~ ]]` is a different implementation in each shell,
+    and a rule that catches `PGPASSWORD=` in bash and not in zsh is a secret
+    published to a git repository. `TestTheIgnorePatternIsSharedByBothShells`
+    pins the two strings together; this pins what each shell does with it.
     """
 
     def classify(self, commands: list[str]) -> dict[str, bool]:
-        """Ask a real bash which of `commands` the default pattern matches."""
+        """Ask a real shell which of `commands` the default pattern matches."""
+        # Through `set --` rather than a named array: bash indexes from 0 and
+        # zsh from 1, `${!a[@]}` is bash-only, and one loop that means the same
+        # thing in both shells is worth more here than the array was.
         array = " ".join(shlex.quote(command) for command in commands)
         out = self.run_shell(
-            f"__corpus=({array})\n"
+            f"set -- {array}\n"
             'printf "PATTERN %s\\n" "${#WOSWOAR_IGNORE}"\n'
-            'for i in "${!__corpus[@]}"; do\n'
-            '  [[ ${__corpus[i]} =~ $WOSWOAR_IGNORE ]] && printf "MATCH %s\\n" "$i" '
-            '|| printf "KEEP %s\\n" "$i"\n'
+            "__i=0\n"
+            'for __c in "$@"; do\n'
+            '  [[ $__c =~ $WOSWOAR_IGNORE ]] && printf "MATCH %s\\n" "$__i" '
+            '|| printf "KEEP %s\\n" "$__i"\n'
+            "  __i=$((__i + 1))\n"
             "done\n"
         )
 
@@ -685,39 +744,81 @@ class TestTheDefaultIgnorePattern(ShellHookTestCase):
 
 
 @requires_bash5
-class TestConstantParity(unittest.TestCase):
+class TestTheBashDefaultIgnorePattern(DefaultIgnorePatternMixin, ShellHookTestCase):
+    pass
+
+
+class ConstantParityMixin(SharedTestBase):
     """The hook hardcodes values that live in Python; pin them together.
 
     ``escape`` has its own parity test. These two constants were mirrored into
     the hook with only a comment to keep them honest, so changing
-    ``MAX_CMD_CHARS`` in Python would silently leave bash truncating at the old
-    length with the old marker, and CI would stay green.
+    ``MAX_CMD_CHARS`` in Python would silently leave the shell truncating at the
+    old length with the old marker, and CI would stay green. There are two hooks
+    now, so each carries its own copy and each needs pinning.
     """
+
+    HOOK: ClassVar[Path] = BASH_HOOK
 
     source: str
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.source = HOOK.read_text(encoding="utf-8")
+        cls.source = cls.HOOK.read_text(encoding="utf-8")
 
     def test_truncation_length_matches(self) -> None:
         match = re.search(r"^__woswoar_max=(\d+)$", self.source, re.MULTILINE)
-        assert match is not None, "__woswoar_max not found in the hook"
+        assert match is not None, f"__woswoar_max not found in {self.HOOK.name}"
         self.assertEqual(int(match.group(1)), MAX_CMD_CHARS)
 
     def test_truncation_marker_matches(self) -> None:
         self.assertIn(f"'{TRUNCATION_MARKER}'", self.source)
 
+
+@requires_bash5
+class TestConstantParity(ConstantParityMixin, unittest.TestCase):
     def test_hook_requires_the_documented_bash_version(self) -> None:
         # doctor reports "5.0+ required" independently; make sure the gate the
         # hook actually enforces is the same one.
         self.assertIn("BASH_VERSINFO[0] < 5", self.source)
 
 
-@requires_bash5
-@unittest.skipUnless(shutil.which("strace"), "strace required")
-class TestForkFree(ShellHookTestCase):
-    """Recording runs on every prompt, so its cost must not scale with usage."""
+class TestTheIgnorePatternIsSharedByBothShells(unittest.TestCase):
+    """One credential filter, spelled out in two files.
+
+    `DefaultIgnorePatternMixin` asks each shell what the pattern it holds does,
+    so a rule missing from one of them is caught there -- but only as 87 corpus
+    entries suddenly classified differently, in whichever suite happens to run.
+    This says the simpler thing directly: the two strings are the same string.
+    It is the cheap half, and it is the half that fails with a useful message
+    when someone extends the pattern in the hook they happened to be editing.
+    """
+
+    #: `: "${WOSWOAR_IGNORE=...}"`, whose closing brace is the last one on the
+    #: line -- the pattern itself contains braces, so a non-greedy match would
+    #: stop inside it.
+    ASSIGNMENT = re.compile(r'^: "\$\{WOSWOAR_IGNORE=(?P<pattern>.*)\}"$', re.MULTILINE)
+
+    def pattern(self, hook: Path) -> str:
+        match = self.ASSIGNMENT.search(hook.read_text(encoding="utf-8"))
+        assert match is not None, f"no WOSWOAR_IGNORE default in {hook.name}"
+        return match.group("pattern")
+
+    def test_both_hooks_ship_the_same_default(self) -> None:
+        bash = self.pattern(BASH_HOOK)
+        # Long enough to be the real thing: an empty capture would make the two
+        # trivially equal and assert nothing.
+        self.assertGreater(len(bash), 100)
+        self.assertEqual(bash, self.pattern(ZSH_HOOK))
+
+
+class CloneScalingMixin(SharedShellTestBase):
+    """Recording runs on every prompt, so its cost must not scale with usage.
+
+    The measurement, and the one assertion that is the same claim for either
+    shell. Everything bash-specific about forking -- the boot string, the shapes
+    of PROMPT_COMMAND that can leave it behind -- stays in `TestForkFree`.
+    """
 
     def clone_count(
         self,
@@ -727,8 +828,8 @@ class TestForkFree(ShellHookTestCase):
     ) -> int:
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
-            ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", "bash", "--norc", "-i"],
-            input=f"{textwrap.dedent(before)}\nsource {HOOK}\n{script}",
+            ["strace", "-f", "-c", "-e", "trace=clone,clone3,vfork,fork", *self.INTERPRETER],
+            input=f"{self.PREAMBLE}{textwrap.dedent(before)}\nsource {self.HOOK}\n{script}",
             text=True,
             env=self.shell_env(env_extra),
             stdout=subprocess.DEVNULL,
@@ -754,6 +855,24 @@ class TestForkFree(ShellHookTestCase):
     #: pins them with a stamp file rather than with a clock.
     NO_SYNC: ClassVar[dict[str, str]] = {"WOSWOAR_SYNC_INTERVAL": "0"}
 
+    def test_clone_count_does_not_scale_with_commands(self) -> None:
+        # Not "zero forks": startup legitimately runs mkdir, and bash two
+        # `trap -p` subshells besides. What matters is that the per-command path
+        # adds nothing, so the count must be identical for 3 and for 30 commands.
+        few = self.clone_count(3, self.NO_SYNC)
+        many = self.clone_count(30, self.NO_SYNC)
+        self.assertEqual(
+            few,
+            many,
+            f"record path forks: {few} clones for 3 commands, {many} for 30",
+        )
+
+
+@requires_bash5
+@unittest.skipUnless(shutil.which("strace"), "strace required")
+class TestForkFree(CloneScalingMixin, ShellHookTestCase):
+    """The bash-specific half: which PROMPT_COMMAND shapes can leave a fork behind."""
+
     def stamp_opens(self, command_count: int) -> int:
         """How many times the shell opened the sync stamp across the run.
 
@@ -766,7 +885,7 @@ class TestForkFree(ShellHookTestCase):
         script = "".join(f"echo cmd{i}\n" for i in range(command_count))
         proc = subprocess.run(
             ["strace", "-f", "-e", "trace=openat", "bash", "--norc", "-i"],
-            input=f"source {HOOK}\n{script}",
+            input=f"source {BASH_HOOK}\n{script}",
             text=True,
             env=self.shell_env(),
             stdout=subprocess.DEVNULL,
@@ -791,16 +910,14 @@ class TestForkFree(ShellHookTestCase):
         self.assertGreater(few, 0, "the stamp was never consulted at all")
         self.assertEqual(few, many, f"{few} stamp reads for 3 commands, {many} for 30")
 
-    def test_clone_count_does_not_scale_with_commands(self) -> None:
-        # Not "zero forks": startup legitimately runs mkdir and two `trap -p`
-        # subshells -- one to see whether the EXIT trap is free, one at the first
-        # prompt to read any prior DEBUG trap. What matters is that the
-        # per-command path adds nothing, so the count must be identical for 3 and
-        # for 30 commands. That also pins the boot string removing itself: were
-        # it left in PROMPT_COMMAND, its substitution would fork every time.
+    def test_neither_scratch_file_branch_forks_per_command(self) -> None:
+        # `CloneScalingMixin` already makes the bare claim for both shells; this
+        # is the half only bash has. The scratch file's directory is chosen at
+        # startup, and a fork added to either branch would be paid on every
+        # command of that shell.
         #
-        # Both scratch-file branches, because they are chosen at startup and a
-        # fork added to either would be paid on every command of that shell.
+        # It also pins the boot string removing itself: were it left in
+        # PROMPT_COMMAND, its substitution would fork at every prompt.
         for label, extra in (("runtime dir", {}), ("fallback", {"XDG_RUNTIME_DIR": ""})):
             with self.subTest(scratch=label):
                 env = {**self.NO_SYNC, **extra}
@@ -1180,7 +1297,7 @@ class TestRecordingIsPrivate(ShellHookTestCase):
         being left behind, which is the direction that silently reopens the
         hole this class exists for.
         """
-        source = HOOK.read_text(encoding="utf-8")
+        source = BASH_HOOK.read_text(encoding="utf-8")
         self.assertIn("umask 077", source)
         self.assertEqual(store.DIR_MODE, 0o700)
         self.assertEqual(store.FILE_MODE, 0o600)
@@ -1477,7 +1594,7 @@ class TestCtrlRLandsOnThePrompt(ShellHookTestCase):
     def test_the_selection_arrives_for_editing_and_does_not_run(self) -> None:
         steps = [
             Typed("", self.PROMPT),
-            Typed(f"source {HOOK}; echo LOAD''ED\n", "LOADED"),
+            Typed(f"source {BASH_HOOK}; echo LOAD''ED\n", "LOADED"),
             # `LOADED` is printed while bash is still running the line; the
             # prompt after it is what says readline has the terminal back.
             Typed("", self.PROMPT),
