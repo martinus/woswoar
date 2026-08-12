@@ -120,7 +120,7 @@ venv.
 
 To track the tip instead of releases, the git URL is still there —
 `pipx install "git+https://github.com/martinus/woswoar.git@main"`, or `@stable`
-for the most recent tag, or `@v0.9.0` to pin exactly. That form needs `git` on
+for the most recent tag, or `@v0.10.0` to pin exactly. That form needs `git` on
 the machine; `pipx install woswoar` does not.
 </details>
 
