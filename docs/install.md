@@ -17,7 +17,8 @@ it again.
 distribution. `woswoar doctor` diagnoses anything else that looks wrong.
 
 **bash and zsh both work.** `install` writes to every shell whose rc file
-already exists, and never creates one — see
+already exists, and never adds a shell you were not already using. With no rc
+file at all it follows `$SHELL` and creates that one — see
 [Living in your shell](shell-integration.md#zsh).
 
 ### macOS
