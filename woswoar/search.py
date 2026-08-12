@@ -739,7 +739,7 @@ def host_width_for(hosts: set[str]) -> int:
     """How wide the machine column should be, or 0 for no column at all.
 
     Nothing to say on a machine whose history is all its own, which is every
-    single-machine install and the whole of the README's Quick Start -- so the
+    single-machine install and the whole of the README's install section -- so the
     column simply is not there, rather than being there and empty.
     """
     if len(hosts) < 2:

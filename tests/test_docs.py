@@ -28,10 +28,21 @@ from urllib.parse import unquote
 
 REPO = Path(__file__).resolve().parent.parent
 README = REPO / "README.md"
+DOCS = REPO / "docs"
+
+#: The uninstall step that takes the plaintext history with it, and the shout
+#: that has to be beside it.
+_DELETES_HISTORY = "rm -rf ~/.local/share/woswoar"
+_SHOUT = "THIS DELETES YOUR RECORDED HISTORY"
+
+#: The document the block lives in. It was the README until the README was cut
+#: down to a landing page; the block moved, and pointing this at the file rather
+#: than searching every markdown for the summary keeps the failure specific.
+SYNC_DOC = REPO / "docs" / "sync.md"
 
 #: The `<details>` the block lives in, named by its summary rather than by a
-#: line number so that editing the README above it does not silently point this
-#: at some other code block.
+#: line number so that editing the document above it does not silently point
+#: this at some other code block.
 _SECTION = "Keeping a machine current while nobody is using it"
 
 _FENCED = re.compile(r"```bash\n(.*?)```", re.S)
@@ -39,9 +50,9 @@ _FENCED = re.compile(r"```bash\n(.*?)```", re.S)
 
 def systemd_block() -> str:
     """The one shell block under the idle-machine `<details>`."""
-    _, marker, rest = README.read_text(encoding="utf-8").partition(_SECTION)
+    _, marker, rest = SYNC_DOC.read_text(encoding="utf-8").partition(_SECTION)
     if not marker:
-        raise AssertionError(f"README has no section titled {_SECTION!r}")
+        raise AssertionError(f"{SYNC_DOC.relative_to(REPO)} has no section titled {_SECTION!r}")
     section, _, _ = rest.partition("</details>")
     blocks = _FENCED.findall(section)
     if len(blocks) != 1:
@@ -216,6 +227,77 @@ class TestEveryDocumentLinkLandsSomewhere(unittest.TestCase):
             if anchor not in headings and unquote(anchor) not in headings:
                 broken.append(f"{source.relative_to(REPO)} -> {target}")
         self.assertEqual(broken, [])
+
+
+class TestNothingIsMovedOutOfSight(unittest.TestCase):
+    """Every page under `docs/` is reachable by clicking from the README.
+
+    The README was 566 lines and most of it moved out into `docs/`. A page that
+    nothing links to is not "moved", it is deleted with the file left behind --
+    and the failure is invisible from inside the file itself, which still reads
+    perfectly. So the check is on the shape of the whole set: start at the
+    landing page, follow relative links, and every document has to be in what
+    you reach.
+    """
+
+    def reachable(self) -> set[Path]:
+        seen = {README.resolve()}
+        queue = [README]
+        while queue:
+            source = queue.pop()
+            for target in _LINK.findall(source.read_text(encoding="utf-8")):
+                if target.startswith(("http://", "https://", "mailto:")):
+                    continue
+                path, _, _ = target.partition("#")
+                if not path.endswith(".md"):
+                    continue
+                doc = (source.parent / path).resolve()
+                if doc.is_file() and doc not in seen:
+                    seen.add(doc)
+                    queue.append(doc)
+        return seen
+
+    def test_every_page_under_docs_can_be_clicked_to(self) -> None:
+        orphans = [
+            str(p.relative_to(REPO))
+            for p in sorted(DOCS.glob("*.md"))
+            if p.resolve() not in self.reachable()
+        ]
+        self.assertEqual(orphans, [])
+
+    def test_there_are_pages_to_reach(self) -> None:
+        """Without this, deleting `docs/` entirely would pass the test above."""
+        self.assertGreater(len(list(DOCS.glob("*.md"))), 5)
+
+
+class TestTheDeletionCommandKeepsItsWarning(unittest.TestCase):
+    """`rm -rf ~/.local/share/woswoar` takes `logs/` with it, and `logs/` is the
+    only plaintext copy of what a machine recorded -- the encrypted repo beside
+    it can be rebuilt, that cannot. The warning is therefore part of the
+    command, not prose around it: a reader who arrives at the block without it
+    loses their history to a documented instruction.
+
+    Cheap to check and it survives the page being moved again, which is the
+    thing that would drop it.
+    """
+
+    def documents_that_delete_the_data(self) -> list[Path]:
+        return [p for p in markdown_files() if _DELETES_HISTORY in p.read_text(encoding="utf-8")]
+
+    def test_the_instruction_is_documented_somewhere(self) -> None:
+        """Otherwise the test below passes by having nothing to look at."""
+        self.assertNotEqual(self.documents_that_delete_the_data(), [])
+
+    def test_the_page_that_deletes_it_says_what_is_lost(self) -> None:
+        for path in self.documents_that_delete_the_data():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=str(path.relative_to(REPO))):
+                # In the block itself, because a pasted block is read on its own
+                # -- the detail below it is only reached by someone who stopped.
+                start = text.index(_DELETES_HISTORY)
+                self.assertIn(_SHOUT, text[max(0, start - 200) : start])
+                self.assertIn("logs/", text)
+                self.assertIn("plaintext copy", text)
 
 
 if __name__ == "__main__":

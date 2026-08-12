@@ -158,7 +158,7 @@ fi
 __woswoar_max=8000
 
 #: Seconds between prompt-triggered syncs; 0 turns them off entirely, which is
-#: what to set if you run the systemd timer from the README instead. The two are
+#: what to set if you run the systemd timer from docs/sync.md instead. The two are
 #: safe together -- `sync.lock` is non-blocking, so whichever arrives second
 #: exits at once -- but running both is just paying twice.
 #:

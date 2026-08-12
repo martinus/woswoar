@@ -210,7 +210,7 @@ class TestTheRepositoryStep(SetupTestCase):
 
     def test_the_hook_is_installed_either_way(self) -> None:
         """Staying local is a supported outcome, not an abort: the single
-        machine case is the README's whole Quick Start."""
+        machine case is the README's whole install section."""
         self.run_setup("")
         self.assertIn("woswoar", self.rcfile.read_text(encoding="utf-8"))
 
