@@ -252,8 +252,16 @@ class TestShellDetection(WoswoarTestCase):
         )
 
     def test_auto_falls_back_to_the_login_shell(self) -> None:
-        """A container or a fresh account has neither file, and still has a shell."""
+        """A container or a fresh account has neither file, and still has a shell.
+
+        This is also the one path on which `install` *creates* an rc file, and
+        the sentence in `docs/shell-integration.md` that says so points here.
+        `sourced` is not enough on its own to say that: a machine that already
+        had a `~/.zshrc` would satisfy it too, so the fixture -- neither file
+        present -- is what makes the file's existence afterwards mean creation.
+        """
         os.environ["SHELL"] = "/usr/bin/zsh"
+        self.assertFalse((self.home / ".zshrc").exists(), "the fixture already had one")
         self.assertEqual(main(["install"]), 0)
         self.assertTrue(self.sourced("zsh"), "the login shell was not consulted")
         self.assertFalse((self.home / ".bashrc").exists(), "it installed for bash as well")

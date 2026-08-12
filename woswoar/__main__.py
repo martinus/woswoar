@@ -1853,7 +1853,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", *HOOKS, "both"],
         default="auto",
         help="which shell(s) to install for (default: auto -- every shell whose "
-        "rc file already exists, never creating one)",
+        "rc file already exists, or $SHELL when there is none)",
     )
     p_setup.set_defaults(func=cmd_setup)
 
@@ -1865,9 +1865,10 @@ def build_parser() -> argparse.ArgumentParser:
         re-run: the block is replaced rather than repeated, which is also how
         to upgrade the hook after installing a new woswoar.
 
-        By default it installs for every shell whose rc file already exists --
-        and it never creates one, so a machine that has never run zsh does not
-        acquire a ~/.zshrc. With neither rc file present it follows $SHELL.
+        By default it installs for every shell whose rc file already exists, so
+        a machine that has never run zsh does not acquire a ~/.zshrc. With
+        neither rc file present it follows $SHELL and creates that one --
+        otherwise a fresh account would get nothing.
 
         Reports any missing tool (fzf, age, git) and the command to install it.
         """,
@@ -1878,7 +1879,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", *HOOKS, "both"],
         default="auto",
         help="which shell(s) to install for (default: auto -- every shell whose "
-        "rc file already exists, never creating one)",
+        "rc file already exists, or $SHELL when there is none)",
     )
     p_install.set_defaults(func=cmd_install)
 
