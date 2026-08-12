@@ -19,26 +19,26 @@ to a git repository.
 
 from __future__ import annotations
 
-import os
-import shlex
 import shutil
 import subprocess
-import tempfile
-import time
 import unittest
 from pathlib import Path
 from typing import ClassVar
 
-from woswoar import search, store
+from woswoar import search
 
-from .support import MACHINE_ID, Typed, run_in_pty
+from .support import MACHINE_ID
 from .test_shell_hook import (
     BASH_HOOK,
     ZSH_HOOK,
+    CaptureMixin,
     CloneScalingMixin,
     ConstantParityMixin,
+    CtrlROnThePromptMixin,
     DefaultIgnorePatternMixin,
     EscapeParityMixin,
+    PromptSyncMixin,
+    RecordingIsPrivateMixin,
     ShellHookTestCase,
 )
 
@@ -79,18 +79,6 @@ class ZshHookTestCase(ShellHookTestCase):
     #: alone. It runs before the hook is sourced, so it is never recorded.
     PREAMBLE: ClassVar[str] = "PS1=; PS2=; unsetopt promptcr promptsp; print\n"
 
-    def raw_logs(self) -> str:
-        """Every byte the hook wrote, unparsed.
-
-        The assertion of choice for anything about a command that must *not* be
-        recorded. `commands()` goes through the parser and the cache, either of
-        which could drop a line for its own reasons -- so "the secret is not in
-        `commands()`" is a weaker claim than the one that matters, which is that
-        it is nowhere on disk.
-        """
-        logs = (Path(os.environ["WOSWOAR_DIR"]) / "logs").rglob("*.tsv")
-        return "".join(path.read_text(encoding="utf-8") for path in logs)
-
     def assertRecorded(self, expected: list[str]) -> None:
         """Which commands were recorded, and how many times each -- not in which order.
 
@@ -108,18 +96,10 @@ class ZshHookTestCase(ShellHookTestCase):
 
 
 @requires_zsh5
-class TestCapture(ZshHookTestCase):
-    def test_records_a_plain_command(self) -> None:
-        self.run_shell("echo hello\n")
-        self.assertEqual(self.commands(), ["echo hello"])
-
-    def test_records_the_whole_compound_line(self) -> None:
-        self.run_shell("true a && true b\n")
-        self.assertEqual(self.commands(), ["true a && true b"])
-
-    def test_records_a_pipeline_in_full(self) -> None:
-        self.run_shell("echo x | cat\n")
-        self.assertEqual(self.commands(), ["echo x | cat"])
+class TestCapture(CaptureMixin, ZshHookTestCase):
+    """`CaptureMixin` carries every claim the two shells share. What is left here
+    is where zsh differs: it is handed the command line rather than reading it
+    back, and its `$?` has to be caught before `emulate` clobbers it."""
 
     def test_a_multiline_loop_is_one_record(self) -> None:
         """The one place the two shells legitimately record different text.
@@ -151,87 +131,6 @@ class TestCapture(ZshHookTestCase):
         """
         self.run_shell("_marker() { echo inside-the-body }\n")
         self.assertEqual(self.commands(), ["_marker() { echo inside-the-body }"])
-
-    def test_blank_lines_record_nothing(self) -> None:
-        self.run_shell("\n\n\necho only-this\n\n")
-        self.assertEqual(self.commands(), ["echo only-this"])
-
-    def test_the_prompt_at_which_the_hook_loads_records_nothing(self) -> None:
-        # `preexec` had not been registered when the `source` line ran, so
-        # nothing was captured for it -- but `precmd` fires at the prompt that
-        # follows, with the state a fresh shell left behind.
-        self.run_shell("echo only-this\n")
-        self.assertEqual(self.commands(), ["echo only-this"])
-
-    def test_metadata_is_captured(self) -> None:
-        self.run_shell("cd /tmp\nfalse\n")
-        by_cmd = self.by_cmd()
-        self.assertEqual(by_cmd["false"].exit_code, 1)
-        self.assertEqual(by_cmd["false"].cwd, "/tmp")
-        self.assertEqual(by_cmd["false"].host, MACHINE_ID)
-        self.assertTrue(by_cmd["false"].session)
-
-    def test_session_id_is_compact_and_hex(self) -> None:
-        # Built with `[##16]`, which yields *upper* case; the `(L)` that fixes
-        # that is the whole reason this assertion is repeated for zsh.
-        self.run_shell("echo hello\n")
-        session = self.recorded()[0].session
-        self.assertRegex(session, r"^[0-9a-f]+-[0-9a-f]+$")
-        self.assertLessEqual(len(session), 16)
-
-    def test_two_shells_get_different_sessions(self) -> None:
-        self.run_shell("echo one\n")
-        self.run_shell("echo two\n")
-        sessions = {e.session for e in self.recorded()}
-        self.assertEqual(len(sessions), 2, "session id must be unique per shell")
-
-    def test_home_is_stored_as_tilde(self) -> None:
-        self.run_shell("cd ~\ntrue marker\n")
-        self.assertEqual(self.by_cmd()["true marker"].cwd, "~")
-
-    def test_path_under_home_is_stored_relative(self) -> None:
-        (self.root / "src").mkdir(exist_ok=True)
-        self.run_shell("cd ~/src\ntrue marker\n")
-        self.assertEqual(self.by_cmd()["true marker"].cwd, "~/src")
-
-    def test_path_outside_home_stays_absolute(self) -> None:
-        self.run_shell("cd /tmp\ntrue marker\n")
-        self.assertEqual(self.by_cmd()["true marker"].cwd, "/tmp")
-
-    def test_sibling_of_home_is_not_mangled(self) -> None:
-        # The trap in ${PWD/#$HOME/~}: with $HOME=/home/martinus it rewrites
-        # /home/martinuscopy to ~copy. Anchored matching must leave it alone.
-        sibling = self.root.parent / f"{self.root.name}-sibling"
-        sibling.mkdir(exist_ok=True)
-        self.addCleanup(sibling.rmdir)
-        self.run_shell(f"cd {sibling}\ntrue marker\n")
-        self.assertEqual(self.by_cmd()["true marker"].cwd, str(sibling))
-
-    def test_duration_is_measured(self) -> None:
-        """Bounded from both sides, and that is the point of it.
-
-        zsh's $EPOCHREALTIME carries *ten* fractional digits where bash's carries
-        six, so woswoar.bash's "strip three characters" conversion is wrong here
-        by a factor of 10,000 -- and a lower bound alone passes with flying
-        colours when the answer is ten thousand times too large.
-        """
-        self.run_shell("sleep 0.3\n")
-        entry = self.recorded()[0]
-        self.assertEqual(entry.cmd, "sleep 0.3")
-        self.assertGreaterEqual(entry.duration_ms, 250)
-        self.assertLess(entry.duration_ms, 30_000)
-
-    def test_duration_survives_a_comma_decimal_locale(self) -> None:
-        """zsh 5.9 formats $EPOCHREALTIME with a period whatever LC_NUMERIC says,
-        where bash does not -- so this passes today with the comma substitution
-        removed. It is kept because the failure it guards is silent and awful: a
-        comma reaching `$((...))` is the comma *operator*, which evaluates to the
-        fractional part and calls it a timestamp.
-        """
-        self.run_shell("sleep 0.3\n", env_extra={"LC_NUMERIC": "de_AT.UTF-8"})
-        entry = self.recorded()[0]
-        self.assertGreaterEqual(entry.duration_ms, 250)
-        self.assertLess(entry.duration_ms, 30_000)
 
     def test_exit_codes_are_recorded(self) -> None:
         """`emulate -L zsh` clobbers $?, so the capture has to come first.
@@ -461,14 +360,7 @@ class TestOptionsThatWouldSilenceRecording(ZshHookTestCase):
 
 
 @requires_zsh5
-class TestRecordingIsPrivate(ZshHookTestCase):
-    def test_the_day_file_is_owner_only_under_a_stock_umask(self) -> None:
-        self.run_shell("echo hello\n")
-        files = list((Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts").rglob("*.tsv"))
-        self.assertTrue(files, "nothing was recorded")
-        for path in files:
-            self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path} is world-readable")
-
+class TestRecordingIsPrivate(RecordingIsPrivateMixin, ZshHookTestCase):
     def test_every_line_written_is_parseable(self) -> None:
         self.run_shell("echo 'a\tb'\necho 'c\\d'\nfor i in 1; do\ntrue\ndone\necho done\n")
         raw = self.raw_logs()
@@ -488,9 +380,6 @@ class TestALostLogDirectory(ZshHookTestCase):
     catches it, and without one the user gets a path printed at the prompt after
     every command, which is exactly the bug 0.4.1 shipped.
     """
-
-    def logdir(self) -> Path:
-        return Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts" / MACHINE_ID
 
     def test_losing_it_mid_session_is_silent(self) -> None:
         out = self.run_shell(
@@ -528,8 +417,13 @@ class TestAZshAndABashShellShareOneHistory(ZshHookTestCase):
     file, and every Ctrl-R re-reads it.
     """
 
-    def test_each_shell_sees_the_others_commands(self) -> None:
-        self.run_shell("echo from_the_zsh_shell\n")
+    def run_a_bash_shell(self) -> None:
+        """One command through the *other* hook, into the same sandbox.
+
+        Not `run_shell`: that one is this suite's zsh. The point of the class is
+        that the two programs land in one file, so one of them has to be spelled
+        out.
+        """
         subprocess.run(
             ["bash", "--norc", "-i"],
             input=f"source {BASH_HOOK}\necho from_the_bash_shell\n",
@@ -540,6 +434,10 @@ class TestAZshAndABashShellShareOneHistory(ZshHookTestCase):
             check=False,
             timeout=60,
         )
+
+    def test_each_shell_sees_the_others_commands(self) -> None:
+        self.run_shell("echo from_the_zsh_shell\n")
+        self.run_a_bash_shell()
         shown = [search.command_from_line(line) for line in search.lines_for("global")]
         self.assertIn("echo from_the_zsh_shell", shown)
         self.assertIn("echo from_the_bash_shell", shown)
@@ -553,88 +451,16 @@ class TestAZshAndABashShellShareOneHistory(ZshHookTestCase):
         reachable from two different programs at once, so it is worth saying
         that they really do share the file."""
         self.run_shell("echo from_the_zsh_shell\n")
-        subprocess.run(
-            ["bash", "--norc", "-i"],
-            input=f"source {BASH_HOOK}\necho from_the_bash_shell\n",
-            text=True,
-            env=self.shell_env(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=60,
-        )
-        files = sorted((Path(os.environ["WOSWOAR_DIR"]) / "logs" / "hosts").rglob("*.tsv"))
+        self.run_a_bash_shell()
+        files = sorted(self.logdir().parent.rglob("*.tsv"))
         self.assertEqual(len(files), 1, f"two shells wrote {len(files)} files: {files}")
 
 
 @requires_zsh5
-class TestPromptTriggeredSync(ZshHookTestCase):
-    """The zsh half of #134, which is a straight port -- so this covers what
-    porting it could have got wrong rather than the feature again.
-
-    Time is never slept on: every "the interval has passed" case is set up by
-    writing the stamp file.
-    """
-
-    def setUp(self) -> None:
-        super().setUp()
-        # Outside the sandbox, for the reason `tests/test_shell_hook.py` spells
-        # out at length: the stand-in is run by a process nobody waits for, and
-        # a file it creates mid-`rmtree` fails an unrelated test.
-        stub_root = Path(tempfile.mkdtemp(prefix="woswoar-zsyncstub-"))
-        self.addCleanup(shutil.rmtree, stub_root, ignore_errors=True)
-        self.calls = stub_root / "sync-calls"
-
-        bindir = self.root / "bin"
-        bindir.mkdir(exist_ok=True)
-        fake = bindir / "woswoar"
-        fake.write_text(
-            f'#!/bin/sh\necho "$*" >> {shlex.quote(str(self.calls))}\nsleep 3\n',
-            encoding="utf-8",
-        )
-        fake.chmod(0o755)
-        self.bindir = bindir
-        self.repo = store.history_dir()
-        (self.repo / ".git").mkdir(parents=True, exist_ok=True)
-        self.stamp = store.sync_stamp_file()
-
-    def shell_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        return super().shell_env(
-            {"PATH": f"{self.bindir}:{os.environ.get('PATH', '')}", **(extra or {})}
-        )
-
-    def syncs(self, timeout: float = 20.0) -> int:
-        deadline = time.monotonic() + timeout
-        seen = 0
-        while time.monotonic() < deadline:
-            if self.calls.exists():
-                lines = self.calls.read_text(encoding="utf-8").splitlines()
-                if lines and len(lines) == seen:
-                    return seen
-                seen = len(lines)
-            time.sleep(0.05)
-        return seen
-
-    def test_it_syncs_once_per_interval_not_once_per_command(self) -> None:
-        self.run_shell("".join(f"echo cmd{i}\n" for i in range(30)))
-        self.assertEqual(self.syncs(), 1)
-
-    def test_the_sync_never_enters_the_shells_job_table(self) -> None:
-        """A plain `&` would report the job at the prompt once a minute forever.
-
-        Asserted through `jobs` rather than by looking for `[1]` in the output:
-        a shell reading a pipe has job control off, so the notification itself is
-        invisible here and a test looking for it passes against a bare `&`.
-        """
-        out = self.run_shell("echo marker\njobs\n")
-        self.assertIn("marker", out, "precondition: the shell ran at all")
-        self.assertNotIn("woswoar sync", out, "the sync is a job of this shell")
-
-    def test_the_stamp_is_owner_only(self) -> None:
-        self.run_shell("")
-        self.syncs()
-        self.assertTrue(self.stamp.exists(), "no stamp was written")
-        self.assertEqual(self.stamp.stat().st_mode & 0o077, 0)
+class TestPromptTriggeredSync(PromptSyncMixin, ZshHookTestCase):
+    """`PromptSyncMixin` owns the stand-in, the polling and the claims about
+    *when* a sync fires. What is left is what zsh does with a value that is not a
+    number, which is not what bash does with one."""
 
     def test_a_hostile_interval_from_the_environment_never_reaches_arithmetic(self) -> None:
         """`WOSWOAR_SYNC_INTERVAL` is inherited: whatever started your shell sets it.
@@ -735,71 +561,10 @@ class TestForkFree(CloneScalingMixin, ZshHookTestCase):
 
 
 @requires_zsh5
-class TestCtrlRLandsOnThePrompt(ZshHookTestCase):
-    """The one property that keeps a recalled command from running by itself.
-
-    `zle` does nothing without a terminal, so this needs a real pty, a real zsh
-    and the real hook. What is stubbed is the picker: the widget's contract with
-    it is one line on stdout.
-    """
-
-    #: What the picker hands back, and what running it would print. Two strings
-    #: on purpose: a terminal echoes what you type at it, so if the recalled text
-    #: and the executed output were spelled the same, "it did not run" would be
-    #: satisfied by the harness's own echo of the line -- `CLAUDE.md` rule 3,
-    #: fourth bullet. The empty `''` is removed by the shell that runs the line
-    #: and by nothing else.
-    SELECTION = "echo RAN''MARK"
-    IF_EXECUTED = "RANMARK"
-
-    PROMPT = "ps> "
-
-    def picker_env(self) -> dict[str, str]:
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        fake = bin_dir / "woswoar"
-        fake.write_text(
-            "#!/bin/sh\n"
-            # Anything but `search` exits quietly: the hook reaches for
-            # `woswoar sync` too, and a complaint would land on the terminal
-            # this test reads.
-            '[ "$1" = search ] || exit 0\n'
-            "printf '%s\\n' \"$WOSWOAR_TEST_SELECTION\"\n",
-            encoding="utf-8",
-        )
-        fake.chmod(0o755)
-        return self.shell_env(
-            {
-                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-                "TERM": "xterm",
-                "PS1": self.PROMPT,
-                "WOSWOAR_TEST_SELECTION": self.SELECTION,
-            }
-        )
-
-    def test_the_selection_arrives_for_editing_and_does_not_run(self) -> None:
-        steps = [
-            Typed("", self.PROMPT),
-            Typed(f"source {ZSH_HOOK}; echo LOAD''ED\n", "LOADED"),
-            Typed("", self.PROMPT),
-            # Ctrl-R, then wait for text the harness has not typed: its only
-            # possible source is zle redrawing the buffer the widget filled in.
-            Typed("\x12", self.SELECTION),
-            # Typed where the widget left the cursor, so it lands *after* the
-            # recalled command. A CURSOR of 0 would run `EXTRAecho ...` instead
-            # and this step would time out with the transcript.
-            Typed(" EXTRA\r", f"{self.IF_EXECUTED} EXTRA"),
-        ]
-        *_, after_keypress, after_enter = run_in_pty(
-            ["zsh", "-f", "-i"], steps, env=self.picker_env()
-        )
-
-        self.assertNotIn(
-            self.IF_EXECUTED,
-            after_keypress,
-            "the keypress executed the selection instead of offering it for editing",
-        )
-        self.assertIn(f"{self.IF_EXECUTED} EXTRA", after_enter, "the edited line is what ran")
+class TestCtrlRLandsOnThePrompt(CtrlROnThePromptMixin, ZshHookTestCase):
+    """The pty test itself is the mixin's -- `self.INTERPRETER` and `self.HOOK`
+    are the only things in it that were ever shell-specific. What is left is the
+    binding, which is `bindkey` here and `bind -x` there."""
 
     def test_the_binding_is_skipped_when_asked(self) -> None:
         """`WOSWOAR_NO_BIND=1` is what a user keeping atuin's Ctrl-R sets, and

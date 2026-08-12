@@ -16,6 +16,9 @@ it again.
 `woswoar install` checks for these and prints the install command for your
 distribution. `woswoar doctor` diagnoses anything else that looks wrong.
 
+There is a **zsh 5.0+** hook too, but `install` does not wire it up — see
+[Living in your shell](shell-integration.md#zsh) for the one line it takes.
+
 > [!WARNING]
 > **Do not install `age` as a snap.** It works, and it starts a sandbox on every
 > call — about 250 ms against 2 ms for a distribution binary. woswoar runs `age`

@@ -95,8 +95,9 @@ export WOSWOAR_SESSION
 #
 # The value is byte-identical to woswoar.bash's and must stay that way. Every
 # alternative in it was argued for and measured there, and that is where the
-# reasoning lives; `TestTheIgnorePatternIsSharedByBothShells` fails if the two
-# drift, so a fix can never be applied to only one shell.
+# reasoning lives; `tests/test_credentials.py`'s `TestParityWithTheHook` holds
+# *every* hook against `credentials._SHARED`, so a rule can never be added to
+# one shell alone -- nor to both shells and not to the importer.
 : "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:]]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|://(hooks\.slack\.com|discord(app)?\.com/api/webhooks)/[^[:space:]]|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
 
 # Appended, not merged into the default above, so that adding one rule of your
@@ -217,7 +218,9 @@ __woswoar_preexec() {
     # not just the space zsh itself looks for.
     [[ -o hist_ignore_space && $cmd == [[:space:]]* ]] && return 0
 
-    # A bare Enter, or a line zsh ran with the history mechanism inactive.
+    # zsh's signal that the history mechanism was inactive: $1 arrives empty.
+    # Not the bare-Enter case, which never reaches here at all -- `preexec` does
+    # not fire for a blank line, checked against 5.9 rather than assumed.
     [[ -n ${cmd//[[:space:]]/} ]] || return 0
 
     # Both options mean the same thing to a log that only ever appends: do not
@@ -328,11 +331,18 @@ __woswoar_record() {
     # rather than testing the file every time: this runs on every command, and
     # the answer changes once a day.
     #
-    # In a subshell, so the caller's umask is untouched no matter what: the fork
-    # happens once per day, not once per command. zsh has a fork-free
-    # alternative here -- `zmodload -F zsh/files b:chmod` makes chmod a builtin
-    # -- but the mode still has to be right at creation, so it would replace one
-    # once-a-day fork with a module load in every shell. Kept as bash has it.
+    # In a subshell, so the caller's umask is untouched no matter what. What it
+    # costs is once per shell *and* then once per day: `__woswoar_today` starts
+    # empty, so this branch also fires at the first recorded command of every
+    # shell, duplicating the `mkdir -p` that startup has just run. Measured at
+    # ~5.4 ms of the 6.8 ms this hook adds to a shell that otherwise starts in
+    # 1.25 ms -- and woswoar.bash pays exactly the same twice, so it is filed
+    # (#183) rather than fixed in one shell here. It is off the per-command
+    # path, which is what this file's fork-count tests are about.
+    #
+    # zsh has a fork-free alternative -- `zmodload -F zsh/files b:chmod` makes
+    # chmod a builtin -- but the mode still has to be right at creation, so it
+    # would trade one fork for a module load in every shell. Kept as bash has it.
     #
     # `mkdir -p` as well, because the directory is otherwise only made when the
     # shell starts, and a shell outlives a lot: an uninstall, a home moved, a

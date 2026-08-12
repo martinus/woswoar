@@ -117,18 +117,30 @@ advertised.
 
 ## zsh
 
-Add the hook **last** in `~/.zshrc`:
+**`woswoar install` does not know about zsh yet.** It writes `woswoar.bash` into
+`~/.local/share/woswoar/` and edits `.bashrc`; the zsh hook ships inside the
+package and stays there. So both the copy and the `.zshrc` line are yours to
+make, and the hook is the one file `woswoar` does not keep up to date for you —
+after `pip install -U woswoar`, repeat the copy.
+
+Add it **last** in `~/.zshrc`:
 
 ```zsh
-source ~/.local/share/woswoar/woswoar.zsh
+source "$(python3 -c 'import pathlib, woswoar
+print(pathlib.Path(woswoar.__file__).parent / "shell" / "woswoar.zsh")')"
 ```
 
-`woswoar install` does not write that line yet — it installs the bash hook and
-edits `.bashrc` — so for now this one line is yours to add. Everything else is
-shared: the same machine id, the same `logs/hosts/<id>/<day>.tsv`, the same
-sync. A machine that runs both shells records into one history and every
-<kbd>Ctrl</kbd>+<kbd>R</kbd> in either sees the other's commands, with nothing
-to exchange in between.
+That sources it straight out of the package, so an upgrade is picked up by the
+next shell and there is nothing to keep in step — at the cost of a Python start
+in your `.zshrc`. If that matters, copy the file to
+`~/.local/share/woswoar/woswoar.zsh` and source the copy instead, and remember
+that `woswoar doctor` does not check that copy for staleness the way it checks
+the bash one.
+
+Everything else is shared: the same machine id, the same
+`logs/hosts/<id>/<day>.tsv`, the same sync. A machine that runs both shells
+records into one history and every <kbd>Ctrl</kbd>+<kbd>R</kbd> in either sees
+the other's commands, with nothing to exchange in between.
 
 **Last, because whoever binds <kbd>Ctrl</kbd>+<kbd>R</kbd> last wins.** Oh My
 Zsh, Prezto and atuin all bind it when they load. `WOSWOAR_NO_BIND=1` keeps

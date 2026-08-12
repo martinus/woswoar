@@ -150,11 +150,20 @@ def run_in_pty(
     # that prompt would then wait for something it had already been handed, until
     # the timeout. It is a load-dependent flake: rare on an idle machine, and
     # reproducible under the parallel runner.
+    #
+    # Offered only to a step that sends *nothing*, which is the only shape that
+    # flake takes. A step that types something must wait for output produced
+    # after its keypress, or its marker stops witnessing that the keypress was
+    # processed at all -- and two consecutive steps sharing a marker (`~/d2` at
+    # `tests/test_search.py`, where Ctrl-T waits for the row it was pressed on)
+    # would then let the second one return before fzf had seen the key. What is
+    # dropped is only ever a tail the previous step already read.
     carry = b""
     try:
         for index, step in enumerate(steps):
             if step.send:
                 os.write(master, step.send.encode())
+                carry = b""
             seen, carry = _read_until(master, step.until, timeout, index, transcript, carry)
             transcript.append(seen)
         return transcript
