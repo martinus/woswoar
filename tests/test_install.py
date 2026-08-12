@@ -18,7 +18,14 @@ from woswoar import cache, store
 from woswoar.__main__ import _BEGIN, main, portable_hook_path
 
 from . import support
-from .support import MACHINE_ID, WoswoarTestCase, make_entry, requires_bash, requires_zsh
+from .support import (
+    MACHINE_ID,
+    WoswoarTestCase,
+    make_entry,
+    requires_bash,
+    requires_bash5,
+    requires_zsh5,
+)
 
 
 class TestPortableHookPath(unittest.TestCase):
@@ -317,10 +324,81 @@ class TestShellDetection(WoswoarTestCase):
         self.assertIn(main_module.HOOKS["bash"], text)
 
 
-@requires_bash
-@requires_zsh
+class TestAFinderVisitDoesNotDisturbTheLogs(WoswoarTestCase):
+    """`.DS_Store` under `logs/` (#160).
+
+    Finder writes one into any directory it displays, and `~/.local/share` is
+    somewhere people browse. Two things must be true of it and neither is true
+    by accident: it is not a log file, and it is not an exposure `doctor` can
+    ask the user to fix -- Finder recreates it at the ambient umask the next
+    time that directory is opened, so a red line about it stays red forever.
+
+    Written by hand rather than by a Mac. That is the point: this has to be
+    pinned by the Linux suite or it regresses the moment nobody is testing on a
+    Mac, which today is everybody.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Beside real logs, in three directories a person would actually open.
+        # A tree of nothing but `.DS_Store` cannot tell a suffix filter from a
+        # walk that found nothing -- `CLAUDE.md` rule 3, second bullet.
+        self.write_log(MACHINE_ID, "2026-08-01", ["1785000000\ts1\t~\t0\t5\treal-command-one"])
+        self.write_log(MACHINE_ID, "2026-08-02", ["1785086400\ts1\t~\t0\t5\treal-command-two"])
+        store.save_machine(store.machine())
+        store.harden()
+        self.litter = [
+            store.logs_dir() / ".DS_Store",
+            store.logs_dir() / "hosts" / ".DS_Store",
+            store.host_dir(MACHINE_ID) / ".DS_Store",
+        ]
+        for path in self.litter:
+            path.write_bytes(b"\x00\x00\x00\x01Bud1")
+
+    def test_it_is_not_read_as_a_log(self) -> None:
+        found = sorted(log.path.name for log in store.iter_log_files())
+        self.assertEqual(found, ["2026-08-01.tsv", "2026-08-02.tsv"])
+        recorded = {entry.cmd for entry in cache.load_entries()}
+        self.assertEqual(recorded, {"real-command-one", "real-command-two"})
+
+    def test_doctor_does_not_report_it_as_an_exposure(self) -> None:
+        """The mode is Finder's to choose and nobody's to keep. A `doctor` that
+        goes red for a file the user cannot durably fix teaches them to stop
+        reading `doctor`, which costs more than this file's mode.
+
+        `loose_paths` is asserted to *see* it, not to miss it. That helper walks
+        the tree independently of woswoar's own idea of what it owns -- that is
+        why it exists -- so the file really is 0644 and saying otherwise would be
+        the wrong claim. What is under test is that woswoar decides not to report
+        it, which is a decision, not an oversight.
+        """
+        for path in self.litter:
+            path.chmod(0o644)
+        self.assertTrue(
+            [p for p in support.loose_paths() if ".DS_Store" in p],
+            "the fixture is not actually loose, so the exclusion below proves nothing",
+        )
+        self.assertEqual(store.readable_by_others(), [])
+        self.assertNotIn("[FAIL] private", support.run_cli("doctor").out)
+
+    def test_a_real_log_left_loose_is_still_reported(self) -> None:
+        """Otherwise the test above passes against a `doctor` that stopped
+        looking at `logs/` at all."""
+        store.host_dir(MACHINE_ID).joinpath("2026-08-01.tsv").chmod(0o644)
+        self.assertTrue(store.readable_by_others(), "the fixture is not actually loose")
+        self.assertIn("[FAIL] private", support.run_cli("doctor").out)
+
+
+@requires_bash5
+@requires_zsh5
 class TestBothShellsRecordIntoOneHistory(WoswoarTestCase):
     """`install`, then a real bash and a real zsh, then one host directory.
+
+    Both gates name a *version*, not merely a binary: each hook refuses below 5
+    and switches itself off, so a test asking only for `bash` or `zsh` fails
+    there rather than skipping -- and says "the two shells disagree" about one
+    that was never recording. macOS is where that stops being hypothetical: it
+    ships bash 3.2, and bash on macOS is out of scope by design, not broken.
 
     Everything upstream of this is asserted in pieces -- which rc file was
     written, which hook was copied. This is the piece nobody can assert from a

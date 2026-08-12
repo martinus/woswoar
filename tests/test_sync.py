@@ -471,6 +471,148 @@ class TestTwoMachines(SyncTestCase):
             self.assertEqual(recall("host"), ["from beta"])
 
 
+class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
+    """`.DS_Store` in the history checkout (#160).
+
+    Finder writes one into any directory it is asked to display, and the history
+    repo is a git working tree under the user's home -- so one arrives the first
+    time anybody looks at their history in a file manager. `sync` stages with
+    `git add -A`, so without a `.gitignore` it is committed and pushed, and two
+    machines whose Finders disagree about it produce a binary conflict on the
+    rebase `sync` does.
+
+    Written by hand here rather than by a Mac: that is the point. This has to be
+    pinned by the Linux suite or it regresses the moment nobody is testing on a
+    Mac -- which today is everybody.
+    """
+
+    def litter(self, fake: Fake, *directories: Path) -> None:
+        """Put a `.DS_Store` in each directory, as Finder would.
+
+        Takes paths from `store` rather than strings to join onto
+        `history_dir()`: the repo layout is that module's to know, and a
+        hand-spelled `hosts/<id>/<day>` plus `mkdir(parents=True)` would go on
+        creating an obsolete directory -- and passing -- if the layout changed.
+        """
+        for directory in directories:
+            (directory / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+
+    def test_the_repo_carries_a_gitignore_for_it(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            text = (store.history_dir() / store.GITIGNORE).read_text(encoding="utf-8")
+        self.assertIn(".DS_Store", text)
+
+    def test_a_repo_that_predates_it_acquires_one_on_the_next_sync(self) -> None:
+        """`init` is not a migration: nobody runs it twice, and re-running it
+        TOFU-pins every host in the repository besides.
+
+        Asserting it on a machine that has just enrolled proves nothing about
+        this -- the file is there either way. Deleting it and syncing is the
+        only fixture that can tell "written at enrolment" from "kept correct",
+        and without it a machine that inited on an earlier woswoar would stage a
+        `.DS_Store` forever.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            ignore = store.history_dir() / store.GITIGNORE
+            ignore.unlink()
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            self.assertTrue(ignore.is_file(), "an existing repo never gets the ignore rules")
+            self.assertIn(".DS_Store", ignore.read_text(encoding="utf-8"))
+
+    def test_supplying_it_does_not_make_every_later_sync_stage_the_tree(self) -> None:
+        """ "Only when absent", and that word is what this pins.
+
+        `git add -A` is a full stat of every chunk this machine ever published,
+        and `run` skips it when the writers say they wrote nothing -- so a
+        `write_gitignore` that rewrote the file each time would report a write on
+        every idle sync and put that stat back, once a minute, forever. Writing
+        identical bytes makes no commit, so a test that only counted commits
+        would pass either way; the staging is the observable thing.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            staged: list[bool] = []
+            real = sync._commit
+
+            def counted() -> bool:
+                staged.append(True)
+                return real()
+
+            with mock.patch.object(sync, "_commit", counted):
+                sync.run()
+            self.assertEqual(staged, [], "an idle sync stated the whole working tree")
+
+    def test_a_sync_neither_stages_it_nor_fails(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+        # Beside real chunks, in the directory a person would actually open --
+        # a repo of nothing but `.DS_Store` cannot tell an ignore rule from an
+        # empty commit.
+        with alpha.active():
+            self.litter(
+                alpha,
+                store.history_dir(),
+                store.repo_host_dir(alpha.id),
+                store.chunk_dir(alpha.id, "2023-11-14"),
+            )
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_002, "git commit")
+            report = sync.run()
+        # It pushed, so the commit that carried the second chunk really was made
+        # -- a run that quietly did nothing would also have staged no `.DS_Store`.
+        self.assertTrue(report.pushed, "the sync did not get as far as pushing")
+        self.assertEqual(report.chunks_written, 1)
+
+        tracked = self.git_in_repo(alpha, "ls-files").split()
+        self.assertTrue(tracked, "nothing is tracked, so this asserts nothing")
+        self.assertEqual(
+            [name for name in tracked if ".DS_Store" in name], [], "Finder's file was committed"
+        )
+
+    def test_a_peer_still_reads_the_history_beside_it(self) -> None:
+        """The claim that matters: the day is merged and verified, not merely
+        that nothing crashed."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "secret-marker-command")
+            sync.run()
+        beta = self.machine("beta")
+        with alpha.active():
+            sync.grant()
+            sync.run()
+        with alpha.active():
+            self.litter(alpha, store.chunk_dir(alpha.id, "2023-11-14"))
+            sync.run()
+
+        self.accept_everyone(beta)
+        with beta.active():
+            sync.run()
+            self.assertIn(
+                "secret-marker-command",
+                {entry.cmd for entry in cache.load_entries()},
+                "the day did not merge past Finder's file",
+            )
+
+    def test_it_is_not_mistaken_for_a_chunk_nobody_signed(self) -> None:
+        """A file in a day directory that no manifest lists is exactly what
+        `unlisted_chunks` exists to report. It must report *chunks*, not
+        everything -- or the first Finder visit reads as tampering."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+        with alpha.active():
+            self.litter(alpha, store.chunk_dir(alpha.id, "2023-11-14"))
+            self.assertEqual(sync.unlisted_chunks(), [])
+
+
 class TestImmutability(SyncTestCase):
     """The invariant the whole storage design rests on."""
 

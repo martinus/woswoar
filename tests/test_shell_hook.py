@@ -33,7 +33,14 @@ from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
-from .support import MACHINE_ID, Typed, WoswoarTestCase, requires_bash, run_in_pty
+from .support import (
+    MACHINE_ID,
+    Typed,
+    WoswoarTestCase,
+    requires_bash,
+    requires_bash5,
+    run_in_pty,
+)
 
 SHELL_DIR = Path(__file__).resolve().parent.parent / "woswoar" / "shell"
 BASH_HOOK = SHELL_DIR / "woswoar.bash"
@@ -61,19 +68,6 @@ ESCAPE_CORPUS = [
     "*?[]{}",
     "x" * 5000,
 ]
-
-
-def bash_major() -> int:
-    bash = shutil.which("bash")
-    if not bash:
-        return 0
-    out = subprocess.run(
-        [bash, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=False
-    )
-    return int(out.stdout.strip() or 0)
-
-
-requires_bash5 = unittest.skipUnless(bash_major() >= 5, "bash 5.0+ required")
 
 
 class ShellHookTestCase(WoswoarTestCase):

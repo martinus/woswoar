@@ -861,10 +861,24 @@ Runtime: **Python standard library only** — `dataclasses`, `pathlib`,
 
 External binaries: `fzf` (the UI), and `age` plus `git` (sync only). Development only: `ruff`, `mypy`, `shellcheck`.
 
-Supported: **bash 5.0+ on Linux.** bash 5 is required for `$EPOCHSECONDS` and
-`$EPOCHREALTIME`; without them the hot path would have to fork `date` on every
-command, giving up the property the whole design is built around. macOS ships
-bash 3.2 and is out of scope.
+Supported: **bash 5.0+ or zsh 5.0+, on Linux and macOS.** The version floors are
+the same reason in two dialects: bash 5 for `$EPOCHSECONDS` and
+`$EPOCHREALTIME`, zsh 5 for the `zsh/datetime` module that provides them.
+Without them the hot path would have to fork `date` on every command, giving up
+the property the whole design is built around.
+
+**macOS arrives through zsh, not through bash.** It ships bash 3.2 — a 2007
+release, kept for licensing reasons — so *bash on macOS* remains out of scope
+and the hook there correctly refuses to load. It also ships zsh 5.9, which is
+why the platform became reachable at all once the zsh hook existed. Two
+consequences worth stating rather than discovering:
+
+- **Fork-freedom is not verified on macOS.** There is no `strace`, and `dtruss`
+  needs SIP disabled, so the one property the whole design rests on is asserted
+  by CI on Linux and taken on the code's word on macOS. The hook is the same
+  file on both.
+- Python 3.10+ is a real obstacle there: the Xcode command line tools ship 3.9.
+  Homebrew or `uv` is the way in, and `docs/install.md` says so.
 
 ---
 

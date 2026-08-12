@@ -69,8 +69,10 @@ _BOILERPLATE = (
     sync.COMMIT_MESSAGE,
     store.README_CONTENT,
     store.GITATTRIBUTES_CONTENT,
+    store.GITIGNORE_CONTENT,
     store.README,
     store.GITATTRIBUTES,
+    store.GITIGNORE,
     store.RECIPIENTS,
     # The repo-layout names, from the module that owns them: tree objects
     # spell out every directory and file name under `hosts/`.
@@ -105,7 +107,16 @@ def _sandbox() -> Iterator[Path]:
     saved = {key: os.environ.get(key) for key in _ENV_KEYS}
     tmp = tempfile.mkdtemp(prefix="woswoar-prove-")
     try:
-        root = Path(tmp)
+        # Resolved, which is nothing on Linux and load-bearing on macOS: there
+        # `$TMPDIR` is `/var/folders/...` and `/var` is a symlink to
+        # `/private/var`. `_published_bytes` prunes git's object store by asking
+        # git for its own directory and comparing that against paths from
+        # `rglob` -- and git answers with the *real* path, so under two spellings
+        # of one directory the prune silently matches nothing: every loose object
+        # is then read raw and inflated, and the byte count double-counts. The
+        # proof still passes, which is what makes it worth resolving here rather
+        # than noticing later.
+        root = Path(tmp).resolve()
         (root / "home").mkdir()
         (root / "home" / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
         for key in _ENV_KEYS:

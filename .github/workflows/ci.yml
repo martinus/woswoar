@@ -353,3 +353,105 @@ jobs:
           run_as alpha trust --yes
           run_as alpha sync
           run_as alpha list --scope global | grep -q 'beta-marker-command'
+
+  macos:
+    # macOS arrives through zsh: it ships bash 3.2, which is below the hook's
+    # floor and refused, and zsh 5.9, which is not. So this job runs the suite,
+    # the sync ceremony and a real first-run install on a Mac -- everything
+    # except the two things that platform cannot answer, each excluded by name
+    # rather than by dropping a guard.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # Not the system python3: the Xcode command line tools ship 3.9, and
+          # woswoar needs 3.10+. That is the first wall a macOS user hits, and a
+          # job that quietly used a newer python than the docs describe would be
+          # the wrong kind of green.
+          python-version: "3.12"
+      - name: install age and fzf
+        # git, ssh-keygen and zsh 5.9 are already on the runner. fzf from brew
+        # satisfies `search.TRANSFORM_SINCE`, which the version assertion below
+        # pins rather than assumes -- the same check the Linux `test` job makes,
+        # because "brew's fzf is new enough" is a fact that can stop being true.
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install age fzf
+          age --version && fzf --version && zsh --version
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from woswoar import search
+          got = search.fzf_version()[1]
+          floor = search.TRANSFORM_SINCE
+          assert got is not None and got >= floor, f'fzf {got} is below {floor}'
+          "
+      # The four modules below are re-run immediately afterwards under
+      # `--no-skips`, so running them here as well is 79% of this job's work
+      # done twice -- `test_sync` alone is 75 s of the suite's 95 s. Measured:
+      # 11.8 s to 8.3 s wall, 174 s to 96 s of CPU, on a runner with three cores
+      # to absorb it. Nothing is lost; every exclusion here reappears below
+      # under a strictly stronger flag.
+      - run: |
+          python -m tools.run_tests \
+            --exclude tests.test_shell_hook_zsh \
+            --exclude tests.test_search \
+            --exclude tests.test_sync \
+            --exclude tests.test_install
+      # `--no-skips` per module, exactly as on Linux. What macOS cannot do is
+      # named rather than waved through:
+      #
+      #  * `tests.test_shell_hook`, the *bash* hook, gets no `--no-skips` step
+      #    at all: macOS ships bash 3.2, every class in it is `@requires_bash5`,
+      #    and the whole module therefore skips itself. Correct -- bash on macOS
+      #    is out of scope, not broken -- and worth saying plainly, because it
+      #    is the one suite here running without that guard.
+      #  * `TestForkFree` counts clones with `strace`, which does not exist on
+      #    macOS; `dtruss` needs SIP disabled. Fork-freedom is therefore proven
+      #    on Linux only, and `docs/install.md` says so rather than leaving it to
+      #    be assumed.
+      #  * `TestAZshAndABashShellShareOneHistory` drives both hooks at once, so
+      #    it needs a bash woswoar records from -- and the one here is 3.2. It
+      #    skips itself correctly; the exclusion is so that skipping is not
+      #    fatal *for this class alone* while staying fatal for the rest.
+      # No `--jobs 1` here, unlike the Linux `hook` job: that serialisation is
+      # for counting forks under strace, and the class that does it is excluded
+      # on the next line. Inheriting the flag would cost 65% for a measurement
+      # this step does not make.
+      - run: |
+          python -m tools.run_tests --only tests.test_shell_hook_zsh --no-skips \
+            --exclude tests.test_shell_hook_zsh.TestForkFree \
+            --exclude tests.test_shell_hook_zsh.TestAZshAndABashShellShareOneHistory
+      - run: python -m tools.run_tests --only tests.test_search --no-skips
+      - run: python -m tools.run_tests --only tests.test_sync --no-skips
+      # Same reason as the zsh suite above: the both-shells class needs a bash 5.
+      - run: |
+          python -m tools.run_tests --only tests.test_install --no-skips \
+            --exclude tests.test_install.TestBothShellsRecordIntoOneHistory
+      - name: install, and record from a real zsh
+        # The first-run flow on a machine that has never seen woswoar, which is
+        # what `install`'s shell detection decides on a real home directory.
+        # `mktemp -d` with no template: BSD mktemp traditionally wanted one, and
+        # this is the job that finds out whether that is still true.
+        run: |
+          set -euxo pipefail
+          export HOME="$(mktemp -d)"
+          touch "$HOME/.zshrc"
+
+          pip install .
+          woswoar --version
+          woswoar install
+          test -f "$HOME/.local/share/woswoar/woswoar.zsh"
+          grep -q 'woswoar' "$HOME/.zshrc"
+
+          zsh -f -i <<'EOF'
+          source "$HOME/.zshrc"
+          echo macos-end-to-end-marker
+          EOF
+          woswoar list --scope global | grep -q 'macos-end-to-end-marker'
+
+          # Not `|| true`, which the Linux job needs because fzf is absent
+          # there. Everything doctor checks is installed here, so a non-zero
+          # exit is a regression on the platform this job exists to cover, and
+          # masking it would leave the line asserting nothing.
+          woswoar doctor

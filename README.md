@@ -66,7 +66,7 @@ one machine. `woswoar` on its own is the only command you have to remember: it
 sets up when there is nothing installed, and afterwards says where this machine
 stands and names the one command to run next, if there is one.
 
-**Needs:** bash 5.0+ or zsh 5.0+ (Linux) · Python 3.10+ ·
+**Needs:** bash 5.0+ or zsh 5.0+ · Linux or macOS · Python 3.10+ ·
 [fzf](https://github.com/junegunn/fzf) ·
 [age](https://github.com/FiloSottile/age) and git *(sync only)* — but **not `age`
 as a snap**, which costs about 250 ms per call against 2 ms and turns a `sync`

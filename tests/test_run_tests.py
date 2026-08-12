@@ -144,6 +144,50 @@ class TestPacking(unittest.TestCase):
         self.assertFalse(run_tests.selects("tests.test_sync_chunks.TestX", "tests.test_sync"))
 
 
+class TestExclusionKeepsTheRestUnderNoSkips(unittest.TestCase):
+    """The macOS case: one class cannot run there, and the guard must survive it.
+
+    `strace` does not exist on macOS, so `TestForkFree` cannot run -- and
+    dropping `--no-skips` for the whole module to accommodate it is exactly the
+    silently-green suite that flag exists to prevent.
+    """
+
+    def test_an_excluded_class_does_not_run_and_does_not_count_as_a_skip(self) -> None:
+        with fixture(PASSES, SKIPS) as classes:
+            code, text = run_main("--jobs", "2", "--no-skips", "--exclude", classes[1])
+        self.assertEqual(code, 0, text)
+        self.assertIn("Ran 1 test", text)
+
+    def test_without_the_exclusion_the_same_run_is_red(self) -> None:
+        """Otherwise the test above passes against an `--exclude` that does
+        nothing, because the class it names never skipped."""
+        with fixture(PASSES, SKIPS):
+            code, _ = run_main("--jobs", "2", "--no-skips")
+        self.assertEqual(code, 1)
+
+    def test_an_exclusion_that_matches_nothing_is_fatal(self) -> None:
+        """A renamed class would otherwise stop being excluded silently, and the
+        job that needs it is the one running where the tool is absent."""
+        with fixture(PASSES):
+            code, text = run_main("--jobs", "2", "--exclude", "zz_fixture_0.TestGone")
+        self.assertEqual(code, 1)
+        self.assertIn("no test class matches --exclude", text)
+
+    def test_one_stale_pattern_beside_a_live_one_is_still_fatal(self) -> None:
+        """The shape the caller actually uses: the macOS job passes two.
+
+        Asking only whether the *set* shrank cannot see this -- the live pattern
+        shrinks it -- so a single-pattern test passes against a check that lets a
+        rename go by silently. This is the case that distinguishes them.
+        """
+        with fixture(PASSES, SKIPS) as classes:
+            code, text = run_main(
+                "--jobs", "2", "--exclude", classes[1], "--exclude", "zz_fixture_0.TestGone"
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("TestGone", text)
+
+
 class TestABatchThatDies(unittest.TestCase):
     """The failure a serial runner cannot have: a worker that never reports."""
 

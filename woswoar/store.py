@@ -31,6 +31,7 @@ _NAME_FILE = ".name"
 
 RECIPIENTS = "recipients.txt"
 GITATTRIBUTES = ".gitattributes"
+GITIGNORE = ".gitignore"
 README = "README.md"
 FORMAT = "FORMAT"
 
@@ -99,6 +100,28 @@ what state this repository is in, run `woswoar doctor`.
 #: only place a merge conflict could arise. A union merge resolves it: the file
 #: is an unordered set of public keys, and keeping both sides is always right.
 GITATTRIBUTES_CONTENT = f"{RECIPIENTS} merge=union\n*{_CHUNK_SUFFIX} -diff -merge -text\n"
+
+#: Finder's per-directory metadata file, by name in the one place that owns the
+#: layout. It turns up in `logs/` and in the history checkout alike, so both the
+#: privacy walk and the repository's ignore rules are talking about this string.
+_FINDER_METADATA = ".DS_Store"
+
+#: What must never be committed, whoever is browsing the checkout. Finder writes
+#: a `.DS_Store` into any directory it is asked to display, and this is a git
+#: working tree that lives under the user's home -- so one arrives the first time
+#: anybody looks at their history in a file manager.
+#:
+#: Not a tidiness rule. `sync` stages with `git add -A`, so without this the file
+#: is committed and pushed to every peer; two machines whose Finders disagree
+#: about it then produce a binary conflict on the rebase that `sync` does, in a
+#: file no part of woswoar knows anything about. `.gitattributes` cannot express
+#: this -- it marks how a tracked file is treated, not whether it is tracked --
+#: so it is a second file.
+#:
+#: The chunk suffix is deliberately *not* here. A chunk that no signed manifest
+#: accounts for is a thing woswoar reports; a chunk git silently ignores is one
+#: nobody ever sees.
+GITIGNORE_CONTENT = f"{_FINDER_METADATA}\n"
 
 
 class Machine(NamedTuple):
@@ -269,6 +292,17 @@ def _private_paths() -> Iterator[tuple[Path, bool]]:
 
     It also yields whether each path is a directory, which the walk already
     knows and which the callers would otherwise re-stat.
+
+    `.DS_Store` is skipped, and that is a decision rather than an oversight. It
+    is Finder's file, not woswoar's: it records icon positions and view settings
+    for a directory somebody opened, holds no command and no path outside the
+    one it sits in, and is recreated at whatever the ambient umask says the
+    moment that directory is browsed again. Both callers would otherwise be
+    wrong about it -- `harden` would keep re-tightening a file that keeps coming
+    back, and `readable_by_others` would report an exposure that no action by
+    the user can durably clear, which is a `doctor` that stays red for something
+    nobody can fix. That teaches people to stop reading `doctor`, which is worth
+    more than the mode of this file.
     """
     history = history_dir().name
     for root in (data_dir(), config_dir(), cache_dir()):
@@ -282,6 +316,8 @@ def _private_paths() -> Iterator[tuple[Path, bool]]:
             for name in dirs:
                 yield here / name, True
             for name in files:
+                if name == _FINDER_METADATA:
+                    continue
                 yield here / name, False
 
 

@@ -153,6 +153,14 @@ def main(argv: list[str] | None = None) -> int:
         help="treat a skipped test as a failure, for jobs that install every optional tool",
     )
     parser.add_argument("--only", default="", help="run only this module or class")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="MODULE_OR_CLASS",
+        help="skip this module or class entirely; repeatable, and each pattern must "
+        "match. For a suite that cannot run somewhere, so the rest keeps --no-skips",
+    )
     parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     parser.add_argument("--out", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -167,6 +175,18 @@ def main(argv: list[str] | None = None) -> int:
         if not classes:
             print(f"::error::no test class matches {args.only!r}")
             return 1
+    # One pattern at a time, and each has to match something. Checking only
+    # that the *set* shrank would let a renamed class stop being excluded as
+    # long as any other pattern still matched -- and the job that needs this
+    # passes two, so that is the likely case rather than the exotic one. What it
+    # would cost is a red build on the platform the tool is missing from, which
+    # is precisely what naming the class was meant to avoid.
+    for pattern in args.exclude:
+        kept = {name: ids for name, ids in classes.items() if not selects(name, pattern)}
+        if len(kept) == len(classes):
+            print(f"::error::no test class matches --exclude {pattern!r}")
+            return 1
+        classes = kept
     expected = {tid for ids in classes.values() for tid in ids}
 
     # Twice the CPUs, because the work is subprocess wait rather than CPU:

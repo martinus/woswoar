@@ -1986,6 +1986,13 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # `init`, which nobody runs twice. This is the migration, and it costs
         # one `is_file` on every idle sync.
         marked = write_repo_format()
+        # The same argument, for the same reason, one release later: a machine
+        # that ran `init` before `.gitignore` existed would otherwise go on
+        # staging a `.DS_Store` forever, which is the whole failure the file was
+        # added to prevent. Re-running `init` is not the answer -- it also
+        # TOFU-pins every host currently in the repo, which is a decision, not a
+        # migration.
+        marked = write_gitignore() or marked
 
         # Before anything is trusted, and only ever subtracting -- see
         # `apply_withdrawals`.
@@ -2389,6 +2396,24 @@ def write_repo_format() -> bool:
     return True
 
 
+def write_gitignore() -> bool:
+    """Write the repo's ignore rules if they are absent. Says whether it wrote.
+
+    Only when absent, and deliberately *not* compared and rewritten the way
+    `_write_repo_metadata` treats `.gitattributes`. This runs on every sync
+    rather than only at enrolment, so two machines on different versions would
+    have a file to take turns overwriting and push to each other -- the failure
+    `store.README_CONTENT` describes, and the reason `write_repo_format` is
+    written this way too. Enrolment still rewrites it to match; a sync only ever
+    supplies a missing one.
+    """
+    path = store.history_dir() / store.GITIGNORE
+    if path.is_file():
+        return False
+    store.write_atomic(path, store.GITIGNORE_CONTENT.encode("utf-8"))
+    return True
+
+
 def repo_format_status() -> IdentityStatus:
     """Whether this machine may write to the repository as it stands.
 
@@ -2433,11 +2458,18 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     """Ensure this machine is enrolled. Returns whether anything changed."""
     changed = False
 
-    attrs = store.history_dir() / store.GITATTRIBUTES
-    current = attrs.read_text(encoding="utf-8") if attrs.is_file() else ""
-    if current != store.GITATTRIBUTES_CONTENT:
-        store.write_atomic(attrs, store.GITATTRIBUTES_CONTENT.encode("utf-8"))
-        changed = True
+    # Both compared and rewritten rather than written once, because both hold
+    # content woswoar depends on rather than prose -- see `store.README_CONTENT`
+    # for the file where that argument comes out the other way.
+    for name, content in (
+        (store.GITATTRIBUTES, store.GITATTRIBUTES_CONTENT),
+        (store.GITIGNORE, store.GITIGNORE_CONTENT),
+    ):
+        path = store.history_dir() / name
+        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if current != content:
+            store.write_atomic(path, content.encode("utf-8"))
+            changed = True
 
     # Only when absent -- see `store.README_CONTENT` for why it is not compared
     # and rewritten the way `.gitattributes` is.
