@@ -827,13 +827,20 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
                     self.assertEqual(self.next_scope(prompt), search._NEXT[scope])
 
     def test_it_repaints_the_prompt_it_reads_back(self) -> None:
-        """`change-prompt` is not decoration: the next press reads it."""
+        """`change-prompt` is not decoration: the next press reads it.
+
+        Against `_prompt_for` rather than a literal `woswoar (host) `. This
+        class is not sandboxed -- it drives the emitted shell and nothing else --
+        so a literal made the assertion depend on whether the machine running
+        the suite happens to have a name woswoar can show. It named the
+        developer's laptop the day `host` gained a label.
+        """
         out = run_binding(
             search._cycle_binding("woswoar", "", " --host-width 0"),
             "transform:",
             "woswoar (global) ",
         )
-        self.assertIn("change-prompt(woswoar (host) )", out)
+        self.assertIn(f"change-prompt({search._prompt_for('host')})", out)
 
     def test_the_reload_keeps_the_colour_and_the_width(self) -> None:
         """A cycle that dropped either would change the layout mid-picker, and
@@ -1776,6 +1783,78 @@ class DirScopeCase(WoswoarTestCase):
         return sorted(recalled(scope))
 
 
+class TestTheMachineInThePrompt(WoswoarTestCase):
+    """`host` narrows to this machine, and nothing on screen said which one.
+
+    Below two machines `host_width_for` draws no machine column at all, so in
+    that scope the prompt was the only place the answer could go -- and being
+    ssh'd somewhere is exactly when Ctrl-H gets pressed. Asked for right after
+    `dir` gained its label: "the other search scopes show nothing, e.g. host
+    could show the current host".
+    """
+
+    def name_this_machine(self, name: str) -> None:
+        """Give this machine a display name, the way `save_machine` does."""
+        store.save_machine(store.machine()._replace(name=name))
+
+    def test_it_names_this_machine(self) -> None:
+        self.name_this_machine("martinus@thinkpad")
+        self.assertEqual(search._prompt_for("host"), "woswoar (host thinkpad) ")
+
+    def test_it_shows_the_half_the_machine_column_would_show(self) -> None:
+        """`user@host` on one person's machines differs in the host, which is
+        why the column tries that half first. The prompt and the column must not
+        disagree about the same machine.
+        """
+        self.name_this_machine("martinus@thinkpad")
+        machine_id = store.machine().id
+        self.assertEqual(
+            search._prompt_for("host"),
+            f"woswoar (host {search.host_labels({machine_id})[machine_id]}) ",
+        )
+
+    def test_a_machine_with_no_name_yet_is_not_named_by_its_id(self) -> None:
+        """`host_label` falls back to eight hex characters, which is right for a
+        column that has to say *something* per row and answers nothing here."""
+        machine_id = store.machine().id
+        (store.host_dir(machine_id) / ".name").unlink(missing_ok=True)
+        self.assertEqual(search._prompt_for("host"), "woswoar (host) ")
+
+    def test_building_the_prompt_does_not_mint_an_identity(self) -> None:
+        """`store.machine()` *generates* one when the file is absent. Building a
+        label is not a reason to write a machine id to disk -- and the four
+        direct keys are built whatever scope the picker opens in, so this would
+        run for someone who never presses Ctrl-H.
+        """
+        store.machine_file().unlink(missing_ok=True)
+        self.assertEqual(search._prompt_for("host"), "woswoar (host) ")
+        self.assertFalse(store.machine_file().exists(), "asking for a prompt created an identity")
+
+    def test_a_machine_name_the_parsers_would_read_is_not_shown(self) -> None:
+        """The name is a person's to choose and reaches the same two parsers the
+        directory does -- `woswoar rename` writes whatever it is given."""
+        self.name_this_machine("box$(whoami)")
+        self.assertEqual(search._prompt_for("host"), "woswoar (host) ")
+
+    def test_the_cycle_repaints_it_too(self) -> None:
+        """Through a real `sh`: landing on `host` by cycling and by Ctrl-H must
+        leave the same string, or the next press reads a different scope."""
+        self.name_this_machine("martinus@thinkpad")
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        out = run_binding(binding, "transform:", "woswoar (global) ")
+        painted = out.split("change-prompt(", 1)[1].split(")+change-preview", 1)[0]
+        self.assertEqual(painted, search._prompt_for("host"))
+
+    def test_the_prompt_it_paints_is_still_read_back_as_host(self) -> None:
+        """A machine name is user text in the string the scope is kept in --
+        the same hazard the directory label had, and `~/src/session-manager` is
+        the shape that used to misroute it."""
+        self.name_this_machine("session-manager")
+        binding = search._cycle_binding("woswoar", "", " --host-width 0")
+        out = run_binding(binding, "transform:", search._prompt_for("host"))
+        self.assertIn(f"--scope {search._NEXT['host']})", out)
+
+
 class TestTheDirectoryInThePrompt(DirScopeCase):
     """`woswoar (dir)` said which scope you were in and not which directory.
 
@@ -1794,12 +1873,18 @@ class TestTheDirectoryInThePrompt(DirScopeCase):
         self.stand_in(self.home / "src/woswoar")
         self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/woswoar) ")
 
-    def test_no_other_scope_gains_a_label(self) -> None:
-        """There is nothing for them to add: `global` is every machine, `host`
-        is this one, `session` is this shell. Only `dir` answers a question the
-        word itself does not."""
+    def test_global_and_session_gain_nothing(self) -> None:
+        """A decision, not an omission.
+
+        `global` is every machine, which is what the word says -- a count of
+        them describes the history rather than the scope, and moves under
+        someone as they sync. `session` is the shell being typed into, and its
+        id is `<second>-<pid>` in hex, which nobody recognises.
+
+        `host` is deliberately absent from this list; it has its own class.
+        """
         self.stand_in(self.home)
-        for scope in ("global", "host", "session"):
+        for scope in ("global", "session"):
             with self.subTest(scope=scope):
                 self.assertEqual(search._prompt_for(scope), f"woswoar ({scope}) ")
 

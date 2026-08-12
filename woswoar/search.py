@@ -177,7 +177,7 @@ def host_label(host_id: str) -> str:
     is what the host directory is called.
     """
     name = make_inert(store.host_name(host_id)).strip()
-    return name or host_id[:8]
+    return name or host_id_placeholder(host_id)
 
 
 def host_labels(hosts: set[str]) -> dict[str, str]:
@@ -283,12 +283,12 @@ def _here_label() -> str:
     return keys[0] if keys else "this directory"
 
 
-#: How much of the prompt a directory may take. The prompt and the query share
-#: one line, so every character here is one fewer to type in.
+#: How much of the prompt a label may take. The prompt and the query share one
+#: line, so every character here is one fewer to type in.
 _PROMPT_LABEL_MAX = 28
 
-#: What a directory may be spelled with to reach the prompt: letters and digits
-#: in any script, and the six punctuation marks a path is actually made of.
+#: What a label may be spelled with to reach the prompt: letters and digits in
+#: any script, and the six punctuation marks a path or a machine name is made of.
 #:
 #: An allowlist, and that is the whole point. The label passes through two
 #: languages on its way to the screen, and a denylist has to be right about
@@ -301,34 +301,86 @@ _PROMPT_LABEL_MAX = 28
 #: silently renamed `~/50%-off` to `~/500ff` and truncated the action string
 #: outright for a name ending in `%`, and it missed the fzf layer entirely.
 #:
-#: Deciding what may pass is a fact about paths; deciding what may not is a fact
-#: about two parsers, and only one of those stays true when fzf gains a feature.
+#: Deciding what may pass is a fact about paths and hostnames; deciding what may
+#: not is a fact about two parsers, and only one of those stays true when fzf
+#: gains a feature.
 _PROMPT_SAFE_PUNCTUATION = frozenset("._-/~ ")
 
 
-def _prompt_label() -> str:
-    """The current directory, as the prompt should show it -- or "" for silence.
+def _safe_for_prompt(label: str) -> str:
+    """``label`` if the prompt can carry it verbatim, else "".
 
-    Silence rather than escaping when the path is spelled with anything else:
-    falling back to `woswoar (dir)`, which is what every release before this one
-    showed for every directory, costs the person with a `(` in a directory name
-    nothing they had. Escaping through two parsers to gain them a label is the
-    trade the other way round, and the layer that would get it wrong runs on
-    every keypress.
+    Silence rather than escaping: falling back to `woswoar (dir)`, which is what
+    every release before 0.10 showed for every directory, costs the person with
+    a `(` in a name nothing they had. Escaping through two parsers to gain them
+    a label is the trade the other way round, and the layer that would get it
+    wrong runs on every keypress.
 
     Cut from the left, because `.../woswoar/tests` says which directory it is
-    and `~/src/very/deep/...` does not.
+    and `~/src/very/deep/...` does not -- and because a machine called
+    `martinus@DT-24YY` is told apart by its end too, which is the argument
+    `_ELLIPSIS` already makes for the machine column.
     """
-    # `_here()` rather than `_here_label()`, which answers "this directory" when
-    # there is none -- a sentence, in a slot the rest of this reads as a path.
-    # An empty tuple is that case, and silence is the right answer to it.
-    keys = _here()
-    label = keys[0] if keys else ""
     if not label or any(
         not char.isalnum() and char not in _PROMPT_SAFE_PUNCTUATION for char in label
     ):
         return ""
     return _clip(label, _PROMPT_LABEL_MAX)
+
+
+def _prompt_suffix(scope: Scope) -> str:
+    """What follows the scope name in the prompt, or "" where nothing does.
+
+    Two of the four scopes have something to add and two do not, and the two
+    that do not are a decision rather than an omission:
+
+    `global` is every machine, which is what the word says; a count of them is a
+    fact about the history rather than about the scope, and it would change
+    under someone as they sync.
+
+    `session` is this shell -- the one being typed into. Its id is
+    `<start second>-<pid>` in hex, which nobody recognises, and "which shell am
+    I in" is not a question the person holding the keyboard has.
+
+    `host` is the one that needed it. Below two machines the machine column is
+    not drawn at all (`host_width_for`), so in that scope nothing on screen says
+    *which* machine -- and being ssh'd somewhere is exactly when you press
+    Ctrl-H.
+    """
+    if scope == "dir":
+        # `_here()` rather than `_here_label()`, which answers "this directory"
+        # when there is none -- a sentence, in a slot the rest of this reads as
+        # a path. An empty tuple is that case, and silence is the answer to it.
+        keys = _here()
+        return _safe_for_prompt(keys[0] if keys else "")
+    if scope == "host":
+        return _safe_for_prompt(_this_machine_label())
+    return ""
+
+
+def _this_machine_label() -> str:
+    """This machine, spelled as the machine column spells it -- or "".
+
+    Guarded on the file existing rather than asking `store.machine()` outright,
+    which *generates* an identity when there is none. Building a prompt is not a
+    reason to write a machine id to disk, even though the `host` scope goes on
+    to read one a moment later: a label is the last thing that should create
+    state.
+
+    `host_labels` rather than the raw name, so the prompt and the column agree
+    on which half of `user@host` to show. An id where a name should be means no
+    `.name` file has arrived yet, and eight hex characters answer nothing.
+    """
+    if not store.machine_file().is_file():
+        return ""
+    machine_id = store.machine().id
+    label = host_labels({machine_id})[machine_id]
+    return "" if label == host_id_placeholder(machine_id) else label
+
+
+def host_id_placeholder(host_id: str) -> str:
+    """What `host_label` falls back to when a machine has no name yet."""
+    return host_id[:8]
 
 
 def _prompt_for(scope: Scope) -> str:
@@ -339,11 +391,8 @@ def _prompt_for(scope: Scope) -> str:
     matches the grammar that function documents. `_timeline_binding` is the one
     that does the latter: it prepends `timeline `, and the arms name both.
     """
-    if scope == "dir":
-        label = _prompt_label()
-        if label:
-            return f"woswoar (dir {label}) "
-    return f"woswoar ({scope}) "
+    suffix = _prompt_suffix(scope)
+    return f"woswoar ({scope} {suffix}) " if suffix else f"woswoar ({scope}) "
 
 
 def empty_note(scope: Scope) -> str | None:
@@ -1083,14 +1132,20 @@ def _cycle_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
 
     The prompt is a second variable for the same reason. `_prompt_for` cannot be
     asked here what to paint, because which scope this lands on is not known
-    until the shell has run -- so the one scope with anything to add supplies its
-    arm, and every other falls through to its own name. Landing on `dir` by
-    cycling and by pressing Ctrl-O must show the same prompt, or the next press
-    reads a different scope from each.
+    until the shell has run -- so every scope with something to add supplies an
+    arm and the rest fall through to their own name. Landing on a scope by
+    cycling and by pressing its direct key must leave the same prompt, or the
+    next press reads a different scope from each.
+
+    Built from `SCOPES` rather than naming `dir`, which is what it named while
+    `dir` was the only labelled scope. `host` is the second, and a third would
+    otherwise be a silent no-op here while the direct key painted it.
     """
-    label = _prompt_label()
-    arm = f'case "$n" in dir) p="dir {label}" ;; *) p=$n ;; esac; ' if label else ""
-    prompt = "woswoar ($p) " if label else "woswoar ($n) "
+    labelled = {scope: _prompt_suffix(scope) for scope in SCOPES}
+    labelled = {scope: suffix for scope, suffix in labelled.items() if suffix}
+    arms = "".join(f'{scope}) p="{scope} {suffix}" ;; ' for scope, suffix in labelled.items())
+    arm = f'case "$n" in {arms}*) p=$n ;; esac; ' if arms else ""
+    prompt = "woswoar ($p) " if arms else "woswoar ($n) "
     switch = _switch_to(self_cmd, "$n", dedup_flag, width, prompt, row=_ESCAPED_N)
     script = _scope_case("n", _NEXT) + arm + f'printf "{switch}"'
     return f"--bind=ctrl-r:transform:{script}"
