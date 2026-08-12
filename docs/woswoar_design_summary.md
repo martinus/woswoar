@@ -602,9 +602,27 @@ Each sync encrypts only the lines added since the last sync into a brand-new,
 never-modified file:
 
 ```
+history/FORMAT                                        woswoar-repo-1, plaintext
 history/hosts/<id>/2026-07-29/<synctime>-<rand>.age   one plain age file
 history/hosts/<id>/keys/2026-07-29.age                that day's identity, sealed to all recipients
 ```
+
+**`FORMAT` names the layout, and it is there before there is anything to
+upgrade.** The cache carries `woswoar-cache-2` and a manifest carries
+`woswoar-manifest-v1` inside its signed bytes; the repository was the one format
+woswoar owns that said nothing about itself. That is only fixable early: a
+machine still on the old version does not write the marker, so a layout change
+that needed one would find the repositories it has to migrate silent about which
+shape they are. Written by `init` and by the first `sync` that finds it absent,
+so an existing installation acquires it with nothing to run.
+
+It is read but barely enforced. A version *newer* than the running woswoar
+refuses the whole sync -- nothing exported, nothing merged, because publishing
+into a shape this version does not understand would be permanent in an
+append-only repo. An older version, an absent file, or content that does not
+parse all read as "this shape" and proceed: the file sits in a repository anyone
+with push access can write, and refusing on garbage would hand any of them a way
+to stop every machine syncing with four bytes.
 
 A chunk covers exactly one plaintext day file, so a machine offline for five
 days emits five chunks. One directory per day keeps a directory to a day's
@@ -830,6 +848,9 @@ Encrypted contents and opaque machine ids still leave the number of machines,
 commit timestamps, and approximate command volume per day visible. Accepted.
 The one shared mutable file is `recipients.txt` (plaintext SSH *public* keys,
 changed only at onboarding); `merge=union` in `.gitattributes` resolves it.
+`FORMAT` is plaintext too and adds nothing: it says which layout the directory
+listing is already showing. It needs no merge rule — it is written once, only
+when absent, so two machines racing to create it write the same bytes.
 
 ---
 

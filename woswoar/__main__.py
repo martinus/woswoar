@@ -456,6 +456,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if sync.is_repo():
         info("remote", sync.remote_summary())
+
+        # The one fact about the repository that decides whether this machine
+        # may write to it at all, and the only place a person can see it: the
+        # marker is a file nobody would think to `cat`, and `sync` mentions it
+        # only by refusing. The verdict comes from `sync` rather than being
+        # re-derived here, like every other line in this block.
+        repo_format = sync.repo_format_status()
+        check("repo format", repo_format.ok, repo_format.detail)
         status = sync.signing_status(store.machine())
         check("signing", status.ok, status.detail)
 
