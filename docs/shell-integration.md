@@ -67,13 +67,23 @@ Switch scope without leaving the picker:
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | **dir** — this directory and below |
 
 <kbd>Ctrl</kbd>+<kbd>R</kbd> inside the picker walks the same four in that order.
-The prompt says which one you are in — and for `dir` it says *which* directory,
-`woswoar (dir ~/src/woswoar)`, because the word on its own does not answer the
-question you switched scope to ask. A long path is cut from the left, keeping
-the end that identifies it. A path spelled with anything beyond letters, digits
-and `._-/~ ` is left off entirely rather than escaped — the label crosses fzf's
-action parser and a shell on its way to the screen, and going quiet there costs
-you only what every earlier release showed anyway.
+
+**The prompt says which scope you are in, and for two of them *which one*:**
+`woswoar (dir ~/src/woswoar)` and `woswoar (host thinkpad)`. Those are the two
+where the word alone does not answer the question you switched scope to ask —
+and for `host` the prompt is the only place it can, because below two machines
+the machine column is not drawn at all.
+
+`global` and `session` add nothing, deliberately. `global` is every machine,
+which is what the word says; a count of them describes your history rather than
+the scope. `session` is the shell you are typing into, and its id is a hex pair
+nobody recognises.
+
+A long label is cut from the left, keeping the end that identifies it — the
+tail of a path, and the host half of `user@host`. A label spelled with anything
+beyond letters, digits and `._-/~ ` is left off entirely rather than escaped:
+it crosses fzf's action parser and a shell on its way to the screen, and going
+quiet costs you only what every release before 0.10 showed anyway.
 
 **`dir` spans machines, and that is deliberate.** `~/src/woswoar` on your laptop
 and on your desktop is the same project, and that cross-machine question is the
