@@ -168,7 +168,7 @@ exists so that nobody has to rediscover it.
 grammar, trust and pinning, manifests, the chunk codec, and git plumbing — plus
 the orchestration that drives them and the status queries `doctor` asks. The
 visible symptom is `sync.Report`: seventeen fields, each a failure from a
-different one of those layers, rendered by eleven consecutive `if` blocks in
+different one of those layers, rendered by twelve consecutive `if` blocks in
 `cmd_sync`. A new failure mode therefore means editing `Report`, `run`,
 `cmd_sync` and `test_sync.py` together.
 
@@ -189,8 +189,18 @@ why everything that wants `logs_dir()` currently depends on the chunk layout too
 counts; `deps.report` returns prose; `progress` uses a `Protocol` with two
 implementations. Each is defensible alone. Together they mean there is no answer
 to "how should a new check report itself?", which is the gap `doctor` falls into
-— four of its checks come from `sync` as `IdentityStatus` values and the other
-nine are derived inline in the CLI.
+— four of its lines come from `sync` as `IdentityStatus` values, and the rest of
+its eighteen `check` calls are derived inline in the CLI, where only a test that
+greps stdout can reach them.
 
-These are tracked as issues rather than fixed in passing; the layering is what
-makes them fixable one at a time.
+These are tracked as issues rather than fixed in passing, and the layering above
+is what makes them fixable one at a time. The order is not the order they are
+listed in — the two cheap ones come first because they make the expensive one
+smaller:
+
+| | issue |
+|---|---|
+| 1 | [#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`. Mechanical, and it takes the chunk layout out of `search`'s dependency cone. |
+| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting, `doctor` first. This is what shrinks `Report`. |
+| 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
+| 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |
