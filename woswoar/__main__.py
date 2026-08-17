@@ -15,18 +15,10 @@ from typing import TYPE_CHECKING
 from . import __version__, cache, importer, search, store
 from .entry import make_inert
 from .errors import WoswoarError
-from .report import Check
+from .report import Check, paragraphs
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotations need it.
     from .sync import Failure, Reader, ReencryptReport
-
-#: Both "no repo key yet" and "some days unreadable" have the same fix, and
-#: used to say so in two independently worded paragraphs.
-_GRANT_REMEDY = (
-    "On a machine that is already enrolled run:\n"
-    "    woswoar accept\n"
-    "then sync here again. Nothing is lost in the meantime."
-)
 
 #: The hook each shell sources, and the file each shell reads at the start of an
 #: interactive session. Two hooks rather than one that branches: the bash one is
@@ -296,21 +288,6 @@ def cmd_search(args: argparse.Namespace) -> int:
         return 1
     print(selection)
     return 0
-
-
-def _restore_remedy(path: str) -> str:
-    """How to recover a file a peer deleted from the history repo.
-
-    Deleting one is a commit like any other and woswoar never rewrites history,
-    so the blob is still reachable in every clone. Shared by the two files this
-    can happen to, so the recipe cannot drift between their messages.
-    """
-    return (
-        "It is still in git history -- woswoar never rewrites it, so every clone\n"
-        "has the blob. To put it back:\n"
-        f"    git -C <history> log --diff-filter=D -- {path}\n"
-        f"    git -C <history> show <commit>^:{path} > that path\n"
-    )
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -617,139 +594,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # failure is stale, and someone who fixed the problem by hand should not
     # have to wait for a background run to stop being told about it.
     sync.clear_failure()
-    if report.revoked:
-        print(
-            "This machine's access to the shared history was revoked, so nothing\n"
-            "is published from here and every other machine refuses what it already\n"
-            "published. This is not something 'woswoar grant' can undo -- a\n"
-            "revocation is permanent, deliberately.\n\n"
-            "Commands are still being recorded locally, and 'woswoar list' still\n"
-            "shows everything this machine had before. To take part again, enrol\n"
-            "with a fresh identity:  woswoar init <url> --new-identity",
-            file=sys.stderr,
-        )
-        return 0
-    print(
-        f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
-        f"merged {report.lines_imported} line(s) from {report.chunks_merged} chunk(s) "
-        f"across {len(report.hosts_seen)} other host(s)"
-    )
-    if report.pushed:
-        print("in sync with the remote")
-    elif not sync.has_remote():
-        print("no remote configured - history is local only")
 
-    if report.unreadable:
-        days = len(report.unreadable)
+    # The summary is stdout and the notices are stderr, which is the one thing
+    # this function still decides. Everything they *say* is `Report.notices`,
+    # because what a field means is sync's to know -- twelve `if report.X:`
+    # blocks lived here, so "does this run warn about a changed signer" was a
+    # question only a test that grepped stderr could ask.
+    if not report.silent:
         print(
-            f"\n{days} day(s) of history are sealed to recipients that do not include\n"
-            f"this machine - it joined after they were written.\n{_GRANT_REMEDY}",
-            file=sys.stderr,
+            f"exported {report.lines_exported} line(s) in {report.chunks_written} chunk(s); "
+            f"merged {report.lines_imported} line(s) from {report.chunks_merged} chunk(s) "
+            f"across {len(report.hosts_seen)} other host(s)"
         )
+        if report.pushed:
+            print("in sync with the remote")
+        elif not sync.has_remote():
+            print("no remote configured - history is local only")
 
-    if report.stale:
-        stale = ", ".join(sorted(report.stale))
-        print(
-            f"\n{len(report.stale)} day(s) could not be rebuilt, and were left exactly as\n"
-            "they were rather than rewritten from the part that could be read:\n"
-            f"{stale}\n"
-            "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
-            "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
-            "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
-            "did.",
-            file=sys.stderr,
-        )
-
-    if report.untrusted:
-        print(
-            f"\n{len(report.untrusted)} machine(s) publish history this one has not been\n"
-            "told to accept, so none of it was merged. That is what a machine enrolled\n"
-            "since this one last looked is supposed to look like.\n"
-            "    woswoar accept",
-            file=sys.stderr,
-        )
-
-    if report.unpinned:
-        print(
-            f"\n{len(report.unpinned)} machine(s) were withdrawn by a revocation. Nothing\n"
-            "they publish is accepted here any more, including history they published\n"
-            "before it that this machine had not yet merged.",
-            file=sys.stderr,
-        )
-
-    if report.changed_signer:
-        print(
-            f"\nWARNING: {len(report.changed_signer)} machine(s) now sign with a different\n"
-            "key than the one accepted here, and nothing from them was merged. That is\n"
-            "either a machine that was re-enrolled or someone rewriting the repository,\n"
-            "and woswoar cannot tell which. If you re-enrolled it, accept the new key:\n"
-            "    woswoar trust --replace",
-            file=sys.stderr,
-        )
-
-    if report.unsignable:
-        print(
-            f"\nWARNING: {len(report.unsignable)} day(s) of this machine's own history\n"
-            "could not be published, because the signed list already in the repository\n"
-            "for them is not one this machine can verify. Publishing a replacement\n"
-            "would disown everything it published earlier on those days.\n"
-            "If this machine's signing key was replaced, that is why: days it signed\n"
-            "with the old one stay as they are, and new days publish normally.",
-            file=sys.stderr,
-        )
-
-    if report.orphaned:
-        lost = ", ".join(sorted(report.orphaned))
-        print(
-            f"\nWARNING: {len(report.orphaned)} day(s) of this machine's own history\n"
-            f"cannot be published: {lost}\n"
-            "Their sealed key is missing from the repository while chunks encrypted to\n"
-            "it are still there. Those chunks are unreadable by every machine, and a\n"
-            "new key would not change that -- so nothing more is written for those\n"
-            "days rather than adding chunks nobody will ever read.\n"
-            "The commands themselves are still in this machine's own logs.\n"
-            f"{_restore_remedy('hosts/<id>/keys/<day>.age')}"
-            "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
-            "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
-            "this machine starts a new key and publishes again.",
-            file=sys.stderr,
-        )
-
-    if report.manifest_missing:
-        lost = ", ".join(sorted(report.manifest_missing))
-        print(
-            f"\nWARNING: {len(report.manifest_missing)} day(s) of this machine's own\n"
-            f"history cannot be published: {lost}\n"
-            "The signed list this machine published for them is gone from the\n"
-            "repository. Signing a replacement would name only what is written now,\n"
-            "so every chunk published earlier that day would stop being one any peer\n"
-            "accepts. Nothing is written for those days instead.\n"
-            f"{_restore_remedy('hosts/<id>/manifests/<day>')}"
-            "'woswoar doctor' prints the days.",
-            file=sys.stderr,
-        )
-
-    if report.foreign:
-        print(
-            f"\n{len(report.foreign)} chunk(s) sit under this machine's own id that it\n"
-            "never signed. They are inert: no machine will read them, including this\n"
-            "one, and nothing was lost -- whatever was in them has been published again\n"
-            "under a chunk that is signed.\n"
-            "Two things look like this and cannot be told apart from here: a run of\n"
-            "this machine that was killed between writing a chunk and signing for it,\n"
-            "and someone else writing into the repository. A power cut is the ordinary\n"
-            "explanation. 'woswoar doctor' lists them under 'chunks'.",
-            file=sys.stderr,
-        )
-
-    if report.unauthenticated:
-        print(
-            f"\nWARNING: {len(report.unauthenticated)} day(s) of history could not be\n"
-            "authenticated and were refused. Every machine signs a list of the chunks\n"
-            "it published, so this means the repo contains history none of your\n"
-            "machines put its name to - someone else can write to it.",
-            file=sys.stderr,
-        )
+    for block in paragraphs(report.notices()):
+        print(block, file=sys.stderr)
     return 0
 
 

@@ -187,15 +187,18 @@ Match the density. [`CLAUDE.md`](../CLAUDE.md) and
 The layering above is real and holds. The *sizes* do not, and this section
 exists so that nobody has to rediscover it.
 
-**`sync.py` is 3234 lines holding five separable concerns** — the recipient-file
+**`sync.py` is 3415 lines holding five separable concerns** — the recipient-file
 grammar, trust and pinning, manifests, the chunk codec, and git plumbing — plus
 the orchestration that drives them and the status queries `doctor` asks. The
-visible symptom is `sync.Report`: seventeen fields, each a failure from a
-different one of those layers, rendered by twelve consecutive `if` blocks in
-`cmd_sync`. A new failure mode therefore means editing `Report`, `run`,
-`cmd_sync` and `test_sync.py` together.
+visible symptom is `sync.Report`: **seventeen fields**, each a failure from a
+different one of those layers. #199 moved their prose out of `cmd_sync` into
+`Report.notices()`, which is a real testability win and *not* the collapse — the
+seventeen are still seventeen, so a new failure mode still means editing a field,
+`run`, `notices` and `test_sync.py` together, and `notices()` has inherited
+`Report`'s job of touching all five concerns. Collapsing them is what this issue
+was sequenced to receive.
 
-**`__main__.py` is 2102 lines and inverts pattern 4 in two places.** An installer
+**`__main__.py` is 1813 lines and inverts pattern 4 in two places.** An installer
 (`installed_shells`, `detect_shells`, `shells_from`, `_hook_bytes`,
 `_write_block`, `_stale_hooks`, `_refresh_hook`) and a setup wizard
 (`_importable`, `_untouched`, `_offer_imports`, `_offer_remote`) are both
@@ -213,18 +216,30 @@ What is left in `store` that does not belong to it is four per-machine files
 repository, so filing them under `archive` would be worse than leaving them, and
 their home is whatever #201 carves out of `sync`.
 
-**Outcome reporting had five spellings**, and is down to four. `report.Check` is
-the one shape (#199): `doctor` and `prove` return them, `sync`'s four
-`*_status` functions return them, and `report.lines` is the only thing that turns
-one into characters. `sync.IdentityStatus` is gone.
+**Outcome reporting had five spellings**, and `report` is now the answer (#199).
+It holds two, and the distinction between them is real rather than a compromise:
 
-What is left is the half the issue calls the larger one. `sync.Report` still has
-seventeen fields, one per failure from a different layer of `sync.py`, and
-`cmd_sync` still renders them in twelve consecutive `if` blocks — multi-paragraph
-prose with no label column, which `report.lines` cannot express today. Whether
-`Check.note` stretches to hold it or the renderer grows a sibling is the open
-question, and it is worth answering before the shape is called settled.
-`search.empty_note`, `importer.Result` and `deps.report` are the small remainder.
+- **`Check`** is a verdict — one line, a label, a marker, and pass/fail/info.
+  `doctor`, `prove` and `sync`'s four `*_status` functions return them, and
+  `report.lines` is the only thing that renders one. `sync.IdentityStatus` is
+  gone.
+- **`Notice`** is an explanation — a paragraph with no label and nothing a marker
+  could usefully say, because several of them carry a recovery recipe.
+  `Report.notices()` decides which of eleven apply, and `report.paragraphs`
+  renders them. `cmd_sync`'s eleven `if report.X:` blocks are one loop; the
+  twelfth, `if report.pushed`, is a summary line and stayed.
+
+Stretching `Check` to cover both was the other option and it was worse: the label
+column and the marker would have been dead weight on every notice, and `lines()`
+would have grown a mode. Two shapes, one module, and a rule for picking — if it
+fits a line and can fail, it is a check.
+
+What remains is smaller and is *not* exempt by the rule above, which is worth
+saying plainly rather than implying: `deps.report` returns preformatted
+paragraphs and is Notice-shaped; `search.empty_note` is a single line that cannot
+fail and is Check-shaped without a label; `importer.Result` is counts the CLI
+words, and `progress` is a different thing altogether — a live Protocol, not a
+result. The first two could convert and have not.
 
 These are tracked as issues rather than fixed in passing, and the layering above
 is what makes them fixable one at a time.
@@ -237,6 +252,6 @@ first because they make the expensive one smaller.
 | | issue |
 |---|---|
 | 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
-| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting. **`doctor` half done**; the `sync.Report` half is what still shrinks `Report`. |
+| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting. `Check` and `Notice` have landed and both `doctor` and `cmd_sync` use them; **`Report`'s seventeen fields are not collapsed**, which was the part #201 was waiting on. |
 | 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
 | 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |

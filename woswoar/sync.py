@@ -39,7 +39,7 @@ from typing import NamedTuple
 from . import archive, crypto, progress, store
 from .entry import make_inert
 from .errors import WoswoarError
-from .report import Check
+from .report import Check, Notice
 from .store import Machine
 
 GIT_TIMEOUT = 300
@@ -48,6 +48,35 @@ GIT_TIMEOUT = 300
 #: is always this machine -- so they are uniform. A varying message would only
 #: leak activity patterns into a place that is not encrypted.
 COMMIT_MESSAGE = "woswoar sync"
+
+#: Both "no repo key yet" and "some days unreadable" have the same fix, and used
+#: to say so in two independently worded paragraphs.
+_GRANT_REMEDY = (
+    "On a machine that is already enrolled run:\n"
+    "    woswoar accept\n"
+    "then sync here again. Nothing is lost in the meantime."
+)
+
+#: What a machine whose key was withdrawn has to do, said once. `add_recipient`
+#: refuses a revoked key with the same advice, and the two were independent
+#: paragraphs 3000 lines apart -- which is the condition `_GRANT_REMEDY` above
+#: exists to end, reproduced inside one module.
+_REENROL_REMEDY = "woswoar init <url> --new-identity"
+
+
+def _restore_remedy(path: str) -> str:
+    """How to recover a file a peer deleted from the history repo.
+
+    Deleting one is a commit like any other and woswoar never rewrites history,
+    so the blob is still reachable in every clone. Shared by the two files this
+    can happen to, so the recipe cannot drift between their messages.
+    """
+    return (
+        "It is still in git history -- woswoar never rewrites it, so every clone\n"
+        "has the blob. To put it back:\n"
+        f"    git -C <history> log --diff-filter=D -- {path}\n"
+        f"    git -C <history> show <commit>^:{path} > that path\n"
+    )
 
 
 class SyncError(WoswoarError):
@@ -84,27 +113,27 @@ class Report:
     #: case that most needed reporting.
     unauthenticated: set[str] = field(default_factory=set)
     #: Hosts publishing history under a signing key nobody here has accepted.
-    #: Not an error and usually not an attack: it is what a machine enrolled
-    #: since this one last looked is *supposed* to look like. `woswoar trust`.
+    #: Not an error and usually not an attack. `notices` says what it is and
+    #: which command settles it -- the explanation lives there now, and this
+    #: comment carried a second, drifted copy that named `trust` where the
+    #: message on screen names `accept`.
     untrusted: set[str] = field(default_factory=set)
     #: Hosts now publishing under a different key than the one pinned here.
-    #: Never resolved silently: it is either a re-enrolled machine or someone
-    #: rewriting the repo, and nothing available here can tell which.
+    #: Never resolved silently; `notices` explains why and what to do.
     changed_signer: set[str] = field(default_factory=set)
     #: Hosts whose pin was dropped because a tombstone withdrew them.
     unpinned: set[str] = field(default_factory=set)
     #: Days of this machine's own history it could not extend, because the
-    #: manifest already there is one it cannot verify. Nothing is published for
-    #: them until the manifest is put right, which beats signing a replacement
-    #: that silently disowns everything published earlier that day.
+    #: manifest already there is one it cannot verify. `notices` explains what
+    #: that costs and why nothing is written for them.
     unsignable: set[str] = field(default_factory=set)
     #: Days of this machine's own history whose sealed day key has gone while
     #: chunks sealed to its public half remain. Nothing further is written for
     #: them, because a new key cannot rescue what the old one sealed.
     orphaned: set[str] = field(default_factory=set)
     #: Days this machine has published before whose signed manifest has gone.
-    #: Signing a fresh one would list only what this run writes, disowning
-    #: everything published earlier -- so nothing is written for them either.
+    #: Nothing is written for them; `notices` explains why and how to recover
+    #: the file.
     manifest_missing: set[str] = field(default_factory=set)
     #: "<day>/<name>" chunks sitting under *this* machine's own id that it never
     #: published. Nothing else would ever look at them -- `merge` skips our own
@@ -121,6 +150,158 @@ class Report:
     #: from anyone, and a machine still waiting for `grant` simply reports the
     #: days it cannot read, like any other unreadable history.
     revoked: bool = False
+
+    @property
+    def silent(self) -> bool:
+        """Nothing this run did is worth summarising.
+
+        Named because two places have to agree about it: `notices` returns the
+        revocation and nothing else, and `cmd_sync` suppresses the summary above
+        it. Left as two independent `if self.revoked` tests, dropping either one
+        prints "exported 0 line(s)... in sync with the remote" directly above a
+        paragraph saying this machine publishes nothing -- and only an
+        end-to-end stdout test would catch it.
+        """
+        return self.revoked
+
+    def notices(self) -> list[Notice]:
+        """Everything this run has to tell a person, in the order it says it.
+
+        Here rather than in `cmd_sync`, which is where all of it used to be: the
+        condition, the count and the prose were eleven `if report.X:` blocks in
+        the CLI, so "does this run warn about a changed signer" was a question
+        only a test that grepped stderr could ask. What each field *means* is
+        this class's to know; how it reaches a terminal is `report`'s.
+
+        These are the notices this class alone decides. The paragraphs
+        `cmd_grant`, `cmd_revoke`, `cmd_trust` and `cmd_accept` print are
+        deliberately not here and should not be moved: they are a *dialog*,
+        ordered against `_confirm` so that a person reads the consequences
+        before they are asked, and turning them into a list to render afterwards
+        would print the reasons someone might answer no after the question.
+        """
+        if self.silent:
+            return [
+                Notice(
+                    "This machine's access to the shared history was revoked, so nothing\n"
+                    "is published from here and every other machine refuses what it already\n"
+                    "published. This is not something 'woswoar grant' can undo -- a\n"
+                    "revocation is permanent, deliberately.\n\n"
+                    "Commands are still being recorded locally, and 'woswoar list' still\n"
+                    "shows everything this machine had before. To take part again, enrol\n"
+                    f"with a fresh identity:  {_REENROL_REMEDY}"
+                )
+            ]
+
+        out: list[Notice] = []
+
+        def say(body: str, warning: bool = False) -> None:
+            """One notice. A helper so the prose stays at a readable column --
+            nested inside `out.append(Notice(` it started eight columns in, and
+            the one body that had to be re-wrapped for it was the one body whose
+            source lines stopped matching the lines it prints."""
+            out.append(Notice(body, warning))
+
+        if self.unreadable:
+            # The count is a local here and nowhere else, because
+            # `{len(self.unreadable)}` is twenty-two source columns for what
+            # prints as one or two -- enough to push this line past the limit and
+            # force a wrap that would stop the source reading like the output.
+            days = len(self.unreadable)
+            say(
+                f"{days} day(s) of history are sealed to recipients that do not include\n"
+                "this machine - it joined after they were written.\n"
+                f"{_GRANT_REMEDY}"
+            )
+        if self.stale:
+            say(
+                f"{len(self.stale)} day(s) could not be rebuilt, and were left exactly as\n"
+                "they were rather than rewritten from the part that could be read:\n"
+                f"{', '.join(sorted(self.stale))}\n"
+                "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
+                "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
+                "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
+                "did."
+            )
+        if self.untrusted:
+            say(
+                f"{len(self.untrusted)} machine(s) publish history this one has not been\n"
+                "told to accept, so none of it was merged. That is what a machine enrolled\n"
+                "since this one last looked is supposed to look like.\n"
+                "    woswoar accept"
+            )
+        if self.unpinned:
+            say(
+                f"{len(self.unpinned)} machine(s) were withdrawn by a revocation. Nothing\n"
+                "they publish is accepted here any more, including history they published\n"
+                "before it that this machine had not yet merged."
+            )
+        if self.changed_signer:
+            say(
+                f"{len(self.changed_signer)} machine(s) now sign with a different\n"
+                "key than the one accepted here, and nothing from them was merged. That is\n"
+                "either a machine that was re-enrolled or someone rewriting the repository,\n"
+                "and woswoar cannot tell which. If you re-enrolled it, accept the new key:\n"
+                "    woswoar trust --replace",
+                warning=True,
+            )
+        if self.unsignable:
+            say(
+                f"{len(self.unsignable)} day(s) of this machine's own history\n"
+                "could not be published, because the signed list already in the repository\n"
+                "for them is not one this machine can verify. Publishing a replacement\n"
+                "would disown everything it published earlier on those days.\n"
+                "If this machine's signing key was replaced, that is why: days it signed\n"
+                "with the old one stay as they are, and new days publish normally.",
+                warning=True,
+            )
+        if self.orphaned:
+            say(
+                f"{len(self.orphaned)} day(s) of this machine's own history\n"
+                f"cannot be published: {', '.join(sorted(self.orphaned))}\n"
+                "Their sealed key is missing from the repository while chunks encrypted to\n"
+                "it are still there. Those chunks are unreadable by every machine, and a\n"
+                "new key would not change that -- so nothing more is written for those\n"
+                "days rather than adding chunks nobody will ever read.\n"
+                "The commands themselves are still in this machine's own logs.\n"
+                f"{_restore_remedy('hosts/<id>/keys/<day>.age')}"
+                "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
+                "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
+                "this machine starts a new key and publishes again.",
+                warning=True,
+            )
+        if self.manifest_missing:
+            say(
+                f"{len(self.manifest_missing)} day(s) of this machine's own\n"
+                f"history cannot be published: {', '.join(sorted(self.manifest_missing))}\n"
+                "The signed list this machine published for them is gone from the\n"
+                "repository. Signing a replacement would name only what is written now,\n"
+                "so every chunk published earlier that day would stop being one any peer\n"
+                "accepts. Nothing is written for those days instead.\n"
+                f"{_restore_remedy('hosts/<id>/manifests/<day>')}"
+                "'woswoar doctor' prints the days.",
+                warning=True,
+            )
+        if self.foreign:
+            say(
+                f"{len(self.foreign)} chunk(s) sit under this machine's own id that it\n"
+                "never signed. They are inert: no machine will read them, including this\n"
+                "one, and nothing was lost -- whatever was in them has been published again\n"
+                "under a chunk that is signed.\n"
+                "Two things look like this and cannot be told apart from here: a run of\n"
+                "this machine that was killed between writing a chunk and signing for it,\n"
+                "and someone else writing into the repository. A power cut is the ordinary\n"
+                "explanation. 'woswoar doctor' lists them under 'chunks'."
+            )
+        if self.unauthenticated:
+            say(
+                f"{len(self.unauthenticated)} day(s) of history could not be\n"
+                "authenticated and were refused. Every machine signs a list of the chunks\n"
+                "it published, so this means the repo contains history none of your\n"
+                "machines put its name to - someone else can write to it.",
+                warning=True,
+            )
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -3226,7 +3407,7 @@ def add_recipient(recipient: str) -> bool:
         # the reason would sit in a file it never prints.
         raise SyncError(
             "this key was revoked, and a revocation is permanent. Re-enrol this "
-            "machine with a new identity:  woswoar init <url> --new-identity"
+            f"machine with a new identity:  {_REENROL_REMEDY}"
         )
     if key in recipients():
         return False
