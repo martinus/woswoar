@@ -59,11 +59,12 @@ LAYERS: dict[str, set[str]] = {
     "credentials": {"errors"},
     "crypto": {"errors"},
     "store": {"entry"},
+    "archive": {"entry", "store"},
     "cache": {"entry", "store"},
     "search": {"cache", "entry", "store"},
     "importer": {"credentials", "entry", "errors", "store"},
-    "sync": {"crypto", "entry", "errors", "progress", "store"},
-    "prove": {"crypto", "deps", "entry", "errors", "progress", "store", "sync"},
+    "sync": {"archive", "crypto", "entry", "errors", "progress", "store"},
+    "prove": {"archive", "crypto", "deps", "entry", "errors", "progress", "store", "sync"},
     "__main__": {"cache", "credentials", "entry", "errors", "importer", "search", "store"},
 }
 
