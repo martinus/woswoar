@@ -210,8 +210,60 @@ first such change, not during one.
   same number of bytes inside one second run each other's cached bytecode —
   which reported a *correct* test as decoration here, and nearly got it
   rewritten.
+
+  It also refuses a replacement that still **contains** the text it replaced,
+  because that leaves the code under test exactly as it was and the run means
+  nothing either way. That is how a *move* gets written wrongly — put the whole
+  span in `old`, including the line being relocated. Three of those shipped in
+  one session before the check existed, each costing a full suite run and each
+  reading as a result. `additive=True` is the escape hatch for the rare edit
+  that really does insert in front of code that stays.
+
+- **Refactors that should change nothing: prove it with `tools/compare.py`.**
+
+  ```sh
+  python -m tools.compare --base main --show .bashrc install doctor status
+  ```
+
+  It runs each command in a throwaway `$HOME` against both revisions, seeds the
+  same machine id on both sides, and diffs stdout, stderr and exit status
+  together. Only `$HOME` and the tree path are normalised by default; anything
+  else needs `--scrub REGEX=REPLACEMENT`, and the active list is printed above
+  the verdict. Quote that list whenever a pull request says "byte-identical" —
+  the claim is worth exactly what was left unnormalised, and there is no way to
+  tell from the outside.
+
+- **A/B timing: `tools/bench.py`, not a loop written on the spot.**
+
+  ```sh
+  python -m tools.bench --importtime woswoar.__main__ --base main
+  ```
+
+  Hand-rolled comparisons got this wrong twice here, in three different ways,
+  and each way survives review because the output looks like a measurement:
+
+  - **The base worktree must sit on the same filesystem.** `/tmp` is tmpfs and
+    the checkout is on btrfs, so a worktree in the obvious place reads out of
+    RAM against a tree reading off an SSD. That alone reported a resolved
+    0.08 ms difference between a tree and *itself*. `bench.py` puts the
+    worktree beside the repository.
+  - **A,B,A,B is not fair** — the second slot of every pair absorbs all the
+    drift, so an afternoon of warming up reads as a slowdown. The blocks are
+    ABBA and BAAB.
+  - **Compare the pairs, not the medians.** `median(B) - median(A)` throws away
+    the pairing that interleaving exists to create, and produces the puzzle of a
+    median gap smaller than the gap between the two minima. `bench.py` reports
+    the median of the per-pair differences with a sign test, and says *not
+    resolved* rather than quoting a number the machine cannot support.
+
+  A cost below measurement is a real answer. Write "below measurement" then,
+  not a figure with two decimal places.
 - Before blaming your branch for a CI failure, measure the same job on `main`,
   enough times to see a one-in-forty flake. Two runs of green proves nothing.
+- Moving a name between modules leaves `.mypy_cache` wrong, and it fails as
+  `AssertionError: Cannot find component 'X' for 'woswoar.old_module.X'` from
+  inside mypy rather than as a type error. `rm -rf .mypy_cache` and re-run; it is
+  not your change.
 - **Commit before comparing two revisions.** `git checkout main` carries
   uncommitted changes across, so a before-and-after benchmark run that way
   measures the same tree twice and reports no difference. That has twice nearly
