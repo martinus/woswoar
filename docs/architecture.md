@@ -25,22 +25,24 @@ entry, errors        the record format, and the exception every layer raises
   crypto             age and ssh-keygen
   credentials
     importer         bash, zsh, atuin
-deps, progress       leaves: asked things by anyone, knowing nobody
+deps, progress,      leaves: asked things by anyone, knowing nobody
+report
 
-sync      <- archive, crypto, progress, store, entry, errors
-prove     <- sync, and everything sync is made of, plus deps
-__main__  <- search, cache, importer, store, entry, errors
-             (sync, crypto, archive and prove only inside the commands
-              that need them -- see "Two costs shape everything")
+sync      <- archive, crypto, progress, report, store, entry, errors
+doctor    <- report, search, cache, crypto, deps, store, entry, errors
+prove     <- sync, and everything sync is made of, plus deps and report
+__main__  <- search, cache, importer, report, store, entry, errors
+             (sync, crypto, archive, doctor and prove only inside the
+              commands that need them -- see "Two costs shape everything")
 ```
 
 | layer | modules | what it may know |
 |---|---|---|
 | format | `entry`, `errors` | nothing else in the package |
-| platform | `store`, `crypto`, `deps`, `progress`, `credentials` | the format layer |
+| platform | `store`, `crypto`, `deps`, `progress`, `report`, `credentials` | the format layer |
 | derived | `cache`, `archive` | the two above |
 | domains | `search`, `sync`, `importer` | everything below, and **never each other** |
-| composition | `prove`, `__main__` | everything |
+| composition | `doctor`, `prove`, `__main__` | everything |
 
 `store` and `archive` are the two halves of the filesystem: `store` owns
 ``logs/`` — the plaintext truth — plus the primitives and machine identity;
@@ -63,10 +65,12 @@ lines, so a lazy import inside a function correctly counts as no edge at all:
 3. **The table is exact.** A new edge is a one-line edit to `LAYERS` and a
    sentence in the pull request. That edit is the review.
 
-`errors`, `deps` and `progress` are deliberately leaves. Each is asked things by
-the layers above without knowing anything about them, so any module can raise a
-`WoswoarError`, report a missing tool, or tick a counter without dragging a
-domain in behind it.
+`errors`, `deps`, `progress` and `report` are deliberately leaves. Each is asked
+things by the layers above without knowing anything about them, so any module can
+raise a `WoswoarError`, report a missing tool, tick a counter or hand back a
+verdict without dragging a domain in behind it. `report` in particular has to be
+free: a check is a value any module might return, and a value type that cost you
+an import of the CLI would not get used.
 
 ---
 
@@ -209,14 +213,18 @@ What is left in `store` that does not belong to it is four per-machine files
 repository, so filing them under `archive` would be worse than leaving them, and
 their home is whatever #201 carves out of `sync`.
 
-**Outcome reporting has five spellings.** `sync` returns a `Report` dataclass and
-`IdentityStatus` records; `search.empty_note` returns prose; `importer` returns
-counts; `deps.report` returns prose; `progress` uses a `Protocol` with two
-implementations. Each is defensible alone. Together they mean there is no answer
-to "how should a new check report itself?", which is the gap `doctor` falls into
-— four of its lines come from `sync` as `IdentityStatus` values, and the rest of
-its eighteen `check` calls are derived inline in the CLI, where only a test that
-greps stdout can reach them.
+**Outcome reporting had five spellings**, and is down to four. `report.Check` is
+the one shape (#199): `doctor` and `prove` return them, `sync`'s four
+`*_status` functions return them, and `report.lines` is the only thing that turns
+one into characters. `sync.IdentityStatus` is gone.
+
+What is left is the half the issue calls the larger one. `sync.Report` still has
+seventeen fields, one per failure from a different layer of `sync.py`, and
+`cmd_sync` still renders them in twelve consecutive `if` blocks — multi-paragraph
+prose with no label column, which `report.lines` cannot express today. Whether
+`Check.note` stretches to hold it or the renderer grows a sibling is the open
+question, and it is worth answering before the shape is called settled.
+`search.empty_note`, `importer.Result` and `deps.report` are the small remainder.
 
 These are tracked as issues rather than fixed in passing, and the layering above
 is what makes them fixable one at a time.
@@ -229,6 +237,6 @@ first because they make the expensive one smaller.
 | | issue |
 |---|---|
 | 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
-| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting, `doctor` first. This is what shrinks `Report`. |
+| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting. **`doctor` half done**; the `sync.Report` half is what still shrinks `Report`. |
 | 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
 | 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |

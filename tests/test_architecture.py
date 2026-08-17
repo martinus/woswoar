@@ -47,15 +47,18 @@ REPO = Path(__file__).resolve().parent.parent
 #: this is for; a table that only caught *additions* would silently rot as
 #: modules lost dependencies and stop describing the package it claims to pin.
 #:
-#: The four leaves are leaves on purpose. `errors` holds the exception every
-#: layer raises, and `deps` and `progress` are asked things by the layers above
-#: without knowing anything about them -- so each of them stays importable from
-#: anywhere without dragging a domain along.
+#: The five leaves are leaves on purpose. `errors` holds the exception every
+#: layer raises; `deps`, `progress` and `report` are asked things by the layers
+#: above without knowing anything about them -- so each of them stays importable
+#: from anywhere without dragging a domain along. `report` in particular has to
+#: be free: a check is a value any module might hand back, and a value type that
+#: cost you an import of the CLI would not be used.
 LAYERS: dict[str, set[str]] = {
     "entry": set(),
     "errors": set(),
     "deps": set(),
     "progress": set(),
+    "report": set(),
     "credentials": {"errors"},
     "crypto": {"errors"},
     "store": {"entry"},
@@ -63,9 +66,32 @@ LAYERS: dict[str, set[str]] = {
     "cache": {"entry", "store"},
     "search": {"cache", "entry", "store"},
     "importer": {"credentials", "entry", "errors", "store"},
-    "sync": {"archive", "crypto", "entry", "errors", "progress", "store"},
-    "prove": {"archive", "crypto", "deps", "entry", "errors", "progress", "store", "sync"},
-    "__main__": {"cache", "credentials", "entry", "errors", "importer", "search", "store"},
+    "sync": {"archive", "crypto", "entry", "errors", "progress", "report", "store"},
+    #: `sync` is deliberately absent: `doctor` reaches it inside the two checks
+    #: that need it, so asking what is wrong with an installation does not pay
+    #: to import the whole sync protocol first.
+    "doctor": {"cache", "crypto", "deps", "entry", "errors", "report", "search", "store"},
+    "prove": {
+        "archive",
+        "crypto",
+        "deps",
+        "entry",
+        "errors",
+        "progress",
+        "report",
+        "store",
+        "sync",
+    },
+    "__main__": {
+        "cache",
+        "credentials",
+        "entry",
+        "errors",
+        "importer",
+        "report",
+        "search",
+        "store",
+    },
 }
 
 #: What a keypress must not pay for. Each is deferred deliberately somewhere,

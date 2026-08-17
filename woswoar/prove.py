@@ -29,18 +29,14 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from . import archive, crypto, deps, store, sync
 from .entry import Entry
 from .errors import WoswoarError
-
-#: Print one pass/fail line, in whatever shape the caller renders checks.
-Check = Callable[[str, bool, str], None]
-#: Print one line of context that cannot fail.
-Info = Callable[[str, str], None]
+from .report import Check
 
 #: `store.ENV_KEYS` is everything woswoar itself resolves paths from; HOME is
 #: for git, which reads ``~/.gitconfig``, whose hooks and filters must neither
@@ -225,11 +221,22 @@ def _name_tokens(name: str) -> tuple[list[str], list[tuple[str, str]]]:
     return searchable, unsearchable
 
 
-def run(check: Check, info: Info) -> None:
+def run() -> Iterator[Check]:
     """Record a canary in a sandbox, publish it, and prove what the remote saw.
 
-    The checks print in the order the bytes travel: plaintext log, sealed
+    The checks come back in the order the bytes travel: plaintext log, sealed
     chunk on the remote, back to plaintext under the key, and nowhere else.
+
+    Returned rather than printed. `doctor` renders them like every other check,
+    and a test can assert that the canary was unreadable without reading a
+    screen -- which for the one command whose whole job is to demonstrate a
+    security property is the difference between a test and a screenshot.
+
+    A generator, not a list. Everything between the sandbox line and the last
+    check is subprocess work -- `git init`, an identity, a full sync, a decrypt,
+    a byte scan of the remote -- and `docs/verify.md` shows the transcript
+    starting with the sandbox path immediately. Accumulating first would leave
+    somebody watching an empty terminal for the whole of it.
     """
     crypto.require()
     crypto.require_signing()
@@ -250,7 +257,11 @@ def run(check: Check, info: Info) -> None:
         # wherever it inherits its environment from.
         with (origin / "config").open("a", encoding="utf-8") as handle:
             handle.write(QUIET_MAINTENANCE)
-        info("sandbox", f"{root} - a throwaway install; your real history is not touched")
+        yield Check(
+            "sandbox",
+            f"{root} - a throwaway install; your real history is not touched",
+            ok=None,
+        )
 
         sync.initialise(remote=str(origin), new_identity=True)
         known = store.machine()
@@ -269,19 +280,19 @@ def run(check: Check, info: Info) -> None:
         store.append_entries(known.id, [entry])
 
         logged = store.log_file(known.id, day).read_bytes()
-        check(
+        yield Check(
             "recorded",
-            marker.encode("utf-8") in logged,
             f"the canary '{marker}' sits in the sandbox's plaintext log,"
             " exactly as logs/ holds your own",
+            ok=marker.encode("utf-8") in logged,
         )
 
         report = sync.run()
-        check(
+        yield Check(
             "published",
-            report.lines_exported >= 1 and report.pushed,
             f"{report.lines_exported} line(s) sealed into {report.chunks_written} chunk(s)"
             " and pushed to the sandbox's remote",
+            ok=report.lines_exported >= 1 and report.pushed,
         )
 
         # Presence first: an absence proof over a repo that never held the
@@ -295,27 +306,31 @@ def run(check: Check, info: Info) -> None:
             )
         except (WoswoarError, OSError, subprocess.SubprocessError, ValueError) as exc:
             opened, detail = False, f"could not open what was published: {exc}"
-        check("sealed", opened, detail)
+        yield Check("sealed", detail, ok=opened)
 
         streams = _published_bytes(origin)
         total = sum(len(data) for _, data in streams)
         hits = _find(streams, marker)
-        check(
+        yield Check(
             "unreadable",
-            not hits,
             f"the canary appears in none of the {total:,} bytes on the remote"
             if not hits
             else f"the canary is readable in: {', '.join(hits)}",
+            ok=not hits,
         )
 
         searchable, unsearchable = _name_tokens(known.name)
         named = [token for token in searchable if _find(streams, token)]
-        check(
+        yield Check(
             "anonymous",
-            not named,
             f"neither is any of: {', '.join(repr(t) for t in searchable)}"
             if not named
             else f"readable on the remote: {', '.join(repr(t) for t in named)}",
+            ok=not named,
         )
         for token, why in unsearchable:
-            info("", f"{token!r} was not searched for ({why}); the full name above still was")
+            yield Check(
+                "",
+                f"{token!r} was not searched for ({why}); the full name above still was",
+                ok=None,
+            )

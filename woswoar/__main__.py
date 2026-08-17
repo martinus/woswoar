@@ -7,16 +7,17 @@ import os
 import re
 import sys
 import textwrap
-import time
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import __version__, cache, importer, search, store
 from .entry import make_inert
 from .errors import WoswoarError
+from .report import Check
 
-if TYPE_CHECKING:  # `sync` is imported lazily; only the annotation needs it.
+if TYPE_CHECKING:  # `sync` is imported lazily; only the annotations need it.
     from .sync import Failure, Reader, ReencryptReport
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and
@@ -389,130 +390,54 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
-#: What `doctor` puts at the front of each line, plain and coloured.
-#:
-#: The plain forms are byte-for-byte what this printed before there was a
-#: coloured one, and they are what everything that is not a person sees: the
-#: suite asserts on `[FAIL] day keys`, and `woswoar doctor | grep FAIL` is a
-#: reasonable thing to have in a script. A tick that only a terminal renders
-#: must not become the thing those depend on.
-#:
-#: The coloured forms are one column wide rather than four or six, so the labels
-#: line up -- which the plain `[ok]`/`[FAIL]` never have.
-_PLAIN_MARKERS = {"ok": "[ok]", "fail": "[FAIL]", "info": "[--]"}
-_COLOUR_MARKERS = {
-    "ok": "\x1b[32m\u2714\x1b[0m",
-    "fail": "\x1b[31m\u2718\x1b[0m",
-    "info": "\x1b[2m\u00b7\x1b[0m",
-}
+def _shell_checks() -> list[Check]:
+    """The installed shells and their versions.
 
-
-def _markers(stream: object | None = None) -> dict[str, str]:
-    """Coloured markers for a terminal, the plain ones for anything else.
-
-    `NO_COLOR` is honoured because it costs one condition and someone always
-    has a reason -- a terminal that renders neither colour nor the glyphs, a log
-    being captured through a pty, a screen reader.
+    The shells this machine has hooks for, or -- on one that has not run
+    `install` yet -- the ones it would get if it did. Reporting on every shell
+    woswoar *could* support instead would fail a perfectly good bash-only
+    machine for not having zsh.
     """
-    out = sys.stdout if stream is None else stream
-    watched = bool(getattr(out, "isatty", lambda: False)())
-    if watched and not os.environ.get("NO_COLOR"):
-        return _COLOUR_MARKERS
-    return _PLAIN_MARKERS
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    import shutil
-
-    from . import crypto, deps, sync
-
-    ok = True
-    marker = _markers()
-
-    def check(label: str, good: bool, detail: str) -> None:
-        """A pass/fail condition: failing means something needs fixing."""
-        nonlocal ok
-        ok = ok and good
-        print(f"{marker['ok' if good else 'fail']} {label:<12} {detail}")
-
-    def info(label: str, detail: str) -> None:
-        """Context that cannot fail, kept visually distinct from a real check."""
-        print(f"{marker['info']} {label:<12} {detail}")
-
-    if args.prove:
-        from . import prove
-
-        prove.run(check, info)
-        if not ok:
-            # Unlike the checks below, nothing here is the user's to fix: the
-            # sandbox is built from scratch, so a FAIL can only be woswoar
-            # publishing something it promised not to.
-            print(
-                "\nA FAIL above is a defect in woswoar itself, not in your setup."
-                "\nPlease report it: https://github.com/martinus/woswoar/issues"
-            )
-        return 0 if ok else 1
-
-    # The shells this machine has hooks for, or -- on one that has not run
-    # `install` yet -- the ones it would get if it did. Reporting on every shell
-    # woswoar *could* support instead would fail a perfectly good bash-only
-    # machine for not having zsh.
+    out = []
     for shell in installed_shells() or detect_shells():
         version = _shell_version(shell)
         major = int(version.split(".")[0]) if version and version[0].isdigit() else 0
-        check(
-            shell,
-            major >= _VERSION_FLOOR,
-            f"{version or 'not found'} ({_VERSION_FLOOR}.0+ required)",
-        )
-
-    fzf = shutil.which("fzf")
-    if fzf is None:
-        check("fzf", False, f"not found - {deps.advice([deps.FZF])}")
-    else:
-        # Which keys this fzf can actually offer, not just that it is there.
-        # An fzf below 0.45 gets a working picker with several keys missing --
-        # correct, silent, and impossible to tell from a bug unless something
-        # says so. Reported from a fleet running 0.73 on one machine and
-        # Debian's 0.44.1 on another.
-        #
-        # The list comes from `search.GATED_KEYS` rather than being written out
-        # here: this sentence and the bindings it describes are the same fact in
-        # two modules, and it was already wrong once -- it still named two keys
-        # after the preview pane became the third.
-        said, _ = search.fzf_version()
-        shown = said or "version unknown"
-        if search.fzf_supports_transform():
-            check("fzf", True, f"{fzf}  ({shown})")
-        else:
-            floor = ".".join(str(part) for part in search.TRANSFORM_SINCE)
-            missing = ", ".join(search.GATED_KEYS[:-1]) + f" and {search.GATED_KEYS[-1]}"
-            check(
-                "fzf",
-                True,
-                f"{fzf}  ({shown} - searching works; {missing} need {floor}+)",
+        out.append(
+            Check(
+                shell,
+                f"{version or 'not found'} ({_VERSION_FLOOR}.0+ required)",
+                ok=major >= _VERSION_FLOOR,
             )
+        )
+    return out
 
-    machine_file = store.machine_file()
-    # Read before anything calls store.machine(), which would create it.
-    has_machine = machine_file.is_file()
-    check("machine", has_machine, str(machine_file))
 
-    # `install` copies each hook into the data directory rather than sourcing it
-    # out of the package, so upgrading woswoar leaves the old shell code running
-    # -- and nothing said so. That was survivable while the hook only recorded;
-    # syncing lives in it now, so a machine that never re-ran `install` silently
-    # keeps whatever sync arrangement it had.
+def _hook_checks() -> list[Check]:
+    """Whether each installed hook is current, and whether its rc file loads it.
+
+    `install` copies each hook into the data directory rather than sourcing it
+    out of the package, so upgrading woswoar leaves the old shell code running
+    -- and nothing said so. That was survivable while the hook only recorded;
+    syncing lives in it now, so a machine that never re-ran `install` silently
+    keeps whatever sync arrangement it had.
+    """
     stale = _stale_hooks()
     present = installed_shells()
+    out = []
     if not present:
-        check("hook", False, f"no hook installed in {store.data_dir()}")
+        out.append(Check("hook", f"no hook installed in {store.data_dir()}", ok=False))
     for shell in present:
         hook = store.data_dir() / HOOKS[shell]
         if shell in stale:
-            check("hook", False, f"{hook} is older than this woswoar - run 'woswoar install'")
+            out.append(
+                Check(
+                    "hook",
+                    f"{hook} is older than this woswoar - run 'woswoar install'",
+                    ok=False,
+                )
+            )
         else:
-            check("hook", True, str(hook))
+            out.append(Check("hook", str(hook), ok=True))
 
     # One line per rc file, and per *installed* shell rather than per rc file
     # that exists: a `.zshrc` on a machine woswoar was only ever installed into
@@ -522,145 +447,68 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         rcfile = rcfile_for(shell)
         sourced = rcfile.is_file() and _BEGIN in rcfile.read_text(encoding="utf-8")
         detail = "sources the hook" if sourced else "has no woswoar block"
-        check(RCFILES[shell].lstrip("."), sourced, f"{rcfile} {detail}")
+        out.append(Check(RCFILES[shell].lstrip("."), f"{rcfile} {detail}", ok=sourced))
+    return out
 
-    # Not just "is age on PATH". A sandboxed age -- snap, flatpak, anything
-    # confined -- answers `--version` perfectly and then cannot open a key,
-    # which is a real failure that used to reach the user as an unexplained
-    # "permission denied" from `init` with doctor reporting nothing at all.
-    age_path = shutil.which("age")
-    if age_path is None:
-        info("age", f"not found, needed for 'woswoar sync' - {deps.advice([deps.AGE])}")
-    else:
-        failure = crypto.selftest()
-        cost = crypto.startup_ms() if not failure else -1.0
-        detail = age_path if cost < 0 else f"{age_path}  ({cost:.0f} ms to start)"
-        check("age", not failure and 0 <= cost < crypto.SLOW_MS, detail)
-        for line in failure.splitlines():
-            print(f"     {line}")
-        if not failure and cost >= crypto.SLOW_MS:
-            # Not a broken age -- a slow one, which is worse to diagnose because
-            # everything works. woswoar runs it about twice per day of history,
-            # so this is the difference between a grant taking three seconds and
-            # taking six minutes, and nothing on screen would say why.
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Render what `doctor` found. Every verdict below is decided elsewhere.
+
+    Printed **as each group comes back**, not after all of them. That is not
+    presentation: the slowest checks are the ones a broken installation makes
+    slow, so accumulating first puts the blank screen exactly where the command
+    is most needed. A snap-packaged `age` takes ~500 ms per spawn and `age_check`
+    spawns it eight times, which is four seconds of nothing -- while the check
+    that would explain it sits undisplayed in a list. It also costs the thing a
+    person does when a command hangs, which is read the last line it printed.
+
+    The order of the report is the loop below, and it is the one thing that
+    genuinely belongs here: `doctor` owns most of the checks and the installer
+    owns three, and neither can state the order the other's lines sit in. It is
+    also the order somebody fixes things in -- the shell before the hook before
+    the rc file -- which is why it is written down rather than sorted.
+    """
+    from . import doctor, report
+
+    marks = report.markers()
+    found: list[Check] = []
+
+    def show(produced: Check | Iterable[Check]) -> None:
+        """Collect a group and put it on screen before the next one is asked."""
+        group = [produced] if isinstance(produced, Check) else list(produced)
+        found.extend(group)
+        for line in report.lines(group, marks):
+            print(line, flush=True)
+
+    if args.prove:
+        from . import prove
+
+        for check in prove.run():
+            show(check)
+        if report.failed(found):
+            # Unlike the checks below, nothing here is the user's to fix: the
+            # sandbox is built from scratch, so a FAIL can only be woswoar
+            # publishing something it promised not to.
             print(
-                f"     age takes {cost:.0f} ms to start. woswoar runs it about twice per\n"
-                f"     day of recorded history, so a year costs about "
-                f"{cost * 2 * 365 / 1000:.0f} s per sync,\n"
-                "     grant or accept that has work to do.",
+                "\nA FAIL above is a defect in woswoar itself, not in your setup."
+                "\nPlease report it: https://github.com/martinus/woswoar/issues"
             )
-            if "/snap/" in age_path:
-                print(
-                    "     This one is a snap, which sets up a sandbox on every call.\n"
-                    "     Install the distribution package or the release binary instead:\n"
-                    f"       sudo snap remove age  &&  {deps.advice([deps.AGE])}"
-                )
-            else:
-                print(
-                    "     A distribution binary starts in a millisecond or two:\n"
-                    f"       {deps.advice([deps.AGE])}"
-                )
+            return 1
+        return 0
 
-    # Checked whether or not a repo exists: `init` is exactly when this breaks,
-    # and gating it behind is_repo() meant doctor was silent in the one state
-    # where someone would think to run it.
-    identity = store.machine().identity if has_machine else ""
-    if identity:
-        status = sync.identity_status(store.machine())
-        check("identity", status.ok, status.detail)
-    else:
-        info("identity", "none yet - chosen by 'woswoar init'")
+    show(_shell_checks())
+    show(doctor.fzf_check())
+    show(doctor.machine_check())
+    show(_hook_checks())
+    show(doctor.age_check())
+    show(doctor.identity_check())
+    show(doctor.repo_checks())
+    show(doctor.local_checks())
 
-    git_path = shutil.which("git")
-    if git_path is None:
-        info("git", f"not found, needed for 'woswoar sync' - {deps.advice([deps.GIT])}")
-
-    if sync.is_repo():
-        info("remote", sync.remote_summary())
-
-        # The one fact about the repository that decides whether this machine
-        # may write to it at all, and the only place a person can see it: the
-        # marker is a file nobody would think to `cat`, and `sync` mentions it
-        # only by refusing. The verdict comes from `sync` rather than being
-        # re-derived here, like every other line in this block.
-        repo_format = sync.repo_format_status()
-        check("repo format", repo_format.ok, repo_format.detail)
-        status = sync.signing_status(store.machine())
-        check("signing", status.ok, status.detail)
-
-        trust = sync.trust_status(store.machine())
-        check("trust", trust.ok, trust.detail)
-
-        # One stat per day this machine has published. Worth doing every time
-        # because `export` only revisits a day that still has lines to publish,
-        # so a day finished before its manifest went is never looked at again.
-        unmanifested = sync.days_missing_a_manifest()
-        if unmanifested:
-            detail = (
-                f"{len(unmanifested)} published day(s) have no signed list, e.g."
-                f" {unmanifested[0]} - peers refuse every chunk this machine"
-                " published on them"
-            )
-        else:
-            detail = "all present"
-        check("manifests", not unmanifested, detail)
-
-        # A listing, no decryption, so it is cheap enough to do every time --
-        # and the state is otherwise silent, which is the whole problem with it.
-        orphaned = sync.orphaned_days()
-        if orphaned:
-            host, day = orphaned[0]
-            detail = (
-                f"{len(orphaned)} sealed key(s) missing, e.g. {host[:8]}/{day}"
-                " - chunks encrypted to them cannot be read by any machine"
-            )
-        else:
-            detail = "all sealed"
-        check("day keys", not orphaned, detail)
-
-        # `sync` says this once, on the pass that first sees the file, and then
-        # the day settles and it stops -- which is right for a one-minute timer
-        # and no use to somebody asking afterwards. Costs no subprocess unless
-        # there is something to find; see `unlisted_chunks`.
-        planted = sync.unlisted_chunks()
-        if planted:
-            host, day, count = planted[0]
-            detail = (
-                f"{sum(n for _, _, n in planted)} chunk(s) in no signed list, e.g."
-                f" {count} under {host[:8]}/{day} - no machine will read them,"
-                " and this one did not write them"
-            )
-        else:
-            detail = "all accounted for"
-        check("chunks", not planted, detail)
-    else:
-        info("sync", "no history repo - run 'woswoar init <url>' to sync machines")
-
-    logs = list(store.iter_log_files())
-    info("logs", f"{len(logs)} file(s) in {store.logs_dir()}")
-
-    # Recorded history is more than ~/.bash_history holds -- the command, the
-    # directory, the exit status, and every other machine's history once sync
-    # has run -- so anything another user can read is a finding, not a note.
-    exposed = store.readable_by_others()
-    if exposed:
-        detail = f"{len(exposed)} path(s) other users can read, e.g. {exposed[0]}"
-        detail += " - run 'woswoar install' to fix"
-    else:
-        detail = f"{store.data_dir()} is owner-only"
-    check("private", not exposed, detail)
-
-    started = time.perf_counter()
-    entries = cache.load_entries()
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    info("cache", f"{len(entries)} entries loaded in {elapsed_ms:.0f} ms")
-
-    session = "set" if os.environ.get("WOSWOAR_SESSION") else "unset (hook not loaded here)"
-    info("session", session)
-
-    if not ok:
+    if report.failed(found):
         print("\nRun 'woswoar install' to fix identity/hook/bashrc problems.")
-    return 0 if ok else 1
+        return 1
+    return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:

@@ -39,6 +39,7 @@ from typing import NamedTuple
 from . import archive, crypto, progress, store
 from .entry import make_inert
 from .errors import WoswoarError
+from .report import Check
 from .store import Machine
 
 GIT_TIMEOUT = 300
@@ -625,12 +626,7 @@ def identity_path(known: Machine) -> Path:
     return path
 
 
-class IdentityStatus(NamedTuple):
-    ok: bool
-    detail: str
-
-
-def identity_status(known: Machine) -> IdentityStatus:
+def identity_status(known: Machine) -> Check:
     """Whether this machine could actually decrypt during an unattended sync.
 
     Lives here rather than in `doctor` so the judgement is testable and stated
@@ -639,23 +635,23 @@ def identity_status(known: Machine) -> IdentityStatus:
     timer -- a failure mode nobody notices without being told.
     """
     if not known.identity:
-        return IdentityStatus(False, "no identity recorded - run 'woswoar init'")
+        return Check("identity", "no identity recorded - run 'woswoar init'", ok=False)
 
     path = Path(known.identity).expanduser()
     if not path.is_file():
-        return IdentityStatus(False, f"identity {path} is missing - re-run 'woswoar init'")
+        return Check("identity", f"identity {path} is missing - re-run 'woswoar init'", ok=False)
     if not crypto.available():
-        return IdentityStatus(True, f"identity {path} (age missing, cannot verify)")
+        return Check("identity", f"identity {path} (age missing, cannot verify)", ok=True)
     reason = crypto.why_unusable(path)
     if reason:
         # No hint appended here: crypto already puts the right advice in the
         # reason, and picking it by grepping this string for "passphrase" made
         # sync depend on crypto's exact wording.
-        return IdentityStatus(False, f"identity {path} {reason}")
-    return IdentityStatus(True, f"identity {path}")
+        return Check("identity", f"identity {path} {reason}", ok=False)
+    return Check("identity", f"identity {path}", ok=True)
 
 
-def signing_status(known: Machine) -> IdentityStatus:
+def signing_status(known: Machine) -> Check:
     """Whether this machine can sign what it publishes, for `doctor` to report.
 
     Lives here rather than in `doctor` for the same reason `identity_status`
@@ -668,23 +664,23 @@ def signing_status(known: Machine) -> IdentityStatus:
     whether an unattended sync will work, not what the key file looks like.
     """
     if not crypto.signing_available():
-        return IdentityStatus(False, "ssh-keygen is not installed - history cannot be signed")
+        return Check("signing", "ssh-keygen is not installed - history cannot be signed", ok=False)
     path = store.signing_key_file()
     if not path.is_file():
-        return IdentityStatus(False, f"{path} is missing - it is created by 'woswoar init'")
+        return Check("signing", f"{path} is missing - it is created by 'woswoar init'", ok=False)
     try:
         verify_key = crypto.signing_public(path)
         probe = b"woswoar signing selftest"
         if not crypto.verify(
             probe, crypto.sign(probe, path, _MANIFEST_MAGIC), verify_key, _MANIFEST_MAGIC
         ):
-            return IdentityStatus(False, f"{path} signs, but the signature does not verify")
+            return Check("signing", f"{path} signs, but the signature does not verify", ok=False)
     except (WoswoarError, OSError) as exc:
-        return IdentityStatus(False, f"{path} cannot sign: {exc}")
-    return IdentityStatus(True, f"{path} ({crypto.fingerprint(verify_key)})")
+        return Check("signing", f"{path} cannot sign: {exc}", ok=False)
+    return Check("signing", f"{path} ({crypto.fingerprint(verify_key)})", ok=True)
 
 
-def trust_status(known: Machine) -> IdentityStatus:
+def trust_status(known: Machine) -> Check:
     """How many machines publishing here this one accepts, for `doctor`.
 
     Beside `signing_status` and `identity_status` for the reason their
@@ -694,14 +690,14 @@ def trust_status(known: Machine) -> IdentityStatus:
     accepted just because no sync has pruned the pin yet.
     """
     if not is_repo():
-        return IdentityStatus(True, "no history repo yet")
+        return Check("trust", "no history repo yet", ok=True)
     accepted = accepted_hosts(State.load())
     others = [host for host in archive.repo_hosts() if host != known.id]
     waiting = [host for host in others if host not in accepted]
     detail = f"{len(others) - len(waiting)} of {len(others)} other machine(s) accepted"
     if waiting:
         detail += " - run 'woswoar trust' to accept the rest"
-    return IdentityStatus(not waiting, detail)
+    return Check("trust", detail, ok=not waiting)
 
 
 def orphaned_day_key(host_id: str, day: str) -> bool:
@@ -2415,7 +2411,7 @@ def write_gitignore() -> bool:
     return True
 
 
-def repo_format_status() -> IdentityStatus:
+def repo_format_status() -> Check:
     """Whether this machine may write to the repository as it stands.
 
     Beside `signing_status` and `trust_status` for the reason their docstrings
@@ -2429,15 +2425,18 @@ def repo_format_status() -> IdentityStatus:
     """
     found = archive.repo_format()
     if found is None:
-        return IdentityStatus(True, f"{archive.REPO_FORMAT} - unmarked, the next sync records it")
+        return Check(
+            "repo format", f"{archive.REPO_FORMAT} - unmarked, the next sync records it", ok=True
+        )
     if found > archive.REPO_FORMAT:
-        return IdentityStatus(
-            False,
+        return Check(
+            "repo format",
             f"repo is format {found}, this woswoar understands {archive.REPO_FORMAT}"
             " - upgrade woswoar here ('pipx upgrade woswoar'); until then nothing"
             " is published or merged",
+            ok=False,
         )
-    return IdentityStatus(True, str(found))
+    return Check("repo format", str(found), ok=True)
 
 
 def require_known_repo_format() -> None:
