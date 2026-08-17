@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import unittest
 
-from tools.bench import BLOCKS, Pair, sign_p, summarise
+from tools.bench import BLOCKS, Pair, comparable, sign_p, summarise
 from tools.bench import _pairs_from as pairs_from
 
 
@@ -94,6 +94,43 @@ class TestItFindsARealDifference(unittest.TestCase):
         faster = summarise(drifting(blocks=10, drift=0.0, offset=-2.0))
         self.assertLess(faster.median, 0)
         self.assertEqual(faster.tree_slower, 0)
+
+
+class TestTheSidesMustHaveDoneTheSameWork(unittest.TestCase):
+    """The hole the three documented traps left open.
+
+    A revision where the flag did not exist yet exits in 40 ms with a usage error
+    while the working tree does 300 ms of work, and a harness that only times
+    them calls that a resolved slowdown.
+    """
+
+    def test_agreeing_statuses_are_reported_not_refused(self) -> None:
+        self.assertIn("exited 0", comparable({0}))
+
+    def test_a_consistently_failing_command_is_still_comparable(self) -> None:
+        """`doctor` exits 1 whenever it has something to report, so refusing every
+        non-zero status would make the most interesting command unbenchmarkable."""
+        self.assertIn("exited 1", comparable({1}))
+
+    def test_disagreement_is_refused(self) -> None:
+        with self.assertRaises(SystemExit) as refused:
+            comparable({0, 2})
+        self.assertIn("did not", str(refused.exception))
+
+    def test_no_readings_is_not_a_crash(self) -> None:
+        self.assertIn("exited 0", comparable(set()))
+
+
+class TestTheCounterbalanceIsCounted(unittest.TestCase):
+    def test_the_report_line_comes_from_the_pairs_and_not_arithmetic(self) -> None:
+        """It used to be derived as `pairs // 2`, which prints the same string
+        whatever the pairs contain -- so the line claiming both orders were used
+        was itself the unchecked claim its comment warned about."""
+        summary = summarise(drifting(blocks=10, drift=0.0))
+        self.assertEqual(summary.tree_first, summary.pairs // 2)
+
+        lopsided = [Pair(1.0, 2.0, tree_first=True) for _ in range(4)]
+        self.assertEqual(summarise(lopsided).tree_first, 4)
 
 
 class TestTheSignTest(unittest.TestCase):

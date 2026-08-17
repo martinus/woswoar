@@ -4,8 +4,18 @@
     python -m tools.bench --base main -- list --show 20
 
 Two revisions, one machine, and a difference small enough that the machine's own
-drift is the same size as the effect. That combination has produced a wrong
-number here twice, in two different ways, and this exists to close both.
+drift is the same size as the effect. That combination produced a wrong number
+here three times over, in three different ways, and this exists to close all
+three: where the two checkouts sat, the order they were measured in, and how the
+readings were summarised.
+
+**The filesystem trap.** ``/tmp`` is tmpfs on the machine this was written on and
+the checkout is on btrfs, so a worktree in the obvious place reads out of RAM
+against a tree reading off an SSD. That is a constant advantage to one side which
+no amount of counterbalancing removes, because it is not drift -- and it was
+enough to report a resolved 0.08 ms difference between a tree and *itself*. Both
+checkouts go on one filesystem, and `same_filesystem` *checks* rather than
+assuming, because "beside the repository" is a remedy and not the invariant.
 
 **The ordering trap.** Running A,B,A,B,... looks fair and is not: within every
 pair A is always measured first, so anything that makes the machine slower over
@@ -34,8 +44,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
-import shutil
 import statistics
 import subprocess
 import sys
@@ -44,6 +52,8 @@ import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
+
+from tools.sandbox import same_filesystem, sandbox_env, seed_machine, worktree
 
 #: One block measures each side twice. ABBA puts A at the ends and B in the
 #: middle; BAAB is its mirror. Either one balances a linear drift on its own;
@@ -56,9 +66,10 @@ class Pair(NamedTuple):
 
     base: float
     tree: float
-    #: Which side was measured first. Kept so the report can show that both
-    #: orders were used -- a counterbalance nobody checks is a claim, not a
-    #: control.
+    #: Which side was measured first. Counted into `Summary.tree_first` and
+    #: printed, because a counterbalance nobody checks is a claim rather than a
+    #: control -- the report used to derive that line as `pairs // 2`, which is
+    #: the same sentence with nothing behind it.
     tree_first: bool
 
     @property
@@ -90,6 +101,9 @@ class Summary(NamedTuple):
     tree_slower: int
     base_median: float
     tree_median: float
+    #: How many pairs measured the working tree first. Counted, not assumed: if
+    #: the block scheduling ever stops alternating, this is where it shows.
+    tree_first: int
 
     @property
     def p(self) -> float:
@@ -112,7 +126,7 @@ class Summary(NamedTuple):
 def summarise(pairs: Sequence[Pair]) -> Summary:
     """The paired statistics. Pure, so the design above can be tested."""
     deltas = sorted(pair.delta for pair in pairs)
-    quarter = max(len(deltas) // 4, 0)
+    quarter = len(deltas) // 4
     return Summary(
         pairs=len(deltas),
         median=statistics.median(deltas),
@@ -121,6 +135,7 @@ def summarise(pairs: Sequence[Pair]) -> Summary:
         tree_slower=sum(1 for value in deltas if value > 0),
         base_median=statistics.median([pair.base for pair in pairs]),
         tree_median=statistics.median([pair.tree for pair in pairs]),
+        tree_first=sum(1 for pair in pairs if pair.tree_first),
     )
 
 
@@ -137,8 +152,8 @@ def _pairs_from(block: str, samples: Sequence[float]) -> list[Pair]:
     return [Pair(second, first, tree_first=True), Pair(third, fourth, tree_first=False)]
 
 
-def _importtime(tree: Path, module: str) -> float:
-    """Milliseconds to import ``module``, from the interpreter's own accounting.
+def _importtime(tree: Path, module: str, env: dict[str, str]) -> tuple[float, int]:
+    """Milliseconds to import ``module``, and the exit status of asking.
 
     Far quieter than wall clock -- it excludes interpreter startup, which is most
     of a short run and none of the question -- and it is the number
@@ -149,84 +164,65 @@ def _importtime(tree: Path, module: str) -> float:
         capture_output=True,
         text=True,
         cwd=tree,
-        env={**os.environ, "PYTHONPATH": str(tree)},
-        check=True,
-    )
-    for line in reversed(done.stderr.splitlines()):
-        if line.rstrip().endswith(module):
-            return int(line.split("|")[1]) / 1000
-    raise SystemExit(f"no importtime line for {module}; is it importable from {tree}?")
-
-
-def _wall(tree: Path, argv: Sequence[str], home: Path) -> float:
-    """Milliseconds of wall clock for one `woswoar` run."""
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(tree),
-        "HOME": str(home),
-        "XDG_DATA_HOME": str(home / "data"),
-        "XDG_CONFIG_HOME": str(home / "config"),
-        "XDG_CACHE_HOME": str(home / "cache"),
-        "NO_COLOR": "1",
-    }
-    started = time.perf_counter()
-    subprocess.run(
-        [sys.executable, "-m", "woswoar", *argv],
-        capture_output=True,
-        cwd=home,
         env=env,
         check=False,
     )
-    return (time.perf_counter() - started) * 1000
+    for line in reversed(done.stderr.splitlines()):
+        if line.rstrip().endswith(module):
+            return int(line.split("|")[1]) / 1000, done.returncode
+    raise SystemExit(f"no importtime line for {module}; is it importable from {tree}?")
 
 
-def _worktree(revision: str) -> tuple[Path, str]:
-    """A checkout of ``revision``, *beside the repository* rather than in /tmp.
-
-    Where it lands is not a detail. On this machine `/tmp` is tmpfs and the
-    checkout is on btrfs, so a worktree in the obvious place reads out of RAM
-    while the tree it is being compared against reads off an SSD -- a constant
-    advantage to one side that no amount of counterbalancing removes, because it
-    is not drift. Measured at the time this was written: it was enough to report
-    a resolved 0.08 ms difference between a tree and *itself*.
-    """
-    sha = subprocess.run(
-        ["git", "rev-parse", "--short", revision], capture_output=True, text=True, check=True
-    ).stdout.strip()
-    path = Path(tempfile.mkdtemp(dir=Path.cwd().parent, prefix=".woswoar-bench-"))
-    path.rmdir()
-    subprocess.run(
-        ["git", "worktree", "add", "--detach", str(path), revision],
+def _wall(tree: Path, argv: Sequence[str], env: dict[str, str]) -> tuple[float, int]:
+    """Milliseconds of wall clock for one `woswoar` run, and its exit status."""
+    started = time.perf_counter()
+    done = subprocess.run(
+        [sys.executable, "-m", "woswoar", *argv],
         capture_output=True,
-        text=True,
-        check=True,
+        cwd=env["HOME"],
+        env=env,
+        check=False,
     )
-    return path, sha
+    return (time.perf_counter() - started) * 1000, done.returncode
 
 
 def run(
     revision: str, blocks: int, module: str | None, argv: Sequence[str], warmup: int
-) -> tuple[Summary, str]:
+) -> tuple[Summary, str, str]:
+    """``(summary, sha, note)`` for the working tree against ``revision``."""
     here = Path.cwd()
-    base, sha = _worktree(revision)
-    # Beside the repository too, and for the same reason: a sandbox on tmpfs
-    # would make a wall-clock run measure the wrong filesystem.
-    homes = tempfile.TemporaryDirectory(dir=here.parent, prefix=".woswoar-bench-home-")
-    try:
-        roots = {}
-        for name in ("base", "tree"):
-            root = Path(homes.name) / name
-            (root / "config" / "woswoar").mkdir(parents=True)
-            (root / "config" / "woswoar" / "machine").write_text(
-                "id=0123456789abcdef\nname=bench@sandbox\n", encoding="utf-8"
+    # Beside the repository, so that the checkout and the tree it is compared
+    # against are on one filesystem -- and then *checked*, because "beside" is a
+    # remedy for the tmpfs trap rather than the invariant, and it fails silently
+    # wherever the parent directory is a different mount.
+    with (
+        worktree(revision, beside=here.parent) as (base, sha),
+        tempfile.TemporaryDirectory(dir=here.parent, prefix=".woswoar-bench-home-") as holder,
+    ):
+        if not same_filesystem(base, here):
+            raise SystemExit(
+                f"{base} and {here} are on different filesystems, so one side would "
+                f"be measured against faster storage than the other. That is not "
+                f"drift and no amount of counterbalancing removes it."
             )
-            roots[name] = root
+        trees = {"base": base, "tree": here}
+        envs = {}
+        for side in trees:
+            home = Path(holder) / side
+            home.mkdir()
+            seed_machine(home, "bench@sandbox")
+            # Once per side, outside every timed region.
+            envs[side] = sandbox_env(trees[side], home)
+
+        codes: set[int] = set()
 
         def once(side: str) -> float:
-            tree = base if side == "base" else here
             if module:
-                return _importtime(tree, module)
-            return _wall(tree, argv, roots[side])
+                elapsed, code = _importtime(trees[side], module, envs[side])
+            else:
+                elapsed, code = _wall(trees[side], argv, envs[side])
+            codes.add(code)
+            return elapsed
 
         # Thrown away rather than counted: the first run of each side pays for
         # cold page cache and a `__pycache__` that does not exist yet, and that
@@ -240,23 +236,37 @@ def run(
             block = BLOCKS[index % len(BLOCKS)]
             samples = [once("base" if letter == "A" else "tree") for letter in block]
             pairs += _pairs_from(block, samples)
-    finally:
-        homes.cleanup()
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(base)],
-            capture_output=True,
-            text=True,
-            check=False,
+
+    return summarise(pairs), sha, comparable(codes)
+
+
+def comparable(codes: set[int]) -> str:
+    """One line about the exit statuses seen, or a refusal. Pure, so it is testable.
+
+    The sides have to have done the same work, or the difference is not a
+    difference in speed. Comparing against a revision where a flag did not exist
+    yet is the ordinary way in: the base exits in 40 ms having printed a usage
+    error while the tree does the job in 300 ms, and without this the report calls
+    that a resolved 260 ms slowdown -- the same class as the three traps the
+    module docstring names, and the one it left open. `compare` checks exit status
+    already; the asymmetry was the tell.
+
+    A consistently non-zero status is fine, and has to be: `doctor` exits 1
+    whenever it has anything to report. What is refused is *disagreement*.
+    """
+    if len(codes) > 1:
+        raise SystemExit(
+            f"the two revisions exited differently ({sorted(codes)}), so they did "
+            f"not do the same work and the timings are not comparable."
         )
-        shutil.rmtree(base, ignore_errors=True)
-    return summarise(pairs), sha
+    return f"both sides exited {codes.pop() if codes else 0}"
 
 
-def report(summary: Summary, revision: str, sha: str, what: str) -> str:
-    orders = f"{summary.pairs // 2} with each side first"
+def report(summary: Summary, revision: str, sha: str, what: str, note: str = "") -> str:
     lines = [
         f"{what}: working tree vs {revision} ({sha})",
-        f"  {summary.pairs} pairs in ABBA/BAAB blocks, {orders}",
+        f"  {summary.pairs} pairs in {summary.pairs // 2} ABBA/BAAB blocks, "
+        f"{summary.tree_first} measured the working tree first" + (f"; {note}" if note else ""),
         f"  base median {summary.base_median:.2f} ms   tree median {summary.tree_median:.2f} ms",
         f"  paired delta: median {summary.median:+.2f} ms, middle half "
         f"{summary.low:+.2f} to {summary.high:+.2f} ms",
@@ -299,9 +309,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not args.importtime and not args.command:
         parser.error("give --importtime MODULE, or a woswoar command to time")
 
-    summary, sha = run(args.base, args.blocks, args.importtime, args.command, args.warmup)
+    if args.blocks < 1:
+        parser.error("--blocks must be at least 1; there is nothing to summarise from none")
+
+    summary, sha, note = run(args.base, args.blocks, args.importtime, args.command, args.warmup)
     what = f"import {args.importtime}" if args.importtime else f"woswoar {' '.join(args.command)}"
-    print(report(summary, args.base, sha, what))
+    print(report(summary, args.base, sha, what, note))
     return 0
 
 
