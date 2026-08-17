@@ -21,14 +21,14 @@ extra: `pip install -e '.[dev]'`. The suite also drives real `age`, real `git`,
 a real `bash` and a real `fzf`, and it will tell you which one is missing.
 
 ```bash
-python -m tools.run_tests                               # 301 tests, sharded, ~6s
+python -m tools.run_tests                               # 993 tests, sharded, ~5s
 python -m unittest discover -s . -t . -p 'test_*.py'    # the same suite, serially
 WOSWOAR_BENCH=1 python -m unittest tests.test_perf      # latency on 52k entries
 ```
 
 The suite is about 88% subprocess wait — it drives real `age`, `git` and
 `ssh-keygen` rather than mocking them — so sharding it across processes takes it
-from ~19s to ~6s. Both commands run the same tests; the runner additionally
+from ~60s to ~5s. Both commands run the same tests; the runner additionally
 fails if any test it discovered never reported back, which is a way a parallel
 run can be green that a serial one cannot.
 
@@ -50,10 +50,20 @@ of edits, run `python -m tools.mutate <spec>.py`, and paste its output into the
 pull request — verbatim, rather than retyping it, which is how a mutation that
 was never run ended up quoted in a commit message here.
 
-Use it rather than writing the loop by hand, for three reasons it has learned:
+Three verdicts, not two. `caught` means a **test method** noticed; `SURVIVED`
+means none did; `BROKE` and `TIMEOUT` mean the run never got to ask, and are
+counted apart from both. That third category exists because a mutation which
+makes a module unimportable also exits non-zero with a plausible `Ran N` — so it
+read as `caught` while the test named in the row never executed, which is a false
+pass in a pull request and indistinguishable from a real one.
+
+Use it rather than writing the loop by hand, for four reasons it has learned:
 
 - **It never edits your working tree.** Each mutation goes into a throwaway copy,
   so an interrupted run cannot leave mutated source behind.
+- **It classifies where the result objects are**, not by reading what `unittest`
+  printed. A dead `setUpClass`, an import that stopped working and a real
+  assertion failure all exit non-zero; only the last of them is an answer.
 - **It runs the table in parallel**, which the copies are what make safe: 197 s
   down to 51 s for four mutations against `tests.test_sync`.
 - **It defuses the bytecode cache.** A `.pyc` is validated against

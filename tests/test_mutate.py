@@ -17,7 +17,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tools.mutate import Mutation, verify
+from tools.mutate import Mutation, Report, Result, Verdict, run, verify
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -377,14 +377,108 @@ class TestAMutationThatBreaksTheSuiteIsNotCaught(MutateTestCase):
     in a pull request is indistinguishable from a real one.
     """
 
-    def test_a_mutation_that_breaks_the_import_is_refused(self) -> None:
-        self.package(guarded=True)
+    def refuses(self, mutation: Mutation) -> None:
+        """Every test here asserts the same thing about a different fixture."""
         with self.assertRaises(SystemExit) as refused:
-            verify(
-                [Mutation("syntax", "mod.py", "def clamp", "def (", "test_mod")],
-                baseline=False,
-            )
-        self.assertIn("ran no tests", str(refused.exception))
+            verify([mutation], baseline=False)
+        self.assertIn("broke collection", str(refused.exception))
+
+    def test_a_mutation_that_breaks_the_import_is_refused(self) -> None:
+        """A *syntax* error, which is only one of the two ways collection breaks.
+
+        This propagates out of `unittest.loader` entirely, so there is no `Ran`
+        line to read. It is the narrow case, and for a long time it was the only
+        one here -- which is why the two below could exist unnoticed.
+        """
+        self.package(guarded=True)
+        self.refuses(Mutation("syntax", "mod.py", "def clamp", "def (", "test_mod"))
+
+    def test_an_import_error_is_not_a_catch(self) -> None:
+        """The shape the fixture above cannot reach, and it reported `caught`.
+
+        `unittest/loader.py` catches `ImportError` -- and only `ImportError` --
+        and turns it into a synthetic `unittest.loader._FailedTest`. So the run
+        prints `Ran 1 test`, `FAILED (errors=1)` and exits non-zero, which a
+        check reading the exit status and the count cannot tell apart from a test
+        noticing the mutation. A SyntaxError takes the other path and produces no
+        count at all, so the sibling fixture above passed on code that got this
+        one wrong: the two answers differ, and only one of them was ever asked.
+        """
+        self.package(guarded=True)
+        self.write("mod.py", "import json\n" + CLAMP)
+        self.refuses(
+            Mutation("the import goes bad", "mod.py", "import json", "import nope_xyz", "test_mod")
+        )
+
+    def test_a_broken_setupclass_is_not_a_catch(self) -> None:
+        """`Ran N` is greater than zero here, and still nothing asserted.
+
+        The first class runs and passes; the second's `setUpClass` dies, which
+        `unittest` reports through an `_ErrorHolder` that is not counted in
+        `testsRun`. So the count is honest, non-zero, and says nothing about
+        whether the mutation was noticed -- the reason the verdict cannot be a
+        function of the count alone.
+        """
+        self.write("mod.py", CLAMP + '\n\ndef helper() -> str:\n    return "ok"\n')
+        self.write(
+            "test_mod.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class A(unittest.TestCase):
+                def test_it(self) -> None:
+                    self.assertEqual(mod.clamp(-5), 0)
+
+
+            class B(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls) -> None:
+                    cls.shouted = mod.helper().upper()
+
+                def test_it(self) -> None:
+                    self.assertEqual(self.shouted, "OK")
+            """,
+        )
+        self.refuses(
+            Mutation("helper returns nothing", "mod.py", 'return "ok"', "return None", "test_mod")
+        )
+
+    def test_a_run_that_died_without_answering_is_not_a_survivor(self) -> None:
+        """The last route, and the only one the probe cannot report on itself.
+
+        `os._exit` skips every `except` and `finally` there is, so the probe is
+        gone before it can say what happened -- which is what a signal, an OOM
+        kill or a segfault in a C extension look like from outside. The parent
+        has nothing to read, and the honest reading of nothing is `broke`.
+
+        Written because the mutation that removes this branch survived: the probe
+        gained an `except BaseException` that writes `loaded: false`, and that
+        made every fixture reach the *other* branch. The code was right and the
+        fixtures could no longer tell.
+        """
+        self.package(guarded=True)
+        self.write("test_mod.py", "import os\n\nos._exit(3)\n")
+        self.refuses(
+            Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")
+        )
+
+    def test_a_target_holding_no_tests_is_not_a_survivor(self) -> None:
+        """The third route to nothing having been asked, and the quietest.
+
+        The target imports, collects, and holds no test methods at all -- so the
+        run is green, exits zero, and would read as `SURVIVED`: a report that the
+        fix is unguarded, produced by a table pointed at a module that could not
+        have guarded anything. Found by mutating this file: the branch existed
+        and nothing reached it.
+        """
+        self.package(guarded=True)
+        self.write("test_empty.py", "import unittest\n")
+        self.refuses(
+            Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_empty")
+        )
 
     def test_a_real_mutation_is_still_caught(self) -> None:
         """The other half: the check must not refuse an ordinary mutation, which
@@ -397,6 +491,185 @@ class TestAMutationThatBreaksTheSuiteIsNotCaught(MutateTestCase):
             ),
             0,
         )
+
+
+class TestASubTestIsARealAnswer(MutateTestCase):
+    """The regression the first version of this classification shipped with.
+
+    Telling a real test from one of `unittest`'s synthetic carriers by asking
+    where its class is defined looks right and is not: `unittest.case._SubTest`
+    is a `TestCase` living in `unittest.case`, so a mutation whose only witness
+    was an assertion inside `with self.subTest(...)` was filed as "the suite
+    broke" -- and, the table being strict, aborted the run while blaming the
+    table. This repository uses `subTest` in more than twenty places, including
+    `tests/test_credentials.py` and `tests/test_architecture.py`.
+
+    The fix is to classify by protocol: `addSubTest` is handed the *owning* test,
+    so recording that is both correct and free of any private name.
+    """
+
+    def test_a_mutation_seen_only_inside_a_subtest_is_caught(self) -> None:
+        self.write("mod.py", CLAMP)
+        self.write(
+            "test_mod.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    # Every assertion this class makes is inside a subTest, which
+                    # is the whole point: there is no plain failure to fall back
+                    # on if the subTest route is misfiled.
+                    for value in (-5, -1):
+                        with self.subTest(value=value):
+                            self.assertEqual(mod.clamp(value), 0)
+            """,
+        )
+        survivors = verify(
+            [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+            baseline=False,
+        )
+        self.assertEqual(survivors, 0, "a subTest assertion is a test noticing")
+
+
+class TestAnUnanswerableRowNeedNotEndTheRun(MutateTestCase):
+    """Strict is right for a hand table and wrong for a generated one.
+
+    A spec file is written by someone, so a row that cannot be answered is their
+    mistake and stopping is what gets it fixed. A table generated from a diff is
+    two hundred rows nobody wrote, and throwing away every answer already paid
+    for because one mutant broke an import is a different trade entirely.
+    """
+
+    def test_the_run_finishes_and_reports_all_three_outcomes(self) -> None:
+        self.package(guarded=True)
+        self.write("mod.py", "import json\n" + CLAMP)
+        report = run(
+            [
+                Mutation("the guard goes", "mod.py", "if value < 0:", "if False:", "test_mod"),
+                Mutation(
+                    "the import goes bad", "mod.py", "import json", "import nope_xyz", "test_mod"
+                ),
+                Mutation(
+                    "the pass-through changes", "mod.py", "return value", "return 99", "test_mod"
+                ),
+            ],
+            baseline=False,
+            strict=False,
+        )
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results],
+            ["caught", "broke", "survived"],
+        )
+
+    def test_strict_is_still_the_default(self) -> None:
+        """Because every spec file in the repository's history relies on it."""
+        self.package(guarded=True)
+        self.write("mod.py", "import json\n" + CLAMP)
+        with self.assertRaises(SystemExit):
+            run(
+                [Mutation("bad", "mod.py", "import json", "import nope_xyz", "test_mod")],
+                baseline=False,
+            )
+
+
+class TestAMutantThatNeverFinishes(MutateTestCase):
+    """A generated mutant can turn a loop bound into one that never fires.
+
+    With no limit, that holds a lane for the rest of the table and the printout
+    stops at its row, because results are reported in table order. The answer is
+    an outcome, not an exception: the other rows still have something to say.
+    """
+
+    def test_it_times_out_instead_of_holding_the_lane(self) -> None:
+        self.package(guarded=True)
+        report = run(
+            [
+                # The *guarded* branch, because that is the one the fixture's test
+                # actually reaches: a loop behind `return 0` is never entered by
+                # `clamp(-5)`, and the row came back `survived` in milliseconds.
+                Mutation(
+                    "clamp never returns",
+                    "mod.py",
+                    "        return 0",
+                    "        while True:\n            pass",
+                    "test_mod",
+                ),
+                Mutation("the guard goes", "mod.py", "if value < 0:", "if False:", "test_mod"),
+            ],
+            baseline=False,
+            strict=False,
+            # Long enough that a healthy row is never mistaken for a hang -- the
+            # sibling row below runs in well under a second -- and short enough
+            # that this test is not the slowest in the file.
+            timeout=5.0,
+        )
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results], ["timeout", "caught"]
+        )
+
+
+class TestFailfastStopsAtTheFirstTestThatNoticed(MutateTestCase):
+    """Worth having because a caught mutant is the common case.
+
+    Not asserted on wall clock, which would be the same claim with a flake
+    attached: each test records that it ran, and the count says how far the run
+    got. Note this is an average, not a bound -- `unittest` runs classes in
+    alphabetical order, so a mutant caught only by the last of them still pays
+    for nearly all of the module.
+    """
+
+    def counting(self) -> Path:
+        ledger = self.root / "ledger.txt"
+        self.write("mod.py", CLAMP)
+        self.write(
+            "test_mod.py",
+            f"""
+            import unittest
+            from pathlib import Path
+
+            import mod
+
+            LEDGER = Path({str(ledger)!r})
+
+
+            class T(unittest.TestCase):
+                def record(self) -> None:
+                    with LEDGER.open("a", encoding="utf-8") as log:
+                        log.write("ran\\n")
+
+                def test_a(self) -> None:
+                    self.record()
+                    self.assertEqual(mod.clamp(-5), 0)
+
+                def test_b(self) -> None:
+                    self.record()
+
+                def test_c(self) -> None:
+                    self.record()
+            """,
+        )
+        return ledger
+
+    def ran_under(self, failfast: bool) -> int:
+        ledger = self.counting()
+        run(
+            [Mutation("the guard goes", "mod.py", "if value < 0:", "if False:", "test_mod")],
+            baseline=False,
+            failfast=failfast,
+        )
+        return len(ledger.read_text(encoding="utf-8").split())
+
+    def test_it_stops_after_the_failure(self) -> None:
+        self.assertEqual(self.ran_under(failfast=True), 1)
+
+    def test_without_it_the_whole_class_runs(self) -> None:
+        """The other half, and the one that makes the number above mean something:
+        a ledger showing 1 proves nothing if 1 is all the class ever writes."""
+        self.assertEqual(self.ran_under(failfast=False), 3)
 
 
 class TestOneLaneIsNotADeadlock(MutateTestCase):
@@ -455,16 +728,95 @@ class TestTheScriptEntryPoint(MutateTestCase):
             ]
             """,
         )
-        finished = subprocess.run(
-            [sys.executable, "-m", "tools.mutate", str(self.root / "spec.py")],
+        finished = self.drive("spec.py")
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertIn("caught", finished.stdout)
+
+    def drive(self, name: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "tools.mutate", str(self.root / name)],
             cwd=self.root,
             capture_output=True,
             text=True,
             check=False,
             env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         )
-        self.assertEqual(finished.returncode, 0, finished.stderr)
+
+    def test_a_script_that_calls_verify_itself_is_not_a_failure(self) -> None:
+        """#213: it ran the table, printed `caught`, and then exited 1.
+
+        The message said the file defined nothing, and because stderr is not
+        buffered against stdout it landed *above* the results it was contradicting.
+        Met while verifying #201, where the fix was to rewrite the spec into the
+        shape the docstring did not show.
+        """
+        self.package(guarded=True)
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation, verify
+
+            verify(
+                [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")]
+            )
+            """,
+        )
+        finished = self.drive("spec.py")
         self.assertIn("caught", finished.stdout)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertNotIn("defines no MUTATIONS", finished.stderr)
+
+    def test_a_script_that_does_both_runs_the_table_once(self) -> None:
+        """The quieter half of #213: minutes of wall clock, silently doubled."""
+        self.package(guarded=True)
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation, verify
+
+            MUTATIONS = [
+                Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")
+            ]
+            verify(MUTATIONS)
+            """,
+        )
+        finished = self.drive("spec.py")
+        self.assertEqual(finished.stdout.count("the clamp is gone"), 1, finished.stdout)
+        self.assertIn("Delete one of the two", finished.stderr)
+
+    def test_a_survivor_exits_nonzero(self) -> None:
+        self.package(guarded=False)
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation
+
+            MUTATIONS = [
+                Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")
+            ]
+            """,
+        )
+        finished = self.drive("spec.py")
+        self.assertIn("SURVIVED", finished.stdout)
+        self.assertEqual(finished.returncode, 1)
+
+    def test_a_row_that_asked_nothing_is_not_clean(self) -> None:
+        """A `BROKE` row is not a pass. Calling it clean would report the table as
+        complete while it was quietly that much smaller than it looks."""
+        mutation = Mutation("x", "mod.py", "a", "b", "test_mod")
+        caught = Result(mutation, Verdict("caught", "test_mod.T.test_it"))
+        self.assertTrue(Report([caught]).clean)
+        self.assertFalse(Report([Result(mutation, Verdict("broke", "why"))]).clean)
+        self.assertFalse(Report([Result(mutation, Verdict("timeout", "why"))]).clean)
+        self.assertFalse(Report([Result(mutation, Verdict("survived"))]).clean)
+        self.assertFalse(Report([caught], baseline_red=True).clean)
+
+    def test_a_script_that_does_neither_still_says_so(self) -> None:
+        self.package(guarded=True)
+        self.write("spec.py", "x = 1\n")
+        finished = self.drive("spec.py")
+        self.assertNotEqual(finished.returncode, 0)
+        self.assertIn("never called verify()", finished.stderr)
 
 
 if __name__ == "__main__":
