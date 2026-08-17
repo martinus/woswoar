@@ -17,11 +17,13 @@ Who sits on whom. Indentation is "imports"; the three at the bottom are what the
 domains are made of.
 
 ```
-entry, errors        the record format, and the exception every layer raises
+entry, errors        the record format, and the exceptions every layer raises
   store              logs/, machine identity, the filesystem primitives
     archive          history/ -- the repo layout    (sync and prove only)
+      manifest       what a host signs for a day    (sync and prove only)
     cache            the parse index
       search         Ctrl-R
+    gitrepo          every git fork woswoar makes
   crypto             age and ssh-keygen
   credentials
     importer         bash, zsh, atuin
@@ -30,20 +32,22 @@ entry, errors        the record format, and the exception every layer raises
 deps, progress,      leaves: asked things by anyone, knowing nobody
 report
 
-sync      <- archive, crypto, progress, report, store, entry, errors
+sync      <- gitrepo, manifest, archive, crypto, progress, report, store,
+             entry, errors
 doctor    <- report, search, cache, crypto, deps, store, entry, errors
 prove     <- sync, and everything sync is made of, plus deps and report
 __main__  <- search, cache, importer, install, setup, report, store,
              entry, errors
-             (sync, crypto, archive, doctor and prove only inside the
-              commands that need them -- see "Two costs shape everything")
+             (sync, gitrepo, manifest, crypto, archive, doctor and prove
+              only inside the commands that need them -- see "Two costs
+              shape everything")
 ```
 
 | layer | modules | what it may know |
 |---|---|---|
 | format | `entry`, `errors` | nothing else in the package |
 | platform | `store`, `crypto`, `deps`, `progress`, `report`, `credentials` | the format layer |
-| derived | `cache`, `archive` | the two above |
+| derived | `cache`, `archive`, `manifest`, `gitrepo` | the two above |
 | domains | `search`, `sync`, `importer`, `install` | everything below, and **never each other** |
 | composition | `setup`, `doctor`, `prove`, `__main__` | everything |
 
@@ -53,6 +57,11 @@ __main__  <- search, cache, importer, install, setup, report, store,
 self-description. Only `sync` and `prove` may reach `archive`. `history_dir` is
 the one path that stays in `store`, because `store._private_paths` has to prune
 that directory by name when it walks for `harden` and `readable_by_others`.
+
+`manifest` and `gitrepo` are derived rather than domains, and the test is that
+neither knows what a sync *is*: `manifest` signs and verifies a day's chunk list
+and `gitrepo` runs git in one directory, and `sync` is the only caller that knows
+the order to do those in. Both were sections of `sync.py` until #201.
 
 Three rules follow, and [`tests/test_architecture.py`](../tests/test_architecture.py)
 holds all three against the real import graph rather than against the `import`
@@ -192,9 +201,24 @@ Match the density. [`CLAUDE.md`](../CLAUDE.md) and
 The layering above is real and holds. The *sizes* do not, and this section
 exists so that nobody has to rediscover it.
 
-**`sync.py` is 3512 lines holding five separable concerns** — the recipient-file
-grammar, trust and pinning, manifests, the chunk codec, and git plumbing — plus
-the orchestration that drives them and the status queries `doctor` asks.
+**`sync.py` held five separable concerns** — the recipient-file grammar, trust
+and pinning, manifests, the chunk codec, and git plumbing — plus the
+orchestration that drives them and the status queries `doctor` asks. #201 has
+taken two of them out, as `manifest.py` and `gitrepo.py`, and stopped there on
+purpose: `run`, `export`, `merge` and `_Day` stay together because *the ordering
+between them is the correctness argument*, not an implementation detail. Fetch
+before export or a day key is sealed to a stale recipient list, permanently; the
+version gate is read after the fetch and before anything is written; `export`
+extends the manifest it last signed and must never list the directory. Those
+three are one-line-to-break and want to be read in one sequence.
+
+So the file is 3172 lines and not the ~1500 that
+[#203](https://github.com/martinus/woswoar/issues/203) asks for. That target is
+not met and is not being quietly dropped: what the two slices bought is that
+`tests/test_sync.py` can now reach the authenticity layer and the git plumbing
+without driving `run()`, which is the ratio #203 was actually measuring. The
+remaining three concerns are a redesign of `run` rather than a move, and nothing
+has shown yet that it would be an improvement.
 
 The visible symptom *was* `sync.Report`: seventeen fields, each a failure from a
 different one of those layers. #199 has collapsed it. The ten fields that were
@@ -207,9 +231,17 @@ that notices it.
 That did not make the file shorter; it is a hundred lines longer, because each
 kind now carries the comment that used to sit on its field. Shortening it was
 never the point. The prose is **movable** now: a kind is a constant, its prose
-and one call site, so each slice #201 carves out of this module takes its own
-kinds with it instead of leaving a 143-line method behind that binds all five
+and one call site, rather than a field in a 143-line method that bound all five
 concerns at once.
+
+In the event neither slice of #201 took a kind with it, and that is worth
+recording because it was the predicted outcome and it did not happen. The reason
+is that an outcome is recorded by whoever *notices* a failure and has the subject
+to name it — `merge` and `export` — not by the layer that failed. `manifest.read`
+returning `{}` is not an outcome; `sync` finding a chunk that no manifest
+accounts for is. What the collapse actually bought the split was `Report` no
+longer having a field per layer, so moving a layer no longer changed its
+signature.
 
 **`__main__.py` was 1813 lines and inverted pattern 4 in two places.** #202 has
 split both out. `install.py` owns which shells woswoar is responsible for, what
@@ -243,8 +275,10 @@ under `history/`, and the filesystem primitives — so everything that wanted
 What is left in `store` that does not belong to it is four per-machine files
 `sync` owns — `state_file`, `sync_stamp_file`, `sync_failure_file`,
 `signing_key_file`. They stayed deliberately: none of them is *in* the
-repository, so filing them under `archive` would be worse than leaving them, and
-their home is whatever #201 carves out of `sync`.
+repository, so filing them under `archive` would be worse than leaving them. #201
+did not find a home for them either: `signing_key_file` is now read by `manifest`
+and by three of `sync`'s status checks, so moving it would trade one split
+vocabulary for another.
 
 **Outcome reporting had five spellings**, and `report` is now the answer (#199).
 It holds two, and the distinction between them is real rather than a compromise:
@@ -273,17 +307,17 @@ fail and is Check-shaped without a label; `importer.Result` is counts the CLI
 words, and `progress` is a different thing altogether — a live Protocol, not a
 result. The first two could convert and have not.
 
-These are tracked as issues rather than fixed in passing, and the layering above
-is what makes them fixable one at a time.
+All four are done.
 [#203](https://github.com/martinus/woswoar/issues/203) carries the argument for
-treating them as one piece of work — they are two half-finished ideas rather than
-four chores — along with what "done" looks like and what must not change on the
-way. The order is not the order they are listed in above: the two cheap ones come
-first because they make the expensive one smaller.
+treating them as one piece of work — they were two half-finished ideas rather
+than four chores — along with what "done" looks like and what must not change on
+the way. The order was not the order they are listed in above: the two cheap ones
+came first because they made the expensive one smaller, and that held — the
+outcome collapse in #199 is what turned #201 from a redesign into two moves.
 
 | | issue |
 |---|---|
 | 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
 | 2 | ~~[#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting~~ — **done**, in three parts: `report.Check`, `report.Notice`, and `sync.Outcome` collapsing `Report`'s seventeen fields to seven. |
 | 3 | ~~[#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`~~ — **done**, as `woswoar/install.py` and `woswoar/setup.py`. |
-| 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |
+| 4 | ~~[#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above~~ — **done**, as `woswoar/manifest.py` and `woswoar/gitrepo.py`. The orchestration stayed; see above for why, and for the line count that did not reach its target. |
