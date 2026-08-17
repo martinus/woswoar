@@ -32,6 +32,13 @@ time here:
   reported a *correct* test as decoration once, and the test was nearly
   rewritten because of it. Every run is ``-B`` and every ``__pycache__`` is
   removed between mutations.
+- **An edit that adds without removing is refused.** A replacement that still
+  contains the text it replaced leaves the code under test exactly as it was, so
+  the run reports "caught" or "SURVIVED" about nothing. That is the easy way to
+  write a *move* wrongly -- put the whole span in ``old``, including the line you
+  mean to relocate -- and it shipped three times in one session before this
+  check. Pass ``additive=True`` for the rare edit that really does mean to insert
+  in front of code that stays.
 - **The tree is restored even when interrupted.** A ``finally`` is not enough on
   its own -- a kill leaves the source mutated, which is exactly the state
   CLAUDE.md rule 6 is about -- so the original text is also written to a
@@ -64,6 +71,11 @@ class Mutation(NamedTuple):
     new: str
     #: Whitespace-separated unittest targets, as `python -m unittest` takes them.
     tests: str
+    #: Say so when the replacement is meant to *contain* the original -- an
+    #: inserted call, an early return in front of code that stays. Otherwise
+    #: `verify` refuses that shape, because it is overwhelmingly a mistake: see
+    #: the check for why, and what it cost before it existed.
+    additive: bool = False
 
 
 class Result(NamedTuple):
@@ -106,6 +118,25 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True) -> int:
                 f"{mutation.label}: {mutation.path} contains the text to replace "
                 f"{found} times, not once. A mutation that matches nothing tests "
                 f"nothing, and one that matches twice tests something else."
+            )
+
+        # The replacement still contains everything it replaced, so the line the
+        # test is supposed to miss is still in the file and the run cannot mean
+        # anything. Always a mistake when the intent was to *move* something --
+        # write the whole span in `old`, including what follows it, or the
+        # original stays put underneath the edit.
+        #
+        # Three of these went out in one session before this check existed. Each
+        # cost a full suite run and read as "caught" when nothing had changed;
+        # the tell is that a mutation meant to break an invariant reports the
+        # same result as one that does nothing, and there is no way to see which
+        # from the output.
+        if not mutation.additive and mutation.old in mutation.new:
+            raise SystemExit(
+                f"{mutation.label}: the text to replace survives verbatim inside "
+                f"the replacement, so the code under test does not change and "
+                f"'caught' would mean nothing. If the point really is to insert "
+                f"something in front of code that stays, pass additive=True."
             )
 
         # Written somewhere findable before the file is touched, so an

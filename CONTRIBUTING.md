@@ -78,6 +78,33 @@ five shapes the codebase keeps reusing. The layering is not a convention —
 real import graph, so a new edge between modules is a deliberate one-line edit
 and a sentence in the pull request.
 
+When the move is supposed to change nothing a user sees, show that rather than
+asserting it:
+
+```sh
+python -m tools.compare --base main --show .bashrc install doctor status
+```
+
+[`tools/compare.py`](tools/compare.py) runs each command against both revisions
+in a throwaway `$HOME`, with the same machine id seeded on both sides, and diffs
+stdout, stderr and exit status together. Only `$HOME` and the tree path are
+normalised unless you ask for more with `--scrub`; whatever is active is printed
+above the verdict, and that list belongs in the pull request beside the claim.
+"Byte-identical" is worth exactly what was left unnormalised.
+
+If the move might cost time, [`tools/bench.py`](tools/bench.py) is the A/B:
+
+```sh
+python -m tools.bench --importtime woswoar.__main__ --base main
+```
+
+It puts the base worktree beside the repository rather than in `/tmp` — which is
+tmpfs here, so the obvious placement measures RAM against an SSD — runs ABBA and
+BAAB blocks so a machine that warms up over the run does not read as a
+regression, and reports the median of the per-pair differences with a sign test.
+When it says *not resolved*, that is the answer: write "below measurement", not a
+figure with two decimal places.
+
 ## Comments explain *why*
 
 The comment density here is deliberate and is most of the value of the codebase.

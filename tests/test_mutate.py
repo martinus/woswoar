@@ -119,6 +119,62 @@ class TestItRefusesToGuess(MutateTestCase):
         self.assertIn("0 times", str(refused.exception))
 
 
+class TestItRefusesAnEditThatOnlyAdds(MutateTestCase):
+    """The mistake this catches shipped three times in one session.
+
+    Writing a *move* as a mutation is easy to get wrong: put only the first half
+    of the span in ``old`` and the replacement ends up containing the line you
+    meant to relocate, so it is still there underneath the edit. The code under
+    test never changes, and the run prints "caught" or "SURVIVED" about nothing
+    -- with no way to tell from the output which of the two you are looking at.
+    """
+
+    def test_a_replacement_containing_the_original_is_refused(self) -> None:
+        self.package(guarded=True)
+        with self.assertRaises(SystemExit) as refused:
+            verify(
+                [
+                    Mutation(
+                        "the guard is hoisted rather than removed",
+                        "mod.py",
+                        "    if value < 0:\n        return 0",
+                        "    print('noise')\n    if value < 0:\n        return 0",
+                        "test_mod",
+                    )
+                ]
+            )
+        self.assertIn("survives verbatim", str(refused.exception))
+
+    def test_additive_says_the_insertion_is_the_point(self) -> None:
+        """The escape hatch, and it has to exist: inserting a call in front of
+        code that stays is how you test the *order* of two steps, which is a real
+        mutation with a real answer."""
+        self.package(guarded=True)
+        survivors = verify(
+            [
+                Mutation(
+                    "an early return is inserted in front of the guard",
+                    "mod.py",
+                    "    if value < 0:",
+                    "    return 99\n    if value < 0:",
+                    "test_mod",
+                    additive=True,
+                )
+            ],
+            baseline=False,
+        )
+        self.assertEqual(survivors, 0, "the inserted return should have been caught")
+
+    def test_the_refusal_happens_before_the_file_is_touched(self) -> None:
+        """Otherwise the check would trade one wasted run for a mutated tree,
+        which is the failure `CLAUDE.md` rule 6 is about."""
+        self.package(guarded=True)
+        before = (self.root / "mod.py").read_text(encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            verify([Mutation("x", "mod.py", "return value", "return value  # same", "test_mod")])
+        self.assertEqual((self.root / "mod.py").read_text(encoding="utf-8"), before)
+
+
 class TestItRestoresTheTree(MutateTestCase):
     def test_the_source_is_unchanged_afterwards(self) -> None:
         self.package(guarded=True)
