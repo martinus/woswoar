@@ -664,7 +664,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    from . import crypto, sync
+    from . import archive, crypto, sync
 
     known, identity, pinned = sync.initialise(
         remote=args.remote,
@@ -675,7 +675,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"identity : {identity}")
     print(f"repo     : {store.history_dir()}")
     print(f"remote   : {sync.remote_summary()}")
-    print(f"\nRecipients now enrolled ({store.recipients_file()}):")
+    print(f"\nRecipients now enrolled ({archive.recipients_file()}):")
     # By fingerprint, not by a truncated key. A prefix of a key looks checkable
     # and is not -- it is the abbreviation `grant` stopped using for exactly
     # that reason, and this is the listing someone reads first.

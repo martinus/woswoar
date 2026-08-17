@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import crypto, progress, store
+from . import archive, crypto, progress, store
 from .entry import make_inert
 from .errors import WoswoarError
 from .store import Machine
@@ -179,7 +179,7 @@ _REVOKED = "-"
 
 
 def _recipient_lines() -> list[str]:
-    path = store.recipients_file()
+    path = archive.recipients_file()
     if not path.is_file():
         return []
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -237,7 +237,7 @@ def _append_recipient_line(line: str) -> None:
     newline rule in two places on the one file every machine in the fleet
     writes and that ``merge=union`` makes unforgiving about stray lines.
     """
-    path = store.recipients_file()
+    path = archive.recipients_file()
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     separator = "" if not existing or existing.endswith("\n") else "\n"
     store.write_atomic(path, f"{existing}{separator}{line}\n".encode())
@@ -323,7 +323,7 @@ def _host_owners() -> Owners:
 
     Everything `signer.pub` says is untrusted, and this used to keep the first
     claim in sorted order and drop the rest -- `setdefault` over
-    `store.repo_hosts()`. Host ids are chosen locally, so anyone who can push
+    `archive.repo_hosts()`. Host ids are chosen locally, so anyone who can push
     could add a directory whose id sorts first, name *your* recipient as its
     owner, and win the mapping for it (#110). `accept` would then print that
     host's verify key directly beneath your own real, checkable age
@@ -335,7 +335,7 @@ def _host_owners() -> Owners:
     other. Silently picking one is what made a contradiction look like a fact.
     """
     claims: dict[str, list[str]] = {}
-    for host_id in store.repo_hosts():
+    for host_id in archive.repo_hosts():
         signer = read_signer(host_id)
         if signer is not None:
             claims.setdefault(signer.owner, []).append(host_id)
@@ -467,7 +467,7 @@ class State:
     #: "<host>/<day>" -> the day directory's mtime when every chunk its signed
     #: manifest listed had been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
-    #: costs on a timer that fires every minute. See `store.day_stamp`.
+    #: costs on a timer that fires every minute. See `archive.day_stamp`.
     #:
     #: Named for what it means: a day merged *completely*, not one looked at.
     #: One left short by an unopenable key or a chunk that would not
@@ -696,7 +696,7 @@ def trust_status(known: Machine) -> IdentityStatus:
     if not is_repo():
         return IdentityStatus(True, "no history repo yet")
     accepted = accepted_hosts(State.load())
-    others = [host for host in store.repo_hosts() if host != known.id]
+    others = [host for host in archive.repo_hosts() if host != known.id]
     waiting = [host for host in others if host not in accepted]
     detail = f"{len(others) - len(waiting)} of {len(others)} other machine(s) accepted"
     if waiting:
@@ -719,7 +719,8 @@ def orphaned_day_key(host_id: str, day: str) -> bool:
     side of this -- a sealed key with no public half is simply re-minted.
     """
     return (
-        store.day_key_public(host_id, day).is_file() and not store.day_key(host_id, day).is_file()
+        archive.day_key_public(host_id, day).is_file()
+        and not archive.day_key(host_id, day).is_file()
     )
 
 
@@ -740,7 +741,7 @@ def has_chunks(host_id: str, day: str) -> bool:
     186 ms rather than 3.8 ms for 40 orphaned days at 20k chunks, in exactly the
     state `doctor` exists to find.
     """
-    return bool(store.chunk_names(host_id, day))
+    return bool(archive.chunk_names(host_id, day))
 
 
 def orphaned_days() -> list[tuple[str, str]]:
@@ -756,8 +757,8 @@ def orphaned_days() -> list[tuple[str, str]]:
     them and a test can assert on the day rather than search for it.
     """
     found = []
-    for host_id in store.repo_hosts():
-        sealed, public = store.day_key_days(host_id)
+    for host_id in archive.repo_hosts():
+        sealed, public = archive.day_key_days(host_id)
         for day in sorted(public - sealed):
             if has_chunks(host_id, day):
                 found.append((host_id, day))
@@ -771,7 +772,7 @@ def manifest_gone(host_id: str, day: str) -> bool:
     so every caller pairs it with "did this machine publish this day", which is
     its own export watermark.
     """
-    return not store.day_manifest(host_id, day).exists()
+    return not archive.day_manifest(host_id, day).exists()
 
 
 def unlisted_chunks() -> list[tuple[str, str, int]]:
@@ -797,11 +798,11 @@ def unlisted_chunks() -> list[tuple[str, str, int]]:
     """
     state = State.load()
     found: list[tuple[str, str, int]] = []
-    for host_id in store.repo_hosts():
+    for host_id in archive.repo_hosts():
         verify_key = state.signers.get(host_id)
         if verify_key is None:
             continue
-        for day, names in store.iter_chunk_days(host_id):
+        for day, names in archive.iter_chunk_days(host_id):
             claimed = _manifest_names(host_id, day)
             if not set(names) - claimed:
                 continue
@@ -824,7 +825,7 @@ def _manifest_names(host_id: str, day: str) -> set[str]:
     unauthenticated rather than as a stray file.
     """
     try:
-        blob = store.day_manifest(host_id, day).read_text(encoding="utf-8")
+        blob = archive.day_manifest(host_id, day).read_text(encoding="utf-8")
     except OSError:
         return set()
     _, _, body = blob.partition(_MANIFEST_SEPARATOR)
@@ -867,21 +868,21 @@ def day_public_key(known: Machine, day: str) -> str:
     that already has chunks -- those are sealed to the old key, and a new one
     cannot help them.
     """
-    pub_path = store.day_key_public(known.id, day)
-    if pub_path.is_file() and store.day_key(known.id, day).is_file():
+    pub_path = archive.day_key_public(known.id, day)
+    if pub_path.is_file() and archive.day_key(known.id, day).is_file():
         return pub_path.read_text(encoding="utf-8").strip()
 
     identity = crypto.generate_identity()
     sealed = crypto.encrypt_to_recipients(identity.secret.encode("utf-8"), recipients())
     # Sealed half first: see `orphaned_day_key`.
-    store.write_atomic(store.day_key(known.id, day), sealed)
+    store.write_atomic(archive.day_key(known.id, day), sealed)
     store.write_atomic(pub_path, (identity.public + "\n").encode("utf-8"))
     return identity.public
 
 
 def open_day_key(known: Machine, host_id: str, day: str) -> str:
     """Recover a day's private identity so its chunks can be read."""
-    sealed_path = store.day_key(host_id, day)
+    sealed_path = archive.day_key(host_id, day)
     try:
         sealed = sealed_path.read_bytes()
     except OSError as exc:
@@ -921,7 +922,7 @@ class Signer(NamedTuple):
 
 def read_signer(host_id: str) -> Signer | None:
     try:
-        lines = store.signer_public(host_id).read_text(encoding="utf-8").splitlines()
+        lines = archive.signer_public(host_id).read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
     if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
@@ -942,7 +943,7 @@ def publish_signer(known: Machine) -> bool:
     if current is not None and current.verify_key == verify_key:
         return False
     store.write_atomic(
-        store.signer_public(known.id),
+        archive.signer_public(known.id),
         f"{verify_key}\n{_own_recipient(known)}\n".encode(),
     )
     return True
@@ -1050,10 +1051,10 @@ def _trust_candidates() -> list[Candidate]:
 
     # Every host, before the loop: `trust` is *always* about a machine this
     # one has never merged, so without this it never had a name to show.
-    learn_names(known, store.repo_hosts())
+    learn_names(known, archive.repo_hosts())
 
     out: list[Candidate] = []
-    for host_id in store.repo_hosts():
+    for host_id in archive.repo_hosts():
         if host_id == known.id:
             continue
         signer = read_signer(host_id)
@@ -1205,7 +1206,7 @@ def write_manifest(known: Machine, day: str, entries: dict[str, Entry]) -> None:
     body = _manifest_body(known.id, day, entries)
     signature = crypto.sign(body.encode("utf-8"), store.signing_key_file(), _MANIFEST_MAGIC)
     blob = signature.decode("utf-8").strip() + _MANIFEST_SEPARATOR + body
-    store.write_atomic(store.day_manifest(known.id, day), blob.encode("utf-8"))
+    store.write_atomic(archive.day_manifest(known.id, day), blob.encode("utf-8"))
 
 
 def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, Entry]:
@@ -1219,7 +1220,7 @@ def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, Entry]:
     produce any of these shapes at will.
     """
     try:
-        blob = store.day_manifest(host_id, day).read_text(encoding="utf-8")
+        blob = archive.day_manifest(host_id, day).read_text(encoding="utf-8")
     except OSError:
         return {}
 
@@ -1440,7 +1441,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # orphaned day cost a fork a minute for as long as it stayed that way,
         # on a path issue #50 is already about. `day in on_disk` first because
         # it is a dict lookup and the other two are stats.
-        on_disk = set(store.chunk_names(known.id, day))
+        on_disk = set(archive.chunk_names(known.id, day))
         if on_disk and orphaned_day_key(known.id, day):
             # See `orphaned_day_key` for what this state is. A fresh key would
             # let this sync succeed and say nothing while the day's existing
@@ -1492,7 +1493,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             public = day_public_key(known, day)
             for piece in split_for_export(data, MAX_EXPORT_BYTES):
                 sealed = crypto.encrypt_to(pack(piece), public)
-                written = store.new_chunk(known.id, day, now)
+                written = archive.new_chunk(known.id, day, now)
                 store.write_atomic(written, sealed)
                 listed[written.name] = Entry(digest_of(sealed))
 
@@ -1545,7 +1546,7 @@ def merge(known: Machine, state: State, report: Report) -> None:
     # Our own plaintext is already the source of truth, so it is dropped here
     # rather than skipped in the loop: the phase names the machine being read,
     # and `_merge_host` counts that machine's days underneath it.
-    others = [host for host in store.repo_hosts() if host != known.id]
+    others = [host for host in archive.repo_hosts() if host != known.id]
     for host_id in others:
         progress.phase(f"reading history from {name_for(host_id).text}")
         report.hosts_seen.add(host_id)
@@ -1651,12 +1652,12 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
     # manifest, and a manifest costs a subprocess. Over a year of three machines
     # that is the difference between ~3.6s and nearly two minutes.
     # Names rather than `Chunk` objects, and paths built only for the chunks
-    # actually read -- see `store.chunk_names` for what that is worth here.
+    # actually read -- see `archive.chunk_names` for what that is worth here.
     #
     # Materialised for its length alone, so the counter can say how far along a
     # first sync is. An idle sync skips every one of these on the stamp check
     # below, and never gets far enough into the wait for anything to be shown.
-    days = list(store.chunk_days(host_id))
+    days = list(archive.chunk_days(host_id))
     for done, chunk_day in enumerate(days):
         progress.tick(done, len(days), "days")
         key = f"{host_id}/{chunk_day}"
@@ -1664,11 +1665,11 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # Read before the listing, not after: a chunk arriving between the two
         # would otherwise be covered by a stamp taken after it landed, and not
         # looked at until something else changed the directory.
-        stamp = store.day_stamp(host_id, chunk_day)
+        stamp = archive.day_stamp(host_id, chunk_day)
         if stamp is not None and state.merged_at.get(key) == stamp:
             continue
 
-        names = store.chunk_names(host_id, chunk_day)
+        names = archive.chunk_names(host_id, chunk_day)
         # `get`, not `setdefault`: a day this machine only ever *looks* at --
         # never granted, or a manifest it cannot verify -- must not gain an
         # empty record that is then written out on every sync forever.
@@ -1697,7 +1698,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # has a reason to read the manifest.
             #
             # `names` because an empty directory is not a day (see
-            # `store.iter_chunk_days`), and stamping one would put a permanent
+            # `archive.iter_chunk_days`), and stamping one would put a permanent
             # entry in `state.json` for something that is not there.
             _stamp(state, key, stamp, settled=bool(names))
             continue
@@ -1705,7 +1706,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         listed = read_manifest(host_id, chunk_day, verify_key)
         day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
-        directory = store.chunk_dir(host_id, chunk_day)
+        directory = archive.chunk_dir(host_id, chunk_day)
         #: Chunk names whose plaintext reached `day`.
         taken: list[str] = []
 
@@ -1936,7 +1937,7 @@ def _merge_name(known: Machine, host_id: str) -> None:
     local = store.name_file(host_id)
     if local.is_file():
         return
-    sealed = store.name_seal(host_id)
+    sealed = archive.name_seal(host_id)
     if not sealed.is_file():
         return
     try:
@@ -1960,7 +1961,7 @@ def run(push: bool = True, now: int | None = None) -> Report:
         raise SyncError("no history repo yet; run 'woswoar init' first")
 
     known = store.machine()
-    if not store.recipients_file().is_file():
+    if not archive.recipients_file().is_file():
         raise SyncError("no recipients.txt in the history repo; run 'woswoar init'")
 
     repo = read_repo()
@@ -2364,7 +2365,7 @@ def initialise(
     # the design and silence would make it invisible.
     state = State.load()
     pinned: list[str] = []
-    for host_id in store.repo_hosts():
+    for host_id in archive.repo_hosts():
         signer = read_signer(host_id)
         if signer is not None and host_id not in state.signers:
             state.signers[host_id] = signer.verify_key
@@ -2387,12 +2388,12 @@ def write_repo_format() -> bool:
     *older* is still this shape, and a repo that says something newer has
     already been refused by `require_known_repo_format` before anything reaches
     here. Rewriting it would also give two machines on different versions a file
-    to take turns overwriting, which is the failure `store.README_CONTENT`
+    to take turns overwriting, which is the failure `archive.README_CONTENT`
     describes for prose and which matters more for a version.
     """
-    if store.format_file().is_file():
+    if archive.format_file().is_file():
         return False
-    store.write_atomic(store.format_file(), store.FORMAT_CONTENT.encode("utf-8"))
+    store.write_atomic(archive.format_file(), archive.FORMAT_CONTENT.encode("utf-8"))
     return True
 
 
@@ -2403,14 +2404,14 @@ def write_gitignore() -> bool:
     `_write_repo_metadata` treats `.gitattributes`. This runs on every sync
     rather than only at enrolment, so two machines on different versions would
     have a file to take turns overwriting and push to each other -- the failure
-    `store.README_CONTENT` describes, and the reason `write_repo_format` is
+    `archive.README_CONTENT` describes, and the reason `write_repo_format` is
     written this way too. Enrolment still rewrites it to match; a sync only ever
     supplies a missing one.
     """
-    path = store.history_dir() / store.GITIGNORE
+    path = store.history_dir() / archive.GITIGNORE
     if path.is_file():
         return False
-    store.write_atomic(path, store.GITIGNORE_CONTENT.encode("utf-8"))
+    store.write_atomic(path, archive.GITIGNORE_CONTENT.encode("utf-8"))
     return True
 
 
@@ -2426,13 +2427,13 @@ def repo_format_status() -> IdentityStatus:
     The detail names both numbers, because the fix is "upgrade this machine" and
     neither is visible anywhere else.
     """
-    found = store.repo_format()
+    found = archive.repo_format()
     if found is None:
-        return IdentityStatus(True, f"{store.REPO_FORMAT} - unmarked, the next sync records it")
-    if found > store.REPO_FORMAT:
+        return IdentityStatus(True, f"{archive.REPO_FORMAT} - unmarked, the next sync records it")
+    if found > archive.REPO_FORMAT:
         return IdentityStatus(
             False,
-            f"repo is format {found}, this woswoar understands {store.REPO_FORMAT}"
+            f"repo is format {found}, this woswoar understands {archive.REPO_FORMAT}"
             " - upgrade woswoar here ('pipx upgrade woswoar'); until then nothing"
             " is published or merged",
         )
@@ -2459,11 +2460,11 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     changed = False
 
     # Both compared and rewritten rather than written once, because both hold
-    # content woswoar depends on rather than prose -- see `store.README_CONTENT`
+    # content woswoar depends on rather than prose -- see `archive.README_CONTENT`
     # for the file where that argument comes out the other way.
     for name, content in (
-        (store.GITATTRIBUTES, store.GITATTRIBUTES_CONTENT),
-        (store.GITIGNORE, store.GITIGNORE_CONTENT),
+        (archive.GITATTRIBUTES, archive.GITATTRIBUTES_CONTENT),
+        (archive.GITIGNORE, archive.GITIGNORE_CONTENT),
     ):
         path = store.history_dir() / name
         current = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -2471,11 +2472,11 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
             store.write_atomic(path, content.encode("utf-8"))
             changed = True
 
-    # Only when absent -- see `store.README_CONTENT` for why it is not compared
+    # Only when absent -- see `archive.README_CONTENT` for why it is not compared
     # and rewritten the way `.gitattributes` is.
-    readme = store.history_dir() / store.README
+    readme = store.history_dir() / archive.README
     if not readme.is_file():
-        store.write_atomic(readme, store.README_CONTENT.encode("utf-8"))
+        store.write_atomic(readme, archive.README_CONTENT.encode("utf-8"))
         changed = True
 
     if write_repo_format():
@@ -2490,7 +2491,7 @@ def _write_repo_metadata(known: Machine, identity: Path) -> bool:
     if publish_signer(known):
         changed = True
 
-    seal = store.name_seal(known.id)
+    seal = archive.name_seal(known.id)
     if not seal.is_file():
         store.write_atomic(
             seal,
@@ -2855,9 +2856,9 @@ def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
     # nobody but the machine that made one ever needs it, which is exactly why a
     # revoked machine keeping its copy buys it nothing.
     sealed: list[Path] = []
-    for host_id in store.repo_hosts():
-        sealed.extend(store.iter_day_keys(host_id))
-        sealed.append(store.name_seal(host_id))
+    for host_id in archive.repo_hosts():
+        sealed.extend(archive.iter_day_keys(host_id))
+        sealed.append(archive.name_seal(host_id))
 
     resealed = skipped = 0
     # Two `age` invocations per file that is ours -- open, then seal to the new
@@ -2998,7 +2999,7 @@ def find_reader(fingerprint: str) -> Reader:
 
 def _still_readable(host_id: str) -> list[str]:
     """Days this host has both a key for and a log it may still append to."""
-    keyed = {store.day_of_key(path) for path in store.iter_day_keys(host_id)}
+    keyed = {archive.day_of_key(path) for path in archive.iter_day_keys(host_id)}
     logged = {store.day_of_log(log.relpath) for log in store.iter_log_files(host_id)}
     return sorted(keyed & logged)
 
@@ -3068,7 +3069,7 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
 
     Holds the same lock `run` does, and must: this is the one operation that
     unlinks chunks, and the timer fires every minute. It is also what makes
-    `store.new_chunk`'s uniqueness check sound, since that check assumes no
+    `archive.new_chunk`'s uniqueness check sound, since that check assumes no
     other process is creating chunks for this host concurrently.
 
     ``before`` defaults to today, and may not be later than it: compaction is
@@ -3101,8 +3102,8 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
         require_known_repo_format()
 
         verify_key = signing_public()
-        by_day: dict[str, list[store.Chunk]] = {}
-        for chunk in store.iter_chunks(known.id):
+        by_day: dict[str, list[archive.Chunk]] = {}
+        for chunk in archive.iter_chunks(known.id):
             if chunk.day < before:
                 by_day.setdefault(chunk.day, []).append(chunk)
 
@@ -3174,7 +3175,7 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
                 skipped += 1
                 continue
 
-            merged = store.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
+            merged = archive.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
             sealed = crypto.encrypt_to(pack(plain), crypto.public_of(secret))
             store.write_atomic(merged, sealed)
             for chunk in chunks:

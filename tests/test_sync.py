@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from woswoar import cache, crypto, progress, prove, search, store, sync
+from woswoar import archive, cache, crypto, progress, prove, search, store, sync
 from woswoar.__main__ import _GRANT_REMEDY, HOOKS, main
 from woswoar.__main__ import _hook_bytes as main_hook_bytes
 from woswoar.entry import Entry, format_line
@@ -148,12 +148,12 @@ class Fake:
         text and is still shown quoted beside a fingerprint.
         """
         key = crypto.generate_identity().public
-        with store.recipients_file().open("a", encoding="utf-8") as handle:
+        with archive.recipients_file().open("a", encoding="utf-8") as handle:
             handle.write(f"{key}\n")
         if name:
             host = secrets.token_hex(8)
             verify_key = crypto.generate_signing_key(self.root / f"signer-{host}")
-            store.write_atomic(store.signer_public(host), f"{verify_key}\n{key}\n".encode())
+            store.write_atomic(archive.signer_public(host), f"{verify_key}\n{key}\n".encode())
             store.write_atomic(store.name_file(host), f"{name}\n".encode())
         return key
 
@@ -243,7 +243,7 @@ class SyncTestCase(unittest.TestCase):
         aged = time.time() - sync.RACY_WINDOW_NS / 1e9 - 60
         with machine.active():
             for day in days:
-                os.utime(store.chunk_dir(host.id, day), (aged, aged))
+                os.utime(archive.chunk_dir(host.id, day), (aged, aged))
 
     def run_cli(self, fake: Fake, *argv: str, tty: bool = False) -> support.Ran:
         """Drive the real CLI as ``fake``. Both streams -- see `support.run_cli`."""
@@ -500,7 +500,7 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
     def test_the_repo_carries_a_gitignore_for_it(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            text = (store.history_dir() / store.GITIGNORE).read_text(encoding="utf-8")
+            text = (store.history_dir() / archive.GITIGNORE).read_text(encoding="utf-8")
         self.assertIn(".DS_Store", text)
 
     def test_a_repo_that_predates_it_acquires_one_on_the_next_sync(self) -> None:
@@ -515,7 +515,7 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            ignore = store.history_dir() / store.GITIGNORE
+            ignore = store.history_dir() / archive.GITIGNORE
             ignore.unlink()
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
@@ -559,8 +559,8 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
             self.litter(
                 alpha,
                 store.history_dir(),
-                store.repo_host_dir(alpha.id),
-                store.chunk_dir(alpha.id, "2023-11-14"),
+                archive.repo_host_dir(alpha.id),
+                archive.chunk_dir(alpha.id, "2023-11-14"),
             )
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_002, "git commit")
@@ -588,7 +588,7 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
             sync.grant()
             sync.run()
         with alpha.active():
-            self.litter(alpha, store.chunk_dir(alpha.id, "2023-11-14"))
+            self.litter(alpha, archive.chunk_dir(alpha.id, "2023-11-14"))
             sync.run()
 
         self.accept_everyone(beta)
@@ -609,7 +609,7 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
         with alpha.active():
-            self.litter(alpha, store.chunk_dir(alpha.id, "2023-11-14"))
+            self.litter(alpha, archive.chunk_dir(alpha.id, "2023-11-14"))
             self.assertEqual(sync.unlisted_chunks(), [])
 
 
@@ -659,7 +659,7 @@ class TestImmutability(SyncTestCase):
         # invariant. Classified by store, not by a regex copied here: a
         # hand-maintained pattern would silently stop matching if the layout
         # changed, leaving this vacuously true while real chunks were rewritten.
-        chunks = {p for p in rewritten if store.is_chunk_path(p)}
+        chunks = {p for p in rewritten if archive.is_chunk_path(p)}
         self.assertEqual(sorted(chunks), [], f"chunks were rewritten: {sorted(chunks)}")
 
         # And the only things that were rewritten are the ones allowed to be.
@@ -691,8 +691,8 @@ class TestImmutability(SyncTestCase):
                 if ": " in line
             )
             stored = int(counts["size-pack"]) * 1024 + int(counts["size"]) * 1024
-            chunk_bytes = sum(c.path.stat().st_size for c in store.iter_chunks(alpha.id))
-            chunks = len(list(store.iter_chunks(alpha.id)))
+            chunk_bytes = sum(c.path.stat().st_size for c in archive.iter_chunks(alpha.id))
+            chunks = len(list(archive.iter_chunks(alpha.id)))
 
         self.assertEqual(chunks, syncs, "each sync must produce exactly one chunk")
         # Chunks are written once and never rewritten, so git stores each
@@ -822,7 +822,7 @@ class TestGrantConfirmation(SyncTestCase):
         alpha = self.machine("alpha", display="box")
         with alpha.active():
             key = sync.recipients()[0]
-            path = store.recipients_file()
+            path = archive.recipients_file()
             path.write_text(f"{key}\n{key}{sync._LABEL_SEP}box\n", encoding="utf-8")
             self.assertEqual(sync.recipients(), [key])
             # And it is still usable, which is the point of deduplicating.
@@ -950,7 +950,7 @@ class TestRevokeSubtraction(SyncTestCase):
         with alpha.active():
             mine = sync.recipients()
             gone = crypto.generate_identity().public
-            store.recipients_file().write_text(
+            archive.recipients_file().write_text(
                 f"-{gone}{sync._LABEL_SEP}revoked\n{gone}{sync._LABEL_SEP}old-laptop\n"
                 + "".join(f"{key}\n" for key in mine),
                 encoding="utf-8",
@@ -972,7 +972,7 @@ class TestRevokeSubtraction(SyncTestCase):
 
             # And appending the line by hand, which is all push access buys,
             # does not bring it back either.
-            with store.recipients_file().open("a", encoding="utf-8") as handle:
+            with archive.recipients_file().open("a", encoding="utf-8") as handle:
                 handle.write(f"{gone}{sync._LABEL_SEP}back-again\n")
             self.assertNotIn(gone, sync.recipients())
 
@@ -990,7 +990,7 @@ class TestRevokeSubtraction(SyncTestCase):
 
         with alpha.active():
             sync.grant(approved=[reader.key for reader in sync.readers()])
-            sealed = store.name_seal(store.machine().id)
+            sealed = archive.name_seal(store.machine().id)
             # Opens for beta here, which is what makes the failure below a
             # consequence of the revocation rather than of never having access.
             crypto.decrypt_with_file(sealed.read_bytes(), beta_identity)
@@ -1056,7 +1056,7 @@ class TestRevokeSubtraction(SyncTestCase):
         with alpha.active():
             # Only one recipient, and it is not this machine -- so `is_mine`
             # does not catch it and the emptiness guard is what has to.
-            store.recipients_file().write_text("", encoding="utf-8")
+            archive.recipients_file().write_text("", encoding="utf-8")
             only = alpha.append_recipient(name="only-one")
             (other,) = sync.readers()
             with self.assertRaises(sync.SyncError) as caught:
@@ -1190,13 +1190,13 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
             day = "2023-11-14"
             with sync.lock():
                 sync._fetch_and_rebase(sync.read_repo())
-                pub = store.day_key_public(alpha.id, day)
+                pub = archive.day_key_public(alpha.id, day)
                 entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
                 sealed = crypto.encrypt_to(
                     sync.pack((format_line(entry) + "\n").encode("utf-8")),
                     pub.read_text(encoding="utf-8").strip(),
                 )
-                target = store.chunk_dir(alpha.id, day) / "9999999999-ffffff.age"
+                target = archive.chunk_dir(alpha.id, day) / "9999999999-ffffff.age"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(sealed)
                 sync._commit()
@@ -1247,7 +1247,7 @@ class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "ours")
             sync.run()
 
-            planted = store.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age"
+            planted = archive.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age"
             planted.write_bytes(b"whatever an attacker likes")
 
             alpha.record("2023-11-14", 1_700_000_002, "ours too")
@@ -1268,9 +1268,11 @@ class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
         with alpha.active():
             sync.grant()
             entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted")
-            pub = store.day_key_public(alpha.id, "2023-11-14").read_text(encoding="utf-8").strip()
+            pub = archive.day_key_public(alpha.id, "2023-11-14").read_text(encoding="utf-8").strip()
             sealed = crypto.encrypt_to(sync.pack((format_line(entry) + "\n").encode("utf-8")), pub)
-            (store.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age").write_bytes(sealed)
+            (archive.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age").write_bytes(
+                sealed
+            )
             alpha.record("2023-11-14", 1_700_000_002, "ours too")
             sync.run(now=1_900_000_000)
 
@@ -1358,7 +1360,7 @@ class TestCrashDebrisIsNotCalledAnIntruder(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "one")
             sync.run()
-            before = set(store.chunk_names(alpha.id, "2023-11-14"))
+            before = set(archive.chunk_names(alpha.id, "2023-11-14"))
 
             alpha.record("2023-11-14", 1_700_000_002, "two")
 
@@ -1370,7 +1372,7 @@ class TestCrashDebrisIsNotCalledAnIntruder(SyncTestCase):
                 mock.patch.object(sync, "write_manifest", die),
             ):
                 sync.run()
-            left = set(store.chunk_names(alpha.id, "2023-11-14")) - before
+            left = set(archive.chunk_names(alpha.id, "2023-11-14")) - before
         self.assertEqual(len(left), 1, "precondition: a chunk was left unsigned")
         return alpha, left.pop()
 
@@ -1415,7 +1417,7 @@ class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
 
     def planted(self, machine: Fake, host: Fake, name: str = "1700000000-dead.age") -> None:
         with machine.active():
-            (store.chunk_dir(host.id, self.DAY) / name).write_bytes(b"not a chunk anyone signed")
+            (archive.chunk_dir(host.id, self.DAY) / name).write_bytes(b"not a chunk anyone signed")
 
     def test_it_is_found_after_sync_has_stopped_saying_so(self) -> None:
         alpha, beta = self.history_across_days(days=1, per_day=2)
@@ -1474,7 +1476,7 @@ class TestDoctorFindsAChunkNobodySigned(SyncTestCase):
         alpha, beta = self.history_across_days(days=1, per_day=2)
         with beta.active():
             sync.run()
-            store.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
+            archive.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
             self.assertEqual(sync.unlisted_chunks(), [])
 
     def test_a_host_this_machine_has_not_pinned_is_not_even_checked(self) -> None:
@@ -1763,9 +1765,9 @@ class TestChunkNaming(support.WoswoarTestCase):
         exactly once in CI, as one missing chunk.
         """
         made: set[Path] = set()
-        store.chunk_dir("host", "2023-11-14").mkdir(parents=True, exist_ok=True)
+        archive.chunk_dir("host", "2023-11-14").mkdir(parents=True, exist_ok=True)
         for _ in range(2000):
-            path = store.new_chunk("host", "2023-11-14", 1_700_000_000)
+            path = archive.new_chunk("host", "2023-11-14", 1_700_000_000)
             self.assertNotIn(path, made)
             made.add(path)
             path.write_bytes(b"x")  # only an existing file can be collided with
@@ -1783,11 +1785,11 @@ class TestLayout(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            chunk = next(iter(store.iter_chunks(alpha.id)))
+            chunk = next(iter(archive.iter_chunks(alpha.id)))
             relpath = chunk.path.relative_to(store.history_dir()).as_posix()
 
         self.assertEqual(relpath.split("/")[:3], ["hosts", alpha.id, "2023-11-14"])
-        self.assertTrue(store.is_chunk_path(relpath), relpath)
+        self.assertTrue(archive.is_chunk_path(relpath), relpath)
 
     def test_sealed_history_is_smaller_than_the_plaintext_it_carries(self) -> None:
         """A day's worth of one machine's commands, compacted into one chunk.
@@ -1808,7 +1810,7 @@ class TestLayout(SyncTestCase):
             sync.run()
             plaintext = store.log_file(alpha.id, "2023-11-14").stat().st_size
             sync.compact(before="2023-11-15")
-            sealed = sum(c.path.stat().st_size for c in store.iter_chunks(alpha.id))
+            sealed = sum(c.path.stat().st_size for c in archive.iter_chunks(alpha.id))
 
         self.assertLess(sealed, plaintext // 2, f"sealed={sealed} plaintext={plaintext}")
 
@@ -1820,12 +1822,12 @@ class TestCompact(SyncTestCase):
             for i in range(5):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"command {i}")
                 sync.run()
-            before = len(list(store.iter_chunks(alpha.id)))
+            before = len(list(archive.iter_chunks(alpha.id)))
             self.assertEqual(before, 5)
 
             days, replaced, _ = sync.compact(before="2023-11-15")
             self.assertEqual((days, replaced), (1, 5))
-            self.assertEqual(len(list(store.iter_chunks(alpha.id))), 1)
+            self.assertEqual(len(list(archive.iter_chunks(alpha.id))), 1)
 
     def test_a_before_in_the_future_is_refused(self) -> None:
         """Issue #69: the only trigger that repeats indefinitely.
@@ -1842,13 +1844,13 @@ class TestCompact(SyncTestCase):
             for i, cmd in enumerate(("git status", "make -j8")):
                 alpha.record("2023-11-14", 1_700_000_001 + i, cmd)
                 sync.run()
-            before = {c.name for c in store.iter_chunks(alpha.id)}
+            before = {c.name for c in archive.iter_chunks(alpha.id)}
 
         with alpha.active():
             with self.assertRaises(sync.SyncError) as refused:
                 sync.compact(before="2099-01-01")
             self.assertIn("in the future", str(refused.exception))
-            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+            self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
 
             # A finished day is still fine, so the guard is on the future and
             # not on the flag.
@@ -1869,11 +1871,11 @@ class TestCompact(SyncTestCase):
                 sync.run()
                 alpha.record("2023-11-14", 1_700_000_001 + i, f"finished {i}")
                 sync.run()
-            live = {c.name for c in store.iter_chunks(alpha.id) if c.day == today}
+            live = {c.name for c in archive.iter_chunks(alpha.id) if c.day == today}
 
             self.assertEqual(sync.compact()[0], 1, "the finished day was not compacted")
             self.assertEqual(
-                {c.name for c in store.iter_chunks(alpha.id) if c.day == today},
+                {c.name for c in archive.iter_chunks(alpha.id) if c.day == today},
                 live,
                 "the default compacted a day still being written",
             )
@@ -2268,10 +2270,10 @@ class TestChunkAuthenticity(SyncTestCase):
         """Flipping bytes in a real chunk must not merely fail to decrypt."""
         alpha, beta = self.enrolled_pair()
         with alpha.active():
-            before = {c.name for c in store.iter_chunks(alpha.id)}
+            before = {c.name for c in archive.iter_chunks(alpha.id)}
             alpha.record("2023-11-14", 1_700_000_002, "cargo build")
             sync.run(now=2_000_000_000)
-            fresh = ({c.name for c in store.iter_chunks(alpha.id)} - before).pop()
+            fresh = ({c.name for c in archive.iter_chunks(alpha.id)} - before).pop()
 
         def flip(work: Path) -> None:
             target = work / "hosts" / alpha.id / "2023-11-14" / fresh
@@ -2337,7 +2339,7 @@ class TestChunkAuthenticity(SyncTestCase):
                 sync.compact(before="2023-11-15")
             self.assertIn("refusing to compact", str(caught.exception))
             # And it is still there, not silently dropped.
-            self.assertTrue(list(store.iter_chunks(alpha.id)))
+            self.assertTrue(list(archive.iter_chunks(alpha.id)))
 
 
 class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
@@ -2358,7 +2360,7 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
             )
             self.assertEqual(len(before), 1)
 
-            store.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
+            archive.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
             alpha.record("2023-11-14", 1_700_000_002, "published later")
             report = sync.run(now=1_900_000_000)
 
@@ -2372,7 +2374,7 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "day one")
             sync.run()
-            store.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
+            archive.day_manifest(alpha.id, "2023-11-14").write_text("wrecked", encoding="utf-8")
 
             # Both days have something to publish, so both are attempted; only
             # the one whose signed list is unreadable is held back. A day with
@@ -2393,14 +2395,14 @@ class TestTheMergeWatermark(SyncTestCase):
     directions, depending only on iteration order.
     """
 
-    def alpha_with_two_chunks(self) -> tuple[Fake, Fake, list[store.Chunk]]:
+    def alpha_with_two_chunks(self) -> tuple[Fake, Fake, list[archive.Chunk]]:
         alpha = self.machine("alpha")
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "first command")
             sync.run(now=1_700_000_500)
             alpha.record("2023-11-14", 1_700_000_002, "second command")
             sync.run(now=1_700_000_600)
-            chunks = sorted(store.iter_chunks(alpha.id), key=lambda c: c.name)
+            chunks = sorted(archive.iter_chunks(alpha.id), key=lambda c: c.name)
         beta = self.machine("beta")
         with alpha.active():
             sync.grant()
@@ -2545,7 +2547,7 @@ class TestCompactionDoesNotDuplicateOnPeers(SyncTestCase):
             # Named below the compacted chunk, which took ts 1_700_000_502.
             alpha.record("2023-11-14", 1_700_000_009, "written after compaction")
             sync.run(now=1_700_000_400)
-            names = sorted(c.name for c in store.iter_chunks(alpha.id))
+            names = sorted(c.name for c in archive.iter_chunks(alpha.id))
         self.assertLess(names[0], names[1], "the fixture no longer builds the case")
 
         with beta.active():
@@ -2689,9 +2691,9 @@ class TestADecompressionBomb(SyncTestCase):
 
             # A chunk alpha signs, holding a payload that unpacks far too big.
             day = "2023-11-14"
-            pub = store.day_key_public(alpha.id, day).read_text(encoding="utf-8").strip()
+            pub = archive.day_key_public(alpha.id, day).read_text(encoding="utf-8").strip()
             sealed = crypto.encrypt_to(zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9), pub)
-            path = store.chunk_dir(alpha.id, day) / "1900000000-ffffff.age"
+            path = archive.chunk_dir(alpha.id, day) / "1900000000-ffffff.age"
             path.write_bytes(sealed)
             listed = sync.read_manifest(alpha.id, day, sync.signing_public())
             listed[path.name] = sync.Entry(sync.digest_of(sealed))
@@ -2910,8 +2912,8 @@ class TestTheRepoExplainsItself(SyncTestCase):
         alpha = self.machine("alpha")
         with alpha.active():
             committed = sync.git("ls-files").splitlines()
-            self.assertIn(store.README, committed, "the README was not committed")
-            text = (store.history_dir() / store.README).read_text(encoding="utf-8")
+            self.assertIn(archive.README, committed, "the README was not committed")
+            text = (store.history_dir() / archive.README).read_text(encoding="utf-8")
         self.assertIn("github.com/martinus/woswoar", text, "no link to the project")
         self.assertIn("Do not edit", text)
 
@@ -2920,7 +2922,7 @@ class TestTheRepoExplainsItself(SyncTestCase):
         self.machine("alpha")
         beta = self.machine("beta")
         with beta.active():
-            self.assertTrue((store.history_dir() / store.README).is_file())
+            self.assertTrue((store.history_dir() / archive.README).is_file())
 
     def test_it_is_written_once_and_then_left_alone(self) -> None:
         """A machine on another version must not rewrite a peer's wording.
@@ -2932,7 +2934,7 @@ class TestTheRepoExplainsItself(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            readme = store.history_dir() / store.README
+            readme = store.history_dir() / archive.README
             readme.write_text("written by another version\n", encoding="utf-8")
             sync._commit()
 
@@ -3013,7 +3015,7 @@ class TestRecipientsPublishNoNames(SyncTestCase):
                 timeout=60,
             )
             with_comment = key.with_suffix(".pub").read_text(encoding="utf-8").strip()
-            store.recipients_file().write_text(
+            archive.recipients_file().write_text(
                 f"{with_comment}{sync._LABEL_SEP}martinus@box\n", encoding="utf-8"
             )
 
@@ -3033,7 +3035,7 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         """
         # A user name that cannot occur in the repo for any other reason. The
         # earlier fixture used "martinus", which is also the owner of the
-        # project URL in `store.README_CONTENT` -- so this failed on a string
+        # project URL in `archive.README_CONTENT` -- so this failed on a string
         # that names no machine, and would have kept failing for every user
         # whose account happens to match a word in a committed file.
         alpha = self.machine("alpha", display="zqoperator@secret-box")
@@ -3054,8 +3056,8 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         # into is exactly what the constant says, so nothing can ever be
         # interpolated into it.
         with alpha.active():
-            readme = (store.history_dir() / store.README).read_text(encoding="utf-8")
-        self.assertEqual(readme, store.README_CONTENT)
+            readme = (store.history_dir() / archive.README).read_text(encoding="utf-8")
+        self.assertEqual(readme, archive.README_CONTENT)
 
     def test_no_name_is_written_into_recipients_at_all(self) -> None:
         """#22: the label used to be `$USER@$(uname -n)`, in cleartext.
@@ -3066,7 +3068,7 @@ class TestRecipientsPublishNoNames(SyncTestCase):
         """
         alpha = self.machine("alpha", display="martinus@secret-box")
         with alpha.active():
-            written = store.recipients_file().read_text(encoding="utf-8")
+            written = archive.recipients_file().read_text(encoding="utf-8")
         self.assertNotIn("secret-box", written)
         self.assertNotIn("martinus", written)
         self.assertNotIn(sync._LABEL_SEP, written)
@@ -3093,7 +3095,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
 
         with beta.active():
             sync.run()
-            victim = store.day_key(alpha.id, "2023-11-14")
+            victim = archive.day_key(alpha.id, "2023-11-14")
             self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
             victim.unlink()
             sync._commit()
@@ -3101,8 +3103,8 @@ class TestAnOrphanedDayKey(SyncTestCase):
 
         with alpha.active():
             sync.run()
-            self.assertFalse(store.day_key(alpha.id, "2023-11-14").is_file())
-            self.assertTrue(store.day_key_public(alpha.id, "2023-11-14").is_file())
+            self.assertFalse(archive.day_key(alpha.id, "2023-11-14").is_file())
+            self.assertTrue(archive.day_key_public(alpha.id, "2023-11-14").is_file())
 
         # What was published before the deletion is still readable by a machine
         # that had already merged it. That is what makes "copy the key back from
@@ -3117,15 +3119,15 @@ class TestAnOrphanedDayKey(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "before")
             sync.run()
-            before = {c.name for c in store.iter_chunks(alpha.id)}
+            before = {c.name for c in archive.iter_chunks(alpha.id)}
 
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "after")
             report = sync.run()
 
             self.assertEqual(report.chunks_written, 0)
             self.assertEqual(report.orphaned, {"2023-11-14"})
-            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+            self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
 
     def test_the_lines_stay_pending_rather_than_being_lost(self) -> None:
         """Refusing must not consume them: `logs/` is the only copy left."""
@@ -3133,15 +3135,15 @@ class TestAnOrphanedDayKey(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "before")
             sync.run()
-            sealed = store.day_key(alpha.id, "2023-11-14").read_bytes()
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            sealed = archive.day_key(alpha.id, "2023-11-14").read_bytes()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "after")
             sync.run()
 
             # Put the sealed half back, which is what copying it from another
             # clone amounts to, and the pending line publishes on the next
             # ordinary sync.
-            store.write_atomic(store.day_key(alpha.id, "2023-11-14"), sealed)
+            store.write_atomic(archive.day_key(alpha.id, "2023-11-14"), sealed)
             report = sync.run()
             self.assertEqual(report.orphaned, set())
             self.assertGreater(report.chunks_written, 0)
@@ -3154,7 +3156,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             # fail loudly and the test would pass for the wrong reason. This is
             # the silent case -- a usable public half whose secret is gone.
             stale = crypto.generate_identity()
-            pub = store.day_key_public(alpha.id, "2023-11-14")
+            pub = archive.day_key_public(alpha.id, "2023-11-14")
             pub.parent.mkdir(parents=True, exist_ok=True)
             pub.write_text(stale.public + "\n", encoding="utf-8")
 
@@ -3163,7 +3165,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
 
             self.assertEqual(report.orphaned, set())
             self.assertEqual(report.chunks_written, 1)
-            self.assertTrue(store.day_key(alpha.id, "2023-11-14").is_file())
+            self.assertTrue(archive.day_key(alpha.id, "2023-11-14").is_file())
             self.assertNotEqual(
                 pub.read_text(encoding="utf-8").strip(),
                 stale.public,
@@ -3196,8 +3198,10 @@ class TestAnOrphanedDayKey(SyncTestCase):
             ):
                 sync.day_public_key(store.machine(), "2023-11-14")
 
-            self.assertTrue(store.day_key(alpha.id, "2023-11-14").is_file(), "sealed half missing")
-            self.assertFalse(store.day_key_public(alpha.id, "2023-11-14").is_file())
+            self.assertTrue(
+                archive.day_key(alpha.id, "2023-11-14").is_file(), "sealed half missing"
+            )
+            self.assertFalse(archive.day_key_public(alpha.id, "2023-11-14").is_file())
             self.assertFalse(
                 sync.orphaned_day_key(alpha.id, "2023-11-14"),
                 "an interrupted mint produced the destructive state",
@@ -3213,7 +3217,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "before")
             sync.run()
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "after")
 
         said = self.run_cli(alpha, "sync").err
@@ -3236,7 +3240,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "ours")
             sync.run()
 
-            pub = store.day_key_public(alpha.id, "2099-01-01")
+            pub = archive.day_key_public(alpha.id, "2099-01-01")
             pub.parent.mkdir(parents=True, exist_ok=True)
             pub.write_text(crypto.generate_identity().public + "\n", encoding="utf-8")
 
@@ -3252,14 +3256,14 @@ class TestAnOrphanedDayKey(SyncTestCase):
                 for i in range(2):
                     alpha.record(day, 1_700_000_001 + i, f"{day}-{i}")
                     sync.run()
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
 
             days, replaced, _ = sync.compact(before="2023-12-01")
 
             self.assertEqual(days, 1, "the healthy day was not compacted")
             self.assertGreater(replaced, 0)
             self.assertGreater(
-                len(list(store.chunk_dir(alpha.id, "2023-11-14").iterdir())),
+                len(list(archive.chunk_dir(alpha.id, "2023-11-14").iterdir())),
                 1,
                 "the unreadable day was touched",
             )
@@ -3274,7 +3278,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             code, healthy, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] day keys", healthy)
 
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
             self.assertEqual(sync.orphaned_days(), [(alpha.id, "2023-11-14")])
 
             code, text, _ = self.run_cli(alpha, "doctor")
@@ -3308,8 +3312,8 @@ class TestADeletedManifest(SyncTestCase):
     def test_nothing_is_written_for_the_day(self) -> None:
         alpha = self.published_day()
         with alpha.active():
-            path = store.day_manifest(alpha.id, "2023-11-14")
-            before = {c.name for c in store.iter_chunks(alpha.id)}
+            path = archive.day_manifest(alpha.id, "2023-11-14")
+            before = {c.name for c in archive.iter_chunks(alpha.id)}
             self.assertTrue(any(name in path.read_text(encoding="utf-8") for name in before))
 
             path.unlink()
@@ -3318,7 +3322,7 @@ class TestADeletedManifest(SyncTestCase):
 
             self.assertEqual(report.chunks_written, 0)
             self.assertEqual(report.manifest_missing, {"2023-11-14"})
-            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+            self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
             # The disowning itself: a replacement would name only this run.
             self.assertFalse(path.exists(), "a replacement manifest was signed")
 
@@ -3330,7 +3334,7 @@ class TestADeletedManifest(SyncTestCase):
         beta = self.machine("beta")
         alpha = self.published_day()
         with alpha.active():
-            path = store.day_manifest(alpha.id, "2023-11-14")
+            path = archive.day_manifest(alpha.id, "2023-11-14")
             original = path.read_bytes()
             path.unlink()
             alpha.record("2023-11-14", 1_700_000_002, "second")
@@ -3360,7 +3364,7 @@ class TestADeletedManifest(SyncTestCase):
         """
         alpha = self.published_day()
         with alpha.active():
-            planted = store.chunk_dir(alpha.id, "2023-11-20")
+            planted = archive.chunk_dir(alpha.id, "2023-11-20")
             planted.mkdir(parents=True, exist_ok=True)
             (planted / "9999999999-ffffff.age").write_bytes(b"whatever an attacker likes")
 
@@ -3369,12 +3373,12 @@ class TestADeletedManifest(SyncTestCase):
 
             self.assertEqual(report.manifest_missing, set())
             self.assertEqual(report.chunks_written, 1)
-            self.assertTrue(store.day_manifest(alpha.id, "2023-11-20").exists())
+            self.assertTrue(archive.day_manifest(alpha.id, "2023-11-20").exists())
 
     def test_sync_says_which_day_and_how_to_get_it_back(self) -> None:
         alpha = self.published_day()
         with alpha.active():
-            store.day_manifest(alpha.id, "2023-11-14").unlink()
+            archive.day_manifest(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "second")
 
         said = self.run_cli(alpha, "sync").err
@@ -3402,7 +3406,7 @@ class TestADeletedManifest(SyncTestCase):
             _, healthy, _ = self.run_cli(alpha, "doctor")
             self.assertIn("[ok] manifests", healthy)
 
-            store.day_manifest(alpha.id, "2023-11-14").unlink()
+            archive.day_manifest(alpha.id, "2023-11-14").unlink()
             self.assertEqual(sync.days_missing_a_manifest(), ["2023-11-14"])
 
             code, text, _ = self.run_cli(alpha, "doctor")
@@ -3433,7 +3437,7 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
             self.assertEqual(report.lines_exported, 200)
 
             secret = sync.open_day_key(store.machine(), alpha.id, "2023-11-14")
-            for chunk in store.iter_chunks(alpha.id):
+            for chunk in archive.iter_chunks(alpha.id):
                 plain = sync.unpack(crypto.decrypt_with_secret(chunk.path.read_bytes(), secret))
                 self.assertLessEqual(len(plain), 512, f"{chunk.name} is over the budget")
 
@@ -3474,13 +3478,13 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
                     with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
                         sync.run()
 
-            before = {c.name for c in store.iter_chunks(alpha.id)}
+            before = {c.name for c in archive.iter_chunks(alpha.id)}
             with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
                 days, replaced, skipped = sync.compact(before="2023-12-01")
 
             self.assertEqual((days, replaced), (0, 0), "an over-budget day was merged")
             self.assertEqual(skipped, 1)
-            self.assertEqual({c.name for c in store.iter_chunks(alpha.id)}, before)
+            self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
 
     def test_a_day_within_the_budget_still_compacts(self) -> None:
         alpha = self.machine("alpha")
@@ -3761,7 +3765,7 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         """
         alpha, beta = self.merged_pair()
         with beta.active():
-            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray = archive.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
             stray.write_bytes(b"disturb the day's stamp")
             stray.unlink()
 
@@ -3836,7 +3840,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         alpha, beta, compacted = self.compacted_and_growing()
         with alpha.active():
             readable = next(
-                name for name in store.chunk_names(alpha.id, self.DAY) if name != compacted
+                name for name in archive.chunk_names(alpha.id, self.DAY) if name != compacted
             )
 
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
@@ -3863,7 +3867,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         """
         alpha, beta, _compacted = self.compacted_and_growing()
         with beta.active():
-            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+            (archive.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
 
             report = sync.run()
             self.assertIn(f"{alpha.id}/{self.DAY}", report.unauthenticated)
@@ -3899,7 +3903,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             self.assertEqual(len(beta.entries()), 4)
             backup = store.history_dir().with_name("history.backup")
             shutil.copytree(store.history_dir(), backup, symlinks=True)
-            first = min(store.chunk_names(alpha.id, self.DAY))
+            first = min(archive.chunk_names(alpha.id, self.DAY))
 
         with alpha.active():
             alpha.record(self.DAY, 1_700_000_009, "the fifth")
@@ -3922,7 +3926,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
 
             # ...and something unmerged in the directory, or the day has
             # nothing fresh and is skipped before any of this is reached.
-            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+            (archive.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
 
         self.settle(beta, alpha, self.DAY)
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(first)):
@@ -3951,7 +3955,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         """
         alpha, beta, compacted = self.compacted_and_growing()
         with alpha.active():
-            (store.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
+            (archive.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
             sync._commit()
             sync._push(sync.read_repo())
 
@@ -3997,7 +4001,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             for i in range(2):
                 alpha.record(self.DAY, 1_700_000_700 + i, f"later {i}")
                 sync.run()
-            names = store.chunk_names(alpha.id, self.DAY)
+            names = archive.chunk_names(alpha.id, self.DAY)
 
         with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(names[-1])):
             report = sync.run()
@@ -4049,7 +4053,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         alpha, beta = self.history_across_days(days=1, per_day=2)
         with beta.active():
             sync.run()
-            (store.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
+            (archive.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
         self.settle(beta, alpha, self.DAY)
 
         # Said once, because the day did change -- and that pass is the one
@@ -4080,7 +4084,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
             sync.run()
 
         with alpha.active():
-            live = set(store.chunk_names(alpha.id, self.DAY))
+            live = set(archive.chunk_names(alpha.id, self.DAY))
         self.assertEqual(self.remembered(beta, alpha), live, "names of chunks that are gone")
         with beta.active():
             self.assertEqual(len(beta.commands()), 6, "compaction lost history")
@@ -4153,7 +4157,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
         with alpha.active():
             alpha.record(self.DAY, 1_700_000_003, "a third line")
             sync.run()
-            store.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
+            archive.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
             sync._commit()
             sync._push(sync.read_repo())
 
@@ -4169,7 +4173,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
             # match, so the day keeps being looked at.
             self.assertNotEqual(
                 sync.State.load().merged_at.get(f"{alpha.id}/{self.DAY}"),
-                store.day_stamp(alpha.id, self.DAY),
+                archive.day_stamp(alpha.id, self.DAY),
                 "an unverifiable manifest settled the day",
             )
             # And nothing was written twice.
@@ -4191,13 +4195,13 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
     def listed(self, machine: Fake) -> list[str]:
         """The days one sync actually lists the chunks of."""
         days: list[str] = []
-        real = store.chunk_names
+        real = archive.chunk_names
 
         def counted(machine_id: str, day: str) -> list[str]:
             days.append(day)
             return real(machine_id, day)
 
-        with machine.active(), mock.patch.object(store, "chunk_names", counted):
+        with machine.active(), mock.patch.object(archive, "chunk_names", counted):
             sync.run()
         return days
 
@@ -4280,7 +4284,7 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         """
         alpha, beta = self.pair()
         with beta.active():
-            stray = store.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
+            stray = archive.chunk_dir(alpha.id, "2023-11-14") / "not-a-chunk"
             stray.write_bytes(b"something landed in the directory")
         self.assertEqual(self.listed(beta), ["2023-11-14"])
         self.settle(beta, alpha, "2023-11-14")
@@ -4303,11 +4307,11 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-15", 1_700_100_002, "arrived mid-listing")
             sync.run()
-            source = store.chunk_dir(alpha.id, "2023-11-15")
-            late = max(store.chunk_names(alpha.id, "2023-11-15"))
+            source = archive.chunk_dir(alpha.id, "2023-11-15")
+            late = max(archive.chunk_names(alpha.id, "2023-11-15"))
             payload = (source / late).read_bytes()
 
-        real = store.chunk_names
+        real = archive.chunk_names
         dropped = False
 
         def racing(machine_id: str, day: str) -> list[str]:
@@ -4316,10 +4320,10 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
             if day == "2023-11-15" and not dropped:
                 dropped = True
                 names = [name for name in names if name != late]
-                (store.chunk_dir(machine_id, day) / late).write_bytes(payload)
+                (archive.chunk_dir(machine_id, day) / late).write_bytes(payload)
             return names
 
-        with beta.active(), mock.patch.object(store, "chunk_names", racing):
+        with beta.active(), mock.patch.object(archive, "chunk_names", racing):
             sync.run()
         self.assertTrue(dropped, "the race was never reached")
 
@@ -4334,12 +4338,12 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         """`state.json` is read and compared every sync, so what goes in it lasts.
 
         A directory named like a day but holding no chunk is not a day (see
-        `store.iter_chunk_days`). Stamping one would leave a permanent entry for
+        `archive.iter_chunk_days`). Stamping one would leave a permanent entry for
         something that was never there -- and this file already only grows.
         """
         alpha, beta = self.pair()
         with beta.active():
-            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow = archive.chunk_dir(alpha.id, "2023-11-20")
             hollow.mkdir(parents=True, exist_ok=True)
         # Old enough that the racy window is not what is keeping it unstamped.
         self.settle(beta, alpha, "2023-11-20")
@@ -4388,8 +4392,8 @@ class TestWalkingAPeersChunks(SyncTestCase):
         """
         alpha, _beta = self.stocked()
         with alpha.active():
-            by_day = list(store.iter_chunk_days(alpha.id))
-            flat = [(chunk.day, chunk.name) for chunk in store.iter_chunks(alpha.id)]
+            by_day = list(archive.iter_chunk_days(alpha.id))
+            flat = [(chunk.day, chunk.name) for chunk in archive.iter_chunks(alpha.id)]
 
         self.assertEqual(
             [(day, name) for day, names in by_day for name in names],
@@ -4413,11 +4417,11 @@ class TestWalkingAPeersChunks(SyncTestCase):
         """
         alpha, _beta = self.stocked()
         with alpha.active():
-            directory = store.chunk_dir(alpha.id, "2023-11-14")
+            directory = archive.chunk_dir(alpha.id, "2023-11-14")
             (directory / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
             (directory / "notes.txt").write_text("not a chunk", encoding="utf-8")
 
-            names = dict(store.iter_chunk_days(alpha.id))["2023-11-14"]
+            names = dict(archive.iter_chunk_days(alpha.id))["2023-11-14"]
         self.assertTrue(all(name.endswith(".age") for name in names), names)
         self.assertEqual(len(names), 2)
 
@@ -4432,14 +4436,14 @@ class TestWalkingAPeersChunks(SyncTestCase):
         """
         alpha, _beta = self.stocked()
         with alpha.active():
-            hollow = store.chunk_dir(alpha.id, "2023-11-20")
+            hollow = archive.chunk_dir(alpha.id, "2023-11-20")
             hollow.mkdir(parents=True, exist_ok=True)
 
-            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertNotIn("2023-11-20", dict(archive.iter_chunk_days(alpha.id)))
             self.assertFalse(sync.has_chunks(alpha.id, "2023-11-20"))
 
             (hollow / "1700000000-abcdef.age.tmp").write_bytes(b"half a chunk")
-            self.assertNotIn("2023-11-20", dict(store.iter_chunk_days(alpha.id)))
+            self.assertNotIn("2023-11-20", dict(archive.iter_chunk_days(alpha.id)))
             self.assertFalse(
                 sync.has_chunks(alpha.id, "2023-11-20"), "a stray file counted as a chunk"
             )
@@ -4457,13 +4461,13 @@ class TestWalkingAPeersChunks(SyncTestCase):
         """
         alpha, _beta = self.stocked()
         walked: list[str] = []
-        real = store.iter_chunk_days
+        real = archive.iter_chunk_days
 
         def spy(machine_id: str) -> Iterator[tuple[str, list[str]]]:
             walked.append(machine_id)
             return real(machine_id)
 
-        with alpha.active(), mock.patch.object(store, "iter_chunk_days", spy):
+        with alpha.active(), mock.patch.object(archive, "iter_chunk_days", spy):
             self.assertTrue(sync.has_chunks(alpha.id, "2023-11-14"))
             sync.orphaned_days()
 
@@ -4479,9 +4483,9 @@ class TestWalkingAPeersChunks(SyncTestCase):
         """They sit in the same host directory, and neither holds chunks."""
         alpha, _beta = self.stocked()
         with alpha.active():
-            siblings = {p.name for p in store.repo_host_dir(alpha.id).iterdir() if p.is_dir()}
+            siblings = {p.name for p in archive.repo_host_dir(alpha.id).iterdir() if p.is_dir()}
             self.assertTrue({"keys", "manifests"} <= siblings, siblings)
-            self.assertEqual({day for day, _ in store.iter_chunk_days(alpha.id)}, set(self.DAYS))
+            self.assertEqual({day for day, _ in archive.iter_chunk_days(alpha.id)}, set(self.DAYS))
 
     def test_an_idle_merge_builds_nothing_per_chunk(self) -> None:
         """The saving itself, asserted where a future change would undo it.
@@ -4491,14 +4495,14 @@ class TestWalkingAPeersChunks(SyncTestCase):
         the names does.
         """
         _alpha, beta = self.stocked()
-        real = store.iter_chunks
+        real = archive.iter_chunks
         used = []
 
-        def spy(machine_id: str) -> Iterator[store.Chunk]:
+        def spy(machine_id: str) -> Iterator[archive.Chunk]:
             used.append(machine_id)
             return real(machine_id)
 
-        with beta.active(), mock.patch.object(store, "iter_chunks", spy):
+        with beta.active(), mock.patch.object(archive, "iter_chunks", spy):
             report = sync.run()
         self.assertEqual(report.chunks_merged, 0)
         self.assertEqual(used, [], "merge built Chunk objects for an idle sync")
@@ -4676,7 +4680,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             crypto.public_half(key).unlink()
             fresh = crypto.generate_signing_key(key)
 
-            published = store.signer_public(alpha.id)
+            published = archive.signer_public(alpha.id)
             sync.run()  # nothing new to export: the signer is all there is
 
             self.assertIn(fresh, published.read_text(encoding="utf-8"))
@@ -4689,7 +4693,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
         # And it reached the remote, which is the point of publishing it.
         beta = self.machine("beta")
         with beta.active():
-            self.assertIn(fresh, store.signer_public(alpha.id).read_text(encoding="utf-8"))
+            self.assertIn(fresh, archive.signer_public(alpha.id).read_text(encoding="utf-8"))
 
     def test_a_day_that_can_never_be_exported_does_not_cost_a_stat_every_run(self) -> None:
         """The state where answering "probably wrote" would undo the whole fix.
@@ -4707,7 +4711,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
 
             # The sealed half gone: `export` refuses the day rather than
             # re-minting a key peers could never open. See `orphaned_day_key`.
-            store.day_key(alpha.id, "2023-11-14").unlink()
+            archive.day_key(alpha.id, "2023-11-14").unlink()
             alpha.record("2023-11-14", 1_700_000_002, "make -j8")
 
             first = self.git_calls()
@@ -4735,7 +4739,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             # leaves behind.
             # Into the day directory the sync above already made, because that
             # is where a run that died after `write_atomic` would have left it.
-            stray = store.chunk_dir(alpha.id, "2023-11-14") / "1700000009-abcdef.age"
+            stray = archive.chunk_dir(alpha.id, "2023-11-14") / "1700000009-abcdef.age"
             stray.write_bytes(b"debris from a run that did not finish")
 
             # An idle sync leaves it alone, which is the whole point.
@@ -4808,8 +4812,8 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             sync.run()
             # A commit that never reached the remote -- what a compaction, or a
             # run that died between committing and pushing, leaves behind.
-            store.recipients_file().write_text(
-                store.recipients_file().read_text(encoding="utf-8") + "\n", "utf-8"
+            archive.recipients_file().write_text(
+                archive.recipients_file().read_text(encoding="utf-8") + "\n", "utf-8"
             )
             sync.git("commit", "-qam", "unpushed")
             calls = self.git_calls()
@@ -4839,7 +4843,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             # Asserted at the git level rather than through `commands()`: alpha
             # cloned before beta existed and has not been told beta is real, so
             # it holds the chunk without yet being willing to read it.
-            self.assertTrue(list(store.chunk_dir(beta.id, "2023-11-14").glob("*.age")))
+            self.assertTrue(list(archive.chunk_dir(beta.id, "2023-11-14").glob("*.age")))
         # And once it is told, the history the rebase brought in is readable.
         self.accept_everyone(alpha)
         with alpha.active():
@@ -5107,15 +5111,15 @@ class TestInitFinishesTheJob(SyncTestCase):
         # machines can see it.
         with alpha.active():
             sync.run()
-            self.assertIn(beta.id, store.repo_hosts())
-            self.assertTrue(store.chunk_names(beta.id, "2023-11-15"))
+            self.assertIn(beta.id, archive.repo_hosts())
+            self.assertTrue(archive.chunk_names(beta.id, "2023-11-15"))
 
     def test_no_sync_still_joins_without_exchanging_anything(self) -> None:
         beta = self.joining_machine()
         out = self.run_cli(beta, "init", str(self.origin), "--new-identity", "--no-sync").out
         self.assertIn("Next: 'woswoar sync'", out)
         with beta.active():
-            self.assertEqual(list(store.chunk_days(beta.id)), [])
+            self.assertEqual(list(archive.chunk_days(beta.id)), [])
 
     def test_a_failed_first_sync_does_not_fail_the_join(self) -> None:
         """The join is done and durable by the time the sync runs -- identity
@@ -5161,7 +5165,7 @@ class TestAHostCannotClaimAnotherMachinesKey(SyncTestCase):
     `accept` shows a machine's age recipient and its signing key one above the
     other. That they belong to one machine comes from the `owner` line in
     `hosts/<id>/signer.pub` -- a file anyone with push access can write. The
-    mapping was built with `setdefault` over `store.repo_hosts()`, which is
+    mapping was built with `setdefault` over `archive.repo_hosts()`, which is
     sorted, and host ids are locally chosen hex: so a directory whose id sorts
     first could name *your* recipient and win it.
 
@@ -5182,7 +5186,7 @@ class TestAHostCannotClaimAnotherMachinesKey(SyncTestCase):
         """
         host = "0" * 16
         verify_key = crypto.generate_signing_key(self.root / f"signer-{host}")
-        store.write_atomic(store.signer_public(host), f"{verify_key}\n{victim_key}\n".encode())
+        store.write_atomic(archive.signer_public(host), f"{verify_key}\n{victim_key}\n".encode())
         store.write_atomic(store.name_file(host), b"martin@laptop\n")
         return host
 
@@ -5808,7 +5812,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
     def marker(self, fake: Fake) -> str:
         with fake.active():
-            path = store.format_file()
+            path = archive.format_file()
             return path.read_text(encoding="utf-8") if path.is_file() else ""
 
     def publish_marker(self, fake: Fake, content: str | None) -> None:
@@ -5824,11 +5828,11 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         with fake.active():
             sync.run()
             if content is None:
-                store.format_file().unlink()
-                sync.git("rm", "--quiet", "--cached", store.FORMAT)
+                archive.format_file().unlink()
+                sync.git("rm", "--quiet", "--cached", archive.FORMAT)
             else:
-                store.write_atomic(store.format_file(), content.encode("utf-8"))
-                sync.git("add", store.FORMAT)
+                store.write_atomic(archive.format_file(), content.encode("utf-8"))
+                sync.git("add", archive.FORMAT)
             sync.git("commit", "--quiet", "-m", "the marker, as another version left it")
             sync.git("push", "--quiet", "origin", "HEAD")
         self.assertEqual(self.marker(fake), content or "", "the fixture did not take")
@@ -5839,11 +5843,11 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
     def mark_future(self, fake: Fake) -> None:
         """A layout this woswoar does not know, as a newer one would write it."""
-        self.publish_marker(fake, store.format_content(store.REPO_FORMAT + 1))
+        self.publish_marker(fake, archive.format_content(archive.REPO_FORMAT + 1))
 
     def test_a_new_repo_records_its_format(self) -> None:
         alpha = self.machine("alpha")
-        self.assertEqual(self.marker(alpha), store.FORMAT_CONTENT)
+        self.assertEqual(self.marker(alpha), archive.FORMAT_CONTENT)
 
     def test_an_existing_repo_acquires_the_marker_on_sync(self) -> None:
         """The migration itself: a repository written before the marker existed
@@ -5859,12 +5863,12 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             # has to be enough on its own to make this run commit and push.
             sync.run()
 
-        self.assertEqual(self.marker(alpha), store.FORMAT_CONTENT)
+        self.assertEqual(self.marker(alpha), archive.FORMAT_CONTENT)
         self.assertIn(
-            store.FORMAT, self.git_in_repo(alpha, "ls-tree", "--name-only", "HEAD").split()
+            archive.FORMAT, self.git_in_repo(alpha, "ls-tree", "--name-only", "HEAD").split()
         )
         self.assertIn(
-            store.FORMAT,
+            archive.FORMAT,
             self.git_in_repo(alpha, "ls-tree", "--name-only", "origin/HEAD").split(),
             "the marker never reached the remote, so no other machine sees it",
         )
@@ -5906,12 +5910,12 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             # Nothing merged, and nothing published either.
             self.assertEqual(beta.commands(), {"beta was here"}, "alpha's history was merged")
             self.assertEqual(
-                list(store.iter_chunks(beta.id)), [], "it published into a repo it cannot read"
+                list(archive.iter_chunks(beta.id)), [], "it published into a repo it cannot read"
             )
 
         message = str(caught.exception)
-        self.assertIn(str(store.REPO_FORMAT + 1), message, message)
-        self.assertIn(str(store.REPO_FORMAT), message, message)
+        self.assertIn(str(archive.REPO_FORMAT + 1), message, message)
+        self.assertIn(str(archive.REPO_FORMAT), message, message)
 
     def test_content_that_does_not_parse_is_not_a_wedge(self) -> None:
         """Anyone who can push can write this file, so garbage in it must not be
@@ -5933,8 +5937,8 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
                 b"woswoar-repo-two\n",
                 "woswoar-repo-\u00b2\n".encode(),
             ):
-                store.write_atomic(store.format_file(), junk)
-                self.assertIsNone(store.repo_format(), junk.decode(errors="replace"))
+                store.write_atomic(archive.format_file(), junk)
+                self.assertIsNone(archive.repo_format(), junk.decode(errors="replace"))
                 # Not just the parse: the whole sync path has to survive it.
                 sync.run()
 
@@ -5960,7 +5964,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             # thing this test needs not to have happened yet.
             sync.git("fetch", "--quiet", "origin")
             sync.git("reset", "--hard", "--quiet", "origin/HEAD")
-            self.assertFalse(store.format_file().is_file(), "the fixture still has the marker")
+            self.assertFalse(archive.format_file().is_file(), "the fixture still has the marker")
 
             # Committed locally and deliberately not pushed, so alpha's marker
             # lands on the remote first and beta's arrives on top of it.
@@ -5974,7 +5978,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             sync.run()
 
         for machine in (alpha, beta):
-            self.assertEqual(self.marker(machine), store.FORMAT_CONTENT)
+            self.assertEqual(self.marker(machine), archive.FORMAT_CONTENT)
             self.assertNotIn(
                 "<<<<<<<",
                 self.marker(machine),
@@ -5988,7 +5992,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         alpha = self.machine("alpha")
         self.mark_future(alpha)
         with alpha.active():
-            before = store.recipients_file().read_text(encoding="utf-8")
+            before = archive.recipients_file().read_text(encoding="utf-8")
 
         with self.assertRaises(sync.SyncError):
             self.machine("beta")
@@ -5997,7 +6001,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             sync.git("fetch", "--quiet", "origin")
             sync.git("reset", "--hard", "--quiet", "origin/HEAD")
             self.assertEqual(
-                store.recipients_file().read_text(encoding="utf-8"),
+                archive.recipients_file().read_text(encoding="utf-8"),
                 before,
                 "the newcomer enrolled into a repo it had already been told to refuse",
             )
@@ -6010,11 +6014,11 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         self.mark_future(alpha)
 
         with alpha.active():
-            sealed = store.day_key(alpha.id, "2023-11-14").read_bytes()
+            sealed = archive.day_key(alpha.id, "2023-11-14").read_bytes()
             with self.assertRaises(sync.SyncError):
                 sync.grant()
             self.assertEqual(
-                store.day_key(alpha.id, "2023-11-14").read_bytes(),
+                archive.day_key(alpha.id, "2023-11-14").read_bytes(),
                 sealed,
                 "the day key was re-sealed into a repo this version cannot read",
             )
@@ -6028,7 +6032,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             for i in range(3):
                 alpha.record("2023-11-14", 1_700_000_001 + i, f"command {i}")
                 sync.run()
-            chunks = len(list(store.iter_chunks(alpha.id)))
+            chunks = len(list(archive.iter_chunks(alpha.id)))
         self.assertGreater(chunks, 1, "nothing to compact, so the fixture proves nothing")
         self.mark_future(alpha)
 
@@ -6036,7 +6040,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             with self.assertRaises(sync.SyncError):
                 sync.compact(before="2023-11-15")
             self.assertEqual(
-                len(list(store.iter_chunks(alpha.id))), chunks, "chunks were deleted anyway"
+                len(list(archive.iter_chunks(alpha.id))), chunks, "chunks were deleted anyway"
             )
 
     def test_doctor_reports_the_format_the_repo_is(self) -> None:
@@ -6044,7 +6048,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         never mentions it. `doctor` is where it becomes visible."""
         alpha = self.machine("alpha")
         self.assertRegex(
-            self.run_cli(alpha, "doctor").out, rf"\[ok\] repo format\s+{store.REPO_FORMAT}\b"
+            self.run_cli(alpha, "doctor").out, rf"\[ok\] repo format\s+{archive.REPO_FORMAT}\b"
         )
 
     def test_doctor_says_what_a_refused_repo_needs(self) -> None:
@@ -6056,5 +6060,5 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
         out = self.run_cli(alpha, "doctor").out
         self.assertRegex(out, r"\[FAIL\] repo format")
-        self.assertIn(str(store.REPO_FORMAT + 1), out)
+        self.assertIn(str(archive.REPO_FORMAT + 1), out)
         self.assertIn("upgrade woswoar", out)

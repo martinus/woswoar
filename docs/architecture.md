@@ -13,22 +13,41 @@ what woswoar does; read this one before moving code.
 
 ## Layers
 
+Who sits on whom. Indentation is "imports"; the three at the bottom are what the
+domains are made of.
+
 ```
-errors ─┬─ credentials ─┐
-        └─ crypto ──────┼─ sync ─┐
-entry ──┬─ store ───────┘        ├─ prove
-        ├─ cache ── search ──────┼─ __main__
-        └─ importer ─────────────┘
-deps, progress ─────────────────── (leaves, asked things by anyone)
+entry, errors        the record format, and the exception every layer raises
+  store              logs/, machine identity, the filesystem primitives
+    archive          history/ -- the repo layout    (sync and prove only)
+    cache            the parse index
+      search         Ctrl-R
+  crypto             age and ssh-keygen
+  credentials
+    importer         bash, zsh, atuin
+deps, progress       leaves: asked things by anyone, knowing nobody
+
+sync      <- archive, crypto, progress, store, entry, errors
+prove     <- sync, and everything sync is made of, plus deps
+__main__  <- search, cache, importer, store, entry, errors
+             (sync, crypto, archive and prove only inside the commands
+              that need them -- see "Two costs shape everything")
 ```
 
 | layer | modules | what it may know |
 |---|---|---|
 | format | `entry`, `errors` | nothing else in the package |
 | platform | `store`, `crypto`, `deps`, `progress`, `credentials` | the format layer |
-| derived | `cache` | the two above |
+| derived | `cache`, `archive` | the two above |
 | domains | `search`, `sync`, `importer` | everything below, and **never each other** |
 | composition | `prove`, `__main__` | everything |
+
+`store` and `archive` are the two halves of the filesystem: `store` owns
+``logs/`` — the plaintext truth — plus the primitives and machine identity;
+`archive` owns the layout of the encrypted repository under ``history/`` and its
+self-description. Only `sync` and `prove` may reach `archive`. `history_dir` is
+the one path that stays in `store`, because `store._private_paths` has to prune
+that directory by name when it walks for `harden` and `readable_by_others`.
 
 Three rules follow, and [`tests/test_architecture.py`](../tests/test_architecture.py)
 holds all three against the real import graph rather than against the `import`
@@ -180,9 +199,15 @@ subsystems living in the argparse module, reachable by a test only through
 stdout. The wizard builds `argparse.Namespace` objects by hand to call sibling
 commands, which is the CLI using its own argument format as an internal API.
 
-**`store.py` carries three vocabularies**: paths under `logs/`, paths under
-`history/`, and filesystem primitives. The middle one is `sync`'s alone, which is
-why everything that wants `logs_dir()` currently depends on the chunk layout too.
+**`store.py` used to carry three vocabularies** — paths under `logs/`, paths
+under `history/`, and the filesystem primitives — so everything that wanted
+`logs_dir()` also depended on the chunk layout. The middle one is
+`woswoar/archive.py` now (#200), and `cache` and `search` no longer reach it.
+What is left in `store` that does not belong to it is four per-machine files
+`sync` owns — `state_file`, `sync_stamp_file`, `sync_failure_file`,
+`signing_key_file`. They stayed deliberately: none of them is *in* the
+repository, so filing them under `archive` would be worse than leaving them, and
+their home is whatever #201 carves out of `sync`.
 
 **Outcome reporting has five spellings.** `sync` returns a `Report` dataclass and
 `IdentityStatus` records; `search.empty_note` returns prose; `importer` returns
@@ -203,7 +228,7 @@ first because they make the expensive one smaller.
 
 | | issue |
 |---|---|
-| 1 | [#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`. Mechanical, and it takes the chunk layout out of `search`'s dependency cone. |
+| 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
 | 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting, `doctor` first. This is what shrinks `Report`. |
 | 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
 | 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |

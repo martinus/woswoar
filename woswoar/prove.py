@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import crypto, deps, store, sync
+from . import archive, crypto, deps, store, sync
 from .entry import Entry
 from .errors import WoswoarError
 
@@ -67,20 +67,20 @@ _BOILERPLATE = (
     sync.COMMIT_NAME,
     sync.COMMIT_EMAIL,
     sync.COMMIT_MESSAGE,
-    store.README_CONTENT,
-    store.GITATTRIBUTES_CONTENT,
-    store.GITIGNORE_CONTENT,
-    store.README,
-    store.GITATTRIBUTES,
-    store.GITIGNORE,
-    store.RECIPIENTS,
+    archive.README_CONTENT,
+    archive.GITATTRIBUTES_CONTENT,
+    archive.GITIGNORE_CONTENT,
+    archive.README,
+    archive.GITATTRIBUTES,
+    archive.GITIGNORE,
+    archive.RECIPIENTS,
     # The repo-layout names, from the module that owns them: tree objects
     # spell out every directory and file name under `hosts/`.
-    store._HOSTS,
-    store._KEYS,
-    store._MANIFESTS,
-    store.signer_public("x").name,
-    store.name_seal("x").name,
+    archive.HOSTS,
+    archive.KEYS,
+    archive.MANIFESTS,
+    archive.signer_public("x").name,
+    archive.name_seal("x").name,
     # git's own vocabulary in refs and config.
     "main",
     "master",
@@ -189,11 +189,11 @@ def _pushed_plaintext(origin: Path, known: store.Machine, day: str) -> bytes:
     if not tip:
         raise WoswoarError("the sandbox remote holds no commit")
     history = store.history_dir()
-    sealed_rel = store.day_key(known.id, day).relative_to(history)
+    sealed_rel = archive.day_key(known.id, day).relative_to(history)
     sealed = _git_bytes("cat-file", "blob", f"{tip}:{sealed_rel}", cwd=origin)
     day_secret = sync.open_day_key_bytes(known, sealed)
 
-    chunk_rel = store.chunk_dir(known.id, day).relative_to(history)
+    chunk_rel = archive.chunk_dir(known.id, day).relative_to(history)
     listing = _git_bytes("ls-tree", "-r", "--name-only", tip, str(chunk_rel), cwd=origin).decode(
         "utf-8"
     )
