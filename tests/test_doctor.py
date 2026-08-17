@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from woswoar import __main__ as main_module
-from woswoar import crypto, store
+from woswoar import crypto, report, store
 
 from . import support
 from .support import WoswoarTestCase, requires_age
@@ -147,11 +147,11 @@ class TestDoctorsMarkers(WoswoarTestCase):
             return True
 
     def test_a_pipe_gets_the_plain_markers(self) -> None:
-        self.assertEqual(main_module._markers(io.StringIO()), main_module._PLAIN_MARKERS)
+        self.assertEqual(report.markers(io.StringIO()), report.PLAIN_MARKERS)
 
     def test_a_terminal_gets_a_green_tick_and_a_red_cross(self) -> None:
-        markers = main_module._markers(self.Tty())
-        self.assertEqual(markers, main_module._COLOUR_MARKERS)
+        markers = report.markers(self.Tty())
+        self.assertEqual(markers, report.COLOUR_MARKERS)
         self.assertIn("\u2714", markers["ok"])
         self.assertIn("\u2718", markers["fail"])
         self.assertTrue(markers["ok"].startswith("\x1b[32m"), "the tick is not green")
@@ -161,7 +161,7 @@ class TestDoctorsMarkers(WoswoarTestCase):
     def test_no_color_is_honoured_on_a_terminal(self) -> None:
         os.environ["NO_COLOR"] = "1"
         self.addCleanup(lambda: os.environ.pop("NO_COLOR", None))
-        self.assertEqual(main_module._markers(self.Tty()), main_module._PLAIN_MARKERS)
+        self.assertEqual(report.markers(self.Tty()), report.PLAIN_MARKERS)
 
     def test_the_run_that_tests_and_scripts_see_is_unchanged(self) -> None:
         """Captured output is not a tty, so this is the real regression guard."""
@@ -180,7 +180,7 @@ class TestDoctorsMarkers(WoswoarTestCase):
                 .replace("\x1b[2m", "")
                 .replace("\x1b[0m", "")
             )
-            for value in main_module._COLOUR_MARKERS.values()
+            for value in report.COLOUR_MARKERS.values()
         }
         self.assertEqual(widths, {1})
 

@@ -1909,14 +1909,14 @@ class TestIdentityStatus(SyncTestCase):
             known = store.machine()
             Path(known.identity).unlink()
             status = sync.identity_status(known)
-            self.assertFalse(status.ok)
+            self.assertIs(status.ok, False)
             self.assertIn("missing", status.detail)
 
     def test_unconfigured_identity_is_reported(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
             status = sync.identity_status(store.machine()._replace(identity=""))
-            self.assertFalse(status.ok)
+            self.assertIs(status.ok, False)
             self.assertIn("woswoar init", status.detail)
 
     def test_passphrase_protected_key_is_reported(self) -> None:
@@ -1931,7 +1931,7 @@ class TestIdentityStatus(SyncTestCase):
                 timeout=60,
             )
             status = sync.identity_status(store.machine()._replace(identity=str(locked)))
-            self.assertFalse(status.ok)
+            self.assertIs(status.ok, False)
             self.assertIn("passphrase", status.detail)
 
 
