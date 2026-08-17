@@ -1462,6 +1462,27 @@ class RecordingIsPrivateMixin(SharedShellTestBase):
         # above cannot say on its own.
         self.assertIsNone(search.interactive("global"), "Ctrl-R would open an empty picker")
 
+    def test_a_command_the_hook_declines_leaves_no_log_file_either(self) -> None:
+        """The same invariant, reached through the other door.
+
+        The test above runs a shell that types nothing, so `__woswoar_record`
+        returns at its first guard. This one *types a command* and has the hook
+        refuse it, which walks every early return between there and the
+        once-a-day block that creates the day file -- and that ordering is the
+        whole of why the file still means "something was recorded".
+
+        It is not a contrived state. `WOSWOAR_IGNORE` rejecting the day's first
+        command is a fresh install whose owner's first act was to export a
+        credential, and `search`'s guard reads a log file's *existence*: a
+        creation hoisted above these returns would leave a rows-less file and
+        make that person's first Ctrl-R an empty picker, on the one path where
+        woswoar has nothing to show and has just told them to press the key.
+        """
+        self.run_shell("export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIabc123\n")
+        self.assertEqual(self.commands(), [], "precondition: the hook recorded it after all")
+        self.assertEqual(sorted(self.logdir().parent.rglob("*.tsv")), [])
+        self.assertIsNone(search.interactive("global"), "Ctrl-R would open an empty picker")
+
     def test_the_hook_agrees_with_store_about_what_private_means(self) -> None:
         """The hook is copied verbatim, so it cannot import the constants.
 
