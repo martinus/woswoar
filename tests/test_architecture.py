@@ -47,7 +47,7 @@ REPO = Path(__file__).resolve().parent.parent
 #: this is for; a table that only caught *additions* would silently rot as
 #: modules lost dependencies and stop describing the package it claims to pin.
 #:
-#: The five leaves are leaves on purpose. `errors` holds the exception every
+#: The five leaves are leaves on purpose. `errors` holds the exceptions every
 #: layer raises; `deps`, `progress` and `report` are asked things by the layers
 #: above without knowing anything about them -- so each of them stays importable
 #: from anywhere without dragging a domain along. `report` in particular has to
@@ -74,17 +74,41 @@ LAYERS: dict[str, set[str]] = {
     #: `importer` and `sync` are deliberately absent: the wizard asks about them
     #: inside the two functions that need them.
     "setup": {"entry", "errors", "install", "report", "store"},
-    "sync": {"archive", "crypto", "entry", "errors", "progress", "report", "store"},
+    #: The two layers that came out of `sync` in #201, and the reason they are
+    #: the two: each reaches strictly *below* it. `manifest` is the authenticity
+    #: layer -- crypto, an `archive` path, an atomic write -- and `gitrepo` is
+    #: every fork woswoar makes, which needs `store` for the repo path and
+    #: `progress` to announce a fetch. Neither knows what a sync is, so neither
+    #: can grow an edge back to one.
+    "gitrepo": {"entry", "errors", "progress", "store"},
+    "manifest": {"archive", "crypto", "entry", "errors", "store"},
+    "sync": {
+        "archive",
+        "crypto",
+        "entry",
+        "errors",
+        "gitrepo",
+        "manifest",
+        "progress",
+        "report",
+        "store",
+    },
     #: `sync` is deliberately absent: `doctor` reaches it inside the two checks
     #: that need it, so asking what is wrong with an installation does not pay
     #: to import the whole sync protocol first.
     "doctor": {"cache", "crypto", "deps", "entry", "errors", "report", "search", "store"},
+    #: `gitrepo` for the commit boilerplate it must not mistake for a leaked
+    #: username; `manifest` only through `sync`. Both arrived when #201 turned
+    #: two of sync's internal layers into modules, which is a name for an edge
+    #: that already existed rather than a new one.
     "prove": {
         "archive",
         "crypto",
         "deps",
         "entry",
         "errors",
+        "gitrepo",
+        "manifest",
         "progress",
         "report",
         "store",
@@ -196,6 +220,68 @@ class TestTheLayering(unittest.TestCase):
                     LAYERS[dependency],
                     f"{module} and {dependency} import each other",
                 )
+
+
+#: Where a `git` argv may be built. `gitrepo` is the seam; `prove._git_bytes`
+#: says beside itself why it is the exception.
+MAY_SPAWN_GIT = {"gitrepo", "prove"}
+
+#: Modules whose functions the test suite patches to count what a sync did, and
+#: which therefore have to be reached by attribute rather than by ``from`` import.
+SPY_SEAMS = ("gitrepo", "manifest")
+
+
+class TestOneModuleSpawnsGit(unittest.TestCase):
+    """`gitrepo.git` is a seam of the kind `docs/architecture.md` lists.
+
+    The fork-count tests in `tests/test_sync.py` rest on this: they patch one
+    attribute and claim to see every git call a sync makes, and a fork spawned
+    from anywhere else would be invisible to them -- and so would be free, on a
+    path that runs once a minute.
+
+    A text scan, and complete only for the shape `subprocess` is actually called
+    with here. `[cmd, *args]` where ``cmd`` happens to hold ``"git"`` would slip
+    past, and a mention of ``["git", ...]`` in a *comment* would fail this even
+    though nothing forks -- loudly, in the direction that gets read. Both are
+    worth knowing when reading a pass rather than reasons not to check: the point
+    of a seam is that the wrong thing is conspicuous, and every real caller in
+    this package spells the literal.
+    """
+
+    def test_no_other_module_builds_a_git_argv(self) -> None:
+        found = {
+            path.stem
+            for path in (REPO / "woswoar").glob("*.py")
+            if '["git"' in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(found, MAY_SPAWN_GIT)
+
+
+class TestTheSeamsAreReachedByAttribute(unittest.TestCase):
+    """``from .manifest import read`` would silently unhook a spy.
+
+    `tests/test_sync.py` counts chunk reads, signature checks and git forks by
+    patching an attribute of `manifest` or `gitrepo`. A ``from`` import binds the
+    function object at import time, so a call site converted to one goes on
+    calling the real function while the spy watches something nothing calls. Two
+    of those counts are asserted to be *zero* -- the laziness that makes
+    signatures affordable, and an idle sync not staging the tree -- and zero is
+    exactly what a spy nothing calls reports.
+
+    So this is the one place the convention is enforced rather than explained.
+    Both module docstrings used to argue it at length and nothing checked it.
+    """
+
+    def test_no_module_from_imports_a_seam(self) -> None:
+        for path in sorted((REPO / "woswoar").glob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for seam in SPY_SEAMS:
+                with self.subTest(module=path.stem, seam=seam):
+                    self.assertNotIn(
+                        f"from .{seam} import",
+                        source,
+                        f"{path.stem} binds a name out of {seam}; reach it as {seam}.<name>",
+                    )
 
 
 class TestTheSearchPathStaysCheap(unittest.TestCase):

@@ -24,13 +24,25 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from woswoar import archive, cache, crypto, progress, prove, search, store, sync
+from woswoar import (
+    archive,
+    cache,
+    crypto,
+    errors,
+    gitrepo,
+    manifest,
+    progress,
+    prove,
+    search,
+    store,
+    sync,
+)
 from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
+from woswoar.gitrepo import COMMIT_MESSAGE as COMMIT
 from woswoar.install import HOOKS
 from woswoar.install import hook_bytes as main_hook_bytes
 from woswoar.sync import _GRANT_REMEDY
-from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support
 from .support import requires_age, requires_git, requires_ssh_keygen
@@ -205,7 +217,46 @@ class SyncTestCase(unittest.TestCase):
 
     def git_in_repo(self, fake: Fake, *args: str) -> str:
         with fake.active():
-            return sync.git(*args)
+            return gitrepo.git(*args)
+
+    @staticmethod
+    def plant_manifest(work: Path, host_id: str, day: str, key: Path, *chunks: Path) -> None:
+        """A well-formed manifest naming ``chunks``, signed with a key of our own.
+
+        Exactly what push access alone can build: correct framing, a correct
+        header, real digests -- and the wrong signature. ``chunks`` is named
+        rather than listed off the directory on purpose; signing whatever happens
+        to be there would make the fixture depend on how much real history the
+        clone already had, and the tests using this are about one planted chunk.
+
+        Here because both callers used to spell out `manifest._body`, the
+        `ssh-keygen` call and the framing -- including a literal ``b"\n\n"``
+        where `manifest._SEPARATOR` is what decides it. That is the repository's
+        file format written down in a test, once per test.
+        """
+        listed = {
+            chunk.name: manifest.ManifestEntry(manifest.digest_of(chunk.read_bytes()))
+            for chunk in chunks
+        }
+        body = manifest._body(host_id, day, listed)
+        signature = crypto.sign(body.encode("utf-8"), key, manifest._MAGIC)
+        signed = work / "hosts" / host_id / "manifests" / day
+        signed.parent.mkdir(parents=True, exist_ok=True)
+        signed.write_bytes(
+            signature.decode("utf-8").strip().encode()
+            + manifest._SEPARATOR.encode("utf-8")
+            + body.encode("utf-8")
+        )
+
+    def publish_repo_edit(self) -> None:
+        """Commit and push a change made to the repo behind `sync`'s back.
+
+        `sync` commits only when it wrote something itself, so a test that edits
+        the repo directly has to publish the edit rather than wait for the next
+        sync to stage it. Call from inside the editing machine's `active()`.
+        """
+        gitrepo.commit()
+        gitrepo.push(gitrepo.read_repo())
 
     def history_across_days(self, days: int, per_day: int) -> tuple[Fake, Fake]:
         """alpha with `days` days of `per_day` commands, each its own chunk,
@@ -541,13 +592,13 @@ class TestAFinderVisitDoesNotBreakSync(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
             staged: list[bool] = []
-            real = sync._commit
+            real = gitrepo.commit
 
             def counted() -> bool:
                 staged.append(True)
                 return real()
 
-            with mock.patch.object(sync, "_commit", counted):
+            with mock.patch.object(gitrepo, "commit", counted):
                 sync.run()
             self.assertEqual(staged, [], "an idle sync stated the whole working tree")
 
@@ -840,7 +891,7 @@ class TestGrantConfirmation(SyncTestCase):
             approved = [reader.key for reader in sync.readers()]
         self.machine("beta")  # enrols behind alpha's back
 
-        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+        with alpha.active(), self.assertRaises(errors.SyncError) as caught:
             sync.grant(approved=approved)
         self.assertIn("changed while you were deciding", str(caught.exception))
 
@@ -866,7 +917,7 @@ class TestGrantConfirmation(SyncTestCase):
 
     def test_a_key_that_is_not_one_line_is_refused_rather_than_written(self) -> None:
         alpha = self.machine("alpha")
-        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+        with alpha.active(), self.assertRaises(errors.SyncError) as caught:
             sync.add_recipient(f"{crypto.generate_identity().public}\nage1intruder")
         self.assertIn("not one line", str(caught.exception))
 
@@ -970,7 +1021,7 @@ class TestRevokeSubtraction(SyncTestCase):
             gone = alpha.append_recipient(name="old-laptop")
             sync.revoke(sync.find_reader(crypto.fingerprint(gone)))
 
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.add_recipient(gone)
             self.assertIn("revocation is permanent", str(caught.exception))
 
@@ -1050,7 +1101,7 @@ class TestRevokeSubtraction(SyncTestCase):
         alpha = self.machine("alpha")
         with alpha.active():
             (mine,) = [reader for reader in sync.readers() if reader.is_mine]
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.revoke(mine)
         self.assertIn("lock this machine out", str(caught.exception))
 
@@ -1063,7 +1114,7 @@ class TestRevokeSubtraction(SyncTestCase):
             archive.recipients_file().write_text("", encoding="utf-8")
             only = alpha.append_recipient(name="only-one")
             (other,) = sync.readers()
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.revoke(other)
             self.assertIn(only, sync.recipients())
         self.assertIn("only machine left", str(caught.exception))
@@ -1110,7 +1161,7 @@ class TestRevokeSubtraction(SyncTestCase):
 
     def test_a_key_shaped_like_a_tombstone_is_refused(self) -> None:
         alpha = self.machine("alpha")
-        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+        with alpha.active(), self.assertRaises(errors.SyncError) as caught:
             sync.add_recipient(f"-{crypto.generate_identity().public}")
         self.assertIn("may not start with", str(caught.exception))
 
@@ -1154,10 +1205,10 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
             beta.record(day, ts, cmd)
             known = store.machine()
             with sync.lock():
-                sync._fetch_and_rebase(sync.read_repo())
+                gitrepo.fetch_and_rebase(gitrepo.read_repo())
                 sync.export(known, sync.State.load(), sync.Report(), ts)
-                sync._commit()
-                sync._push(sync.read_repo())
+                gitrepo.commit()
+                gitrepo.push(gitrepo.read_repo())
 
     def revoke_beta(self, alpha: Fake, beta: Fake) -> None:
         with beta.active():
@@ -1195,7 +1246,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
         with beta.active():
             day = "2023-11-14"
             with sync.lock():
-                sync._fetch_and_rebase(sync.read_repo())
+                gitrepo.fetch_and_rebase(gitrepo.read_repo())
                 pub = archive.day_key_public(alpha.id, day)
                 entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
                 sealed = crypto.encrypt_to(
@@ -1205,8 +1256,8 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
                 target = archive.chunk_dir(alpha.id, day) / "9999999999-ffffff.age"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(sealed)
-                sync._commit()
-                sync._push(sync.read_repo())
+                gitrepo.commit()
+                gitrepo.push(gitrepo.read_repo())
 
         with gamma.active():
             sync.run()
@@ -1259,7 +1310,7 @@ class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
             alpha.record("2023-11-14", 1_700_000_002, "ours too")
             report = sync.run(now=1_900_000_000)
 
-            listed = sync.read_manifest(
+            listed = manifest.read(
                 alpha.id, "2023-11-14", crypto.signing_public(store.signing_key_file())
             )
             self.assertNotIn(planted.name, listed, "export signed a chunk it did not write")
@@ -1309,13 +1360,13 @@ class TestFindReader(SyncTestCase):
         alpha = self.machine("alpha")
         with alpha.active():
             alpha.append_recipient(name="old-laptop")
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.find_reader("age1")
         self.assertIn("matches 2 machines", str(caught.exception))
 
     def test_a_fingerprint_nobody_has_is_refused(self) -> None:
         alpha = self.machine("alpha")
-        with alpha.active(), self.assertRaises(sync.SyncError) as caught:
+        with alpha.active(), self.assertRaises(errors.SyncError) as caught:
             sync.find_reader("SHA256:nothing-like-this")
         self.assertIn("no enrolled machine", str(caught.exception))
 
@@ -1375,7 +1426,7 @@ class TestCrashDebrisIsNotCalledAnIntruder(SyncTestCase):
 
             with (
                 contextlib.suppress(KeyboardInterrupt),
-                mock.patch.object(sync, "write_manifest", die),
+                mock.patch.object(manifest, "write", die),
             ):
                 sync.run()
             left = set(archive.chunk_names(alpha.id, "2023-11-14")) - before
@@ -1531,7 +1582,7 @@ class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
         hostile = f"--upload-pack=touch {witness}"
 
         alpha = self.machine("alpha")
-        with alpha.active(), self.assertRaises(sync.SyncError) as refused:
+        with alpha.active(), self.assertRaises(errors.SyncError) as refused:
             sync.initialise(remote=hostile)
         self.assertIn("may not start with", str(refused.exception))
         self.assertFalse(witness.exists(), "the remote was executed")
@@ -1544,7 +1595,7 @@ class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
         edit could narrow.
         """
         seen: list[tuple[str, ...]] = []
-        real = sync.git
+        real = gitrepo.git
 
         def spy(*args: str, **kwargs: object) -> str:
             seen.append(args)
@@ -1553,15 +1604,15 @@ class TestARemoteIsAnAddressNotAnOption(SyncTestCase):
         # A machine that has never been set up, because those are the only two
         # calls that are ever handed a remote -- an already-initialised one
         # clones nothing and this would watch an empty list.
-        with mock.patch.object(sync, "git", spy):
+        with mock.patch.object(gitrepo, "git", spy):
             alpha = self.machine("alpha")
 
         # `remote add` is only reached when the repo was *not* cloned -- a clone
         # sets origin itself. That is `woswoar init` with no remote, and a
         # remote given later; without it this watches the clone alone.
         with alpha.active():
-            sync.git("remote", "remove", "origin")
-            with mock.patch.object(sync, "git", spy):
+            gitrepo.git("remote", "remove", "origin")
+            with mock.patch.object(gitrepo, "git", spy):
                 sync.initialise(remote=str(self.origin))
 
         handed = [call for call in seen if call[:1] == ("clone",) or call[:2] == ("remote", "add")]
@@ -1855,7 +1906,7 @@ class TestCompact(SyncTestCase):
             before = {c.name for c in archive.iter_chunks(alpha.id)}
 
         with alpha.active():
-            with self.assertRaises(sync.SyncError) as refused:
+            with self.assertRaises(errors.SyncError) as refused:
                 sync.compact(before="2099-01-01")
             self.assertIn("in the future", str(refused.exception))
             self.assertEqual({c.name for c in archive.iter_chunks(alpha.id)}, before)
@@ -1955,7 +2006,7 @@ class TestLocalOnly(SyncTestCase):
 
     def test_concurrent_sync_is_refused_not_corrupted(self) -> None:
         alpha = self.machine("alpha")
-        with alpha.active(), sync.lock(), self.assertRaises(sync.SyncError):
+        with alpha.active(), sync.lock(), self.assertRaises(errors.SyncError):
             sync.run()
 
 
@@ -2217,21 +2268,7 @@ class TestChunkAuthenticity(SyncTestCase):
             signer = work / "hosts" / "deadbeefdeadbeef" / "signer.pub"
             signer.write_text(f"{verify_key}\n{owner}\n", encoding="utf-8")
             chunk = work / "hosts" / "deadbeefdeadbeef" / "2023-11-14" / "9999999999-ffffff.age"
-            body = sync._manifest_body(
-                "deadbeefdeadbeef",
-                "2023-11-14",
-                {chunk.name: sync.Entry(sync.digest_of(chunk.read_bytes()))},
-            )
-            manifest = work / "hosts" / "deadbeefdeadbeef" / "manifests" / "2023-11-14"
-            manifest.parent.mkdir(parents=True, exist_ok=True)
-            manifest.write_bytes(
-                crypto.sign(body.encode("utf-8"), theirs, sync._MANIFEST_MAGIC)
-                .decode()
-                .strip()
-                .encode()
-                + b"\n\n"
-                + body.encode("utf-8")
-            )
+            self.plant_manifest(work, "deadbeefdeadbeef", "2023-11-14", theirs, chunk)
 
         self.push_as_attacker(plant)
 
@@ -2309,17 +2346,7 @@ class TestChunkAuthenticity(SyncTestCase):
             chunk = work / "hosts" / alpha.id / "2023-11-14" / "9999999999-ffffff.age"
             theirs = self.root / "attacker-key"
             crypto.generate_signing_key(theirs)
-            body = sync._manifest_body(
-                alpha.id,
-                "2023-11-14",
-                {chunk.name: sync.Entry(sync.digest_of(chunk.read_bytes()))},
-            )
-            signature = crypto.sign(body.encode("utf-8"), theirs, sync._MANIFEST_MAGIC)
-            manifest = work / "hosts" / alpha.id / "manifests" / "2023-11-14"
-            manifest.parent.mkdir(parents=True, exist_ok=True)
-            manifest.write_bytes(
-                signature.decode("utf-8").strip().encode() + b"\n\n" + body.encode("utf-8")
-            )
+            self.plant_manifest(work, alpha.id, "2023-11-14", theirs, chunk)
 
         self.push_as_attacker(plant)
 
@@ -2343,7 +2370,7 @@ class TestChunkAuthenticity(SyncTestCase):
 
         with alpha.active():
             sync.run()  # pulls the planted chunk into alpha's own working tree
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.compact(before="2023-11-15")
             self.assertIn("refusing to compact", str(caught.exception))
             # And it is still there, not silently dropped.
@@ -2363,7 +2390,7 @@ class TestExportWillNotDisownItsOwnHistory(SyncTestCase):
         with alpha.active():
             alpha.record("2023-11-14", 1_700_000_001, "published earlier")
             sync.run()
-            before = sync.read_manifest(
+            before = manifest.read(
                 alpha.id, "2023-11-14", crypto.signing_public(store.signing_key_file())
             )
             self.assertEqual(len(before), 1)
@@ -2415,16 +2442,6 @@ class TestTheMergeWatermark(SyncTestCase):
         with alpha.active():
             sync.grant()
         return alpha, beta, chunks
-
-    def publish_repo_edit(self) -> None:
-        """Commit and push a change made to the repo behind `sync`'s back.
-
-        `sync` commits only when it wrote something itself, so a test that edits
-        the repo directly has to publish the edit rather than wait for the next
-        sync to stage it. Call from inside the editing machine's `active()`.
-        """
-        sync._commit()
-        sync._push(sync.read_repo())
 
     def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
         """The silent half, and the worse one.
@@ -2703,11 +2720,10 @@ class TestADecompressionBomb(SyncTestCase):
             sealed = crypto.encrypt_to(zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9), pub)
             path = archive.chunk_dir(alpha.id, day) / "1900000000-ffffff.age"
             path.write_bytes(sealed)
-            listed = sync.read_manifest(alpha.id, day, sync.signing_public())
-            listed[path.name] = sync.Entry(sync.digest_of(sealed))
-            sync.write_manifest(store.machine(), day, listed)
-            sync._commit()
-            sync._push(sync.read_repo())
+            listed = manifest.read(alpha.id, day, sync.signing_public())
+            listed[path.name] = manifest.ManifestEntry(manifest.digest_of(sealed))
+            manifest.write(store.machine(), day, listed)
+            self.publish_repo_edit()
 
         with beta.active():
             report = sync.run()
@@ -2919,7 +2935,7 @@ class TestTheRepoExplainsItself(SyncTestCase):
     def test_init_commits_a_readme(self) -> None:
         alpha = self.machine("alpha")
         with alpha.active():
-            committed = sync.git("ls-files").splitlines()
+            committed = gitrepo.git("ls-files").splitlines()
             self.assertIn(archive.README, committed, "the README was not committed")
             text = (store.history_dir() / archive.README).read_text(encoding="utf-8")
         self.assertIn("github.com/martinus/woswoar", text, "no link to the project")
@@ -2944,7 +2960,7 @@ class TestTheRepoExplainsItself(SyncTestCase):
         with alpha.active():
             readme = store.history_dir() / archive.README
             readme.write_text("written by another version\n", encoding="utf-8")
-            sync._commit()
+            gitrepo.commit()
 
             # `init` again is the path that could rewrite it -- `sync` never
             # touches repo metadata at all.
@@ -3052,7 +3068,7 @@ class TestRecipientsPublishNoNames(SyncTestCase):
             sync.run()
             # Through `doctor --prove`'s scanner: it walks `.git` -- where git
             # would record an author identity, kept constant by
-            # `_ensure_repo_config` -- and additionally inflates every object,
+            # `gitrepo.ensure_config` -- and additionally inflates every object,
             # where a name in a *superseded* revision of `recipients.txt`
             # would hide from a raw walk and still be pushed. That rewritten
             # file is exactly how #22 leaked names in the first place.
@@ -3106,8 +3122,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             victim = archive.day_key(alpha.id, "2023-11-14")
             self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
             victim.unlink()
-            sync._commit()
-            sync._push(sync.read_repo())
+            self.publish_repo_edit()
 
         with alpha.active():
             sync.run()
@@ -3298,7 +3313,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
 class TestADeletedManifest(SyncTestCase):
     """Issue #63, the sibling of #42 in the other rewritable file.
 
-    `read_manifest` returns nothing for "absent" and for "will not verify"
+    `manifest.read` returns nothing for "absent" and for "will not verify"
     alike, and only the second was guarded. So a deleted manifest looked exactly
     like a day never published: the fresh one signed at the end of `export`
     named only what that run wrote, and every chunk published earlier that day
@@ -3647,13 +3662,13 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         when the assertion can say which chunks came back.
         """
         opened: list[str] = []
-        real = sync.open_chunk
+        real = manifest.open_chunk
 
         def counted(path: Path, digest: str) -> bytes:
             opened.append(path.name)
             return real(path, digest)
 
-        with machine.active(), mock.patch.object(sync, "open_chunk", counted):
+        with machine.active(), mock.patch.object(manifest, "open_chunk", counted):
             sync.run()
         return opened
 
@@ -3732,7 +3747,7 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         def refuse(path: Path, expected: str) -> bytes:
             raise ValueError(f"{path.name} is not the chunk its manifest names")
 
-        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", refuse):
             report = sync.run()
         self.assertIn(f"{alpha.id}/2023-11-14", report.subjects(sync.UNAUTHENTICATED))
 
@@ -3768,7 +3783,7 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         day of history per run.
 
         The day's directory is disturbed first, so the mtime stamp of #85 does
-        not skip it before `read_manifest` is ever reached. Without that this
+        not skip it before `manifest.read` is ever reached. Without that this
         test passes whether or not the laziness it is named for still exists.
         """
         alpha, beta = self.merged_pair()
@@ -3778,13 +3793,15 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
             stray.unlink()
 
             reads: list[str] = []
-            real = sync.read_manifest
+            real = manifest.read
 
-            def counted(host_id: str, day: str, verify_key: str) -> dict[str, sync.Entry]:
+            def counted(
+                host_id: str, day: str, verify_key: str
+            ) -> dict[str, manifest.ManifestEntry]:
                 reads.append(day)
                 return real(host_id, day, verify_key)
 
-            with mock.patch.object(sync, "read_manifest", counted):
+            with mock.patch.object(manifest, "read", counted):
                 sync.run()
             self.assertEqual(reads, [], "a day with nothing new still read its manifest")
 
@@ -3809,14 +3826,14 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         with alpha.active():
             self.assertEqual(sync.compact(before="2023-12-01")[0], 1)
             verify_key = sync.signing_public()
-            listed = sync.read_manifest(alpha.id, self.DAY, verify_key)
+            listed = manifest.read(alpha.id, self.DAY, verify_key)
             compacted = next(name for name, entry in listed.items() if entry.subsumes)
             alpha.record(self.DAY, 1_700_000_600, "and another")
             sync.run()
         return alpha, beta, compacted
 
     def damaged(self, name: str) -> Callable[[Path, str], bytes]:
-        real = sync.open_chunk
+        real = manifest.open_chunk
 
         def refuse(path: Path, expected: str) -> bytes:
             if path.name == name:
@@ -3828,7 +3845,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
     def test_a_day_keeps_what_it_had_when_a_chunk_will_not_open(self) -> None:
         alpha, beta, compacted = self.compacted_and_growing()
 
-        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", self.damaged(compacted)):
             report = sync.run()
             self.assertIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             self.assertEqual(len(beta.entries()), 5, "the day was rewritten from a partial read")
@@ -3851,7 +3868,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
                 name for name in archive.chunk_names(alpha.id, self.DAY) if name != compacted
             )
 
-        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", self.damaged(compacted)):
             sync.run()
             remembered = sync.State.load().merged.get(f"{alpha.id}/{self.DAY}", set())
         # Not the one that failed, and -- the point -- not the one that read
@@ -3937,7 +3954,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
             (archive.chunk_dir(alpha.id, self.DAY) / "1700000000-dead.age").write_bytes(b"x")
 
         self.settle(beta, alpha, self.DAY)
-        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(first)):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", self.damaged(first)):
             self.assertIn(key, sync.run().subjects(sync.STALE))
             self.assertNotIn(key, sync.State.load().merged_at, "a refused rewrite was stamped")
             self.assertEqual(len(beta.entries()), 5, "the day was rebuilt from a partial read")
@@ -3945,7 +3962,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
     def test_sync_says_which_day_it_left_alone(self) -> None:
         """New user-facing behaviour, so it is pinned like its neighbours."""
         alpha, beta, compacted = self.compacted_and_growing()
-        with mock.patch.object(sync, "open_chunk", self.damaged(compacted)):
+        with mock.patch.object(manifest, "open_chunk", self.damaged(compacted)):
             ran = self.run_cli(beta, "sync")
         self.assertEqual(ran.code, 0)
         said = ran.err
@@ -3964,8 +3981,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         alpha, beta, compacted = self.compacted_and_growing()
         with alpha.active():
             (archive.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
-            sync._commit()
-            sync._push(sync.read_repo())
+            self.publish_repo_edit()
 
         with beta.active():
             report = sync.run()
@@ -4011,7 +4027,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
                 sync.run()
             names = archive.chunk_names(alpha.id, self.DAY)
 
-        with beta.active(), mock.patch.object(sync, "open_chunk", self.damaged(names[-1])):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", self.damaged(names[-1])):
             report = sync.run()
             self.assertNotIn(f"{alpha.id}/{self.DAY}", report.subjects(sync.STALE))
             # The one that read was kept, rather than held back with the other.
@@ -4146,7 +4162,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
     def test_a_manifest_that_will_not_verify_settles_nothing(self) -> None:
         """The hazard both halves share, and the one that loses history.
 
-        `read_manifest` answers with *nothing* for a manifest that is missing,
+        `manifest.read` answers with *nothing* for a manifest that is missing,
         unsigned or mis-signed -- not because the day is empty. Treating that as
         "every signed chunk is merged" would stamp a day whose chunks are all
         still being refused, and would prune the day's record to nothing. The
@@ -4166,8 +4182,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
             alpha.record(self.DAY, 1_700_000_003, "a third line")
             sync.run()
             archive.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
-            sync._commit()
-            sync._push(sync.read_repo())
+            self.publish_repo_edit()
 
         with beta.active():
             sync.run()
@@ -4271,10 +4286,10 @@ class TestSkippingAnUnchangedDay(SyncTestCase):
         # would keep the day being read again whatever the completeness rule
         # said. The second runs against a day that is settled and still short --
         # the only state in which the rule is the thing being tested.
-        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", refuse):
             sync.run()
         self.settle(beta, alpha, "2023-11-15")
-        with beta.active(), mock.patch.object(sync, "open_chunk", refuse):
+        with beta.active(), mock.patch.object(manifest, "open_chunk", refuse):
             report = sync.run()
         self.assertIn(f"{alpha.id}/2023-11-15", report.subjects(sync.UNAUTHENTICATED))
 
@@ -4622,18 +4637,21 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     def git_calls(self) -> list[str]:
         """Every git subcommand one `sync.run()` spawns, in order.
 
-        Counted at `sync.git`, which is the only place in the package that
+        Counted at `gitrepo.git`, which is the only place in the package that
         spawns git -- the same seam the chunk-read counters in this file use,
-        and it needs no argv sniffing to tell git from `age`.
+        and it needs no argv sniffing to tell git from `age`. That claim used to
+        be prose here; `tests/test_architecture.py::TestOneModuleSpawnsGit` now
+        holds it, because a fork from anywhere else would be invisible to this
+        and so would be free.
         """
-        real = sync.git
+        real = gitrepo.git
         seen: list[str] = []
 
         def spy(*args: str, **kwargs: object) -> str:
             seen.append(" ".join(args[:2]))
             return real(*args, **kwargs)  # type: ignore[arg-type]
 
-        with mock.patch.object(sync, "git", spy):
+        with mock.patch.object(gitrepo, "git", spy):
             sync.run()
         return seen
 
@@ -4693,7 +4711,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
 
             self.assertIn(fresh, published.read_text(encoding="utf-8"))
             self.assertEqual(
-                sync.git("status", "--porcelain", "--", str(published)),
+                gitrepo.git("status", "--porcelain", "--", str(published)),
                 "",
                 "the republished signer was left uncommitted",
             )
@@ -4752,19 +4770,19 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
 
             # An idle sync leaves it alone, which is the whole point.
             sync.run()
-            self.assertNotIn(stray.name, sync.git("show", "--name-only", "--format=", "HEAD"))
+            self.assertNotIn(stray.name, gitrepo.git("show", "--name-only", "--format=", "HEAD"))
 
             # The next run with something of its own to write picks it up.
             alpha.record("2023-11-14", 1_700_000_002, "make -j8")
             sync.run()
             # HEAD, not the last few commits: the catch-up has to happen on
             # the run that wrote, not eventually.
-            self.assertIn(stray.name, sync.git("show", "--name-only", "--format=", "HEAD"))
+            self.assertIn(stray.name, gitrepo.git("show", "--name-only", "--format=", "HEAD"))
 
     def test_a_sync_with_something_to_say_still_pushes(self) -> None:
         """The half that would silently stop publishing if the skip overreached.
 
-        `_fetch_and_rebase` decides "level with the remote" *before* this run's
+        `gitrepo.fetch_and_rebase` decides "level with the remote" *before* this
         chunk is committed, so a skip keyed on that alone strands every machine
         that was up to date a moment ago -- which is every machine, every time.
         """
@@ -4823,14 +4841,14 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             archive.recipients_file().write_text(
                 archive.recipients_file().read_text(encoding="utf-8") + "\n", "utf-8"
             )
-            sync.git("commit", "-qam", "unpushed")
+            gitrepo.git("commit", "-qam", "unpushed")
             calls = self.git_calls()
             self.assertIn("push --quiet", calls)
             # The branch is read rather than assumed: the harness's bare remote
             # is created with no `-b`, so it is whatever `init.defaultBranch`
             # says on the machine running the suite.
-            branch = sync.read_repo().branch
-            head, upstream = sync._resolve("HEAD", f"refs/remotes/origin/{branch}")
+            branch = gitrepo.read_repo().branch
+            head, upstream = gitrepo.resolve("HEAD", f"refs/remotes/origin/{branch}")
             self.assertEqual(head, upstream)
 
     def test_a_sync_behind_the_remote_still_rebases(self) -> None:
@@ -4868,7 +4886,7 @@ class TestResolvingSeveralRefsInOneFork(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            head, missing = sync._resolve("HEAD", "refs/remotes/origin/no-such-branch")
+            head, missing = gitrepo.resolve("HEAD", "refs/remotes/origin/no-such-branch")
             self.assertEqual(len(head), 40)
             self.assertEqual(missing, "")
 
@@ -4876,9 +4894,9 @@ class TestResolvingSeveralRefsInOneFork(SyncTestCase):
         """The state `init` is in while enrolling the very first machine."""
         alpha = self.machine("alpha")
         with alpha.active():
-            branch = sync.read_repo().branch
-            sync.git("update-ref", "-d", "HEAD")
-            self.assertEqual(sync._resolve("HEAD", f"refs/remotes/origin/{branch}"), ["", ""])
+            branch = gitrepo.read_repo().branch
+            gitrepo.git("update-ref", "-d", "HEAD")
+            self.assertEqual(gitrepo.resolve("HEAD", f"refs/remotes/origin/{branch}"), ["", ""])
 
 
 class TestTheCommitIdentityIsStillPinned(SyncTestCase):
@@ -4890,15 +4908,15 @@ class TestTheCommitIdentityIsStillPinned(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            sync.git("config", "--unset", "user.name", check=False)
-            sync.git("config", "--unset", "user.email", check=False)
-            self.assertEqual(sync.read_repo().name, "")
+            gitrepo.git("config", "--unset", "user.name", check=False)
+            gitrepo.git("config", "--unset", "user.email", check=False)
+            self.assertEqual(gitrepo.read_repo().name, "")
 
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             sync.run()
-            self.assertEqual(sync.read_repo().name, sync.COMMIT_NAME)
-            self.assertEqual(sync.read_repo().email, sync.COMMIT_EMAIL)
-            self.assertIn(sync.COMMIT_NAME, sync.git("log", "-1", "--format=%an"))
+            self.assertEqual(gitrepo.read_repo().name, gitrepo.COMMIT_NAME)
+            self.assertEqual(gitrepo.read_repo().email, gitrepo.COMMIT_EMAIL)
+            self.assertIn(gitrepo.COMMIT_NAME, gitrepo.git("log", "-1", "--format=%an"))
 
     def test_a_repo_with_no_remote_is_seen_to_have_none(self) -> None:
         """The remote is now inferred from config keys rather than `git remote`.
@@ -4908,9 +4926,9 @@ class TestTheCommitIdentityIsStillPinned(SyncTestCase):
         """
         alpha = self.machine("alpha")
         with alpha.active():
-            self.assertTrue(sync.read_repo().has_remote)
-            sync.git("remote", "remove", "origin")
-            self.assertFalse(sync.read_repo().has_remote)
+            self.assertTrue(gitrepo.read_repo().has_remote)
+            gitrepo.git("remote", "remove", "origin")
+            self.assertFalse(gitrepo.read_repo().has_remote)
 
             alpha.record("2023-11-14", 1_700_000_001, "git status")
             report = sync.run()
@@ -5137,7 +5155,7 @@ class TestInitFinishesTheJob(SyncTestCase):
         beta = self.joining_machine()
 
         def unreachable(*args: object, **kwargs: object) -> None:
-            raise sync.SyncError("could not read from remote repository")
+            raise errors.SyncError("could not read from remote repository")
 
         with mock.patch.object(sync, "run", unreachable):
             code, out, err = self.run_cli(beta, "init", str(self.origin), "--new-identity")
@@ -5146,7 +5164,7 @@ class TestInitFinishesTheJob(SyncTestCase):
         self.assertIn("joined, but the first sync failed", err)
         self.assertIn("woswoar sync", out + err)
         with beta.active():
-            self.assertTrue(sync.is_repo(), "the join itself was still completed")
+            self.assertTrue(gitrepo.is_repo(), "the join itself was still completed")
 
     def test_it_points_at_accept_when_there_is_another_machine(self) -> None:
         """The step that is easy to miss, because it happens somewhere else."""
@@ -5360,7 +5378,7 @@ class TestABackgroundSyncThatKeepsFailing(SyncTestCase):
         """Make the export step raise, as a broken remote would."""
 
         def boom(*args: object, **kwargs: object) -> None:
-            raise sync.SyncError(self.MESSAGE)
+            raise errors.SyncError(self.MESSAGE)
 
         with mock.patch.object(sync, "export", boom):
             yield
@@ -5671,7 +5689,7 @@ class TestTheHookKeepsItselfUpToDate(SyncTestCase):
         hook.write_text("# older\n", encoding="utf-8")
 
         def boom(*args: object, **kwargs: object) -> None:
-            raise sync.SyncError("could not connect to the remote")
+            raise errors.SyncError("could not connect to the remote")
 
         with mock.patch.object(sync, "export", boom):
             self.assertEqual(self.run_cli(alpha, "sync").code, 1)
@@ -5837,12 +5855,12 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             sync.run()
             if content is None:
                 archive.format_file().unlink()
-                sync.git("rm", "--quiet", "--cached", archive.FORMAT)
+                gitrepo.git("rm", "--quiet", "--cached", archive.FORMAT)
             else:
                 store.write_atomic(archive.format_file(), content.encode("utf-8"))
-                sync.git("add", archive.FORMAT)
-            sync.git("commit", "--quiet", "-m", "the marker, as another version left it")
-            sync.git("push", "--quiet", "origin", "HEAD")
+                gitrepo.git("add", archive.FORMAT)
+            gitrepo.git("commit", "--quiet", "-m", "the marker, as another version left it")
+            gitrepo.git("push", "--quiet", "origin", "HEAD")
         self.assertEqual(self.marker(fake), content or "", "the fixture did not take")
 
     def strip_marker(self, fake: Fake) -> None:
@@ -5913,7 +5931,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
         with beta.active():
             beta.record("2023-11-15", 1_700_100_001, "beta was here")
-            with self.assertRaises(sync.SyncError) as caught:
+            with self.assertRaises(errors.SyncError) as caught:
                 sync.run()
             # Nothing merged, and nothing published either.
             self.assertEqual(beta.commands(), {"beta was here"}, "alpha's history was merged")
@@ -5970,8 +5988,8 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             # Beta's own tree back to the same state, without syncing -- a fetch
             # here would be one machine learning about the other, which is the
             # thing this test needs not to have happened yet.
-            sync.git("fetch", "--quiet", "origin")
-            sync.git("reset", "--hard", "--quiet", "origin/HEAD")
+            gitrepo.git("fetch", "--quiet", "origin")
+            gitrepo.git("reset", "--hard", "--quiet", "origin/HEAD")
             self.assertFalse(archive.format_file().is_file(), "the fixture still has the marker")
 
             # Committed locally and deliberately not pushed, so alpha's marker
@@ -6002,12 +6020,12 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         with alpha.active():
             before = archive.recipients_file().read_text(encoding="utf-8")
 
-        with self.assertRaises(sync.SyncError):
+        with self.assertRaises(errors.SyncError):
             self.machine("beta")
 
         with alpha.active():
-            sync.git("fetch", "--quiet", "origin")
-            sync.git("reset", "--hard", "--quiet", "origin/HEAD")
+            gitrepo.git("fetch", "--quiet", "origin")
+            gitrepo.git("reset", "--hard", "--quiet", "origin/HEAD")
             self.assertEqual(
                 archive.recipients_file().read_text(encoding="utf-8"),
                 before,
@@ -6023,7 +6041,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
         with alpha.active():
             sealed = archive.day_key(alpha.id, "2023-11-14").read_bytes()
-            with self.assertRaises(sync.SyncError):
+            with self.assertRaises(errors.SyncError):
                 sync.grant()
             self.assertEqual(
                 archive.day_key(alpha.id, "2023-11-14").read_bytes(),
@@ -6045,7 +6063,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         self.mark_future(alpha)
 
         with alpha.active():
-            with self.assertRaises(sync.SyncError):
+            with self.assertRaises(errors.SyncError):
                 sync.compact(before="2023-11-15")
             self.assertEqual(
                 len(list(archive.iter_chunks(alpha.id))), chunks, "chunks were deleted anyway"

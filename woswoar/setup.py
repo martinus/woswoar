@@ -92,9 +92,9 @@ def untouched() -> bool:
     creates it, so almost any command makes it exist and it says nothing about
     whether anyone has set anything up.
     """
-    from . import sync
+    from . import gitrepo
 
-    if install.installed_shells() or sync.is_repo():
+    if install.installed_shells() or gitrepo.is_repo():
         return False
     return not any(store.iter_log_files())
 

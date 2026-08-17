@@ -128,7 +128,7 @@ def identity_check() -> Check:
     """Whether this machine could actually decrypt during an unattended sync.
 
     Checked whether or not a repo exists: `init` is exactly when this breaks,
-    and gating it behind `is_repo()` meant doctor was silent in the one state
+    and gating it behind `gitrepo.is_repo()` meant doctor was silent in the one
     where someone would think to run it.
     """
     from . import sync
@@ -140,21 +140,21 @@ def identity_check() -> Check:
 
 def repo_checks() -> list[Check]:
     """Everything about the history repository, or the note that there is none."""
-    from . import sync
+    from . import gitrepo, sync
 
     out: list[Check] = []
     if shutil.which("git") is None:
         advice = deps.advice([deps.GIT])
         out.append(Check("git", f"not found, needed for 'woswoar sync' - {advice}", ok=None))
 
-    if not sync.is_repo():
+    if not gitrepo.is_repo():
         out.append(
             Check("sync", "no history repo - run 'woswoar init <url>' to sync machines", ok=None)
         )
         return out
 
     known = store.machine()
-    out.append(Check("remote", sync.remote_summary(), ok=None))
+    out.append(Check("remote", gitrepo.remote_summary(), ok=None))
 
     # Taken from `sync` whole -- label included. The repo format marker is a
     # file nobody would think to `cat` and `sync` mentions it only by refusing,

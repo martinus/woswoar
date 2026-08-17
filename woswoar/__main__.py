@@ -285,7 +285,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _init(remote: str | None, *, new_identity: bool, identity: Path | None, no_sync: bool) -> int:
     """Join a history repo and report it. Shared with `setup`'s step 4."""
-    from . import archive, crypto, sync
+    from . import archive, crypto, gitrepo, sync
 
     known, identity_used, pinned = sync.initialise(
         remote=remote, new_identity=new_identity, identity=identity
@@ -293,7 +293,7 @@ def _init(remote: str | None, *, new_identity: bool, identity: Path | None, no_s
     print(f"machine  : {known.name} ({known.id})")
     print(f"identity : {identity_used}")
     print(f"repo     : {store.history_dir()}")
-    print(f"remote   : {sync.remote_summary()}")
+    print(f"remote   : {gitrepo.remote_summary()}")
     print(f"\nRecipients now enrolled ({archive.recipients_file()}):")
     # By fingerprint, not by a truncated key. A prefix of a key looks checkable
     # and is not -- it is the abbreviation `grant` stopped using for exactly
@@ -361,7 +361,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def _sync(*, no_push: bool) -> int:
     """Sync and report it. Shared with `setup`'s step 4."""
-    from . import sync
+    from . import gitrepo, sync
 
     # Before the sync, not after: a remote that is unreachable must not be able
     # to keep the hook out of date, and these two have nothing to do with each
@@ -408,7 +408,7 @@ def _sync(*, no_push: bool) -> int:
         )
         if report.pushed:
             print("in sync with the remote")
-        elif not sync.has_remote():
+        elif not gitrepo.has_remote():
             print("no remote configured - history is local only")
 
     for block in paragraphs(report.notices()):
@@ -697,7 +697,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     `setup` is the exception, and only when nothing is installed: it is all
     questions already, and there is nothing here yet to widen access to.
     """
-    from . import cache, setup, sync
+    from . import cache, gitrepo, setup, sync
 
     if setup.untouched():
         print("Nothing installed here yet -- setting up.\n")
@@ -717,7 +717,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     # says so too, but only somebody who already suspects a problem runs doctor.
     _report_stale_hook()
 
-    if not sync.is_repo():
+    if not gitrepo.is_repo():
         print(
             "\nThis machine keeps its history to itself.\n"
             "Next:  woswoar init <url>   to share it with your other machines"
@@ -857,9 +857,9 @@ def _offer_imports() -> None:
 
 def _offer_remote() -> int:
     """Join a history repo, or finish without one."""
-    from . import setup, sync
+    from . import gitrepo, setup
 
-    if sync.is_repo():
+    if gitrepo.is_repo():
         print("     already joined a history repo; syncing")
         return _sync(no_push=False)
 
