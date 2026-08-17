@@ -231,25 +231,18 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
     nothing to fix.
     """
 
-    def setUp(self) -> None:
-        super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._saved = {key: os.environ.get(key) for key in ("HOME", "SHELL")}
-        self.addCleanup(self._restore)
-        os.environ["HOME"] = str(self.home)
-        os.environ["SHELL"] = "/bin/bash"
-
-    def _restore(self) -> None:
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    def install_bash(self, rcfile_text: str = "") -> Path:
+        """Install into the sandbox home the way a person does, and hand back
+        the `.bashrc` that names it: no `--rcfile`, so `install` finds the file
+        through `$HOME` -- which is the path the incident behind these tests
+        went down, and the one worth exercising rather than routing around."""
+        rcfile = self.home / ".bashrc"
+        rcfile.write_text(rcfile_text, encoding="utf-8")
+        support.run_cli("install")
+        return rcfile
 
     def test_a_bash_only_machine_is_not_asked_about_zsh(self) -> None:
-        (self.home / ".bashrc").write_text("", encoding="utf-8")
-        support.run_cli("install")
+        self.install_bash()
         out = support.run_cli("doctor").out
         self.assertRegex(out, r"\] bash ")
         self.assertNotIn("] zsh ", out)
@@ -271,12 +264,107 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
         self.assertRegex(out, r"\] zsh +.+ \(5\.0\+ required\)")
 
     def test_each_installed_shell_gets_its_own_rcfile_line(self) -> None:
-        (self.home / ".bashrc").write_text("", encoding="utf-8")
         (self.home / ".zshrc").write_text("", encoding="utf-8")
-        support.run_cli("install")
+        self.install_bash()
         out = support.run_cli("doctor").out
         self.assertIn(f"{self.home}/.bashrc sources the hook", out)
         self.assertIn(f"{self.home}/.zshrc sources the hook", out)
+
+    def test_a_block_left_by_a_test_install_is_not_reported_as_working(self) -> None:
+        """The line pointing *somewhere*, not the marker being present.
+
+        A real `.bashrc` was found sourcing
+        `/tmp/woswoar-test-kc71_9n1/data/woswoar.bash` -- a sandbox that a test
+        run deleted on the way out. Every interactive shell printed a `No such
+        file or directory`, nothing was recorded for months, and `doctor` said
+        `bashrc ... sources the hook` the whole time, because the block was
+        there. The block being there is not the claim the line makes.
+        """
+        rcfile = self.install_bash()
+        gone = self.root / "gone" / "woswoar.bash"
+        install.write_block(rcfile, gone)
+
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] bashrc", out)
+        self.assertIn(str(gone), out, "the report does not say where the line points")
+        self.assertIn("woswoar install", out, "no remedy named")
+
+    def test_reinstalling_is_a_remedy_that_works(self) -> None:
+        """Without this the test above is satisfied by a check that can only
+        fail, and the command it tells people to run is untested."""
+        install.write_block(self.install_bash(), self.root / "gone" / "woswoar.bash")
+        self.assertIn("[FAIL] bashrc", support.run_cli("doctor").out)
+
+        support.run_cli("install")
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_the_line_is_read_the_way_a_shell_reads_it(self) -> None:
+        """`$HOME/...` is what `install` writes whenever the hook is under the
+        home directory, and it is what a shared dotfiles `.bashrc` carries. A
+        check that compared the line to the hook's absolute path as text would
+        fail every one of those installs, which is a red `doctor` on a machine
+        with nothing wrong -- worse than the false green it replaced.
+
+        The sandbox puts `WOSWOAR_DIR` outside `$HOME`, where `install` writes
+        an absolute path, so this has to move it in: without that the fixture
+        cannot tell the two spellings apart.
+        """
+        os.environ["WOSWOAR_DIR"] = str(self.home / ".local/share/woswoar")
+        text = self.install_bash().read_text(encoding="utf-8")
+
+        self.assertIn('source "$HOME/', text, "the fixture wrote an absolute path")
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_a_block_a_person_wrote_is_read_the_way_the_shell_would(self) -> None:
+        """Every spelling here loads the hook in a real shell, so none of them
+        may be reported as broken -- the remedy is `woswoar install`, which
+        would overwrite a line its owner wrote deliberately.
+
+        This is the branch of `_expanded` and `_SOURCE_LINE` that `install`
+        never writes, and without it the tolerance they carry is untested code
+        deciding whether a green report is green.
+        """
+        os.environ["WOSWOAR_DIR"] = str(self.home / ".local/share/woswoar")
+        rcfile = self.install_bash()
+        hook = store.data_dir() / install.HOOKS["bash"]
+        under_home = hook.relative_to(self.home).as_posix()
+
+        for line in (f". ~/{under_home}", f'source "${{HOME}}/{under_home}"', f"source {hook}"):
+            rcfile.write_text(f"{install.BEGIN}\n{line}\n# <<< woswoar <<<\n", encoding="utf-8")
+            self.assertIn("[ok] bashrc", support.run_cli("doctor").out, line)
+
+    def test_another_installers_source_line_is_not_mistaken_for_ours(self) -> None:
+        """An rc file is full of `source` lines and exactly one is woswoar's.
+
+        Reading the first one in the file would report nvm's path as the hook's
+        -- a red `doctor` on a healthy machine, with a remedy that changes
+        nothing. The marked block is what makes this answerable at all, and it
+        has to be the thing searched rather than merely the thing found.
+        """
+        text = self.install_bash('source "$HOME/.nvm/nvm.sh"\n').read_text(encoding="utf-8")
+
+        self.assertLess(
+            text.index("nvm.sh"),
+            text.index(install.BEGIN),
+            "the fixture's other source line has to come first to test anything",
+        )
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_a_block_that_sources_nothing_is_not_a_missing_block(self) -> None:
+        """Three states, three lines: someone who has never installed, someone
+        whose line points at the wrong file, and someone who edited the block
+        down to a comment. Telling the third they have no woswoar block sends
+        them looking for something that is right in front of them."""
+        # The install is for the hook it leaves in the data directory; the rc
+        # file it wrote is replaced on the next line.
+        self.install_bash().write_text(
+            f"{install.BEGIN}\n# I took this out for a bit\n# <<< woswoar <<<\n",
+            encoding="utf-8",
+        )
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] bashrc", out)
+        self.assertIn("sources nothing", out)
+        self.assertNotIn("has no woswoar block", out)
 
     def test_a_machine_with_nothing_installed_still_reports_a_shell(self) -> None:
         """`installed_shells()` is empty before the first `install`, and a doctor

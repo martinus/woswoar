@@ -47,7 +47,9 @@ from woswoar.sync import _GRANT_REMEDY
 from . import support
 from .support import requires_age, requires_git, requires_ssh_keygen
 
-#: One authoritative list, plus HOME which only these tests need to redirect.
+#: One authoritative list, plus the HOME these tests give each machine of its
+#: own -- `WoswoarTestCase` redirects it once for the whole suite, and here
+#: every simulated machine needs a different one.
 _ENV = (*support.ENV_KEYS, "HOME")
 
 #: `gc --auto` runs after a commit and after a push, and `gc.autoDetach` sends

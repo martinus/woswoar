@@ -10,10 +10,11 @@ rewrites the hook file when it is behind. Its rule -- only ever *re*-write, neve
 create -- was held by one test asserting on the CLI's stdout, which is a thin
 thread for the one function here that edits a file nobody asked it to.
 
-The two `Check` producers are here for the reason `doctor` records: they are the
+The `Check` producers are here for the reason `doctor` records: they are the
 installer's judgements, and they lived in `__main__` only because the installer
-did. `cmd_doctor` splices them into the middle of its report, because the shell
-version leads and the rc file comes between `machine` and `age`.
+did. `cmd_doctor` splices `shell_checks` and `hook_checks` into the middle of its
+report, because the shell version leads and the rc file comes between `machine`
+and `age`.
 
 `hook_bytes` is deliberately one function returning bytes, and must stay that
 way -- see its docstring for the `as_file` trap that shape exists to close.
@@ -55,6 +56,12 @@ _VERSION_FLOOR = 5
 BEGIN = "# >>> woswoar >>>"
 _END = "# <<< woswoar <<<"
 _BLOCK = re.compile(re.escape(BEGIN) + r".*?" + re.escape(_END) + r"\n?", re.DOTALL)
+
+#: The line inside the block that loads the hook, as `write_block` writes it and
+#: as a shell would accept it -- `.` is `source`, and the quotes are optional.
+#: Only ever matched *within* a block, so it cannot pick up a `source` line
+#: someone else's installer put in the same rc file.
+_SOURCE_LINE = re.compile(r'^[ \t]*(?:source|\.)[ \t]+"?(?P<path>[^"\n]+?)"?[ \t]*$', re.M)
 
 
 def rcfile_for(shell: str) -> Path:
@@ -350,12 +357,81 @@ def hook_checks() -> list[Check]:
     # that exists: a `.zshrc` on a machine woswoar was only ever installed into
     # bash for is not a problem, and reporting it as one would send someone
     # looking for a block that is correctly absent.
-    for shell in present or detect_shells():
-        rcfile = rcfile_for(shell)
-        sourced = rcfile.is_file() and BEGIN in rcfile.read_text(encoding="utf-8")
-        detail = "sources the hook" if sourced else "has no woswoar block"
-        out.append(Check(RCFILES[shell].lstrip("."), f"{rcfile} {detail}", ok=sourced))
+    out += [rcfile_check(shell) for shell in present or detect_shells()]
     return out
+
+
+def _sourced_path(rcfile: Path) -> str | None:
+    """What ``rcfile``'s woswoar block tells the shell to load, verbatim.
+
+    ``None`` when there is no block, and the empty string when there is one that
+    sources nothing -- three states, because `doctor` says something different
+    about each, and collapsing them into "is there a block" was how it came to
+    say nothing useful about any of them.
+
+    The search is anchored *inside* the block, which is the whole reason the
+    marked block exists: an rc file is full of `source` lines, and only ours is
+    ours to judge.
+    """
+    text = rcfile.read_text(encoding="utf-8") if rcfile.is_file() else ""
+    block = _BLOCK.search(text)
+    if not block:
+        return None
+    line = _SOURCE_LINE.search(block.group())
+    return line.group("path") if line else ""
+
+
+def _expanded(raw: str) -> Path:
+    """The file a shell would actually open for ``raw``.
+
+    `os.path.expandvars` rather than the `$HOME` and `${HOME}` this file's own
+    `portable_hook_path` writes, and that generality is the point: a
+    hand-written block spelling the same file through `$XDG_DATA_HOME`, or a
+    dotfiles repo that keeps its own variable, works in the shell and must not
+    be reported as broken. A name that is *not* set expands to itself, so it
+    still fails to match the hook -- which is the safe direction, since what
+    `doctor` can honestly say is "I cannot see that this loads the hook".
+    """
+    return Path(os.path.expandvars(raw)).expanduser()
+
+
+def rcfile_check(shell: str) -> Check:
+    """Whether this shell's rc file loads *this machine's* hook.
+
+    That the block was there used to be the whole test, and it is the wrong
+    question: the marker says somebody ran `install` once, not that what they
+    installed is still where the line points. A `.bashrc` was found here
+    sourcing `/tmp/woswoar-test-.../woswoar.bash` -- a throwaway directory from
+    a test run, deleted the moment that run ended. Every interactive shell
+    printed `No such file or directory`, nothing was recorded for months, and
+    `doctor` reported a green `bashrc ... sources the hook` throughout. It is
+    the one line of the report that a person checks *because* their history
+    stopped working.
+
+    Compared as paths rather than by reading the file, because the failure is
+    about where the line points: a hook that is missing, empty or from an older
+    woswoar is a different verdict with a different remedy, and `hook_checks`
+    prints it directly above this line.
+    """
+    rcfile = rcfile_for(shell)
+    label = RCFILES[shell].lstrip(".")
+    raw = _sourced_path(rcfile)
+    if raw is None:
+        return Check(label, f"{rcfile} has no woswoar block", ok=False)
+    if not raw:
+        return Check(label, f"{rcfile} has a woswoar block that sources nothing", ok=False)
+    hook = store.data_dir() / HOOKS[shell]
+    # `realpath` on both sides, and never `samefile`: the whole point is a line
+    # pointing at something that no longer exists, and `samefile` raises there.
+    # It also settles a home directory reached through a symlink, which is every
+    # macOS sandbox and some real setups.
+    if os.path.realpath(_expanded(raw)) != os.path.realpath(hook):
+        return Check(
+            label,
+            f"{rcfile} sources {raw}, not the installed hook - run 'woswoar install'",
+            ok=False,
+        )
+    return Check(label, f"{rcfile} sources the hook", ok=True)
 
 
 class Installed(NamedTuple):

@@ -118,18 +118,6 @@ class TestInstallWarnsAboutMissingTools(WoswoarTestCase):
         os.environ["PATH"] = str(empty)
         self.addCleanup(lambda: os.environ.__setitem__("PATH", self._path))
 
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._home = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.home)
-        self.addCleanup(self._restore_home)
-
-    def _restore_home(self) -> None:
-        if self._home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._home
-
     def test_install_still_succeeds_but_says_what_is_missing(self) -> None:
         ran = support.run_cli("install", "--rcfile", str(self.home / ".bashrc"))
 
