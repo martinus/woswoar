@@ -190,6 +190,21 @@ def run_binding(binding: str, marker: str, prompt: str | None = None) -> str:
     ).stdout
 
 
+def as_fzf_would(binding: str, index: str) -> str:
+    """``binding`` with `{n}` resolved the way fzf resolves it before running.
+
+    ``index`` is the empty string for "no current item", which is what fzf
+    substitutes there -- measured against 0.73.1 with a query matching nothing,
+    because the manual documents the placeholder and not that case.
+
+    The escaped `\\{n}` is deliberately left alone: fzf consumes the backslash
+    and passes the placeholder through, which is the whole reason the preview
+    spells it that way. A plain `str.replace` would rewrite it too and this
+    would stop resembling what happens.
+    """
+    return re.sub(r"(?<!\\)\{n}", index, binding)
+
+
 #: Every scope's direct key, spelled as fzf takes it. Hand-written rather than
 #: read out of `search.KEYS`: a test that derived the key the way the code does
 #: would agree with it about a wrong one. Asserted against `search.SCOPES` so a
@@ -1201,7 +1216,7 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
         # against the list still on screen, which put the cursor anywhere but
         # on what was found. `clear-query` so that typing next filters the
         # timeline rather than re-applying the search that got you here.
-        for piece in ("--around {n}", "--print-anchor", "+pos($p)", "reload-sync(", "clear-query"):
+        for piece in ("--around $i", "--print-anchor", "+pos($p)", "reload-sync(", "clear-query"):
             self.assertIn(piece, binds, f"the ctrl-t binding is missing {piece}")
         header = next(a for a in argv if a.startswith("--header="))
         self.assertIn("ctrl-t timeline", header, "the key is bound but never mentioned")
@@ -1229,6 +1244,37 @@ class TestTheTimelineAroundACommand(WoswoarTestCase):
                 out = run_binding(binding, "transform:", f"woswoar ({scope}) ")
                 self.assertIn(f"change-prompt(woswoar (timeline {scope}) )", out)
                 self.assertIn(f"--scope {scope} --around", out)
+
+    def test_it_emits_nothing_when_no_row_is_highlighted(self) -> None:
+        """`{n}` is empty when there is no current item, and the line it used to
+        compose was `woswoar list ... --around` with the value missing.
+
+        fzf runs the transform anyway rather than declining to -- it has no way
+        to know the placeholder mattered -- so the reload ran, argparse refused
+        the flag, and `[Command failed: /home/…/woswoar list --colour
+        --host-width 10 --scope global --around ]` appeared in the list where
+        the history should be. Reported from a real picker by pressing Ctrl-R
+        and then Ctrl-T fast enough that the first key's reload had not landed.
+
+        Emitting no action at all is the remedy, and the second half of this
+        test is what keeps that from being satisfied by a binding that emits
+        nothing ever.
+        """
+        binding = search._timeline_binding("true", "", " --host-width 0")
+
+        nothing = run_binding(as_fzf_would(binding, ""), "transform:", "woswoar (global) ")
+        self.assertEqual(nothing, "", "an empty index still produced actions")
+
+        picked = run_binding(as_fzf_would(binding, "4"), "transform:", "woswoar (global) ")
+        # The whole reload, not `--around 4` anywhere in the output: the preview
+        # this key repoints carries the same flag, so the looser assertion holds
+        # just as well when the *list* was left unanchored -- which is a timeline
+        # of the wrong rows under a pane describing the right ones.
+        self.assertIn(
+            "reload-sync(true list --colour --host-width 0 --scope global --around 4)",
+            picked,
+            "the anchor never reached the list the key reloads",
+        )
 
     def test_the_prompt_it_paints_is_one_it_can_read_back(self) -> None:
         """The round trip, which the test above only ever walks one way.
@@ -1551,7 +1597,12 @@ class TestThePreviewBinding(unittest.TestCase):
                 self.assertIn("change-preview(", bind)
                 self.assertIn("--show", bind)
         timeline = next(a for a in binds if a.startswith("--bind=ctrl-t:"))
-        self.assertIn("--show \\{n} --scope $s --around {n}", timeline)
+        # `\{n}` for the row and `$i` for the window, and the difference is the
+        # point: the first is a template fzf re-expands on every cursor move,
+        # the second is the anchor this keypress chose, frozen into the action.
+        # `$i` and not `{n}` because an index fzf substitutes with nothing when
+        # no row is current took `--around`'s value with it.
+        self.assertIn("--show \\{n} --scope $s --around $i", timeline)
         cycle = next(a for a in binds if a.startswith("--bind=ctrl-r:"))
         self.assertIn("--show \\{n} --scope $n", cycle)
         self.assertNotIn("--around", cycle, "the way out of a timeline must not stay in it")
@@ -1740,6 +1791,59 @@ class TestThePreviewUnderARealFzf(WoswoarTestCase):
             ]
         )
         self.assertNotIn("~/d0", moved, "the pane answered from the ranked list, not the window")
+
+
+@requires_fzf
+class TestWhatFzfSubstitutesWhenNoRowIsCurrent(WoswoarTestCase):
+    """The premise `_timeline_binding`'s guard rests on, measured rather than assumed.
+
+    `man fzf` documents `{n}` as the index of the current item and says nothing
+    about a list that has no current item -- and the answer decides whether a
+    guard is needed at all. It is: fzf runs the transform anyway and replaces
+    the placeholder with *nothing*, so `--around {n}` became `--around` with the
+    value missing and the reload died on it. Reported from a real picker as
+    Ctrl-R followed quickly by Ctrl-T, where the first key's reload had not
+    landed and the list was momentarily empty.
+
+    This asserts fzf's behaviour, not woswoar's, and that is the point: the day
+    it answers `-1` or declines to run the transform, the guard's shape is wrong
+    and nothing else here would say so. `tests.test_search.TestTheTimelineAroundACommand`
+    holds what woswoar does with the answer.
+
+    A bare fzf rather than the picker, because what is under test is one
+    substitution and the picker would put its own list, prompt and scope
+    machinery between the question and the answer.
+    """
+
+    def test_an_absent_current_item_makes_the_index_empty(self) -> None:
+        recorded = self.root / "index"
+        # Two files rather than one long `--bind`: quoting a shell snippet
+        # through fzf's binding parser *and* an f-string is how a test comes to
+        # measure its own escaping.
+        recorder = self.root / "recorder.sh"
+        recorder.write_text(
+            f'#!/bin/sh\nprintf "[%s]" "$1" > {recorded}\nprintf "change-prompt(done )"\n',
+            encoding="utf-8",
+        )
+        recorder.chmod(0o755)
+
+        run_in_pty(
+            [
+                "sh",
+                "-c",
+                "printf 'alpha\\nbeta\\n' | fzf --height=10 --layout=reverse --prompt='p> ' "
+                f"--bind='ctrl-t:transform:{recorder} \"{{n}}\"'",
+            ],
+            [
+                Typed("", "p>"),
+                # A query nothing matches, which is the state without the race.
+                Typed("zzzz", "0/2"),
+                Typed("\x14", "done"),
+                Typed("\x1b", ""),
+            ],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TERM": "xterm"},
+        )
+        self.assertEqual(recorded.read_text(encoding="utf-8"), "[]")
 
 
 class DirScopeCase(WoswoarTestCase):

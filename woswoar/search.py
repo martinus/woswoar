@@ -1228,10 +1228,25 @@ def _timeline_binding(self_cmd: str, dedup_flag: str, width: str) -> str:
     # Not `_switch_to`: every one of its three actions is different here --
     # `reload-sync` rather than `reload`, a prompt that says `timeline`, and a
     # preview pinned to this window. What they have in common is only the shape.
-    window = _list_command(self_cmd, "$s", dedup_flag, width, around=" --around {n}")
-    preview = _preview_command(self_cmd, "$s", dedup_flag, row=_ESCAPED_N, around=" --around {n}")
+    window = _list_command(self_cmd, "$s", dedup_flag, width, around=" --around $i")
+    preview = _preview_command(self_cmd, "$s", dedup_flag, row=_ESCAPED_N, around=" --around $i")
     script = (
         _scope_case("s", _SAME)
+        # `{n}` through a variable, and nothing at all when it is empty. With no
+        # current item fzf substitutes the placeholder with *nothing* rather
+        # than declining to run the transform -- measured against 0.73.1, and
+        # not something the manual says -- so the line composed here became
+        # `woswoar list ... --around` with the value missing, and the reload
+        # printed `[Command failed: ...]` into the list where the history should
+        # be. Reported from a real picker: Ctrl-R and then Ctrl-T quickly enough
+        # that the reload the first key started had not landed, so for that
+        # moment there was no item under the cursor. A query matching nothing
+        # gets there too, and is how it is tested.
+        #
+        # Doing nothing is the whole remedy: a timeline is "what happened either
+        # side of *this* command", and there is no this. The key stays live and
+        # the next press, on a list that has rows, works.
+        + 'i="{n}"; if [ -z "$i" ]; then exit 0; fi; '
         # One extra invocation, on a keypress rather than on the prompt path:
         # `pos` has to be composed into the same action string as the `reload`
         # it applies to, so it cannot be read out of the reload's own output.
