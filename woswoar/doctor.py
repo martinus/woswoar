@@ -12,10 +12,11 @@ here writes to a stream, and nothing here decides what a marker looks like;
 `report` owns that.
 
 The checks the *installer* owns -- which shell, whether the hook is current,
-whether the rc file sources it -- are still built in `__main__`, because the
-installer itself is. They are spliced in by `cmd_doctor`, which is where the
-order of the whole report lives. When #202 lifts the installer out, they can
-move beside these.
+whether the rc file sources it -- live in `install` rather than here, because
+they are its judgements and it owns the constants they are stated against. Both
+sets are spliced together by `cmd_doctor`, which is where the order of the whole
+report lives: the shell version leads, and the hook and rc file come between
+`machine` and `age`.
 """
 
 from __future__ import annotations

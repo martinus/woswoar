@@ -7,15 +7,17 @@ which differs the moment two machines disagree about the username.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
 
-from woswoar import __main__ as main_module
-from woswoar import cache, store
-from woswoar.__main__ import _BEGIN, main, portable_hook_path
+from woswoar import cache, install, store
+from woswoar.__main__ import main
+from woswoar.install import portable_hook_path
 
 from . import support
 from .support import (
@@ -212,14 +214,14 @@ class TestShellDetection(WoswoarTestCase):
 
     def rcfiles(self, *shells: str) -> None:
         for shell in shells:
-            (self.home / main_module.RCFILES[shell]).write_text("# mine\n", encoding="utf-8")
+            (self.home / install.RCFILES[shell]).write_text("# mine\n", encoding="utf-8")
 
     def sourced(self, shell: str) -> bool:
         """Whether that shell's rc file now sources that shell's hook."""
-        rcfile = self.home / main_module.RCFILES[shell]
+        rcfile = self.home / install.RCFILES[shell]
         if not rcfile.is_file():
             return False
-        return main_module.HOOKS[shell] in rcfile.read_text(encoding="utf-8")
+        return install.HOOKS[shell] in rcfile.read_text(encoding="utf-8")
 
     def test_auto_installs_into_every_existing_rcfile(self) -> None:
         """A machine with both shells must record from both.
@@ -233,7 +235,7 @@ class TestShellDetection(WoswoarTestCase):
         self.assertTrue(self.sourced("bash"), "the bash hook was not wired up")
         self.assertTrue(self.sourced("zsh"), "the zsh hook was not wired up")
         for shell in ("bash", "zsh"):
-            self.assertTrue((store.data_dir() / main_module.HOOKS[shell]).is_file())
+            self.assertTrue((store.data_dir() / install.HOOKS[shell]).is_file())
 
     def test_auto_does_not_create_an_rcfile_that_is_absent(self) -> None:
         """The half that keeps `install` from making a decision for someone.
@@ -247,7 +249,7 @@ class TestShellDetection(WoswoarTestCase):
         self.assertTrue(self.sourced("bash"))
         self.assertFalse((self.home / ".zshrc").exists(), "install created a ~/.zshrc")
         self.assertFalse(
-            (store.data_dir() / main_module.HOOKS["zsh"]).exists(),
+            (store.data_dir() / install.HOOKS["zsh"]).exists(),
             "a hook was copied for a shell with no rc file",
         )
 
@@ -301,7 +303,7 @@ class TestShellDetection(WoswoarTestCase):
         self.rcfiles("bash")
         target = self.home / ".zshrc"
         self.assertEqual(main(["install", "--rcfile", str(target)]), 0)
-        self.assertIn(main_module.HOOKS["zsh"], target.read_text(encoding="utf-8"))
+        self.assertIn(install.HOOKS["zsh"], target.read_text(encoding="utf-8"))
         self.assertFalse(self.sourced("bash"), "--rcfile installed a second shell as well")
 
     def test_rcfile_with_shell_both_is_refused_rather_than_resolved(self) -> None:
@@ -316,7 +318,7 @@ class TestShellDetection(WoswoarTestCase):
         self.assertEqual(ran.code, 1)
         self.assertIn("--rcfile names one file", ran.err)
         self.assertNotIn(
-            main_module.HOOKS["zsh"],
+            install.HOOKS["zsh"],
             (self.home / ".bashrc").read_text(encoding="utf-8"),
             "it wrote the zsh hook into the bash rc file anyway",
         )
@@ -328,8 +330,8 @@ class TestShellDetection(WoswoarTestCase):
         target = self.home / "rc"
         self.assertEqual(main(["install", "--rcfile", str(target)]), 0)
         text = target.read_text(encoding="utf-8")
-        self.assertEqual(text.count(_BEGIN), 1)
-        self.assertIn(main_module.HOOKS["bash"], text)
+        self.assertEqual(text.count(install.BEGIN), 1)
+        self.assertIn(install.HOOKS["bash"], text)
 
 
 class TestAFinderVisitDoesNotDisturbTheLogs(WoswoarTestCase):
@@ -470,10 +472,82 @@ class TestBothShellsRecordIntoOneHistory(WoswoarTestCase):
         self.assertIn("echo from_zsh_marker", recorded, "the zsh rc line did not record")
 
 
+class TestInstallHardensAfterItCopies(WoswoarTestCase):
+    """The order `install` does its two jobs in, which a comment claimed and
+    nothing held.
+
+    `write_bytes` creates at the ambient umask, so hardening *first* leaves the
+    files install itself just wrote as the ones its own migration missed -- and
+    on a machine with a permissive umask that is a world-readable copy of the
+    shell hook in a directory woswoar promises is owner-only. Found by mutation
+    while moving this code in #202: the invariant predates the move, the test
+    does not.
+    """
+
+    def test_a_permissive_umask_does_not_leave_the_hook_readable(self) -> None:
+        # 0 rather than a merely loose value: this is what makes `write_bytes`
+        # produce 0666, which is the state the ordering exists to clean up.
+        previous_mask = os.umask(0)
+        self.addCleanup(os.umask, previous_mask)
+
+        # `--rcfile` rather than a fifth copy of this file's redirect-`$HOME`
+        # fixture. The only reason to move `$HOME` would be to keep the block out
+        # of the real `~/.bashrc`, and naming a file does that; nothing here reads
+        # a rc file, because `--shell bash` means detection never runs.
+        rcfile = self.root / "bashrc"
+        self.assertEqual(main(["install", "--shell", "bash", "--rcfile", str(rcfile)]), 0)
+        # `support.loose_paths`, not `store.readable_by_others`: the latter and
+        # `store.harden` are both built on `store._private_paths`, so asking it
+        # would be the migration checking itself -- a path that walk stopped
+        # yielding would be skipped by `harden` and reported clean in the same
+        # breath. The helper says so in its own docstring, and the sibling test
+        # `test_a_stock_umask_cannot_loosen_what_is_written` already used it.
+        self.assertEqual(
+            support.loose_paths(),
+            [],
+            "install left something another account on this machine can read",
+        )
+
+
+class TestTheHookIsReportedBeforeTheRcFile(WoswoarTestCase):
+    """Why `install_hooks` and `wire_rcfiles` are two calls rather than one.
+
+    The rc file is the step that can fail on someone else's terms -- a read-only
+    home, a `.zshrc` owned by root, a path that is not a file at all. When it
+    does, the hook is already copied and can be sourced by hand, and that is the
+    one thing worth knowing. This is the test that holds it; `install.py` says why
+    the seam is there.
+    """
+
+    def test_an_unwritable_rcfile_still_names_the_hook_it_copied(self) -> None:
+        # A directory, because it fails the same way a read-only file does and
+        # needs no root to arrange: `write_text` on it raises OSError.
+        blocked = self.root / "not-a-file"
+        blocked.mkdir()
+
+        # `support.run_cli` cannot be used here: it returns the captured streams,
+        # and the exception means it never returns. The point of the test is what
+        # reached stdout *before* the failure, so the capture has to outlive it.
+        shown = io.StringIO()
+        with self.assertRaises(OSError), contextlib.redirect_stdout(shown):
+            main(["install", "--shell", "bash", "--rcfile", str(blocked)])
+
+        hook = store.data_dir() / install.HOOKS["bash"]
+        self.assertEqual(
+            hook.read_bytes(), install.hook_bytes("bash"), "the hook was not copied first"
+        )
+        self.assertIn(
+            f"hook    : {hook}",
+            shown.getvalue(),
+            "the install failed without saying where the hook it wrote is",
+        )
+
+
 class TestTheRefreshNeverCreates(WoswoarTestCase):
     """The hazard #159 names, and the reason this is not a tidy-up.
 
-    `_refresh_hook` runs unattended, from the background sync a prompt starts.
+    `install.refresh_hook` runs unattended, from the background sync a prompt
+    starts.
     If it ever *created* rather than refreshed, the first sync after an upgrade
     would put a `woswoar.zsh` on a bash-only machine: a file nothing sources,
     that nobody asked for, from a command nobody ran.
@@ -496,7 +570,7 @@ class TestTheRefreshNeverCreates(WoswoarTestCase):
             os.environ["HOME"] = self._home
 
     def hook(self, shell: str) -> Path:
-        return store.data_dir() / main_module.HOOKS[shell]
+        return store.data_dir() / install.HOOKS[shell]
 
     def test_a_refresh_never_creates_a_second_hook(self) -> None:
         # A `.zshrc` as well, so that *detection* would say zsh -- the refresh
@@ -506,8 +580,8 @@ class TestTheRefreshNeverCreates(WoswoarTestCase):
         (self.home / ".zshrc").write_text("# mine\n", encoding="utf-8")
         self.hook("bash").write_bytes(b"# an older woswoar\n")
 
-        self.assertTrue(main_module._refresh_hook(), "the stale bash hook was not refreshed")
-        self.assertEqual(self.hook("bash").read_bytes(), main_module._hook_bytes("bash"))
+        self.assertTrue(install.refresh_hook(), "the stale bash hook was not refreshed")
+        self.assertEqual(self.hook("bash").read_bytes(), install.hook_bytes("bash"))
         self.assertFalse(self.hook("zsh").exists(), "the refresh planted a hook nobody installed")
 
     def test_a_stale_zsh_hook_is_refreshed(self) -> None:
@@ -520,15 +594,46 @@ class TestTheRefreshNeverCreates(WoswoarTestCase):
         self.assertEqual(main(["install", "--shell", "zsh"]), 0)
         self.hook("zsh").write_bytes(b"# an older woswoar\n")
 
-        self.assertTrue(main_module._refresh_hook())
-        self.assertEqual(self.hook("zsh").read_bytes(), main_module._hook_bytes("zsh"))
+        self.assertTrue(install.refresh_hook())
+        self.assertEqual(self.hook("zsh").read_bytes(), install.hook_bytes("zsh"))
+
+    def test_the_names_of_the_refreshed_hooks_come_back(self) -> None:
+        """What #202 made load-bearing. `refresh_hook` used to print the message
+        itself; now it returns the hooks it rewrote and `cmd_sync` prints them, so
+        an empty return is the difference between a person being told their shell
+        code was replaced under them and it happening in silence. Nothing else
+        asserts that message, and the file is rewritten either way -- so a
+        `return []` would leave every other test in this class green."""
+        self.assertEqual(main(["install", "--shell", "zsh"]), 0)
+        for shell in ("bash", "zsh"):
+            self.hook(shell).write_bytes(b"# an older woswoar\n")
+        self.assertEqual(
+            sorted(install.refresh_hook()), sorted(self.hook(s) for s in install.HOOKS)
+        )
+
+    def test_a_sync_says_which_hook_it_replaced(self) -> None:
+        """The other end of the same thread: the message reaching a terminal.
+
+        Through the CLI, because what broke in the move was *which* function
+        prints -- a test that only called `refresh_hook` would pass with nobody
+        printing at all.
+        """
+        self.hook("bash").write_bytes(b"# an older woswoar\n")
+        ran = support.run_cli("sync")
+        self.assertIn("updated the shell hook", ran.out)
+        self.assertIn(str(self.hook("bash")), ran.out)
+
+    def test_a_current_hook_is_not_announced(self) -> None:
+        """Otherwise every sync would report an upgrade that did not happen."""
+        ran = support.run_cli("sync")
+        self.assertNotIn("updated the shell hook", ran.out)
 
     def test_a_stale_zsh_hook_makes_doctor_say_so(self) -> None:
         self.assertEqual(main(["install", "--shell", "zsh"]), 0)
         self.hook("zsh").write_bytes(b"# an older woswoar\n")
         ran = support.run_cli("doctor")
         self.assertIn("older than this woswoar", ran.out)
-        self.assertIn(main_module.HOOKS["zsh"], ran.out)
+        self.assertIn(install.HOOKS["zsh"], ran.out)
 
 
 if __name__ == "__main__":
