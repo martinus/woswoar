@@ -399,6 +399,16 @@ Deferring the `importer` import was kept for the same reason plus one more: it
 matches how `sync` is already handled, and it moved importing the CLI module
 from 26.6 to 24.6 ms.
 
+> That deferral has since been undone, and this paragraph is left as the record
+> of why it was made. `build_parser` reads `importer.KINDS` to populate the
+> `import` subcommand's choices, and the parser is built on every invocation, so
+> the CLI imports the module at the top level again. Re-measured: 0.75 ms of the
+> ~15 ms it takes to import `__main__`, against the 2 ms above on a different
+> machine. Restoring it means moving `KINDS` somewhere cheaper, which is a
+> millisecond of fifteen — the case the convergence rule at the end of
+> `CLAUDE.md` says to state and leave alone. `sync`, `crypto` and `prove` are
+> still deferred, and `tests/test_architecture.py` now holds them there.
+
 Going meaningfully below this needs a structural change, and both candidates are
 worse than the problem:
 

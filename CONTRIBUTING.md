@@ -69,6 +69,15 @@ passed review, and guarded nothing:
 Prefer driving the real thing over asserting on a mock. The suite already runs a
 real `bash` for the shell hook and real `age` and `git` for sync; follow that.
 
+## Before moving code
+
+[`docs/architecture.md`](docs/architecture.md) is the map: which module may
+import which, the two costs that shape most of the odd-looking decisions, and the
+five shapes the codebase keeps reusing. The layering is not a convention —
+[`tests/test_architecture.py`](tests/test_architecture.py) holds it against the
+real import graph, so a new edge between modules is a deliberate one-line edit
+and a sentence in the pull request.
+
 ## Comments explain *why*
 
 The comment density here is deliberate and is most of the value of the codebase.
