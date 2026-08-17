@@ -33,7 +33,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import archive, crypto, deps, store, sync
+from . import archive, crypto, deps, gitrepo, store, sync
 from .entry import Entry
 from .errors import WoswoarError
 from .report import Check
@@ -60,9 +60,9 @@ QUIET_MAINTENANCE = "[gc]\n\tauto = 0\n\tautoDetach = false\n[receive]\n\tautogc
 #: commit email, and a user sharing a name with the maintainer collides with
 #: the repository URL in the committed README.
 _BOILERPLATE = (
-    sync.COMMIT_NAME,
-    sync.COMMIT_EMAIL,
-    sync.COMMIT_MESSAGE,
+    gitrepo.COMMIT_NAME,
+    gitrepo.COMMIT_EMAIL,
+    gitrepo.COMMIT_MESSAGE,
     archive.README_CONTENT,
     archive.GITATTRIBUTES_CONTENT,
     archive.GITIGNORE_CONTENT,
@@ -137,7 +137,7 @@ def _sandbox() -> Iterator[Path]:
 
 
 def _git_bytes(*args: str, cwd: Path | None = None) -> bytes:
-    """git output as raw bytes; `sync.git` decodes, and objects are not text."""
+    """git output as raw bytes; `gitrepo.git` decodes, and objects are not text."""
     done = subprocess.run(["git", *args], capture_output=True, check=False, timeout=60, cwd=cwd)
     if done.returncode != 0:
         raise WoswoarError(

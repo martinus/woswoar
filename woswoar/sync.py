@@ -19,14 +19,21 @@ The shape of this, and why:
 - Each host signs a manifest of its own chunks, per day, with a key only it
   holds. That is what makes a chunk attributable to one machine rather than to
   the fleet, and so what lets `revoke` stop a machine publishing as well as
-  reading. See `_manifest_body` and `_trusted_signer`.
+  reading. See `manifest` and `_trusted_signer`.
+
+What is left here is the orchestration -- `run`, `export`, `merge`, `_Day` -- and
+the ordering between those *is* the correctness argument, which is why they were
+not split further: fetch before export or a day key is sealed to a stale
+recipient list, permanently; the version gate is read after the fetch and before
+anything is written; `export` extends the manifest it last signed and must never
+list the directory. Two layers that did come out cleanly are `manifest`, the
+authenticity layer, and `gitrepo`, every fork and the only thing here that talks
+to the network -- so nothing in this module spawns a subprocess any more.
 """
 
 from __future__ import annotations
 
 import fcntl
-import hashlib
-import subprocess
 import time
 import zlib
 from collections import Counter
@@ -36,18 +43,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, crypto, progress, store
+from . import archive, crypto, gitrepo, manifest, progress, store
 from .entry import make_inert
-from .errors import WoswoarError
+from .errors import SyncError, WoswoarError
 from .report import Check, Notice
 from .store import Machine
-
-GIT_TIMEOUT = 300
-
-#: Commits carry no useful information -- the content is opaque and the author
-#: is always this machine -- so they are uniform. A varying message would only
-#: leak activity patterns into a place that is not encrypted.
-COMMIT_MESSAGE = "woswoar sync"
 
 #: Both "no repo key yet" and "some days unreadable" have the same fix, and used
 #: to say so in two independently worded paragraphs.
@@ -77,10 +77,6 @@ def _restore_remedy(path: str) -> str:
         f"    git -C <history> log --diff-filter=D -- {path}\n"
         f"    git -C <history> show <commit>^:{path} > that path\n"
     )
-
-
-class SyncError(WoswoarError):
-    pass
 
 
 class Outcome:
@@ -398,37 +394,6 @@ class Report:
             if subjects:
                 out.append(Notice(kind.body(sorted(subjects)), kind.warning))
         return out
-
-
-# ---------------------------------------------------------------------------
-# git
-# ---------------------------------------------------------------------------
-
-
-def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
-    repo = cwd or store.history_dir()
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=GIT_TIMEOUT,
-    )
-    if check and result.returncode != 0:
-        raise SyncError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def has_remote() -> bool:
-    """For the callers that want only this. The definition lives in `Repo`."""
-    return read_repo().has_remote
-
-
-def remote_summary() -> str:
-    """One line describing where history is published, for humans."""
-    remotes = git("remote", "-v", check=False).splitlines()
-    return remotes[0] if remotes else "none (history is local only)"
 
 
 #: Separates a key from the text after it. Only two things ever wrote such
@@ -949,7 +914,7 @@ def signing_status(known: Machine) -> Check:
         verify_key = crypto.signing_public(path)
         probe = b"woswoar signing selftest"
         if not crypto.verify(
-            probe, crypto.sign(probe, path, _MANIFEST_MAGIC), verify_key, _MANIFEST_MAGIC
+            probe, crypto.sign(probe, path, manifest.MAGIC), verify_key, manifest.MAGIC
         ):
             return Check("signing", f"{path} signs, but the signature does not verify", ok=False)
     except (WoswoarError, OSError) as exc:
@@ -1038,16 +1003,6 @@ def orphaned_days() -> list[tuple[str, str]]:
     return found
 
 
-def manifest_gone(host_id: str, day: str) -> bool:
-    """No signed list for a day, said once so both callers ask it the same way.
-
-    Meaningless on its own -- a day never published has no manifest either --
-    so every caller pairs it with "did this machine publish this day", which is
-    its own export watermark.
-    """
-    return not archive.day_manifest(host_id, day).exists()
-
-
 def unlisted_chunks() -> list[tuple[str, str, int]]:
     """``(host, day, how many)`` for chunks no signed manifest accounts for.
 
@@ -1076,33 +1031,17 @@ def unlisted_chunks() -> list[tuple[str, str, int]]:
         if verify_key is None:
             continue
         for day, names in archive.iter_chunk_days(host_id):
-            claimed = _manifest_names(host_id, day)
+            claimed = manifest.claimed_names(host_id, day)
             if not set(names) - claimed:
                 continue
             # Only now is it worth a signature check: an unverifiable manifest
             # accounts for nothing, and would make every chunk of the day look
             # planted when the manifest is what is wrong.
-            listed = read_manifest(host_id, day, verify_key)
+            listed = manifest.read(host_id, day, verify_key)
             strays = set(names) - set(listed)
             if strays and listed:
                 found.append((host_id, day, len(strays)))
     return found
-
-
-def _manifest_names(host_id: str, day: str) -> set[str]:
-    """The names a day's manifest claims, *without* checking who signed it.
-
-    Only ever used to decide whether a signature check is worth doing. A forged
-    manifest can make a chunk look accounted for here, and that is fine: the
-    same forgery makes every peer refuse the whole day, which `sync` reports as
-    unauthenticated rather than as a stray file.
-    """
-    try:
-        blob = archive.day_manifest(host_id, day).read_text(encoding="utf-8")
-    except OSError:
-        return set()
-    _, _, body = blob.partition(_MANIFEST_SEPARATOR)
-    return {line.partition(" ")[0] for line in body.splitlines()[1:]}
 
 
 def days_missing_a_manifest() -> list[str]:
@@ -1124,7 +1063,7 @@ def days_missing_a_manifest() -> list[str]:
     return [
         day
         for day in sorted(store.day_of_log(relpath) for relpath in State.load().exported)
-        if manifest_gone(known.id, day)
+        if manifest.missing(known.id, day)
     ]
 
 
@@ -1295,9 +1234,9 @@ def _refresh() -> None:
     the operation is about to act on. That is the one direction a security
     confirmation must never be wrong in.
     """
-    repo = read_repo()
+    repo = gitrepo.read_repo()
     if repo.has_remote:
-        _fetch_and_rebase(repo)
+        gitrepo.fetch_and_rebase(repo)
 
 
 def trust_candidates() -> list[Candidate]:
@@ -1408,117 +1347,6 @@ def apply_withdrawals(state: State, report: Report) -> None:
     for host_id in sorted(withdrawn_hosts(state)):
         del state.signers[host_id]
         report.record(UNPINNED, host_id)
-
-
-# ---------------------------------------------------------------------------
-# Manifests: which chunks a host says are its own, signed so nobody else can say
-# it. The whole of chunk authenticity rests on this.
-# ---------------------------------------------------------------------------
-
-#: First token of a manifest body, and the ssh-keygen signature namespace, which
-#: are deliberately the same string. It is *inside the signed bytes* and also the
-#: domain the signature is made in, so a future manifest shape gets one new value
-#: and old signatures stop verifying against it twice over -- rather than a
-#: version check somebody has to remember to write.
-_MANIFEST_MAGIC = "woswoar-manifest-v1"
-
-#: Separates the armoured signature from the bytes it covers. The signature is
-#: in the same file as the body, not beside it, so `write_atomic` makes the two
-#: impossible to disagree -- a detached pair has a window where one has landed
-#: and the other has not, and during that window a real chunk looks forged.
-_MANIFEST_SEPARATOR = "\n\n"
-
-
-def digest_of(data: bytes) -> str:
-    """The digest a manifest records for a chunk."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def _manifest_header(host_id: str, day: str) -> str:
-    """The line that binds a manifest to one host and one day.
-
-    Built in one place and compared in another, so the round trip cannot be
-    broken from one side only.
-    """
-    return f"{_MANIFEST_MAGIC} {host_id} {day}"
-
-
-class Entry(NamedTuple):
-    """One line of a manifest: a chunk, and what it replaced.
-
-    ``subsumes`` is empty for an ordinary chunk and holds the names `compact`
-    merged into this one otherwise. It is in the *signed* bytes because it
-    decides what a peer does with the chunk, and anything that decides that has
-    to be something only the publishing machine can say.
-    """
-
-    digest: str
-    subsumes: tuple[str, ...] = ()
-
-
-def _manifest_body(host_id: str, day: str, entries: dict[str, Entry]) -> str:
-    """The signed part of a manifest: what this host claims it wrote that day.
-
-    The header names the host and the day, so a genuine manifest cannot be
-    lifted to another host's directory or another date and still verify --
-    ssh-keygen's own principal matching cannot do that job (see
-    `crypto.verify`), so it is done here, in the bytes the signature covers.
-
-    Sorted, so the same set of chunks always produces byte-identical output and
-    a sync that adds nothing rewrites nothing.
-    """
-    lines = [_manifest_header(host_id, day)]
-    for name in sorted(entries):
-        entry = entries[name]
-        lines.append(" ".join([name, entry.digest, *entry.subsumes]))
-    return "\n".join(lines) + "\n"
-
-
-def write_manifest(known: Machine, day: str, entries: dict[str, Entry]) -> None:
-    """Sign this host's chunk list for ``day`` and write it."""
-    body = _manifest_body(known.id, day, entries)
-    signature = crypto.sign(body.encode("utf-8"), store.signing_key_file(), _MANIFEST_MAGIC)
-    blob = signature.decode("utf-8").strip() + _MANIFEST_SEPARATOR + body
-    store.write_atomic(archive.day_manifest(known.id, day), blob.encode("utf-8"))
-
-
-def read_manifest(host_id: str, day: str, verify_key: str) -> dict[str, Entry]:
-    """The digests ``host_id`` signed for ``day``, or ``{}`` if it did not.
-
-    Empty rather than an exception for an unsigned, malformed, mis-signed or
-    mis-addressed manifest, because callers do the same thing with all of them:
-    every chunk of that day goes unverified and is refused. Distinguishing them
-    would be distinguishing a truthful failure from an attacker's, which is
-    exactly the split #29 tried for chunk tags and reverted -- an attacker can
-    produce any of these shapes at will.
-    """
-    try:
-        blob = archive.day_manifest(host_id, day).read_text(encoding="utf-8")
-    except OSError:
-        return {}
-
-    signature, separator, body = blob.partition(_MANIFEST_SEPARATOR)
-    if not separator:
-        return {}
-    if not crypto.verify(
-        body.encode("utf-8"), signature.encode("utf-8"), verify_key, _MANIFEST_MAGIC
-    ):
-        return {}
-
-    lines = body.splitlines()
-    # Checked *after* the signature, so this only ever parses bytes the host's
-    # own key vouched for. The header binding is the point: without it a
-    # manifest signed for one day would verify for every other day.
-    if not lines or lines[0] != _manifest_header(host_id, day):
-        return {}
-
-    entries: dict[str, Entry] = {}
-    for line in lines[1:]:
-        name, _, rest = line.partition(" ")
-        digest, _, subsumed = rest.partition(" ")
-        if name and digest:
-            entries[name] = Entry(digest, tuple(subsumed.split()))
-    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -1648,7 +1476,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
     is the one thing nothing here ever inspects. Listing the directory would
     sweep such a chunk into a manifest *this machine signs*, laundering it into
     something every peer believes -- without even the `compact` run that
-    `open_chunk` was written to guard. Extending a list we already signed makes
+    `manifest.open_chunk` was written to guard. Extending a list we already signed makes
     a chunk we did not write unrepresentable in a manifest we do sign.
 
     The signature covers the whole day's list every time, so a manifest is a
@@ -1710,7 +1538,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         progress.tick(done, len(fresh), "days")
         # Before the manifest, not after. Refusing does not advance
         # `state.exported`, so a refused day comes back on every sync -- and
-        # `read_manifest` forks `ssh-keygen -Y verify`. Checked afterwards, one
+        # `manifest.read` forks `ssh-keygen -Y verify`. Checked afterwards, one
         # orphaned day cost a fork a minute for as long as it stayed that way,
         # on a path issue #50 is already about. `day in on_disk` first because
         # it is a dict lookup and the other two are stats.
@@ -1725,7 +1553,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             continue
 
         # A manifest this machine wrote before and that is no longer there.
-        # `read_manifest` returns nothing for "absent" and for "will not verify"
+        # `manifest.read` returns nothing for "absent" and for "will not verify"
         # alike, and the branch below only covers the second -- so a deletion
         # looked exactly like a day never published, and the fresh manifest
         # signed at the end of this loop listed only what this run wrote.
@@ -1739,14 +1567,14 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # keying on that would let anyone who can push plant one on a day we
         # have not published yet and block that day for good.
         published_before = any(relpath in state.exported for relpath, _, _ in tails)
-        has_manifest = not manifest_gone(known.id, day)
+        has_manifest = not manifest.missing(known.id, day)
         if published_before and not has_manifest:
             report.record(MANIFEST_MISSING, day)
             continue
 
         # What this machine has already put its name to for this day. Extended,
         # never rebuilt from the directory -- see the docstring.
-        listed = read_manifest(known.id, day, verify_key)
+        listed = manifest.read(known.id, day, verify_key)
         if not listed and has_manifest:
             # There is a manifest for this day and this machine cannot verify
             # it, so it cannot tell what it has already published. Signing a
@@ -1768,7 +1596,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
                 sealed = crypto.encrypt_to(pack(piece), public)
                 written = archive.new_chunk(known.id, day, now)
                 store.write_atomic(written, sealed)
-                listed[written.name] = Entry(digest_of(sealed))
+                listed[written.name] = manifest.ManifestEntry(manifest.digest_of(sealed))
 
                 report.chunks_written += 1
                 report.lines_exported += piece.count(b"\n")
@@ -1780,7 +1608,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             # does leave is chunks in no manifest, which is issue #66.
             state.exported[relpath] = new_offset
 
-        write_manifest(known, day, listed)
+        manifest.write(known, day, listed)
         wrote = True
 
         # A chunk under this host's own id that this host never wrote. `merge`
@@ -1826,28 +1654,6 @@ def merge(known: Machine, state: State, report: Report) -> None:
         report.hosts_seen.add(host_id)
         _merge_host(known, host_id, state, report)
         _merge_name(known, host_id)
-
-
-def open_chunk(path: Path, expected: str) -> bytes:
-    """A chunk's sealed bytes, or :class:`ValueError` if they are not the ones
-    the host's signed manifest names.
-
-    The *only* way to read a chunk. Verification lives here so that "read a
-    chunk without checking it" is not expressible: `compact` once took the other
-    branch and became a laundering path -- it re-sealed and re-tagged whatever
-    it found under this host's own id, which `merge` never inspects, turning a
-    planted chunk into one every peer would believe, and then deleted the
-    evidence.
-
-    The digest, not a tag: what makes the bytes trustworthy is that a signature
-    by one specific machine covers this digest. A shared tag could be produced
-    by anyone who could check it, which is what made a revoked machine able to
-    keep publishing (#38).
-    """
-    blob = path.read_bytes()
-    if digest_of(blob) != expected:
-        raise ValueError(f"{path.name} is not the chunk its manifest names")
-    return blob
 
 
 def _trusted_signer(host_id: str, state: State, report: Report) -> str | None:
@@ -1977,7 +1783,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             _stamp(state, key, stamp, settled=bool(names))
             continue
 
-        listed = read_manifest(host_id, chunk_day, verify_key)
+        listed = manifest.read(host_id, chunk_day, verify_key)
         day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
         directory = archive.chunk_dir(host_id, chunk_day)
@@ -2012,7 +1818,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             # and the parser only ever see bytes one of this user's own machines
             # wrote.
             try:
-                blob = open_chunk(directory / name, day.listed[name].digest)
+                blob = manifest.open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
                 report.record(UNAUTHENTICATED, key)
                 continue
@@ -2080,7 +1886,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
         # the day is re-listed and its manifest re-verified, one `ssh-keygen`
         # fork, on every sync for ever (#87).
         #
-        # An empty `listed` is not "a day holding nothing": `read_manifest`
+        # An empty `listed` is not "a day holding nothing": `manifest.read`
         # answers that way for a manifest that is missing, unsigned, or will not
         # verify. Settling on it would stamp a day whose every chunk is still
         # being refused, and pruning on it would forget the whole day and merge
@@ -2120,7 +1926,11 @@ class _Day:
     """
 
     def __init__(
-        self, host_id: str, day: str, listed: dict[str, Entry], already: frozenset[str]
+        self,
+        host_id: str,
+        day: str,
+        listed: dict[str, manifest.ManifestEntry],
+        already: frozenset[str],
     ) -> None:
         self.host_id = host_id
         self.day = day
@@ -2238,8 +2048,8 @@ def run(push: bool = True, now: int | None = None) -> Report:
     if not archive.recipients_file().is_file():
         raise SyncError("no recipients.txt in the history repo; run 'woswoar init'")
 
-    repo = read_repo()
-    _ensure_repo_config(repo)
+    repo = gitrepo.read_repo()
+    gitrepo.ensure_config(repo)
     report = Report()
     remote = push and repo.has_remote
 
@@ -2251,7 +2061,7 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # stale list would produce a key that machines enrolled since the last
         # sync can never open -- silently, and permanently, because the repo is
         # append-only.
-        in_sync = _fetch_and_rebase(repo) if remote else False
+        in_sync = gitrepo.fetch_and_rebase(repo) if remote else False
 
         # Straight after the fetch, so what is checked is what the remote says
         # rather than what this machine last wrote, and before anything is
@@ -2317,7 +2127,7 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # Benign in the same way `publish_signer`'s equivalent is: the marker
         # waits for the next export, `grant`, `revoke` or `init`, all of which
         # sweep the tree unconditionally -- and every peer writes it too.
-        committed = _commit() if published or exported or marked else False
+        committed = gitrepo.commit() if published or exported or marked else False
 
         if remote:
             # `push` contacts the remote even with nothing to send, which is the
@@ -2326,163 +2136,13 @@ def run(push: bool = True, now: int | None = None) -> Report:
             # to send -- and `pushed` still holds, since it means this machine's
             # history is on the remote, not that bytes moved.
             if committed or not in_sync:
-                _push(repo)
+                gitrepo.push(repo)
             report.pushed = True
 
         merge(known, state, report)
         state.save()
 
     return report
-
-
-#: Object ids as `rev-parse` prints them. Both lengths, because a repo may be
-#: SHA-256 rather than SHA-1 -- woswoar never creates one, but it is handed the
-#: repo the user cloned.
-_HEX = frozenset("0123456789abcdef")
-
-
-def _resolve(*refs: str) -> list[str]:
-    """Resolve several refs in one fork; an unresolvable one comes back empty.
-
-    `rev-parse --verify` takes a single ref, so asking about two costs two forks.
-    Plain `rev-parse` takes any number, but *echoes* an argument it could not
-    resolve instead of failing that line, hence the shape check.
-    """
-    printed = git("rev-parse", *refs, check=False).splitlines()
-    if len(printed) != len(refs):
-        return [""] * len(refs)
-    return [line if len(line) in (40, 64) and _HEX.issuperset(line) else "" for line in printed]
-
-
-def _fetch_and_rebase(repo: Repo) -> bool:
-    """Adopt the remote's history under ours; say whether we now match it.
-
-    Announced rather than counted: this is one `git fetch` over the network, so
-    there is nothing to be a fraction of, and a slow one here is a slow remote
-    rather than anything woswoar is doing.
-
-    Fetch-then-rebase rather than ``git pull --rebase`` because the tracking ref
-    may legitimately not exist: cloning an *empty* remote configures a branch
-    pointing at nothing, which is the normal state for the first machine to
-    enrol. Checking the fetched ref directly handles that and the ordinary case
-    with one code path.
-
-    HEAD is resolved in the same fork, and a HEAD already equal to the fetched
-    ref needs no replaying at all -- the shape of every idle run of the
-    one-minute timer. Returning that fact lets the caller skip a push that would
-    contact the remote to send nothing.
-
-    The rebase cannot conflict over chunks -- every machine only ever adds files
-    below its own host id. ``recipients.txt`` is the single shared file, and
-    ``.gitattributes`` marks it ``merge=union`` so both sides' keys survive.
-
-    Do not answer the question with ``merge --ff-only`` succeeding. Merging a ref
-    that is already an *ancestor* of HEAD succeeds too -- it is a no-op -- so a
-    machine holding commits nobody else has would read as level and never
-    publish them. Only where HEAD lands says anything.
-    """
-    progress.phase("fetching from the remote")
-    git("fetch", "--quiet", "origin")
-    local, upstream = _resolve("HEAD", f"refs/remotes/origin/{repo.branch}")
-    if not upstream:
-        return False
-    if local == upstream:
-        return True
-    try:
-        git("rebase", "--autostash", f"origin/{repo.branch}")
-    except SyncError:
-        git("rebase", "--abort", check=False)
-        raise
-    # A rebase with nothing of its own to replay lands exactly on the fetched
-    # ref: this machine only received. Worth one fork on the path that just
-    # rebased -- never on the idle path -- because it saves opening a connection
-    # to the remote to send it nothing, on every machine every time any peer
-    # records a command.
-    return _resolve("HEAD")[0] == upstream
-
-
-def _push(repo: Repo) -> None:
-    """Publish, retrying once if someone else pushed while we worked."""
-    progress.phase("publishing to the remote")
-    try:
-        git("push", "--quiet", "-u", "origin", repo.branch)
-    except SyncError:
-        _fetch_and_rebase(repo)
-        git("push", "--quiet", "-u", "origin", repo.branch)
-
-
-#: Commit metadata is one of the few things in the repo that is *not* encrypted,
-#: so it is pinned to a fixed identity rather than inheriting the user's real
-#: name and email from their global gitconfig. Set on the repo so that rebase
-#: and commit alike pick it up, including on a machine with no gitconfig at all.
-COMMIT_NAME = "woswoar"
-COMMIT_EMAIL = "woswoar@localhost"
-
-
-class Repo(NamedTuple):
-    """What a command needs to know about the git repo, read once up front.
-
-    Every field was its own `git` fork before, repeated by each helper that
-    wanted it: `user.name` and `user.email` read every run to be written
-    approximately never, `git remote`, and `branch --show-current` twice per
-    sync. None of it can change under a command -- woswoar never checks a branch
-    out, and the identity is written at `init` -- so reading it once and passing
-    it down is the whole saving, on a timer that fires every minute.
-
-    `git remote` needs no fork of its own: it prints the names in the
-    `remote.<name>.url` keys of the same local config read here.
-    """
-
-    has_remote: bool
-    name: str
-    email: str
-    branch: str
-
-
-def read_repo() -> Repo:
-    values: dict[str, str] = {}
-    for line in git("config", "--list", "--local", check=False).splitlines():
-        key, _, value = line.partition("=")
-        values[key] = value
-    has_remote = any(key.startswith("remote.") and key.endswith(".url") for key in values)
-    return Repo(
-        has_remote=has_remote,
-        name=values.get("user.name", ""),
-        email=values.get("user.email", ""),
-        # Only asked for when there is a remote to name it to: every reader of
-        # this field is inside an `if has_remote`, and a local-only install
-        # would otherwise fork once a minute for a string nothing reads.
-        #
-        # `branch --show-current` rather than `rev-parse --abbrev-ref HEAD`,
-        # which cannot answer on an unborn HEAD -- exactly the state `init` is
-        # in when it enrols the first machine.
-        branch=git("branch", "--show-current") if has_remote else "",
-    )
-
-
-def _ensure_repo_config(repo: Repo) -> None:
-    """Pin the commit identity, writing only what is actually wrong."""
-    if repo.name != COMMIT_NAME:
-        git("config", "user.name", COMMIT_NAME)
-    if repo.email != COMMIT_EMAIL:
-        git("config", "user.email", COMMIT_EMAIL)
-
-
-def _commit() -> bool:
-    # `--verbose` prints one "add '<path>'"/"remove '<path>'" line per staged
-    # path and nothing at all when the index already matches, so the same
-    # command that stages also answers "is there anything to commit". The
-    # obvious `status --porcelain` afterwards costs a second full stat of a
-    # working tree that is tens of thousands of chunks after a couple of years.
-    #
-    # `run` no longer reaches here on an idle sync -- it asks its writers first
-    # -- so this is now paid only by runs that did write, and by `grant`,
-    # `revoke` and `init`. That makes it cheaper, not unnecessary: those runs
-    # still have a whole tree to stat, and doing it once beats doing it twice.
-    if not git("add", "-A", "--verbose"):
-        return False
-    git("commit", "-q", "-m", COMMIT_MESSAGE)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2596,7 +2256,7 @@ def initialise(
             #
             # git ignores the option for a remote that is not a local path, so
             # it costs an ssh clone nothing.
-            git(
+            gitrepo.git(
                 "clone",
                 "--quiet",
                 "--no-local",
@@ -2607,19 +2267,19 @@ def initialise(
             )
         else:
             history.mkdir(parents=True, exist_ok=True)
-            git("init", "--quiet", "-b", "main")
-    if remote and not has_remote():
-        git("remote", "add", "origin", "--", remote)
+            gitrepo.git("init", "--quiet", "-b", "main")
+    if remote and not gitrepo.has_remote():
+        gitrepo.git("remote", "add", "origin", "--", remote)
 
     # After the remote is added, not before: that is what decides `has_remote`.
-    repo = read_repo()
-    _ensure_repo_config(repo)
+    repo = gitrepo.read_repo()
+    gitrepo.ensure_config(repo)
 
     # Adopt the remote's state before enrolling, so we append to the real
     # recipients.txt rather than creating a competing one.
     publishing = repo.has_remote
     if publishing:
-        _fetch_and_rebase(repo)
+        gitrepo.fetch_and_rebase(repo)
 
     # Before enrolling, not after: joining a repository whose layout this
     # version cannot read would publish a key and a name into it, and nothing
@@ -2628,7 +2288,7 @@ def initialise(
     require_known_repo_format()
 
     if _write_repo_metadata(known, chosen):
-        _commit()
+        gitrepo.commit()
 
     # Trust on first use, and only here. Every host already in the repo when
     # this machine cloned is pinned: the user named the remote, and at this
@@ -2650,7 +2310,7 @@ def initialise(
     # `grant` run elsewhere cannot include it, so onboarding would appear to
     # succeed and then silently fail to grant access to any older history.
     if publishing:
-        _push(repo)
+        gitrepo.push(repo)
 
     return known, chosen, pinned
 
@@ -3096,23 +2756,23 @@ def _access_change() -> Iterator[_AccessChange]:
 
     known = store.machine()
     identity = identity_path(known)
-    repo = read_repo()
-    _ensure_repo_config(repo)
+    repo = gitrepo.read_repo()
+    gitrepo.ensure_config(repo)
     remote = repo.has_remote
 
     # The same lock sync takes: this rewrites files in the working tree, and a
     # timer-driven sync must not be reading them halfway through.
     with lock():
         if remote:
-            _fetch_and_rebase(repo)
+            gitrepo.fetch_and_rebase(repo)
         # `grant` and `revoke` rewrite every sealed key file in the repo, which
         # is a bigger write than `sync` makes -- so the version gate belongs
         # here too, and after the fetch for the same reason.
         require_known_repo_format()
         yield _AccessChange(identity, known, remote)
-        _commit()
+        gitrepo.commit()
         if remote:
-            _push(repo)
+            gitrepo.push(repo)
 
 
 def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
@@ -3408,7 +3068,7 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
             # Stronger than the tag this replaced: a tag proved only that
             # *someone* enrolled had written it, which a revoked machine could
             # still forge. A signature proves this machine wrote it.
-            listed = read_manifest(known.id, day, verify_key)
+            listed = manifest.read(known.id, day, verify_key)
             if {chunk.name for chunk in chunks} - set(listed):
                 raise SyncError(
                     f"refusing to compact {day}: it holds chunks this machine never "
@@ -3420,14 +3080,14 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
                 plaintexts = [
                     unpack(
                         crypto.decrypt_with_secret(
-                            open_chunk(c.path, listed[c.name].digest), secret
+                            manifest.open_chunk(c.path, listed[c.name].digest), secret
                         )
                     )
                     for c in chunks
                 ]
             except (ValueError, zlib.error) as exc:
                 # `zlib.error` as well as `ValueError`, which it is not a
-                # subclass of: `open_chunk` raises the second and `unpack` the
+                # subclass of: `manifest.open_chunk` raises the second and `unpack` the
                 # first, so catching only one let a chunk that will not
                 # decompress -- damaged, or past `MAX_CHUNK_BYTES` -- escape as
                 # a bare zlib traceback instead of the guided refusal.
@@ -3461,15 +3121,15 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
             # What it replaced, recorded and signed. A peer that already merged
             # any of those must not merge this as if it were new history, and it
             # cannot work that out from the bytes -- the lines are the same ones.
-            listed[merged.name] = Entry(
-                digest_of(sealed), tuple(sorted(chunk.name for chunk in chunks))
+            listed[merged.name] = manifest.ManifestEntry(
+                manifest.digest_of(sealed), tuple(sorted(chunk.name for chunk in chunks))
             )
-            write_manifest(known, day, listed)
+            manifest.write(known, day, listed)
             days += 1
             replaced += len(chunks)
 
         if days:
-            _commit()
+            gitrepo.commit()
 
     return days, replaced, skipped
 

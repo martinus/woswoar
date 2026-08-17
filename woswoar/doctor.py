@@ -140,7 +140,7 @@ def identity_check() -> Check:
 
 def repo_checks() -> list[Check]:
     """Everything about the history repository, or the note that there is none."""
-    from . import sync
+    from . import gitrepo, sync
 
     out: list[Check] = []
     if shutil.which("git") is None:
@@ -154,7 +154,7 @@ def repo_checks() -> list[Check]:
         return out
 
     known = store.machine()
-    out.append(Check("remote", sync.remote_summary(), ok=None))
+    out.append(Check("remote", gitrepo.remote_summary(), ok=None))
 
     # Taken from `sync` whole -- label included. The repo format marker is a
     # file nobody would think to `cat` and `sync` mentions it only by refusing,

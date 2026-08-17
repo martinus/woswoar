@@ -154,7 +154,7 @@ and only a seam test would have caught it.
 
 | invariant | seam | what it replaced |
 |---|---|---|
-| a chunk is never read unverified | `sync.open_chunk` | `compact` reading chunks directly, which laundered planted ones |
+| a chunk is never read unverified | `manifest.open_chunk` | `compact` reading chunks directly, which laundered planted ones |
 | `age` is never handed a path in `$HOME` | `crypto._run` | per-function conversion, which missed `encrypt_to_recipients` |
 | a peer's history is neutralised once | `cache._read_from`, via `parse_line(inert=True)` | neutralising per display site, forgotten once already |
 | access never widens without a human | `__main__._confirm` | one `isatty` branch copied per command |

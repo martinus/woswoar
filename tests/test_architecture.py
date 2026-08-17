@@ -47,7 +47,7 @@ REPO = Path(__file__).resolve().parent.parent
 #: this is for; a table that only caught *additions* would silently rot as
 #: modules lost dependencies and stop describing the package it claims to pin.
 #:
-#: The five leaves are leaves on purpose. `errors` holds the exception every
+#: The five leaves are leaves on purpose. `errors` holds the exceptions every
 #: layer raises; `deps`, `progress` and `report` are asked things by the layers
 #: above without knowing anything about them -- so each of them stays importable
 #: from anywhere without dragging a domain along. `report` in particular has to
@@ -74,17 +74,41 @@ LAYERS: dict[str, set[str]] = {
     #: `importer` and `sync` are deliberately absent: the wizard asks about them
     #: inside the two functions that need them.
     "setup": {"entry", "errors", "install", "report", "store"},
-    "sync": {"archive", "crypto", "entry", "errors", "progress", "report", "store"},
+    #: The two layers that came out of `sync` in #201, and the reason they are
+    #: the two: each reaches strictly *below* it. `manifest` is the authenticity
+    #: layer -- crypto, an `archive` path, an atomic write -- and `gitrepo` is
+    #: every fork woswoar makes, which needs `store` for the repo path and
+    #: `progress` to announce a fetch. Neither knows what a sync is, so neither
+    #: can grow an edge back to one.
+    "gitrepo": {"entry", "errors", "progress", "store"},
+    "manifest": {"archive", "crypto", "entry", "errors", "store"},
+    "sync": {
+        "archive",
+        "crypto",
+        "entry",
+        "errors",
+        "gitrepo",
+        "manifest",
+        "progress",
+        "report",
+        "store",
+    },
     #: `sync` is deliberately absent: `doctor` reaches it inside the two checks
     #: that need it, so asking what is wrong with an installation does not pay
     #: to import the whole sync protocol first.
     "doctor": {"cache", "crypto", "deps", "entry", "errors", "report", "search", "store"},
+    #: `gitrepo` for the commit boilerplate it must not mistake for a leaked
+    #: username; `manifest` only through `sync`. Both arrived when #201 turned
+    #: two of sync's internal layers into modules, which is a name for an edge
+    #: that already existed rather than a new one.
     "prove": {
         "archive",
         "crypto",
         "deps",
         "entry",
         "errors",
+        "gitrepo",
+        "manifest",
         "progress",
         "report",
         "store",
