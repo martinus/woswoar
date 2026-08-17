@@ -25,9 +25,10 @@ from typing import Any, ClassVar
 from unittest import mock
 
 from woswoar import archive, cache, crypto, progress, prove, search, store, sync
-from woswoar.__main__ import _GRANT_REMEDY, HOOKS, main
+from woswoar.__main__ import HOOKS, main
 from woswoar.__main__ import _hook_bytes as main_hook_bytes
 from woswoar.entry import Entry, format_line
+from woswoar.sync import _GRANT_REMEDY
 from woswoar.sync import COMMIT_MESSAGE as COMMIT
 
 from . import support

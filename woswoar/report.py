@@ -7,14 +7,18 @@ and `doctor` fell straight into the gap: four of its lines came from `sync` as
 values a test could assert on, and the rest were derived inline in the CLI where
 only a test that greps stdout could reach them.
 
-`Check` replaced two of the five: the `(ok, detail)` pair `sync` used for its
-four status functions, and the inline deriving. Be exact about what is left,
-because the docstring that overclaims is the one nobody corrects --
-`sync.Report`'s seventeen fields, `search.empty_note`, `importer.Result` and
-`deps.report` are all still themselves, and `lines()` below is `doctor`'s
-renderer. `cmd_sync`'s prose is multi-paragraph and has no label column, so
-whether `note` stretches to hold it or this module grows a second renderer is
-genuinely open. See #199.
+Two shapes live here, and the split is the answer to the question the first half
+of #199 left open -- whether `cmd_sync`'s multi-paragraph prose could go through
+`Check`. It could not, and forcing it would have put a dead label column and a
+meaningless marker on every paragraph:
+
+- `Check` is a **verdict**: one line, a label, pass/fail/info.
+- `Notice` is an **explanation**: a paragraph, no label, sometimes a recipe.
+
+The rule for picking, when something new needs reporting: if it fits a line and
+can pass or fail, it is a check. Be exact about what is *not* here --
+`search.empty_note`, `importer.Result` and `deps.report` are still themselves,
+and none of them is shaped like either of these.
 
 So a check is a **value**. Whoever knows the answer builds one; exactly one
 place turns it into characters. That is what makes a verdict testable without
@@ -95,6 +99,55 @@ class Check(NamedTuple):
         for saying how many log files there are.
         """
         return self.ok is False
+
+
+class Notice(NamedTuple):
+    """Something a command has to say at length, rather than in a column.
+
+    The sibling `Check` needed and the open question #199 left. A check is one
+    line with a label and a marker; several of `sync`'s outcomes are a paragraph
+    of five to ten lines with a remedy in them, no label, and nothing a marker
+    could usefully say -- `report.orphaned` carries a `git log --diff-filter=D`
+    recipe. Stretching `Check.note` to hold that was the other option and it was
+    worse: the label column and the marker would have been dead weight on every
+    one of them, and `lines()` would have grown a mode.
+
+    So two shapes, and the distinction is real: **a check is a verdict, a notice
+    is an explanation.** Anything that fits a line and can pass or fail is a
+    `Check`; anything that has to explain a state at length is a `Notice`.
+
+    ``warning`` is data rather than the word being part of the prose. Five of
+    `sync`'s eleven said `WARNING:` in their first line and six did not, which is
+    a severity a test could previously only find by grepping for the word.
+
+    Two things this deliberately does not share with `Check`. Severity here is a
+    bool rather than `Check`'s three-valued ``ok``, because a paragraph is never
+    "passing" -- it exists only when something is worth saying. And the prefix is
+    plain text rather than going through `markers`: a marker is a column in a
+    table of verdicts, and there is no table here. `paragraphs` is a thin
+    renderer for that reason, and the prose is the producer's.
+    """
+
+    body: str
+    #: Worth shouting about: the repository disagrees with what this machine
+    #: expects, or history could not be published. The quieter six are ordinary
+    #: states -- a machine that has not been granted access yet, a peer nobody
+    #: has accepted -- which are not going wrong so much as not finished.
+    warning: bool = False
+
+
+def paragraphs(notices: list[Notice]) -> list[str]:
+    """Each notice as the block to print, blank line first.
+
+    The leading newline is here rather than in every one of eleven prose
+    strings, which is where it used to be -- a blank line between paragraphs is
+    a fact about printing paragraphs, not about any one of them.
+    """
+    out = []
+    for notice in notices:
+        prefix = "WARNING: " if notice.warning else ""
+        out.append(f"\n{prefix}{notice.body}")
+    return out
 
 
 def markers(stream: TextIO | None = None) -> dict[str, str]:

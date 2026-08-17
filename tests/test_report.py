@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import io
 import unittest
+from typing import ClassVar
 
-from woswoar import doctor, report
-from woswoar.report import Check
+from woswoar import doctor, report, sync
+from woswoar.report import Check, Notice
 
 from . import support
 from .support import WoswoarTestCase
@@ -50,6 +51,94 @@ class TestTheCheckValue(unittest.TestCase):
 
     def test_an_empty_report_has_not_failed(self) -> None:
         self.assertFalse(report.failed([]))
+
+
+class TestNotices(unittest.TestCase):
+    """The paragraph sibling of `Check`, and `sync`'s decision about which apply.
+
+    Every one of these was a `if report.X:` block inside `cmd_sync` that printed
+    to stderr, so "does this run warn about a changed signer" could only be asked
+    by running a sync and grepping. The severity in particular was the *word*
+    `WARNING` inside the prose; it is a field now.
+    """
+
+    def test_a_warning_says_so_and_a_plain_notice_does_not(self) -> None:
+        self.assertEqual(report.paragraphs([Notice("body")]), ["\nbody"])
+        self.assertEqual(report.paragraphs([Notice("body", warning=True)]), ["\nWARNING: body"])
+
+    def test_the_blank_line_belongs_to_the_renderer(self) -> None:
+        """It used to be the first character of all eleven prose strings, which
+        is a fact about printing paragraphs rather than about any of them."""
+        for block in report.paragraphs([Notice("a"), Notice("b", warning=True)]):
+            self.assertTrue(block.startswith("\n"), block)
+
+    def test_a_clean_run_says_nothing(self) -> None:
+        self.assertEqual(sync.Report().notices(), [])
+
+    #: Every state that produces a notice, and whether it shouts. One list, not
+    #: three: the field names were written out for the count, for the severity,
+    #: and again as the expected sets, so adding a twelfth notice meant editing
+    #: three places and a partial edit left a silently weaker test.
+    STATES: ClassVar[dict[str, bool]] = {
+        "unreadable": False,
+        "stale": False,
+        "untrusted": False,
+        "unpinned": False,
+        "foreign": False,
+        "changed_signer": True,
+        "unsignable": True,
+        "orphaned": True,
+        "manifest_missing": True,
+        "unauthenticated": True,
+    }
+
+    def test_each_state_produces_exactly_one_notice_at_the_right_volume(self) -> None:
+        """Severity is data now, so it can be asserted rather than grepped for.
+        The quiet ones are states that are not going wrong -- a machine waiting
+        to be accepted -- and the loud ones are the repository disagreeing with
+        this machine, or history that could not be published."""
+        for field, shouts in self.STATES.items():
+            with self.subTest(field=field):
+                report_ = sync.Report()
+                setattr(report_, field, {"host/2026-01-01"})
+                notices = report_.notices()
+                self.assertEqual(len(notices), 1, f"{field} produced the wrong count")
+                self.assertIs(notices[0].warning, shouts)
+
+    def test_every_reportable_field_is_covered(self) -> None:
+        """Without this, deleting a row above would quietly stop testing that
+        state -- the loop would simply have one fewer thing to do."""
+        every = sync.Report()
+        for field in self.STATES:
+            setattr(every, field, {"host/2026-01-01"})
+        self.assertEqual(len(every.notices()), len(self.STATES))
+
+    def test_a_revoked_machine_is_told_that_and_nothing_else(self) -> None:
+        """Every other line would describe work it did not do: it publishes
+        nothing and merges nothing."""
+        report_ = sync.Report(revoked=True)
+        report_.unreadable = {"host/2026-01-01"}
+        report_.unauthenticated = {"host/2026-01-02"}
+        notices = report_.notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("revocation is permanent", notices[0].body)
+
+    def test_the_days_a_notice_names_are_listed_in_order(self) -> None:
+        """Three notices interpolate their set, and a set has no order.
+
+        Twelve days, not two, and that is the point: with two, the set's own
+        iteration order is already sorted about half the time, so dropping the
+        `sorted()` left this passing -- the fixture trap `CLAUDE.md` rule 3 names
+        first, hit exactly. `str` hashing is seed-randomised, so no fixed set can
+        make a wrong order *certain*; twelve makes an accidental pass one run in
+        a few hundred million, well below any flake worth having.
+        """
+        days = [f"2026-01-{n:02d}" for n in range(1, 13)]
+        report_ = sync.Report()
+        report_.orphaned = set(days)
+        body = report_.notices()[0].body
+        listed = body.split("cannot be published: ")[1].split("\n")[0].split(", ")
+        self.assertEqual(listed, sorted(days))
 
 
 class TestRendering(unittest.TestCase):
