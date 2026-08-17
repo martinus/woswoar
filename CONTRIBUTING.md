@@ -47,11 +47,25 @@ and the only way to know is to try it:
 
 [`tools/mutate.py`](tools/mutate.py) is that loop, written down. Give it a table
 of edits, run `python -m tools.mutate <spec>.py`, and paste its output into the
-pull request. Use it rather than writing the loop by hand: it clears every
-`__pycache__` between mutations, because a `.pyc` is validated against
-`(mtime, size)` and two edits of the same size inside one second will run each
-other's cached bytecode — which reported a *correct* test as decoration here and
-nearly got it deleted.
+pull request — verbatim, rather than retyping it, which is how a mutation that
+was never run ended up quoted in a commit message here.
+
+Use it rather than writing the loop by hand, for three reasons it has learned:
+
+- **It never edits your working tree.** Each mutation goes into a throwaway copy,
+  so an interrupted run cannot leave mutated source behind.
+- **It runs the table in parallel**, which the copies are what make safe: 197 s
+  down to 51 s for four mutations against `tests.test_sync`.
+- **It defuses the bytecode cache.** A `.pyc` is validated against
+  `(mtime, size)`, so two edits of the same size inside one second will run each
+  other's cached bytecode — which reported a *correct* test as decoration here and
+  nearly got it deleted. The copies start with no cache and the runs are told not
+  to write one.
+
+It also refuses a replacement that still contains the text it replaced, since
+that leaves the code under test unchanged and the result means nothing either
+way. Pass `additive=True` when inserting in front of code that stays is genuinely
+the point — testing the *order* of two steps needs it.
 
 ### When a mutation survives, suspect the fixture first
 
@@ -79,18 +93,17 @@ real import graph, so a new edge between modules is a deliberate one-line edit
 and a sentence in the pull request.
 
 When the move is supposed to change nothing a user sees, show that rather than
-asserting it:
+asserting it — [`tools/compare.py`](tools/compare.py) runs the same commands
+against both revisions in a throwaway `$HOME` and diffs stdout, stderr and exit
+status together:
 
 ```sh
 python -m tools.compare --base main --show .bashrc install doctor status
 ```
 
-[`tools/compare.py`](tools/compare.py) runs each command against both revisions
-in a throwaway `$HOME`, with the same machine id seeded on both sides, and diffs
-stdout, stderr and exit status together. Only `$HOME` and the tree path are
-normalised unless you ask for more with `--scrub`; whatever is active is printed
-above the verdict, and that list belongs in the pull request beside the claim.
-"Byte-identical" is worth exactly what was left unnormalised.
+Only `$HOME` and the tree path are normalised unless you ask for more with
+`--scrub`; whatever is active is printed above the verdict, and that list belongs
+in the pull request beside the claim.
 
 If the move might cost time, [`tools/bench.py`](tools/bench.py) is the A/B:
 
@@ -98,12 +111,10 @@ If the move might cost time, [`tools/bench.py`](tools/bench.py) is the A/B:
 python -m tools.bench --importtime woswoar.__main__ --base main
 ```
 
-It puts the base worktree beside the repository rather than in `/tmp` — which is
-tmpfs here, so the obvious placement measures RAM against an SSD — runs ABBA and
-BAAB blocks so a machine that warms up over the run does not read as a
-regression, and reports the median of the per-pair differences with a sign test.
-When it says *not resolved*, that is the answer: write "below measurement", not a
-figure with two decimal places.
+Both tools' docstrings explain the traps they encode — where the two checkouts
+sit, the order readings are taken in, how they are summarised — and it is worth
+reading `bench.py`'s before quoting a number from it. When it says *not
+resolved*, that is the answer: write "below measurement".
 
 ## Comments explain *why*
 

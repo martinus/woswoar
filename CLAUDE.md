@@ -202,62 +202,35 @@ first such change, not during one.
   `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
   serially, and takes about three times as long.
 
-- Mutation-test through `tools/mutate.py` rather than writing the loop again. It
-  runs `-B`, clears every `__pycache__` between mutations, refuses an edit that
-  matches other than exactly once, checks the baseline is green, and restores
-  the tree even when interrupted. The trap it exists for: a `.pyc` is validated
-  against `(mtime_seconds, size)`, so two mutations that change a file by the
-  same number of bytes inside one second run each other's cached bytecode —
-  which reported a *correct* test as decoration here, and nearly got it
-  rewritten.
+- Three tools in `tools/` exist because the same mistake was made more than
+  once. Each one's module docstring carries the full argument for why it is
+  shaped as it is; reach for them rather than writing the loop again.
 
-  It also refuses a replacement that still **contains** the text it replaced,
-  because that leaves the code under test exactly as it was and the run means
-  nothing either way. That is how a *move* gets written wrongly — put the whole
-  span in `old`, including the line being relocated. Three of those shipped in
-  one session before the check existed, each costing a full suite run and each
-  reading as a result. `additive=True` is the escape hatch for the rare edit
-  that really does insert in front of code that stays.
-
-- **Refactors that should change nothing: prove it with `tools/compare.py`.**
+  | when | tool |
+  |---|---|
+  | a fix needs a test that fails without it (rule 3) | [`tools/mutate.py`](tools/mutate.py) |
+  | a refactor is supposed to change no output | [`tools/compare.py`](tools/compare.py) |
+  | a change might have cost time | [`tools/bench.py`](tools/bench.py) |
 
   ```sh
+  python -m tools.mutate <spec>.py
   python -m tools.compare --base main --show .bashrc install doctor status
-  ```
-
-  It runs each command in a throwaway `$HOME` against both revisions, seeds the
-  same machine id on both sides, and diffs stdout, stderr and exit status
-  together. Only `$HOME` and the tree path are normalised by default; anything
-  else needs `--scrub REGEX=REPLACEMENT`, and the active list is printed above
-  the verdict. Quote that list whenever a pull request says "byte-identical" —
-  the claim is worth exactly what was left unnormalised, and there is no way to
-  tell from the outside.
-
-- **A/B timing: `tools/bench.py`, not a loop written on the spot.**
-
-  ```sh
   python -m tools.bench --importtime woswoar.__main__ --base main
   ```
 
-  Hand-rolled comparisons got this wrong twice here, in three different ways,
-  and each way survives review because the output looks like a measurement:
+  Three things to carry into a pull request, because they are about what you
+  write rather than what the tool does:
 
-  - **The base worktree must sit on the same filesystem.** `/tmp` is tmpfs and
-    the checkout is on btrfs, so a worktree in the obvious place reads out of
-    RAM against a tree reading off an SSD. That alone reported a resolved
-    0.08 ms difference between a tree and *itself*. `bench.py` puts the
-    worktree beside the repository.
-  - **A,B,A,B is not fair** — the second slot of every pair absorbs all the
-    drift, so an afternoon of warming up reads as a slowdown. The blocks are
-    ABBA and BAAB.
-  - **Compare the pairs, not the medians.** `median(B) - median(A)` throws away
-    the pairing that interleaving exists to create, and produces the puzzle of a
-    median gap smaller than the gap between the two minima. `bench.py` reports
-    the median of the per-pair differences with a sign test, and says *not
-    resolved* rather than quoting a number the machine cannot support.
+  - **Paste mutation output verbatim.** Retyping it is how a mutation that was
+    never run ended up quoted in a commit message here.
+  - **Quote `compare`'s scrub list beside any "byte-identical" claim.** The claim
+    is worth exactly what was left unnormalised, and nothing outside that list
+    can tell you.
+  - **"Below measurement" is a real answer.** When `bench` says *not resolved*,
+    write that, not a figure with two decimal places — and say which statistic
+    and how many blocks, because a difference of medians and a median of paired
+    differences are not the same number.
 
-  A cost below measurement is a real answer. Write "below measurement" then,
-  not a figure with two decimal places.
 - Before blaming your branch for a CI failure, measure the same job on `main`,
   enough times to see a one-in-forty flake. Two runs of green proves nothing.
 - Moving a name between modules leaves `.mypy_cache` wrong, and it fails as

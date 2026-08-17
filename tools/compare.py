@@ -29,10 +29,8 @@ Exits 0 when the two agree and 1 when they do not, printing a unified diff.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,68 +38,28 @@ from collections.abc import Iterable, Sequence
 from difflib import unified_diff
 from pathlib import Path
 
-#: What the sandbox's machine identity is, on both sides. Seeded rather than
-#: scrubbed: `install` prints the id it generated, and a fresh one per run would
-#: differ between the two trees for a reason that says nothing. Two characters
-#: short of a real id would be caught by nothing, so this is the same
-#: sixteen-hex-digit shape `tests/support.py` uses, and for the same reason.
-MACHINE_ID = "0123456789abcdef"
-MACHINE_FILE = f"id={MACHINE_ID}\nname=compare@sandbox\n"
+from tools.sandbox import sandbox_env, seed_machine, worktree
 
 
-class Scrub(argparse.Action):
-    """``--scrub 'REGEX=REPLACEMENT'``, collected in the order given."""
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: str | Sequence[str] | None,
-        option_string: str | None = None,
-    ) -> None:
-        text = str(values)
-        if "=" not in text:
+def _scrubs(parser: argparse.ArgumentParser, given: Sequence[str]) -> list[tuple[str, str]]:
+    """``REGEX=REPLACEMENT`` pairs, in the order given."""
+    out = []
+    for text in given:
+        pattern, sep, replacement = text.partition("=")
+        if not sep:
             parser.error(f"--scrub wants REGEX=REPLACEMENT, got {text!r}")
-        pattern, replacement = text.split("=", 1)
-        getattr(namespace, self.dest).append((pattern, replacement))
-
-
-def _sandbox(tree: Path, stack: list[tempfile.TemporaryDirectory[str]]) -> dict[str, str]:
-    """A throwaway home, and the environment that points woswoar at it.
-
-    Deliberately not the caller's environment with a few keys added: a
-    `WOSWOAR_SESSION` left over from the shell that started this, or an
-    `XDG_DATA_HOME` set on the developer's machine and not on anyone else's,
-    would reach one side and be reported as a difference between revisions.
-    """
-    home = tempfile.TemporaryDirectory(prefix="woswoar-compare-")
-    stack.append(home)
-    root = Path(home.name)
-    config = root / "config" / "woswoar"
-    config.mkdir(parents=True)
-    (config / "machine").write_text(MACHINE_FILE, encoding="utf-8")
-    return {
-        "HOME": str(root),
-        "XDG_DATA_HOME": str(root / "data"),
-        "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
-        "PYTHONPATH": str(tree),
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        # A terminal would turn on colour and the progress meter, neither of
-        # which is what this is comparing, and both of which vary with how the
-        # comparison itself was invoked.
-        "NO_COLOR": "1",
-        "SHELL": "/bin/bash",
-    }
+        out.append((pattern, replacement))
+    return out
 
 
 def _record(
     tree: Path, commands: Sequence[str], show: Sequence[str], scrubs: Sequence[tuple[str, str]]
 ) -> str:
     """Everything ``tree`` printed for ``commands``, normalised."""
-    stack: list[tempfile.TemporaryDirectory[str]] = []
-    try:
-        env = _sandbox(tree, stack)
+    with tempfile.TemporaryDirectory(prefix="woswoar-compare-") as home:
+        root = Path(home)
+        seed_machine(root, "compare@sandbox")
+        env = sandbox_env(tree, root)
         out = []
         for command in commands:
             argv = shlex.split(command)
@@ -131,29 +89,6 @@ def _record(
         for pattern, replacement in scrubs:
             text = re.sub(pattern, replacement, text)
         return text
-    finally:
-        for home in reversed(stack):
-            home.cleanup()
-
-
-def _worktree(revision: str) -> tuple[Path, str]:
-    """A detached checkout of ``revision``, and the sha it resolved to."""
-    sha = subprocess.run(
-        ["git", "rev-parse", "--short", revision],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    path = Path(tempfile.mkdtemp(prefix="woswoar-compare-tree-"))
-    # `mkdtemp` made it, and `git worktree add` wants to make it itself.
-    path.rmdir()
-    subprocess.run(
-        ["git", "worktree", "add", "--detach", str(path), revision],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return path, sha
 
 
 def compare(
@@ -164,19 +99,9 @@ def compare(
 ) -> tuple[bool, str]:
     """``(agreed, report)`` for the working tree against ``revision``."""
     here = Path.cwd()
-    base, sha = _worktree(revision)
-    try:
+    with worktree(revision) as (base, sha):
         before = _record(base, commands, show, scrubs)
         after = _record(here, commands, show, scrubs)
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(base)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        shutil.rmtree(base, ignore_errors=True)
-
     return verdict(before, after, f"{revision} ({sha})", len(commands), scrubs)
 
 
@@ -227,7 +152,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument(
         "--scrub",
-        action=Scrub,
+        action="append",
         default=[],
         metavar="REGEX=REPLACEMENT",
         help="normalise something else before comparing (repeatable). Listed in "
@@ -236,7 +161,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("commands", nargs="+", help="woswoar command lines, run in order")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    agreed, report = compare(args.base, args.commands, args.show, args.scrub)
+    agreed, report = compare(args.base, args.commands, args.show, _scrubs(parser, args.scrub))
     print(report)
     return 0 if agreed else 1
 
