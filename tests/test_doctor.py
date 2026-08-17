@@ -231,22 +231,6 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
     nothing to fix.
     """
 
-    def setUp(self) -> None:
-        super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._saved = {key: os.environ.get(key) for key in ("HOME", "SHELL")}
-        self.addCleanup(self._restore)
-        os.environ["HOME"] = str(self.home)
-        os.environ["SHELL"] = "/bin/bash"
-
-    def _restore(self) -> None:
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
     def test_a_bash_only_machine_is_not_asked_about_zsh(self) -> None:
         (self.home / ".bashrc").write_text("", encoding="utf-8")
         support.run_cli("install")
@@ -277,6 +261,91 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
         out = support.run_cli("doctor").out
         self.assertIn(f"{self.home}/.bashrc sources the hook", out)
         self.assertIn(f"{self.home}/.zshrc sources the hook", out)
+
+    def test_a_block_left_by_a_test_install_is_not_reported_as_working(self) -> None:
+        """The line pointing *somewhere*, not the marker being present.
+
+        A real `.bashrc` was found sourcing
+        `/tmp/woswoar-test-kc71_9n1/data/woswoar.bash` -- a sandbox that a test
+        run deleted on the way out. Every interactive shell printed a `No such
+        file or directory`, nothing was recorded for months, and `doctor` said
+        `bashrc ... sources the hook` the whole time, because the block was
+        there. The block being there is not the claim the line makes.
+        """
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        gone = self.root / "gone" / "woswoar.bash"
+        install.write_block(self.home / ".bashrc", gone)
+
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] bashrc", out)
+        self.assertIn(str(gone), out, "the report does not say where the line points")
+        self.assertIn("woswoar install", out, "no remedy named")
+
+    def test_reinstalling_is_a_remedy_that_works(self) -> None:
+        """Without this the test above is satisfied by a check that can only
+        fail, and the command it tells people to run is untested."""
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        install.write_block(self.home / ".bashrc", self.root / "gone" / "woswoar.bash")
+        self.assertIn("[FAIL] bashrc", support.run_cli("doctor").out)
+
+        support.run_cli("install")
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_the_line_is_read_the_way_a_shell_reads_it(self) -> None:
+        """`$HOME/...` is what `install` writes whenever the hook is under the
+        home directory, and it is what a shared dotfiles `.bashrc` carries. A
+        check that compared the line to the hook's absolute path as text would
+        fail every one of those installs, which is a red `doctor` on a machine
+        with nothing wrong -- worse than the false green it replaced.
+
+        The sandbox puts `WOSWOAR_DIR` outside `$HOME`, where `install` writes
+        an absolute path, so this has to move it in: without that the fixture
+        cannot tell the two spellings apart.
+        """
+        os.environ["WOSWOAR_DIR"] = str(self.home / ".local/share/woswoar")
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+
+        text = (self.home / ".bashrc").read_text(encoding="utf-8")
+        self.assertIn('source "$HOME/', text, "the fixture wrote an absolute path")
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_another_installers_source_line_is_not_mistaken_for_ours(self) -> None:
+        """An rc file is full of `source` lines and exactly one is woswoar's.
+
+        Reading the first one in the file would report nvm's path as the hook's
+        -- a red `doctor` on a healthy machine, with a remedy that changes
+        nothing. The marked block is what makes this answerable at all, and it
+        has to be the thing searched rather than merely the thing found.
+        """
+        rcfile = self.home / ".bashrc"
+        rcfile.write_text('source "$HOME/.nvm/nvm.sh"\n', encoding="utf-8")
+        support.run_cli("install")
+
+        self.assertTrue(
+            rcfile.read_text(encoding="utf-8").index("nvm.sh")
+            < rcfile.read_text(encoding="utf-8").index(install.BEGIN),
+            "the fixture's other source line has to come first to test anything",
+        )
+        self.assertIn("[ok] bashrc", support.run_cli("doctor").out)
+
+    def test_a_block_that_sources_nothing_is_not_a_missing_block(self) -> None:
+        """Three states, three lines: someone who has never installed, someone
+        whose line points at the wrong file, and someone who edited the block
+        down to a comment. Telling the third they have no woswoar block sends
+        them looking for something that is right in front of them."""
+        (self.home / ".bashrc").write_text("", encoding="utf-8")
+        support.run_cli("install")
+        (self.home / ".bashrc").write_text(
+            f"{install.BEGIN}\n# I took this out for a bit\n# <<< woswoar <<<\n",
+            encoding="utf-8",
+        )
+        out = support.run_cli("doctor").out
+        self.assertIn("[FAIL] bashrc", out)
+        self.assertIn("sources nothing", out)
+        self.assertNotIn("has no woswoar block", out)
 
     def test_a_machine_with_nothing_installed_still_reports_a_shell(self) -> None:
         """`installed_shells()` is empty before the first `install`, and a doctor

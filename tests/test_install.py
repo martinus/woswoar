@@ -46,21 +46,35 @@ class TestPortableHookPath(unittest.TestCase):
         )
 
 
+class TestTheSuiteCannotReachTheRealHome(WoswoarTestCase):
+    """The guard the incident asks for, and the reason it is in *this* file.
+
+    `install` is the one command that writes outside `store`'s directories:
+    `rcfile_for` is `Path.home() / ".bashrc"`, and no XDG variable stands in
+    front of it. Two tests here ran it with no `--rcfile` while `$HOME` was
+    still the developer's own, so the suite edited the `.bashrc` and `.zshrc` of
+    the machine running it -- pointing them at a sandbox that `tearDown` then
+    deleted. That is a broken shell, found months later on a real machine.
+
+    So this asserts the sandbox rather than any behaviour of woswoar: a test
+    must not be able to reach the real home by *forgetting* to redirect it.
+    """
+
+    def test_home_is_the_sandbox(self) -> None:
+        self.assertEqual(Path.home(), self.home)
+        self.assertEqual(install.rcfile_for("bash").parent, self.home)
+
+    def test_the_login_shell_of_the_machine_running_the_suite_does_not_leak(self) -> None:
+        """`auto` reads `$SHELL` when there is no rc file to go on, so leaving it
+        alone makes `install --shell auto` answer differently on a developer's
+        zsh box than in CI. That has cost a release before, in the fzf check."""
+        self.assertEqual(os.environ["SHELL"], "/bin/bash")
+
+
 class TestInstall(WoswoarTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._home_before = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.home)
-        self.addCleanup(self._restore_home)
         self.rcfile = self.home / ".bashrc"
-
-    def _restore_home(self) -> None:
-        if self._home_before is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._home_before
 
     def install(self) -> str:
         self.assertEqual(main(["install", "--rcfile", str(self.rcfile)]), 0)
@@ -192,25 +206,6 @@ class TestShellDetection(WoswoarTestCase):
     unconditionally puts a `~/.zshrc` on the machine of somebody who has never
     run zsh.
     """
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._saved = {key: os.environ.get(key) for key in ("HOME", "SHELL")}
-        self.addCleanup(self._restore)
-        os.environ["HOME"] = str(self.home)
-        # Never inherited from the machine running the suite: `auto`'s fallback
-        # reads it, so a developer whose login shell is zsh would otherwise get
-        # a different answer from CI.
-        os.environ["SHELL"] = "/bin/bash"
-
-    def _restore(self) -> None:
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     def rcfiles(self, *shells: str) -> None:
         for shell in shells:
@@ -418,22 +413,9 @@ class TestBothShellsRecordIntoOneHistory(WoswoarTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._saved = {key: os.environ.get(key) for key in ("HOME", "SHELL")}
-        self.addCleanup(self._restore)
-        os.environ["HOME"] = str(self.home)
-        os.environ["SHELL"] = "/bin/bash"
         for name in (".bashrc", ".zshrc"):
             (self.home / name).write_text("", encoding="utf-8")
         self.assertEqual(main(["install"]), 0)
-
-    def _restore(self) -> None:
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     def run_shell(self, argv: list[str], rcfile: str, marker: str) -> None:
         """One command, in a shell that loads its own rc file the way a login does.
@@ -555,19 +537,8 @@ class TestTheRefreshNeverCreates(WoswoarTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self._home = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.home)
-        self.addCleanup(self._restore)
         (self.home / ".bashrc").write_text("# mine\n", encoding="utf-8")
         self.assertEqual(main(["install", "--shell", "bash"]), 0)
-
-    def _restore(self) -> None:
-        if self._home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._home
 
     def hook(self, shell: str) -> Path:
         return store.data_dir() / install.HOOKS[shell]

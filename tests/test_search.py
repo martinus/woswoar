@@ -1570,7 +1570,6 @@ class TestTheDirectoryPromptUnderARealFzf(WoswoarTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.home = self.root / "home"
         # `session-manager`, not `proj`, and that is the whole fixture: a path
         # with no scope name in it answers `global` under the old substring arms
         # too, so this test passed against them -- verified by running it with
@@ -1744,20 +1743,16 @@ class TestThePreviewUnderARealFzf(WoswoarTestCase):
 
 
 class DirScopeCase(WoswoarTestCase):
-    """A sandbox with a home of its own, and a way to stand somewhere in it.
+    """A way to stand somewhere in the sandbox home.
 
     Shared because getting the fixture right is most of what testing `dir`
-    costs: `$HOME` is not in `store.ENV_KEYS`, so the base class does not
-    isolate it, and `os.chdir` does not touch `$PWD` -- it is the *shell* that
-    maintains that. A test that only chdir'd would exercise the `getcwd`
-    fallback while believing it exercised the `$PWD` path.
+    costs: `os.chdir` does not touch `$PWD` -- it is the *shell* that maintains
+    that. A test that only chdir'd would exercise the `getcwd` fallback while
+    believing it exercised the `$PWD` path.
     """
 
     def setUp(self) -> None:
         super().setUp()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self.set_env("HOME", str(self.home))
         self.addCleanup(os.chdir, os.getcwd())
         self.ts = NOW
 

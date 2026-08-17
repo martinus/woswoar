@@ -51,19 +51,6 @@ class SetupTestCase(WoswoarTestCase):
         self._tty.start()
         self.addCleanup(self._tty.stop)
 
-        # `importer` resolves every default path from `Path.home()`, and
-        # `WoswoarTestCase` redirects the XDG variables but not HOME -- so
-        # without this these tests read the developer's own shell history and
-        # `setup` offers to import it.
-        previous = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.root)
-        self.addCleanup(
-            lambda: (
-                os.environ.__setitem__("HOME", previous)
-                if previous is not None
-                else os.environ.pop("HOME", None)
-            )
-        )
         # Step 1 asks an extra question when a tool is missing, so leaving this
         # to the machine makes every scripted answer below land on a different
         # prompt depending on whether fzf happens to be installed. CI installs

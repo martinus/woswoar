@@ -308,10 +308,27 @@ ENV_KEYS = store.ENV_KEYS
 
 
 class WoswoarTestCase(unittest.TestCase):
-    """Runs each test against a throwaway WOSWOAR_DIR.
+    """Runs each test against a throwaway WOSWOAR_DIR and a throwaway ``$HOME``.
 
     Every path in :mod:`woswoar.store` is resolved from the environment on each
     call rather than at import time, which is what makes this isolation work.
+
+    ``$HOME`` is redirected here rather than in each test class that happens to
+    need it, and that is not tidiness. `store.ENV_KEYS` does not contain HOME --
+    it never had to, because every path `store` resolves has an XDG variable in
+    front of it -- but `install` does not go through `store` to find a shell's
+    rc file: `rcfile_for` is `Path.home() / ".bashrc"`. So two tests here that
+    ran `install` with no `--rcfile` wrote a woswoar block into the **developer's
+    own** `~/.bashrc` and `~/.zshrc`, pointing at a `WOSWOAR_DIR` that the very
+    next line of `tearDown` deleted. That is a broken shell on the machine
+    running the suite: every interactive session printed a `No such file or
+    directory` and recorded nothing. It was found on a real machine, months
+    after the fact, by a `doctor` that said the bashrc was fine.
+
+    Four test classes had already grown their own copy of this redirect for
+    smaller versions of the same reason -- reading the developer's real shell
+    history, offering to import it. The lesson those four missed is that a test
+    must not be able to reach the real home *by forgetting to say so*.
     """
 
     def setUp(self) -> None:
@@ -328,11 +345,22 @@ class WoswoarTestCase(unittest.TestCase):
         self.root = Path(self._tmp.name).resolve()
         self.addCleanup(self._tmp.cleanup)
 
-        self._saved = {key: os.environ.get(key) for key in ENV_KEYS}
+        self._saved = {key: os.environ.get(key) for key in (*ENV_KEYS, "HOME", "SHELL")}
         self.addCleanup(self._restore_env)
 
         for key in ENV_KEYS:
             os.environ.pop(key, None)
+        # A directory of its own rather than `self.root`: `install` writes into
+        # `$HOME` and so does the importer, and a test asserting on what is in
+        # the sandbox root should not have to know which of those put it there.
+        self.home = self.root / "home"
+        self.home.mkdir()
+        os.environ["HOME"] = str(self.home)
+        # For the same reason, one variable further out: `install`'s `auto` falls
+        # back to `$SHELL` when there is no rc file to go on, so a developer
+        # whose login shell is zsh would otherwise get a different answer from
+        # CI. A test that is *about* that fallback sets it to what it needs.
+        os.environ["SHELL"] = "/bin/bash"
         os.environ["WOSWOAR_DIR"] = str(self.root / "data")
         os.environ["XDG_CONFIG_HOME"] = str(self.root / "config")
         os.environ["XDG_CACHE_HOME"] = str(self.root / "cache")
