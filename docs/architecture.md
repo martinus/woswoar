@@ -213,10 +213,13 @@ broken, and they want to be read in one sequence rather than found in three file
 
 So the file came down by a tenth and is still well over 3000 lines, not the
 ~1500 that [#203](https://github.com/martinus/woswoar/issues/203) asks for. That
-target is
-not met and is not being quietly dropped: what the two slices bought is that
-`tests/test_sync.py` can now reach the authenticity layer and the git plumbing
-without driving `run()`, which is the ratio #203 was actually measuring.
+target is not met and is not being quietly dropped. What the two slices bought is
+the other criterion: a behaviour of either layer can now be reached without
+driving `run()`. `tests/test_manifest.py` is the first collection of that, and it
+is not a tidiness exercise — `manifest.signs_and_verifies` is the check behind
+`doctor`'s `signing` line, and while it sat inline in `sync.signing_status`
+nothing in the suite reached it. Replacing the verify call with `return False`
+survived every one of the 966 tests.
 
 Of the three concerns still in there, two really are a redesign of `run` rather
 than a move — trust and pinning is a set of functions that each take `State` and
