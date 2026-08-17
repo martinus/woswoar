@@ -47,17 +47,12 @@ class TestPortableHookPath(unittest.TestCase):
 
 
 class TestTheSuiteCannotReachTheRealHome(WoswoarTestCase):
-    """The guard the incident asks for, and the reason it is in *this* file.
+    """The guard for `WoswoarTestCase`'s `$HOME` redirect -- see its docstring
+    for the incident, which is one this file's tests caused.
 
-    `install` is the one command that writes outside `store`'s directories:
-    `rcfile_for` is `Path.home() / ".bashrc"`, and no XDG variable stands in
-    front of it. Two tests here ran it with no `--rcfile` while `$HOME` was
-    still the developer's own, so the suite edited the `.bashrc` and `.zshrc` of
-    the machine running it -- pointing them at a sandbox that `tearDown` then
-    deleted. That is a broken shell, found months later on a real machine.
-
-    So this asserts the sandbox rather than any behaviour of woswoar: a test
-    must not be able to reach the real home by *forgetting* to redirect it.
+    It belongs here because `install` is the command that made it reachable:
+    `rcfile_for` is `Path.home() / ".bashrc"`, the one path in woswoar with no
+    XDG variable in front of it.
     """
 
     def test_home_is_the_sandbox(self) -> None:
@@ -65,9 +60,16 @@ class TestTheSuiteCannotReachTheRealHome(WoswoarTestCase):
         self.assertEqual(install.rcfile_for("bash").parent, self.home)
 
     def test_the_login_shell_of_the_machine_running_the_suite_does_not_leak(self) -> None:
-        """`auto` reads `$SHELL` when there is no rc file to go on, so leaving it
-        alone makes `install --shell auto` answer differently on a developer's
-        zsh box than in CI. That has cost a release before, in the fzf check."""
+        """`auto` falls back to `$SHELL` when there is no rc file to go on, so
+        an un-scrubbed one makes `install` answer differently on a developer's
+        zsh box than in CI. That has cost a release before, in the fzf check.
+
+        The behaviour first, because that is the property worth having. The
+        constant after it, because the behaviour alone cannot fail on a machine
+        whose login shell is already bash -- which is most of them, and would
+        leave this silent exactly where a guard is cheapest to lose.
+        """
+        self.assertEqual(install.detect_shells(), ["bash"])
         self.assertEqual(os.environ["SHELL"], "/bin/bash")
 
 
@@ -472,10 +474,9 @@ class TestInstallHardensAfterItCopies(WoswoarTestCase):
         previous_mask = os.umask(0)
         self.addCleanup(os.umask, previous_mask)
 
-        # `--rcfile` rather than a fifth copy of this file's redirect-`$HOME`
-        # fixture. The only reason to move `$HOME` would be to keep the block out
-        # of the real `~/.bashrc`, and naming a file does that; nothing here reads
-        # a rc file, because `--shell bash` means detection never runs.
+        # `--rcfile` because what is under test is the *hook's* mode, and naming
+        # the file keeps the rc file out of it entirely: `--shell bash` means
+        # detection never runs, so nothing here reads one.
         rcfile = self.root / "bashrc"
         self.assertEqual(main(["install", "--shell", "bash", "--rcfile", str(rcfile)]), 0)
         # `support.loose_paths`, not `store.readable_by_others`: the latter and

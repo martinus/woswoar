@@ -105,7 +105,7 @@ def _never_asks(prompt: str = "") -> str:
 
 
 class TestItRefusesWithNobodyToAsk(WoswoarTestCase):
-    """No HOME redirection needed: it exits before reading anything."""
+    """None of `SetupTestCase`'s fixture needed: it exits before asking."""
 
     def test_a_pipe_gets_the_commands_to_run_instead(self) -> None:
         with (
@@ -333,7 +333,7 @@ class TestTheBareCommandOnAFreshMachine(SetupTestCase):
             main_module.cmd_status(argparse.Namespace())
         self.assertTrue(answers.asked, "setup never ran")
         # `cmd_status` passes no --rcfile, so this is the default ~/.bashrc --
-        # under the redirected HOME, not the one the other tests here point at.
+        # the sandbox's, not the one the other tests here name explicitly.
         self.assertIn("woswoar", (Path.home() / ".bashrc").read_text(encoding="utf-8"))
 
     def test_a_hook_alone_is_enough_to_be_reported_on_instead(self) -> None:
