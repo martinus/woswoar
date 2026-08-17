@@ -30,7 +30,7 @@ import subprocess
 import time
 import zlib
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,8 +83,225 @@ class SyncError(WoswoarError):
     pass
 
 
+class Outcome:
+    """One way a sync run goes other than plainly working.
+
+    Everything about a kind in one literal: what it is called, how loudly to say
+    it, and the paragraph that explains it. Those three used to live apart -- a
+    field on `Report`, a `warning=True` argument, and one branch of a 143-line
+    `notices` -- and the drift that costs was already visible before this: a
+    field comment here named `trust` where the message on screen names `accept`.
+
+    Declaring them together is also what makes them movable, which is the reason
+    this landed before #201 rather than after. A kind now travels with the code
+    that detects it: the constant, its prose and the `record` call are the whole
+    of it, and neither `Report` nor `notices` names a single one of them.
+
+    ``body`` is handed the subjects already sorted. Every message that lists them
+    listed them sorted, and the ones that only count them do not care -- so the
+    sort belongs here rather than being repeated, or forgotten, in each.
+
+    A plain class rather than the `NamedTuple` this file uses elsewhere, because
+    these are singletons used as dictionary keys and identity is the equality
+    wanted. A tuple compares by value, so two kinds that happened to be worded
+    alike would silently be one key.
+    """
+
+    def __init__(
+        self, name: str, body: Callable[[list[str]], str], *, warning: bool = False
+    ) -> None:
+        #: For `repr` alone: a failing test prints the whole `Report`, and
+        #: `<Outcome unreadable>` is the difference between reading that and not.
+        self.name = name
+        self.body = body
+        #: Worth shouting about: the repository disagrees with what this machine
+        #: expects, or history could not be published. The quieter ones are
+        #: ordinary states -- a machine not granted access yet, a peer nobody has
+        #: accepted -- which are not going wrong so much as not finished.
+        self.warning = warning
+        OUTCOMES.append(self)
+
+    def __repr__(self) -> str:
+        return f"<Outcome {self.name}>"
+
+
+#: Every kind of outcome, in the order a run reports them. Appended to by
+#: `Outcome` itself as each is declared, rather than written out a second time
+#: underneath them: a hand-kept list is a second thing to keep in step, and a
+#: kind missing from it would never be reported at all -- silently, because
+#: nothing else reads this.
+OUTCOMES: list[Outcome] = []
+
+
+#: "<host>/<day>" entries sealed before this machine was enrolled. Not an error:
+#: it is what a freshly joined machine sees until someone runs `grant` on a
+#: machine that was already a recipient.
+UNREADABLE = Outcome(
+    "unreadable",
+    lambda days: (
+        f"{len(days)} day(s) of history are sealed to recipients that do not include\n"
+        "this machine - it joined after they were written.\n"
+        f"{_GRANT_REMEDY}"
+    ),
+)
+
+#: "<host>/<day>" left exactly as it was, because rebuilding it would have needed
+#: a chunk this machine could not read. Stale rather than short: the day keeps
+#: every line it already had, and the next sync tries again.
+STALE = Outcome(
+    "stale",
+    lambda days: (
+        f"{len(days)} day(s) could not be rebuilt, and were left exactly as\n"
+        "they were rather than rewritten from the part that could be read:\n"
+        f"{', '.join(days)}\n"
+        "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
+        "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
+        "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
+        "did."
+    ),
+)
+
+#: Hosts publishing history under a signing key nobody here has accepted. Not an
+#: error and usually not an attack.
+UNTRUSTED = Outcome(
+    "untrusted",
+    lambda hosts: (
+        f"{len(hosts)} machine(s) publish history this one has not been\n"
+        "told to accept, so none of it was merged. That is what a machine enrolled\n"
+        "since this one last looked is supposed to look like.\n"
+        "    woswoar accept"
+    ),
+)
+
+#: Hosts whose pin was dropped because a tombstone withdrew them.
+UNPINNED = Outcome(
+    "unpinned",
+    lambda hosts: (
+        f"{len(hosts)} machine(s) were withdrawn by a revocation. Nothing\n"
+        "they publish is accepted here any more, including history they published\n"
+        "before it that this machine had not yet merged."
+    ),
+)
+
+#: Hosts now publishing under a different key than the one pinned here. Never
+#: resolved silently.
+CHANGED_SIGNER = Outcome(
+    "changed_signer",
+    lambda hosts: (
+        f"{len(hosts)} machine(s) now sign with a different\n"
+        "key than the one accepted here, and nothing from them was merged. That is\n"
+        "either a machine that was re-enrolled or someone rewriting the repository,\n"
+        "and woswoar cannot tell which. If you re-enrolled it, accept the new key:\n"
+        "    woswoar trust --replace"
+    ),
+    warning=True,
+)
+
+#: Days of this machine's own history it could not extend, because the manifest
+#: already there is one it cannot verify.
+UNSIGNABLE = Outcome(
+    "unsignable",
+    lambda days: (
+        f"{len(days)} day(s) of this machine's own history\n"
+        "could not be published, because the signed list already in the repository\n"
+        "for them is not one this machine can verify. Publishing a replacement\n"
+        "would disown everything it published earlier on those days.\n"
+        "If this machine's signing key was replaced, that is why: days it signed\n"
+        "with the old one stay as they are, and new days publish normally."
+    ),
+    warning=True,
+)
+
+#: Days of this machine's own history whose sealed day key has gone while chunks
+#: sealed to its public half remain. Nothing further is written for them, because
+#: a new key cannot rescue what the old one sealed.
+ORPHANED = Outcome(
+    "orphaned",
+    lambda days: (
+        f"{len(days)} day(s) of this machine's own history\n"
+        f"cannot be published: {', '.join(days)}\n"
+        "Their sealed key is missing from the repository while chunks encrypted to\n"
+        "it are still there. Those chunks are unreadable by every machine, and a\n"
+        "new key would not change that -- so nothing more is written for those\n"
+        "days rather than adding chunks nobody will ever read.\n"
+        "The commands themselves are still in this machine's own logs.\n"
+        f"{_restore_remedy('hosts/<id>/keys/<day>.age')}"
+        "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
+        "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
+        "this machine starts a new key and publishes again."
+    ),
+    warning=True,
+)
+
+#: Days this machine has published before whose signed manifest has gone. Nothing
+#: is written for them.
+MANIFEST_MISSING = Outcome(
+    "manifest_missing",
+    lambda days: (
+        f"{len(days)} day(s) of this machine's own\n"
+        f"history cannot be published: {', '.join(days)}\n"
+        "The signed list this machine published for them is gone from the\n"
+        "repository. Signing a replacement would name only what is written now,\n"
+        "so every chunk published earlier that day would stop being one any peer\n"
+        "accepts. Nothing is written for those days instead.\n"
+        f"{_restore_remedy('hosts/<id>/manifests/<day>')}"
+        "'woswoar doctor' prints the days."
+    ),
+    warning=True,
+)
+
+#: "<day>/<name>" chunks sitting under *this* machine's own id that it never
+#: published. Nothing else would ever look at them -- `merge` skips our own id --
+#: and they are deliberately not swept into a manifest we sign.
+FOREIGN = Outcome(
+    "foreign",
+    lambda chunks: (
+        f"{len(chunks)} chunk(s) sit under this machine's own id that it\n"
+        "never signed. They are inert: no machine will read them, including this\n"
+        "one, and nothing was lost -- whatever was in them has been published again\n"
+        "under a chunk that is signed.\n"
+        "Two things look like this and cannot be told apart from here: a run of\n"
+        "this machine that was killed between writing a chunk and signing for it,\n"
+        "and someone else writing into the repository. A power cut is the ordinary\n"
+        "explanation. 'woswoar doctor' lists them under 'chunks'."
+    ),
+)
+
+#: "<host>/<day>" entries that could not be authenticated, and so were refused
+#: rather than merged.
+#:
+#: One category on purpose: a manifest that is missing, malformed, signed by the
+#: wrong key, or signed for another day are the same answer, as is a chunk whose
+#: digest it does not list. Splitting them on the shape of the bytes was tried
+#: and reverted, because an attacker can produce any of those shapes at will --
+#: so the split told the reassuring story for exactly the case that most needed
+#: reporting.
+UNAUTHENTICATED = Outcome(
+    "unauthenticated",
+    lambda days: (
+        f"{len(days)} day(s) of history could not be\n"
+        "authenticated and were refused. Every machine signs a list of the chunks\n"
+        "it published, so this means the repo contains history none of your\n"
+        "machines put its name to - someone else can write to it."
+    ),
+    warning=True,
+)
+
+
 @dataclass
 class Report:
+    """What one sync run did.
+
+    Seventeen fields once: four counters, two flags, a set of hosts, and ten
+    more sets that were each a *kind* of outcome. Those ten are now one
+    dictionary keyed by `Outcome`, which is what makes adding a failure mode a
+    single `record` call beside the code that detects it, rather than an edit to
+    this class, to `notices` and to the tests in lockstep.
+
+    What is left as a field is what is genuinely a field: how much was moved, and
+    two states of the machine itself.
+    """
+
     chunks_written: int = 0
     lines_exported: int = 0
     chunks_merged: int = 0
@@ -93,52 +310,10 @@ class Report:
     #: that was already level with the remote and committed nothing sets it
     #: without sending anything, because there was nothing to send.
     pushed: bool = False
-    #: "<host>/<day>" left exactly as it was, because rebuilding it would have
-    #: needed a chunk this machine could not read. Stale rather than short: the
-    #: day keeps every line it already had, and the next sync tries again.
-    stale: set[str] = field(default_factory=set)
+    #: Every other machine whose history this run looked at, whether or not it
+    #: had anything new. Not an outcome: it is the denominator the summary line
+    #: is stated against, and there is nothing to warn about.
     hosts_seen: set[str] = field(default_factory=set)
-    #: "<host>/<day>" entries sealed before this machine was enrolled. Not an
-    #: error: it is what a freshly joined machine sees until someone runs
-    #: `grant` on a machine that was already a recipient.
-    unreadable: set[str] = field(default_factory=set)
-    #: "<host>/<day>" entries that could not be authenticated, and so were
-    #: refused rather than merged.
-    #:
-    #: One category on purpose: a manifest that is missing, malformed, signed by
-    #: the wrong key, or signed for another day are the same answer, as is a
-    #: chunk whose digest it does not list. Splitting them on the shape of the
-    #: bytes was tried and reverted, because an attacker can produce any of those
-    #: shapes at will -- so the split told the reassuring story for exactly the
-    #: case that most needed reporting.
-    unauthenticated: set[str] = field(default_factory=set)
-    #: Hosts publishing history under a signing key nobody here has accepted.
-    #: Not an error and usually not an attack. `notices` says what it is and
-    #: which command settles it -- the explanation lives there now, and this
-    #: comment carried a second, drifted copy that named `trust` where the
-    #: message on screen names `accept`.
-    untrusted: set[str] = field(default_factory=set)
-    #: Hosts now publishing under a different key than the one pinned here.
-    #: Never resolved silently; `notices` explains why and what to do.
-    changed_signer: set[str] = field(default_factory=set)
-    #: Hosts whose pin was dropped because a tombstone withdrew them.
-    unpinned: set[str] = field(default_factory=set)
-    #: Days of this machine's own history it could not extend, because the
-    #: manifest already there is one it cannot verify. `notices` explains what
-    #: that costs and why nothing is written for them.
-    unsignable: set[str] = field(default_factory=set)
-    #: Days of this machine's own history whose sealed day key has gone while
-    #: chunks sealed to its public half remain. Nothing further is written for
-    #: them, because a new key cannot rescue what the old one sealed.
-    orphaned: set[str] = field(default_factory=set)
-    #: Days this machine has published before whose signed manifest has gone.
-    #: Nothing is written for them; `notices` explains why and how to recover
-    #: the file.
-    manifest_missing: set[str] = field(default_factory=set)
-    #: "<day>/<name>" chunks sitting under *this* machine's own id that it never
-    #: published. Nothing else would ever look at them -- `merge` skips our own
-    #: id -- and they are deliberately not swept into a manifest we sign.
-    foreign: set[str] = field(default_factory=set)
     #: True when this machine's own key was withdrawn. It publishes nothing --
     #: nobody would accept it -- and reads nothing new. Recording carries on;
     #: `grant` cannot undo it, and saying otherwise would send someone to another
@@ -149,7 +324,27 @@ class Report:
     #: With per-machine signing there is no such state: publishing needs nothing
     #: from anyone, and a machine still waiting for `grant` simply reports the
     #: days it cannot read, like any other unreadable history.
+    #:
+    #: A flag rather than an `Outcome` because it has no subjects to count and it
+    #: silences every other notice; see `silent`.
     revoked: bool = False
+    #: Everything that went other than plainly, by kind. Absent means none, which
+    #: is why `record` and `subjects` exist rather than callers reaching in.
+    outcomes: dict[Outcome, set[str]] = field(default_factory=dict)
+
+    def record(self, kind: Outcome, subject: str) -> None:
+        """Note that `subject` -- a day, a host, a chunk -- came out this way."""
+        self.outcomes.setdefault(kind, set()).add(subject)
+
+    def subjects(self, kind: Outcome) -> set[str]:
+        """Everything recorded under `kind`, empty if nothing was.
+
+        For reading only. The empty case is a fresh set rather than a stored
+        one, so writing through it does nothing and `record` stays the single way
+        in -- which is what lets a kind nothing happened under simply be absent
+        from the dictionary rather than present and empty.
+        """
+        return self.outcomes.get(kind, set())
 
     @property
     def silent(self) -> bool:
@@ -170,8 +365,10 @@ class Report:
         Here rather than in `cmd_sync`, which is where all of it used to be: the
         condition, the count and the prose were eleven `if report.X:` blocks in
         the CLI, so "does this run warn about a changed signer" was a question
-        only a test that grepped stderr could ask. What each field *means* is
-        this class's to know; how it reaches a terminal is `report`'s.
+        only a test that grepped stderr could ask. Then they were eleven blocks
+        here instead, which was the same method with a better address. Now the
+        prose sits on the kind and this is the loop over them -- so a new kind
+        does not touch this at all.
 
         These are the notices this class alone decides. The paragraphs
         `cmd_grant`, `cmd_revoke`, `cmd_trust` and `cmd_accept` print are
@@ -181,6 +378,8 @@ class Report:
         would print the reasons someone might answer no after the question.
         """
         if self.silent:
+            # Not an `Outcome`: it has nothing to count, and it replaces the
+            # report rather than joining it.
             return [
                 Notice(
                     "This machine's access to the shared history was revoked, so nothing\n"
@@ -194,113 +393,10 @@ class Report:
             ]
 
         out: list[Notice] = []
-
-        def say(body: str, warning: bool = False) -> None:
-            """One notice. A helper so the prose stays at a readable column --
-            nested inside `out.append(Notice(` it started eight columns in, and
-            the one body that had to be re-wrapped for it was the one body whose
-            source lines stopped matching the lines it prints."""
-            out.append(Notice(body, warning))
-
-        if self.unreadable:
-            # The count is a local here and nowhere else, because
-            # `{len(self.unreadable)}` is twenty-two source columns for what
-            # prints as one or two -- enough to push this line past the limit and
-            # force a wrap that would stop the source reading like the output.
-            days = len(self.unreadable)
-            say(
-                f"{days} day(s) of history are sealed to recipients that do not include\n"
-                "this machine - it joined after they were written.\n"
-                f"{_GRANT_REMEDY}"
-            )
-        if self.stale:
-            say(
-                f"{len(self.stale)} day(s) could not be rebuilt, and were left exactly as\n"
-                "they were rather than rewritten from the part that could be read:\n"
-                f"{', '.join(sorted(self.stale))}\n"
-                "Nothing was lost. If it persists, a chunk of that day is damaged in this\n"
-                "checkout, or missing from it; woswoar never rewrites or deletes a chunk,\n"
-                "so 'git -C ~/.local/share/woswoar/history log --diff-filter=MD' finds who\n"
-                "did."
-            )
-        if self.untrusted:
-            say(
-                f"{len(self.untrusted)} machine(s) publish history this one has not been\n"
-                "told to accept, so none of it was merged. That is what a machine enrolled\n"
-                "since this one last looked is supposed to look like.\n"
-                "    woswoar accept"
-            )
-        if self.unpinned:
-            say(
-                f"{len(self.unpinned)} machine(s) were withdrawn by a revocation. Nothing\n"
-                "they publish is accepted here any more, including history they published\n"
-                "before it that this machine had not yet merged."
-            )
-        if self.changed_signer:
-            say(
-                f"{len(self.changed_signer)} machine(s) now sign with a different\n"
-                "key than the one accepted here, and nothing from them was merged. That is\n"
-                "either a machine that was re-enrolled or someone rewriting the repository,\n"
-                "and woswoar cannot tell which. If you re-enrolled it, accept the new key:\n"
-                "    woswoar trust --replace",
-                warning=True,
-            )
-        if self.unsignable:
-            say(
-                f"{len(self.unsignable)} day(s) of this machine's own history\n"
-                "could not be published, because the signed list already in the repository\n"
-                "for them is not one this machine can verify. Publishing a replacement\n"
-                "would disown everything it published earlier on those days.\n"
-                "If this machine's signing key was replaced, that is why: days it signed\n"
-                "with the old one stay as they are, and new days publish normally.",
-                warning=True,
-            )
-        if self.orphaned:
-            say(
-                f"{len(self.orphaned)} day(s) of this machine's own history\n"
-                f"cannot be published: {', '.join(sorted(self.orphaned))}\n"
-                "Their sealed key is missing from the repository while chunks encrypted to\n"
-                "it are still there. Those chunks are unreadable by every machine, and a\n"
-                "new key would not change that -- so nothing more is written for those\n"
-                "days rather than adding chunks nobody will ever read.\n"
-                "The commands themselves are still in this machine's own logs.\n"
-                f"{_restore_remedy('hosts/<id>/keys/<day>.age')}"
-                "'woswoar doctor' prints the host id and day. If it really is gone, delete\n"
-                "keys/<day>.pub to write the day off: the old chunks stay unreadable, but\n"
-                "this machine starts a new key and publishes again.",
-                warning=True,
-            )
-        if self.manifest_missing:
-            say(
-                f"{len(self.manifest_missing)} day(s) of this machine's own\n"
-                f"history cannot be published: {', '.join(sorted(self.manifest_missing))}\n"
-                "The signed list this machine published for them is gone from the\n"
-                "repository. Signing a replacement would name only what is written now,\n"
-                "so every chunk published earlier that day would stop being one any peer\n"
-                "accepts. Nothing is written for those days instead.\n"
-                f"{_restore_remedy('hosts/<id>/manifests/<day>')}"
-                "'woswoar doctor' prints the days.",
-                warning=True,
-            )
-        if self.foreign:
-            say(
-                f"{len(self.foreign)} chunk(s) sit under this machine's own id that it\n"
-                "never signed. They are inert: no machine will read them, including this\n"
-                "one, and nothing was lost -- whatever was in them has been published again\n"
-                "under a chunk that is signed.\n"
-                "Two things look like this and cannot be told apart from here: a run of\n"
-                "this machine that was killed between writing a chunk and signing for it,\n"
-                "and someone else writing into the repository. A power cut is the ordinary\n"
-                "explanation. 'woswoar doctor' lists them under 'chunks'."
-            )
-        if self.unauthenticated:
-            say(
-                f"{len(self.unauthenticated)} day(s) of history could not be\n"
-                "authenticated and were refused. Every machine signs a list of the chunks\n"
-                "it published, so this means the repo contains history none of your\n"
-                "machines put its name to - someone else can write to it.",
-                warning=True,
-            )
+        for kind in OUTCOMES:
+            subjects = self.subjects(kind)
+            if subjects:
+                out.append(Notice(kind.body(sorted(subjects)), kind.warning))
         return out
 
 
@@ -1311,7 +1407,7 @@ def apply_withdrawals(state: State, report: Report) -> None:
     """
     for host_id in sorted(withdrawn_hosts(state)):
         del state.signers[host_id]
-        report.unpinned.add(host_id)
+        report.record(UNPINNED, host_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1625,7 +1721,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             # chunks stayed unreadable, so nothing is written. The lines stay
             # pending -- `state.exported` is not advanced -- so they are still
             # in `logs/` and publish once the sealed key is restored.
-            report.orphaned.add(day)
+            report.record(ORPHANED, day)
             continue
 
         # A manifest this machine wrote before and that is no longer there.
@@ -1645,7 +1741,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         published_before = any(relpath in state.exported for relpath, _, _ in tails)
         has_manifest = not manifest_gone(known.id, day)
         if published_before and not has_manifest:
-            report.manifest_missing.add(day)
+            report.record(MANIFEST_MISSING, day)
             continue
 
         # What this machine has already put its name to for this day. Extended,
@@ -1658,7 +1754,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             # the signed list and every peer would then refuse them -- losing
             # published history to a file somebody else was able to corrupt.
             # Nothing is written for this day, and it is reported.
-            report.unsignable.add(day)
+            report.record(UNSIGNABLE, day)
             continue
 
         for relpath, data, new_offset in tails:
@@ -1697,7 +1793,8 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # every manifest, which is the cost this loop exists to avoid. A planted
         # chunk on a quiet day is refused by peers either way, because it is in
         # no manifest -- this is a report, not the defence.
-        report.foreign |= {f"{day}/{name}" for name in on_disk - set(listed)}
+        for name in on_disk - set(listed):
+            report.record(FOREIGN, f"{day}/{name}")
 
     # Set at the manifest rather than approximated by "we got past the guards".
     # A day can be refused for an orphaned key, a missing manifest or one that
@@ -1768,12 +1865,12 @@ def _trusted_signer(host_id: str, state: State, report: Report) -> str | None:
     """
     pinned = state.signers.get(host_id)
     if pinned is None:
-        report.untrusted.add(host_id)
+        report.record(UNTRUSTED, host_id)
         return None
 
     published = read_signer(host_id)
     if published and published.verify_key != pinned:
-        report.changed_signer.add(host_id)
+        report.record(CHANGED_SIGNER, host_id)
         return None
     return pinned
 
@@ -1893,7 +1990,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # missing, unsigned, mis-signed or mis-addressed manifest as
                 # well as a chunk simply absent from a good one -- see
                 # `Report.unauthenticated`.
-                report.unauthenticated.add(key)
+                report.record(UNAUTHENTICATED, key)
                 continue
 
             if chunk_day not in day_keys:
@@ -1908,7 +2005,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                     day_keys[chunk_day] = None
             secret = day_keys[chunk_day]
             if secret is None:
-                report.unreadable.add(key)
+                report.record(UNREADABLE, key)
                 continue
 
             # Authenticated before it is decrypted or decompressed, so age, zlib
@@ -1917,7 +2014,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             try:
                 blob = open_chunk(directory / name, day.listed[name].digest)
             except (OSError, ValueError):
-                report.unauthenticated.add(key)
+                report.record(UNAUTHENTICATED, key)
                 continue
 
             try:
@@ -1929,7 +2026,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 # abort the sync. Aborting would block this machine's own export
                 # and every other host's readable chunks, on this run and every
                 # run after it.
-                report.unreadable.add(key)
+                report.record(UNREADABLE, key)
                 continue
 
             day.add(plaintext, report)
@@ -1965,7 +2062,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             and bool(set(day.listed) - set(taken))
         )
         if refused:
-            report.stale.add(key)
+            report.record(STALE, key)
         else:
             day.flush(report)
             # Recorded only once the bytes are on disk. A refused rewrite that

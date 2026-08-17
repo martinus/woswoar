@@ -187,16 +187,24 @@ Match the density. [`CLAUDE.md`](../CLAUDE.md) and
 The layering above is real and holds. The *sizes* do not, and this section
 exists so that nobody has to rediscover it.
 
-**`sync.py` is 3415 lines holding five separable concerns** — the recipient-file
+**`sync.py` is 3512 lines holding five separable concerns** — the recipient-file
 grammar, trust and pinning, manifests, the chunk codec, and git plumbing — plus
-the orchestration that drives them and the status queries `doctor` asks. The
-visible symptom is `sync.Report`: **seventeen fields**, each a failure from a
-different one of those layers. #199 moved their prose out of `cmd_sync` into
-`Report.notices()`, which is a real testability win and *not* the collapse — the
-seventeen are still seventeen, so a new failure mode still means editing a field,
-`run`, `notices` and `test_sync.py` together, and `notices()` has inherited
-`Report`'s job of touching all five concerns. Collapsing them is what this issue
-was sequenced to receive.
+the orchestration that drives them and the status queries `doctor` asks.
+
+The visible symptom *was* `sync.Report`: seventeen fields, each a failure from a
+different one of those layers. #199 has collapsed it. The ten fields that were
+each a *kind* of outcome are one dictionary keyed by `sync.Outcome` — a declared
+constant carrying its own name, its severity and its paragraph — so `Report` is
+seven fields that name no kind at all, `notices()` is a loop over the kinds in
+declaration order, and a new failure mode is one `record` call beside the code
+that notices it.
+
+That did not make the file shorter; it is a hundred lines longer, because each
+kind now carries the comment that used to sit on its field. Shortening it was
+never the point. The prose is **movable** now: a kind is a constant, its prose
+and one call site, so each slice #201 carves out of this module takes its own
+kinds with it instead of leaving a 143-line method behind that binds all five
+concerns at once.
 
 **`__main__.py` is 1813 lines and inverts pattern 4 in two places.** An installer
 (`installed_shells`, `detect_shells`, `shells_from`, `_hook_bytes`,
@@ -225,9 +233,11 @@ It holds two, and the distinction between them is real rather than a compromise:
   gone.
 - **`Notice`** is an explanation — a paragraph with no label and nothing a marker
   could usefully say, because several of them carry a recovery recipe.
-  `Report.notices()` decides which of eleven apply, and `report.paragraphs`
-  renders them. `cmd_sync`'s eleven `if report.X:` blocks are one loop; the
-  twelfth, `if report.pushed`, is a summary line and stayed.
+  `Report.notices()` decides which apply and `report.paragraphs` renders them.
+  `cmd_sync`'s eleven `if report.X:` blocks became eleven in `notices()` and are
+  now a loop over `sync.OUTCOMES`; the twelfth, `if report.pushed`, is a summary
+  line and stayed. The prose lives on the kind, so neither `Report` nor
+  `notices()` mentions any individual one.
 
 Stretching `Check` to cover both was the other option and it was worse: the label
 column and the marker would have been dead weight on every notice, and `lines()`
@@ -252,6 +262,6 @@ first because they make the expensive one smaller.
 | | issue |
 |---|---|
 | 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
-| 2 | [#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting. `Check` and `Notice` have landed and both `doctor` and `cmd_sync` use them; **`Report`'s seventeen fields are not collapsed**, which was the part #201 was waiting on. |
+| 2 | ~~[#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting~~ — **done**, in three parts: `report.Check`, `report.Notice`, and `sync.Outcome` collapsing `Report`'s seventeen fields to seven. |
 | 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
 | 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |

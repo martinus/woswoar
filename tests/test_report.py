@@ -75,50 +75,67 @@ class TestNotices(unittest.TestCase):
     def test_a_clean_run_says_nothing(self) -> None:
         self.assertEqual(sync.Report().notices(), [])
 
-    #: Every state that produces a notice, and whether it shouts. One list, not
-    #: three: the field names were written out for the count, for the severity,
-    #: and again as the expected sets, so adding a twelfth notice meant editing
-    #: three places and a partial edit left a silently weaker test.
+    #: Every kind that produces a notice, in report order, and whether it
+    #: shouts. Written out by hand on purpose: `sync.OUTCOMES` carries both
+    #: facts now, so reading the severity off the kind and asserting it against
+    #: itself would pass whatever the declaration said. This is the second
+    #: opinion, and the test below ties the two together so a new kind cannot
+    #: arrive without one.
     STATES: ClassVar[dict[str, bool]] = {
         "unreadable": False,
         "stale": False,
         "untrusted": False,
         "unpinned": False,
-        "foreign": False,
         "changed_signer": True,
         "unsignable": True,
         "orphaned": True,
         "manifest_missing": True,
+        "foreign": False,
         "unauthenticated": True,
     }
 
-    def test_each_state_produces_exactly_one_notice_at_the_right_volume(self) -> None:
+    def test_each_kind_produces_exactly_one_notice_at_the_right_volume(self) -> None:
         """Severity is data now, so it can be asserted rather than grepped for.
         The quiet ones are states that are not going wrong -- a machine waiting
         to be accepted -- and the loud ones are the repository disagreeing with
         this machine, or history that could not be published."""
-        for field, shouts in self.STATES.items():
-            with self.subTest(field=field):
+        for kind in sync.OUTCOMES:
+            with self.subTest(kind=kind.name):
                 report_ = sync.Report()
-                setattr(report_, field, {"host/2026-01-01"})
+                report_.record(kind, "host/2026-01-01")
                 notices = report_.notices()
-                self.assertEqual(len(notices), 1, f"{field} produced the wrong count")
-                self.assertIs(notices[0].warning, shouts)
+                self.assertEqual(len(notices), 1, f"{kind.name} produced the wrong count")
+                self.assertIs(notices[0].warning, self.STATES[kind.name])
 
-    def test_every_reportable_field_is_covered(self) -> None:
-        """Without this, deleting a row above would quietly stop testing that
-        state -- the loop would simply have one fewer thing to do."""
+    def test_every_kind_is_covered_by_the_table_above(self) -> None:
+        """Both directions, and both matter. A kind missing from `STATES` is one
+        whose severity nobody stated twice; a row left in `STATES` after its kind
+        went is a `KeyError` waiting in the loop above rather than here, which is
+        a worse place to read it."""
+        self.assertEqual([kind.name for kind in sync.OUTCOMES], list(self.STATES))
+
+    def test_the_notices_come_out_in_the_order_the_kinds_are_declared(self) -> None:
+        """Recorded backwards on purpose. `Report.outcomes` is a dict, and a dict
+        preserves the order things were put into it -- so a `notices` that looped
+        over what this run happened to record, rather than over `OUTCOMES`, would
+        pass any test that recorded them in the right order to begin with. What
+        `cmd_sync` printed was a fixed sequence of `if` blocks, and it should
+        stay one.
+        """
         every = sync.Report()
-        for field in self.STATES:
-            setattr(every, field, {"host/2026-01-01"})
-        self.assertEqual(len(every.notices()), len(self.STATES))
+        for kind in reversed(sync.OUTCOMES):
+            every.record(kind, "host/2026-01-01")
+        self.assertEqual(
+            [notice.body for notice in every.notices()],
+            [kind.body(["host/2026-01-01"]) for kind in sync.OUTCOMES],
+        )
 
     def test_a_revoked_machine_is_told_that_and_nothing_else(self) -> None:
         """Every other line would describe work it did not do: it publishes
         nothing and merges nothing."""
         report_ = sync.Report(revoked=True)
-        report_.unreadable = {"host/2026-01-01"}
-        report_.unauthenticated = {"host/2026-01-02"}
+        report_.record(sync.UNREADABLE, "host/2026-01-01")
+        report_.record(sync.UNAUTHENTICATED, "host/2026-01-02")
         notices = report_.notices()
         self.assertEqual(len(notices), 1)
         self.assertIn("revocation is permanent", notices[0].body)
@@ -135,7 +152,8 @@ class TestNotices(unittest.TestCase):
         """
         days = [f"2026-01-{n:02d}" for n in range(1, 13)]
         report_ = sync.Report()
-        report_.orphaned = set(days)
+        for day in days:
+            report_.record(sync.ORPHANED, day)
         body = report_.notices()[0].body
         listed = body.split("cannot be published: ")[1].split("\n")[0].split(", ")
         self.assertEqual(listed, sorted(days))
