@@ -222,6 +222,37 @@ class TestTheLayering(unittest.TestCase):
                 )
 
 
+#: Where a `git` argv may be built. `gitrepo` is the seam; `prove` is the one
+#: exception and says why in its own docstring -- it wants raw bytes out of a
+#: throwaway repository, where `gitrepo`'s decoded text would corrupt a blob it
+#: is scanning for a leaked username.
+MAY_SPAWN_GIT = {"gitrepo", "prove"}
+
+
+class TestOneModuleSpawnsGit(unittest.TestCase):
+    """`gitrepo.git` is a seam of the kind `docs/architecture.md` lists.
+
+    The fork-count tests in `tests/test_sync.py` rest on this: they patch one
+    attribute and claim to see every git call a sync makes, and a fork spawned
+    from anywhere else would be invisible to them -- and so would be free, on a
+    path that runs once a minute.
+
+    A text scan, and complete only for the shape `subprocess` is actually called
+    with here. `[cmd, *args]` where ``cmd`` happens to hold ``"git"`` would slip
+    past, which is worth knowing when reading a pass rather than a reason not to
+    check: the whole point of a seam is that the wrong thing is *conspicuous*,
+    and every real caller in this package spells the literal.
+    """
+
+    def test_no_other_module_builds_a_git_argv(self) -> None:
+        found = {
+            path.stem
+            for path in (REPO / "woswoar").glob("*.py")
+            if '["git"' in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(found, MAY_SPAWN_GIT)
+
+
 class TestTheSearchPathStaysCheap(unittest.TestCase):
     """Ctrl-R runs `woswoar list` in a fresh interpreter, so every module the CLI
     imports at the top level is paid for on every keypress.

@@ -3777,7 +3777,7 @@ class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
         day of history per run.
 
         The day's directory is disturbed first, so the mtime stamp of #85 does
-        not skip it before `read_manifest` is ever reached. Without that this
+        not skip it before `manifest.read` is ever reached. Without that this
         test passes whether or not the laziness it is named for still exists.
         """
         alpha, beta = self.merged_pair()
