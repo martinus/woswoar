@@ -21,6 +21,16 @@ from tools.mutate import Mutation, verify
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+#: The module every fixture here mutates. One spelling: three fixtures wrote it
+#: out separately, so a change to one left the others self-consistent but no
+#: longer testing the module the rest of the file targets.
+CLAMP = """
+def clamp(value: int) -> int:
+    if value < 0:
+        return 0
+    return value
+"""
+
 
 class MutateTestCase(unittest.TestCase):
     """Each test builds a tiny package and mutates *that*, not woswoar."""
@@ -45,15 +55,7 @@ class MutateTestCase(unittest.TestCase):
 
     def package(self, guarded: bool) -> None:
         """A module with one behaviour, and a test that may or may not see it."""
-        self.write(
-            "mod.py",
-            """
-            def clamp(value: int) -> int:
-                if value < 0:
-                    return 0
-                return value
-            """,
-        )
+        self.write("mod.py", CLAMP)
         assertion = (
             "self.assertEqual(mod.clamp(-5), 0)" if guarded else "self.assertEqual(mod.clamp(5), 5)"
         )
@@ -175,6 +177,128 @@ class TestItRefusesAnEditThatOnlyAdds(MutateTestCase):
         self.assertEqual((self.root / "mod.py").read_text(encoding="utf-8"), before)
 
 
+class TestTheWorkingTreeIsNeverTouched(MutateTestCase):
+    """The stronger claim the sandbox design makes, and the one worth testing.
+
+    The two tests below it check the tree is intact *afterwards*, which was true
+    of the earlier design too -- it mutated the source and restored it in a
+    `finally`. What that could not survive was a kill in between, which is the
+    state CLAUDE.md rule 6 is about and which cost real work here. So this
+    watches from inside: the suite a mutation runs reports what it could see of
+    the original file at the moment it was running.
+    """
+
+    def witnessing(self, witness: Path) -> None:
+        """A package whose test records the state of the *original* tree.
+
+        The absolute path is baked in, so the test reads the working tree no
+        matter which directory it is running from -- which is the whole question.
+        """
+        self.write("mod.py", CLAMP)
+        original = (self.root / "mod.py").resolve()
+        self.write(
+            "test_mod.py",
+            f"""
+            import os
+            import unittest
+            from pathlib import Path
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    Path({str(witness)!r}).write_text(
+                        os.getcwd() + "\\n" + Path({str(original)!r}).read_text(),
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(mod.clamp(-5), 0)
+            """,
+        )
+
+    def test_the_suite_runs_somewhere_else_entirely(self) -> None:
+        witness = self.root / "witness.txt"
+        self.witnessing(witness)
+        verify([Mutation("x", "mod.py", "if value < 0:", "if False:", "test_mod")], baseline=False)
+        where, _ = witness.read_text(encoding="utf-8").split("\n", 1)
+        self.assertNotEqual(
+            Path(where).resolve(),
+            self.root.resolve(),
+            "the mutation ran in the working tree rather than a copy of it",
+        )
+
+    def test_the_original_file_is_unmutated_while_the_suite_runs(self) -> None:
+        """Not just restored afterwards. A `finally` gives you the second; only a
+        copy gives you the first, and the difference is what happens when the run
+        is killed."""
+        witness = self.root / "witness.txt"
+        self.witnessing(witness)
+        verify([Mutation("x", "mod.py", "if value < 0:", "if False:", "test_mod")], baseline=False)
+        _, seen = witness.read_text(encoding="utf-8").split("\n", 1)
+        self.assertIn("if value < 0:", seen)
+        self.assertNotIn("if False:", seen)
+
+
+class TestItRunsThemInParallel(MutateTestCase):
+    """Independent by construction, and mostly waiting on a subprocess.
+
+    Asserted by occupancy rather than by wall clock: each mutation's test drops a
+    marker, counts how many markers exist at that moment, and records the count.
+    A serial run can never see more than one. A threshold on elapsed time would
+    be the same claim with a flake attached.
+    """
+
+    def test_more_than_one_mutation_is_in_flight_at_once(self) -> None:
+        markers = self.root / "markers"
+        markers.mkdir()
+        counts = self.root / "counts.txt"
+        self.write("mod.py", CLAMP)
+        self.write(
+            "test_mod.py",
+            f"""
+            import os
+            import time
+            import unittest
+            from pathlib import Path
+
+            import mod
+
+            MARKERS = Path({str(markers)!r})
+            COUNTS = Path({str(counts)!r})
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    mine = MARKERS / str(os.getpid())
+                    mine.write_text("here", encoding="utf-8")
+                    # Long enough that a parallel run overlaps and a serial one
+                    # cannot, without being long enough to matter to the suite.
+                    time.sleep(0.4)
+                    with COUNTS.open("a", encoding="utf-8") as log:
+                        log.write(f"{{len(list(MARKERS.iterdir()))}}\\n")
+                    mine.unlink()
+                    self.assertEqual(mod.clamp(-5), 0)
+            """,
+        )
+        verify(
+            [
+                # Not `return value + {index}`: that contains the text it
+                # replaces, so the additive guard refuses it -- which it did, to
+                # this fixture, within minutes of the guard existing.
+                Mutation(f"row {index}", "mod.py", "return value", f"return {index}", "test_mod")
+                for index in range(1, 5)
+            ],
+            baseline=False,
+            # Explicit, because the default is derived from the core count and a
+            # two-core CI runner would resolve it to a serial run -- so this test
+            # would assert the machine rather than the mechanism.
+            workers=4,
+        )
+        seen = [int(line) for line in counts.read_text(encoding="utf-8").split()]
+        self.assertTrue(seen, "no mutation reported its occupancy")
+        self.assertGreater(max(seen), 1, f"every mutation ran alone: {seen}")
+
+
 class TestItRestoresTheTree(MutateTestCase):
     def test_the_source_is_unchanged_afterwards(self) -> None:
         self.package(guarded=True)
@@ -241,6 +365,81 @@ class TestTheBytecodeTrap(MutateTestCase):
         self.assertLess(
             time.time() - started, 60, "precondition: the two runs shared a wall-clock second"
         )
+
+
+class TestAMutationThatBreaksTheSuiteIsNotCaught(MutateTestCase):
+    """The one hazard here that lies in the direction a reader believes.
+
+    `_run` used to answer "the exit status was non-zero", and a mutation that
+    makes the module unimportable exits non-zero too -- so it printed `caught`
+    while the test named in the row never ran. That is the inverse of the
+    decoration failure rule 3 is about, and it is worse, because a false `caught`
+    in a pull request is indistinguishable from a real one.
+    """
+
+    def test_a_mutation_that_breaks_the_import_is_refused(self) -> None:
+        self.package(guarded=True)
+        with self.assertRaises(SystemExit) as refused:
+            verify(
+                [Mutation("syntax", "mod.py", "def clamp", "def (", "test_mod")],
+                baseline=False,
+            )
+        self.assertIn("ran no tests", str(refused.exception))
+
+    def test_a_real_mutation_is_still_caught(self) -> None:
+        """The other half: the check must not refuse an ordinary mutation, which
+        also exits non-zero but does so after running the test."""
+        self.package(guarded=True)
+        self.assertEqual(
+            verify(
+                [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+                baseline=False,
+            ),
+            0,
+        )
+
+
+class TestOneLaneIsNotADeadlock(MutateTestCase):
+    """The narrowest configuration, and the one that hung three CI jobs.
+
+    With a single lane and a baseline to check, the baseline used to take the only
+    borrowable sandbox on the main thread and never give it back, so every
+    mutation blocked forever on an empty queue. `workers` defaults to a value
+    derived from the core count, which is 16 on the machine this was written on
+    and 1 on a two-core runner -- so it passed locally and hung there.
+
+    Driven as a subprocess with a timeout because the failure is a hang. A test
+    that waits forever reports nothing, which is the same reason
+    `tests/test_setup.py` has an `input` that raises rather than blocks.
+    """
+
+    def test_a_single_lane_with_a_baseline_finishes(self) -> None:
+        self.package(guarded=True)
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation, verify
+
+            verify(
+                [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+                baseline=True,
+                workers=1,
+            )
+            """,
+        )
+        try:
+            finished = subprocess.run(
+                [sys.executable, str(self.root / "spec.py")],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+                timeout=90,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("one lane plus a baseline deadlocked: the run never finished")
+        self.assertIn("caught", finished.stdout, finished.stderr)
 
 
 class TestTheScriptEntryPoint(MutateTestCase):
