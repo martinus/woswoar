@@ -697,7 +697,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     `setup` is the exception, and only when nothing is installed: it is all
     questions already, and there is nothing here yet to widen access to.
     """
-    from . import cache, setup, sync
+    from . import cache, gitrepo, setup, sync
 
     if setup.untouched():
         print("Nothing installed here yet -- setting up.\n")
@@ -717,7 +717,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     # says so too, but only somebody who already suspects a problem runs doctor.
     _report_stale_hook()
 
-    if not sync.is_repo():
+    if not gitrepo.is_repo():
         print(
             "\nThis machine keeps its history to itself.\n"
             "Next:  woswoar init <url>   to share it with your other machines"
@@ -857,9 +857,9 @@ def _offer_imports() -> None:
 
 def _offer_remote() -> int:
     """Join a history repo, or finish without one."""
-    from . import setup, sync
+    from . import gitrepo, setup
 
-    if sync.is_repo():
+    if gitrepo.is_repo():
         print("     already joined a history repo; syncing")
         return _sync(no_push=False)
 

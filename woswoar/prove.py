@@ -137,7 +137,13 @@ def _sandbox() -> Iterator[Path]:
 
 
 def _git_bytes(*args: str, cwd: Path | None = None) -> bytes:
-    """git output as raw bytes; `gitrepo.git` decodes, and objects are not text."""
+    """git output as raw bytes; `gitrepo.git` decodes, and objects are not text.
+
+    The one place in the package outside `gitrepo` that spawns git, and the only
+    reason is that decoding would corrupt the very blob this scans for a leaked
+    username. `tests/test_architecture.py::TestOneModuleSpawnsGit` names this
+    module as the exception and defers to this paragraph for why.
+    """
     done = subprocess.run(["git", *args], capture_output=True, check=False, timeout=60, cwd=cwd)
     if done.returncode != 0:
         raise WoswoarError(

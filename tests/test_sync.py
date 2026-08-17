@@ -219,6 +219,45 @@ class SyncTestCase(unittest.TestCase):
         with fake.active():
             return gitrepo.git(*args)
 
+    @staticmethod
+    def plant_manifest(work: Path, host_id: str, day: str, key: Path, *chunks: Path) -> None:
+        """A well-formed manifest naming ``chunks``, signed with a key of our own.
+
+        Exactly what push access alone can build: correct framing, a correct
+        header, real digests -- and the wrong signature. ``chunks`` is named
+        rather than listed off the directory on purpose; signing whatever happens
+        to be there would make the fixture depend on how much real history the
+        clone already had, and the tests using this are about one planted chunk.
+
+        Here because both callers used to spell out `manifest._body`, the
+        `ssh-keygen` call and the framing -- including a literal ``b"\n\n"``
+        where `manifest._SEPARATOR` is what decides it. That is the repository's
+        file format written down in a test, once per test.
+        """
+        listed = {
+            chunk.name: manifest.ManifestEntry(manifest.digest_of(chunk.read_bytes()))
+            for chunk in chunks
+        }
+        body = manifest._body(host_id, day, listed)
+        signature = crypto.sign(body.encode("utf-8"), key, manifest._MAGIC)
+        signed = work / "hosts" / host_id / "manifests" / day
+        signed.parent.mkdir(parents=True, exist_ok=True)
+        signed.write_bytes(
+            signature.decode("utf-8").strip().encode()
+            + manifest._SEPARATOR.encode("utf-8")
+            + body.encode("utf-8")
+        )
+
+    def publish_repo_edit(self) -> None:
+        """Commit and push a change made to the repo behind `sync`'s back.
+
+        `sync` commits only when it wrote something itself, so a test that edits
+        the repo directly has to publish the edit rather than wait for the next
+        sync to stage it. Call from inside the editing machine's `active()`.
+        """
+        gitrepo.commit()
+        gitrepo.push(gitrepo.read_repo())
+
     def history_across_days(self, days: int, per_day: int) -> tuple[Fake, Fake]:
         """alpha with `days` days of `per_day` commands, each its own chunk,
         and a beta that has been granted but has merged nothing yet."""
@@ -2229,18 +2268,7 @@ class TestChunkAuthenticity(SyncTestCase):
             signer = work / "hosts" / "deadbeefdeadbeef" / "signer.pub"
             signer.write_text(f"{verify_key}\n{owner}\n", encoding="utf-8")
             chunk = work / "hosts" / "deadbeefdeadbeef" / "2023-11-14" / "9999999999-ffffff.age"
-            body = manifest._body(
-                "deadbeefdeadbeef",
-                "2023-11-14",
-                {chunk.name: manifest.ManifestEntry(manifest.digest_of(chunk.read_bytes()))},
-            )
-            signed = work / "hosts" / "deadbeefdeadbeef" / "manifests" / "2023-11-14"
-            signed.parent.mkdir(parents=True, exist_ok=True)
-            signed.write_bytes(
-                crypto.sign(body.encode("utf-8"), theirs, manifest.MAGIC).decode().strip().encode()
-                + b"\n\n"
-                + body.encode("utf-8")
-            )
+            self.plant_manifest(work, "deadbeefdeadbeef", "2023-11-14", theirs, chunk)
 
         self.push_as_attacker(plant)
 
@@ -2318,17 +2346,7 @@ class TestChunkAuthenticity(SyncTestCase):
             chunk = work / "hosts" / alpha.id / "2023-11-14" / "9999999999-ffffff.age"
             theirs = self.root / "attacker-key"
             crypto.generate_signing_key(theirs)
-            body = manifest._body(
-                alpha.id,
-                "2023-11-14",
-                {chunk.name: manifest.ManifestEntry(manifest.digest_of(chunk.read_bytes()))},
-            )
-            signature = crypto.sign(body.encode("utf-8"), theirs, manifest.MAGIC)
-            signed = work / "hosts" / alpha.id / "manifests" / "2023-11-14"
-            signed.parent.mkdir(parents=True, exist_ok=True)
-            signed.write_bytes(
-                signature.decode("utf-8").strip().encode() + b"\n\n" + body.encode("utf-8")
-            )
+            self.plant_manifest(work, alpha.id, "2023-11-14", theirs, chunk)
 
         self.push_as_attacker(plant)
 
@@ -2424,16 +2442,6 @@ class TestTheMergeWatermark(SyncTestCase):
         with alpha.active():
             sync.grant()
         return alpha, beta, chunks
-
-    def publish_repo_edit(self) -> None:
-        """Commit and push a change made to the repo behind `sync`'s back.
-
-        `sync` commits only when it wrote something itself, so a test that edits
-        the repo directly has to publish the edit rather than wait for the next
-        sync to stage it. Call from inside the editing machine's `active()`.
-        """
-        gitrepo.commit()
-        gitrepo.push(gitrepo.read_repo())
 
     def test_a_chunk_that_failed_once_is_retried_rather_than_skipped(self) -> None:
         """The silent half, and the worse one.
@@ -2715,8 +2723,7 @@ class TestADecompressionBomb(SyncTestCase):
             listed = manifest.read(alpha.id, day, sync.signing_public())
             listed[path.name] = manifest.ManifestEntry(manifest.digest_of(sealed))
             manifest.write(store.machine(), day, listed)
-            gitrepo.commit()
-            gitrepo.push(gitrepo.read_repo())
+            self.publish_repo_edit()
 
         with beta.active():
             report = sync.run()
@@ -3061,7 +3068,7 @@ class TestRecipientsPublishNoNames(SyncTestCase):
             sync.run()
             # Through `doctor --prove`'s scanner: it walks `.git` -- where git
             # would record an author identity, kept constant by
-            # `_ensure_repo_config` -- and additionally inflates every object,
+            # `gitrepo.ensure_config` -- and additionally inflates every object,
             # where a name in a *superseded* revision of `recipients.txt`
             # would hide from a raw walk and still be pushed. That rewritten
             # file is exactly how #22 leaked names in the first place.
@@ -3115,8 +3122,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
             victim = archive.day_key(alpha.id, "2023-11-14")
             self.assertTrue(victim.is_file(), "beta cannot even see the key; premise is wrong")
             victim.unlink()
-            gitrepo.commit()
-            gitrepo.push(gitrepo.read_repo())
+            self.publish_repo_edit()
 
         with alpha.active():
             sync.run()
@@ -3307,7 +3313,7 @@ class TestAnOrphanedDayKey(SyncTestCase):
 class TestADeletedManifest(SyncTestCase):
     """Issue #63, the sibling of #42 in the other rewritable file.
 
-    `read_manifest` returns nothing for "absent" and for "will not verify"
+    `manifest.read` returns nothing for "absent" and for "will not verify"
     alike, and only the second was guarded. So a deleted manifest looked exactly
     like a day never published: the fresh one signed at the end of `export`
     named only what that run wrote, and every chunk published earlier that day
@@ -3975,8 +3981,7 @@ class TestARewriteIsAllOrNothing(SyncTestCase):
         alpha, beta, compacted = self.compacted_and_growing()
         with alpha.active():
             (archive.chunk_dir(alpha.id, self.DAY) / compacted).unlink()
-            gitrepo.commit()
-            gitrepo.push(gitrepo.read_repo())
+            self.publish_repo_edit()
 
         with beta.active():
             report = sync.run()
@@ -4157,7 +4162,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
     def test_a_manifest_that_will_not_verify_settles_nothing(self) -> None:
         """The hazard both halves share, and the one that loses history.
 
-        `read_manifest` answers with *nothing* for a manifest that is missing,
+        `manifest.read` answers with *nothing* for a manifest that is missing,
         unsigned or mis-signed -- not because the day is empty. Treating that as
         "every signed chunk is merged" would stamp a day whose chunks are all
         still being refused, and would prune the day's record to nothing. The
@@ -4177,8 +4182,7 @@ class TestADayIsWhatItsManifestSays(SyncTestCase):
             alpha.record(self.DAY, 1_700_000_003, "a third line")
             sync.run()
             archive.day_manifest(alpha.id, self.DAY).write_text("wrecked", encoding="utf-8")
-            gitrepo.commit()
-            gitrepo.push(gitrepo.read_repo())
+            self.publish_repo_edit()
 
         with beta.active():
             sync.run()
@@ -4778,7 +4782,7 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
     def test_a_sync_with_something_to_say_still_pushes(self) -> None:
         """The half that would silently stop publishing if the skip overreached.
 
-        `_fetch_and_rebase` decides "level with the remote" *before* this run's
+        `gitrepo.fetch_and_rebase` decides "level with the remote" *before* this
         chunk is committed, so a skip keyed on that alone strands every machine
         that was up to date a moment ago -- which is every machine, every time.
         """
@@ -5160,7 +5164,7 @@ class TestInitFinishesTheJob(SyncTestCase):
         self.assertIn("joined, but the first sync failed", err)
         self.assertIn("woswoar sync", out + err)
         with beta.active():
-            self.assertTrue(sync.is_repo(), "the join itself was still completed")
+            self.assertTrue(gitrepo.is_repo(), "the join itself was still completed")
 
     def test_it_points_at_accept_when_there_is_another_machine(self) -> None:
         """The step that is easy to miss, because it happens somewhere else."""

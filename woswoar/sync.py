@@ -17,18 +17,17 @@ The shape of this, and why:
 - Each chunk is decrypted exactly once, ever. The plaintext lands in ``logs/``
   and the cache picks it up from there.
 - Each host signs a manifest of its own chunks, per day, with a key only it
-  holds. That is what makes a chunk attributable to one machine rather than to
-  the fleet, and so what lets `revoke` stop a machine publishing as well as
-  reading. See `manifest` and `_trusted_signer`.
+  holds -- see `manifest`, which owns that layer and the argument for it, and
+  `_trusted_signer`, which decides whose signature counts.
 
-What is left here is the orchestration -- `run`, `export`, `merge`, `_Day` -- and
-the ordering between those *is* the correctness argument, which is why they were
-not split further: fetch before export or a day key is sealed to a stale
-recipient list, permanently; the version gate is read after the fetch and before
-anything is written; `export` extends the manifest it last signed and must never
-list the directory. Two layers that did come out cleanly are `manifest`, the
-authenticity layer, and `gitrepo`, every fork and the only thing here that talks
-to the network -- so nothing in this module spawns a subprocess any more.
+What is left here is the orchestration: `run`, `export`, `merge` and `_Day`. They
+stayed in one file because the *ordering* between them is the correctness
+argument rather than an implementation detail, and each of the three orderings
+that matter is one line from being broken. The list is in `docs/architecture.md`
+under "The repository is append-only", and each one is also commented where it is
+enforced. Two layers did come out cleanly: `manifest`, the authenticity layer,
+and `gitrepo`, every git fork and the only thing here that talks to the network
+-- so nothing in this module spawns a subprocess any more.
 """
 
 from __future__ import annotations
@@ -656,10 +655,6 @@ def learn_names(known: Machine, host_ids: Iterable[str]) -> None:
         _merge_name(known, host_id)
 
 
-def is_repo() -> bool:
-    return (store.history_dir() / ".git").exists()
-
-
 # ---------------------------------------------------------------------------
 # Local sync state
 # ---------------------------------------------------------------------------
@@ -902,8 +897,8 @@ def signing_status(known: Machine) -> Check:
     keeps recording, looks healthy, and says so only on a timer's stderr.
 
     Checked by actually signing and verifying rather than by looking at the
-    file, the same argument `why_unusable` makes about age: what matters is
-    whether an unattended sync will work, not what the key file looks like.
+    file -- see `manifest.signs_and_verifies`, which owns the round trip because
+    it owns the namespace the signature has to be made in.
     """
     if not crypto.signing_available():
         return Check("signing", "ssh-keygen is not installed - history cannot be signed", ok=False)
@@ -912,10 +907,7 @@ def signing_status(known: Machine) -> Check:
         return Check("signing", f"{path} is missing - it is created by 'woswoar init'", ok=False)
     try:
         verify_key = crypto.signing_public(path)
-        probe = b"woswoar signing selftest"
-        if not crypto.verify(
-            probe, crypto.sign(probe, path, manifest.MAGIC), verify_key, manifest.MAGIC
-        ):
+        if not manifest.signs_and_verifies(path, verify_key):
             return Check("signing", f"{path} signs, but the signature does not verify", ok=False)
     except (WoswoarError, OSError) as exc:
         return Check("signing", f"{path} cannot sign: {exc}", ok=False)
@@ -931,7 +923,7 @@ def trust_status(known: Machine) -> Check:
     it. Withdrawn hosts are subtracted, so a revoked machine never reads as
     accepted just because no sync has pruned the pin yet.
     """
-    if not is_repo():
+    if not gitrepo.is_repo():
         return Check("trust", "no history repo yet", ok=True)
     accepted = accepted_hosts(State.load())
     others = [host for host in archive.repo_hosts() if host != known.id]
@@ -1063,7 +1055,7 @@ def days_missing_a_manifest() -> list[str]:
     return [
         day
         for day in sorted(store.day_of_log(relpath) for relpath in State.load().exported)
-        if manifest.missing(known.id, day)
+        if not manifest.exists(known.id, day)
     ]
 
 
@@ -1476,8 +1468,8 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
     is the one thing nothing here ever inspects. Listing the directory would
     sweep such a chunk into a manifest *this machine signs*, laundering it into
     something every peer believes -- without even the `compact` run that
-    `manifest.open_chunk` was written to guard. Extending a list we already signed makes
-    a chunk we did not write unrepresentable in a manifest we do sign.
+    `manifest.open_chunk` was written to guard. Extending a list we already
+    signed makes a chunk we did not write unrepresentable in a manifest we sign.
 
     The signature covers the whole day's list every time, so a manifest is a
     complete statement of what this host published that day, not a delta.
@@ -1567,7 +1559,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # keying on that would let anyone who can push plant one on a day we
         # have not published yet and block that day for good.
         published_before = any(relpath in state.exported for relpath, _, _ in tails)
-        has_manifest = not manifest.missing(known.id, day)
+        has_manifest = manifest.exists(known.id, day)
         if published_before and not has_manifest:
             report.record(MANIFEST_MISSING, day)
             continue
@@ -2041,7 +2033,7 @@ def run(push: bool = True, now: int | None = None) -> Report:
     """Export, exchange with the remote, import. Safe to run concurrently."""
     crypto.require()
     crypto.require_signing()
-    if not is_repo():
+    if not gitrepo.is_repo():
         raise SyncError("no history repo yet; run 'woswoar init' first")
 
     known = store.machine()
@@ -2220,7 +2212,7 @@ def initialise(
     store.save_machine(known)
 
     history = store.history_dir()
-    if not is_repo():
+    if not gitrepo.is_repo():
         store.private_dir(history.parent)
         if remote and not any(history.glob("*")):
             # `--` before anything the user supplied. `git clone` takes
@@ -2751,7 +2743,7 @@ def _access_change() -> Iterator[_AccessChange]:
     the working tree as it was rather than half-applied.
     """
     crypto.require()
-    if not is_repo():
+    if not gitrepo.is_repo():
         raise SyncError("no history repo yet; run 'woswoar init' first")
 
     known = store.machine()

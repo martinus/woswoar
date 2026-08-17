@@ -19,8 +19,8 @@ domains are made of.
 ```
 entry, errors        the record format, and the exceptions every layer raises
   store              logs/, machine identity, the filesystem primitives
-    archive          history/ -- the repo layout    (sync and prove only)
-      manifest       what a host signs for a day    (sync and prove only)
+    archive          history/ -- the repo layout
+      manifest       what a host signs for a day
     cache            the parse index
       search         Ctrl-R
     gitrepo          every git fork woswoar makes
@@ -54,14 +54,15 @@ __main__  <- search, cache, importer, install, setup, report, store,
 `store` and `archive` are the two halves of the filesystem: `store` owns
 ``logs/`` — the plaintext truth — plus the primitives and machine identity;
 `archive` owns the layout of the encrypted repository under ``history/`` and its
-self-description. Only `sync` and `prove` may reach `archive`. `history_dir` is
+self-description. Only `sync`, `manifest` and `prove` may reach `archive`.
+`history_dir` is
 the one path that stays in `store`, because `store._private_paths` has to prune
 that directory by name when it walks for `harden` and `readable_by_others`.
 
 `manifest` and `gitrepo` are derived rather than domains, and the test is that
-neither knows what a sync *is*: `manifest` signs and verifies a day's chunk list
-and `gitrepo` runs git in one directory, and `sync` is the only caller that knows
-the order to do those in. Both were sections of `sync.py` until #201.
+neither knows what a sync *is*: `manifest` signs and verifies a day's chunk list,
+`gitrepo` runs git in one directory, and `sync` is the only caller that knows the
+order to do those in. Both were sections of `sync.py` until #201.
 
 Three rules follow, and [`tests/test_architecture.py`](../tests/test_architecture.py)
 holds all three against the real import graph rather than against the `import`
@@ -205,20 +206,26 @@ exists so that nobody has to rediscover it.
 and pinning, manifests, the chunk codec, and git plumbing — plus the
 orchestration that drives them and the status queries `doctor` asks. #201 has
 taken two of them out, as `manifest.py` and `gitrepo.py`, and stopped there on
-purpose: `run`, `export`, `merge` and `_Day` stay together because *the ordering
-between them is the correctness argument*, not an implementation detail. Fetch
-before export or a day key is sealed to a stale recipient list, permanently; the
-version gate is read after the fetch and before anything is written; `export`
-extends the manifest it last signed and must never list the directory. Those
-three are one-line-to-break and want to be read in one sequence.
+purpose: `run`, `export`, `merge` and `_Day` stay together for the reason
+"Two costs shape everything" gives above — those operations are ordered and the
+ordering is the correctness argument. Each of the three is one line from being
+broken, and they want to be read in one sequence rather than found in three files.
 
-So the file is 3172 lines and not the ~1500 that
-[#203](https://github.com/martinus/woswoar/issues/203) asks for. That target is
+So the file came down by a tenth and is still well over 3000 lines, not the
+~1500 that [#203](https://github.com/martinus/woswoar/issues/203) asks for. That
+target is
 not met and is not being quietly dropped: what the two slices bought is that
 `tests/test_sync.py` can now reach the authenticity layer and the git plumbing
-without driving `run()`, which is the ratio #203 was actually measuring. The
-remaining three concerns are a redesign of `run` rather than a move, and nothing
-has shown yet that it would be an improvement.
+without driving `run()`, which is the ratio #203 was actually measuring.
+
+Of the three concerns still in there, two really are a redesign of `run` rather
+than a move — trust and pinning is a set of functions that each take `State` and
+record an `Outcome` into `Report`, and the recipients grammar has `add_recipient`
+sitting inside the `grant`/`revoke` flow. The third is not: the chunk codec
+(`pack`, `unpack`, `split_for_export` and the two size bounds) imports nothing
+from the package, and no ordering argument touches it. That is a cleaner slice
+than either of the two taken here, and it is
+[#214](https://github.com/martinus/woswoar/issues/214).
 
 The visible symptom *was* `sync.Report`: seventeen fields, each a failure from a
 different one of those layers. #199 has collapsed it. The ten fields that were

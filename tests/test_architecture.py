@@ -222,11 +222,13 @@ class TestTheLayering(unittest.TestCase):
                 )
 
 
-#: Where a `git` argv may be built. `gitrepo` is the seam; `prove` is the one
-#: exception and says why in its own docstring -- it wants raw bytes out of a
-#: throwaway repository, where `gitrepo`'s decoded text would corrupt a blob it
-#: is scanning for a leaked username.
+#: Where a `git` argv may be built. `gitrepo` is the seam; `prove._git_bytes`
+#: says beside itself why it is the exception.
 MAY_SPAWN_GIT = {"gitrepo", "prove"}
+
+#: Modules whose functions the test suite patches to count what a sync did, and
+#: which therefore have to be reached by attribute rather than by ``from`` import.
+SPY_SEAMS = ("gitrepo", "manifest")
 
 
 class TestOneModuleSpawnsGit(unittest.TestCase):
@@ -239,9 +241,11 @@ class TestOneModuleSpawnsGit(unittest.TestCase):
 
     A text scan, and complete only for the shape `subprocess` is actually called
     with here. `[cmd, *args]` where ``cmd`` happens to hold ``"git"`` would slip
-    past, which is worth knowing when reading a pass rather than a reason not to
-    check: the whole point of a seam is that the wrong thing is *conspicuous*,
-    and every real caller in this package spells the literal.
+    past, and a mention of ``["git", ...]`` in a *comment* would fail this even
+    though nothing forks -- loudly, in the direction that gets read. Both are
+    worth knowing when reading a pass rather than reasons not to check: the point
+    of a seam is that the wrong thing is conspicuous, and every real caller in
+    this package spells the literal.
     """
 
     def test_no_other_module_builds_a_git_argv(self) -> None:
@@ -251,6 +255,33 @@ class TestOneModuleSpawnsGit(unittest.TestCase):
             if '["git"' in path.read_text(encoding="utf-8")
         }
         self.assertEqual(found, MAY_SPAWN_GIT)
+
+
+class TestTheSeamsAreReachedByAttribute(unittest.TestCase):
+    """``from .manifest import read`` would silently unhook a spy.
+
+    `tests/test_sync.py` counts chunk reads, signature checks and git forks by
+    patching an attribute of `manifest` or `gitrepo`. A ``from`` import binds the
+    function object at import time, so a call site converted to one goes on
+    calling the real function while the spy watches something nothing calls. Two
+    of those counts are asserted to be *zero* -- the laziness that makes
+    signatures affordable, and an idle sync not staging the tree -- and zero is
+    exactly what a spy nothing calls reports.
+
+    So this is the one place the convention is enforced rather than explained.
+    Both module docstrings used to argue it at length and nothing checked it.
+    """
+
+    def test_no_module_from_imports_a_seam(self) -> None:
+        for path in sorted((REPO / "woswoar").glob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for seam in SPY_SEAMS:
+                with self.subTest(module=path.stem, seam=seam):
+                    self.assertNotIn(
+                        f"from .{seam} import",
+                        source,
+                        f"{path.stem} binds a name out of {seam}; reach it as {seam}.<name>",
+                    )
 
 
 class TestTheSearchPathStaysCheap(unittest.TestCase):

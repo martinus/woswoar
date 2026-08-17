@@ -6,13 +6,18 @@ isolated behind the `Repo` record -- the rest of sync passes that record down
 rather than asking git again.
 
 `git` is deliberately the single seam. Nothing else in the package spawns git
-(`prove._git_bytes` is the one exception, and it wants raw bytes from a sandbox
-repository rather than this module's decoded text), so the fork-count tests in
-`tests/test_sync.py` can patch one module attribute and see every call `sync.run`
-makes. That is why `sync` calls these as ``gitrepo.git(...)`` rather than
-importing the names: a ``from`` import binds the function object at import time,
-and patching this module would then miss every call site in sync -- silently, as
-a fork count that got smaller.
+(`prove._git_bytes` is the one exception and says why beside itself), so the
+fork-count tests in `tests/test_sync.py` can patch one module attribute and see
+every call `sync.run` makes.
+
+That is also why `sync` reaches these as ``gitrepo.read_repo()`` rather than
+binding the bare names with a ``from`` import: such an import copies the function
+object at import time, so a spy installed on this module would then miss every
+call site in `sync` -- silently, as a count that got smaller. It is the *wrappers* that
+matter here rather than `git` itself, which `sync` only calls in `initialise`;
+`commit`, `read_repo`, `fetch_and_rebase` and `push` are the ones the tests
+patch. `tests/test_architecture.py::TestTheSeamsAreReachedByAttribute` holds it,
+because two paragraphs of prose held it before and prose does not fail CI.
 """
 
 from __future__ import annotations
@@ -37,6 +42,17 @@ COMMIT_MESSAGE = "woswoar sync"
 #: and commit alike pick it up, including on a machine with no gitconfig at all.
 COMMIT_NAME = "woswoar"
 COMMIT_EMAIL = "woswoar@localhost"
+
+
+def is_repo() -> bool:
+    """Whether there is a history repository here at all.
+
+    The one git *fact*, as against the forks below, and it is here because it is
+    the question modules that want nothing else from git ask: `setup` reaches for
+    it and for nothing else, so its home decides whether the wizard imports the
+    whole sync protocol to answer it.
+    """
+    return (store.history_dir() / ".git").exists()
 
 
 def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:

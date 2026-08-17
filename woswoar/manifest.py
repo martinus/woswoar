@@ -9,10 +9,13 @@ Each host signs a manifest of its own chunks, per day, with a key only it holds.
 That is what makes a chunk attributable to one machine rather than to the fleet,
 and so what lets `revoke` stop a machine publishing as well as reading.
 
-`sync` calls these qualified, as ``manifest.open_chunk(...)``. That keeps this
-module's attributes the single seam the tests count reads and verifications at --
-a ``from`` import would bind the function object in `sync` and leave a spy
-installed here blind to every call site there.
+`sync` reaches these by attribute -- ``manifest.open_chunk(...)`` -- and never by
+binding the bare name, so that this module's attributes stay the single seam the
+tests count chunk reads and signature checks at. `read`,
+`write` and `open_chunk` are the three they patch, and one of those counts is
+asserted to be *zero*, which is the shape that passes vacuously against a spy
+nothing calls. See `gitrepo` for the same argument at more length, and
+`tests/test_architecture.py::TestTheSeamsAreReachedByAttribute` for the check.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from .store import Machine
 #: domain the signature is made in, so a future manifest shape gets one new value
 #: and old signatures stop verifying against it twice over -- rather than a
 #: version check somebody has to remember to write.
-MAGIC = "woswoar-manifest-v1"
+_MAGIC = "woswoar-manifest-v1"
 
 #: Separates the armoured signature from the bytes it covers. The signature is
 #: in the same file as the body, not beside it, so `write_atomic` makes the two
@@ -43,13 +46,30 @@ def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def signs_and_verifies(key: Path, verify_key: str) -> bool:
+    """Whether ``key`` can actually produce a signature this host accepts back.
+
+    Here rather than in `sync.signing_status`, which reports it, because the
+    namespace is the thing being tested and the namespace is this module's.
+    `_MAGIC` is *inside* the signed bytes, so a self-test made in some other
+    namespace would pass while every real manifest failed to verify -- which is
+    the failure `doctor` runs this check to rule out.
+
+    Signed and verified for real rather than inspecting the key file, the same
+    argument `crypto.why_unusable` makes about age: what matters is whether an
+    unattended sync will work.
+    """
+    probe = b"woswoar signing selftest"
+    return crypto.verify(probe, crypto.sign(probe, key, _MAGIC), verify_key, _MAGIC)
+
+
 def _header(host_id: str, day: str) -> str:
     """The line that binds a manifest to one host and one day.
 
     Built in one place and compared in another, so the round trip cannot be
     broken from one side only.
     """
-    return f"{MAGIC} {host_id} {day}"
+    return f"{_MAGIC} {host_id} {day}"
 
 
 class ManifestEntry(NamedTuple):
@@ -90,7 +110,7 @@ def _body(host_id: str, day: str, entries: dict[str, ManifestEntry]) -> str:
 def write(known: Machine, day: str, entries: dict[str, ManifestEntry]) -> None:
     """Sign this host's chunk list for ``day`` and write it."""
     body = _body(known.id, day, entries)
-    signature = crypto.sign(body.encode("utf-8"), store.signing_key_file(), MAGIC)
+    signature = crypto.sign(body.encode("utf-8"), store.signing_key_file(), _MAGIC)
     blob = signature.decode("utf-8").strip() + _SEPARATOR + body
     store.write_atomic(archive.day_manifest(known.id, day), blob.encode("utf-8"))
 
@@ -113,7 +133,7 @@ def read(host_id: str, day: str, verify_key: str) -> dict[str, ManifestEntry]:
     signature, separator, body = blob.partition(_SEPARATOR)
     if not separator:
         return {}
-    if not crypto.verify(body.encode("utf-8"), signature.encode("utf-8"), verify_key, MAGIC):
+    if not crypto.verify(body.encode("utf-8"), signature.encode("utf-8"), verify_key, _MAGIC):
         return {}
 
     lines = body.splitlines()
@@ -148,14 +168,14 @@ def claimed_names(host_id: str, day: str) -> set[str]:
     return {line.partition(" ")[0] for line in body.splitlines()[1:]}
 
 
-def missing(host_id: str, day: str) -> bool:
-    """No signed list for a day, said once so both callers ask it the same way.
+def exists(host_id: str, day: str) -> bool:
+    """Whether a day has a signed list at all, said once so both callers agree.
 
     Meaningless on its own -- a day never published has no manifest either --
     so every caller pairs it with "did this machine publish this day", which is
     its own export watermark.
     """
-    return not archive.day_manifest(host_id, day).exists()
+    return archive.day_manifest(host_id, day).exists()
 
 
 def open_chunk(path: Path, expected: str) -> bytes:
