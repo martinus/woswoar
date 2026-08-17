@@ -4635,7 +4635,10 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
 
         Counted at `gitrepo.git`, which is the only place in the package that
         spawns git -- the same seam the chunk-read counters in this file use,
-        and it needs no argv sniffing to tell git from `age`.
+        and it needs no argv sniffing to tell git from `age`. That claim used to
+        be prose here; `tests/test_architecture.py::TestOneModuleSpawnsGit` now
+        holds it, because a fork from anywhere else would be invisible to this
+        and so would be free.
         """
         real = gitrepo.git
         seen: list[str] = []
