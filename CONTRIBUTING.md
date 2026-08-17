@@ -96,7 +96,10 @@ reach for the wrong fix is doing the main thing.
   PR description rather than fixing it quietly or filing an issue nobody will
   do. The bar for filing is in [`CLAUDE.md`](CLAUDE.md) rule 4.
 - Every issue carries exactly one priority label, `P0`–`P3`, and they sort
-  lexically so the open list reads as an implementation order.
+  lexically so the open list reads as an implementation order. The exception is
+  an issue that only contains other issues: it carries `tracking` and no
+  priority, because priority *is* the implementation order and a container has
+  none.
 
 Nothing is merged without the maintainer saying so, including by the maintainer's
 own agents.

@@ -127,6 +127,14 @@ Priority is *implementation order*, not just severity. When ranking, weigh:
 State the reasoning in the issue when the ranking is not obvious from the title.
 If new information changes the picture, relabel the issue and say why.
 
+**One exception, and it follows from that sentence.** An issue that only
+*contains* other issues carries `tracking` and no priority at all. Priority is
+implementation order, and a container has none — its children have it, and they
+are what someone actually picks up. A tracking issue given a `P2` sits in the
+ordered list above as a peer of the four issues inside it, so working that list
+top-down reaches a card with nothing to do on it. Keep the argument, the order
+and the definition of done in the tracking issue; keep the priority on the work.
+
 ## 6. Never discard a change you cannot get back
 
 `git checkout -- <file>`, `git restore`, `git stash` and `git reset --hard` have
