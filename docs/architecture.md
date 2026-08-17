@@ -194,9 +194,12 @@ its eighteen `check` calls are derived inline in the CLI, where only a test that
 greps stdout can reach them.
 
 These are tracked as issues rather than fixed in passing, and the layering above
-is what makes them fixable one at a time. The order is not the order they are
-listed in — the two cheap ones come first because they make the expensive one
-smaller:
+is what makes them fixable one at a time.
+[#203](https://github.com/martinus/woswoar/issues/203) carries the argument for
+treating them as one piece of work — they are two half-finished ideas rather than
+four chores — along with what "done" looks like and what must not change on the
+way. The order is not the order they are listed in above: the two cheap ones come
+first because they make the expensive one smaller.
 
 | | issue |
 |---|---|
