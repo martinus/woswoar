@@ -18,7 +18,7 @@ import io
 import unittest
 from typing import ClassVar
 
-from woswoar import doctor, report, sync
+from woswoar import doctor, install, report, sync
 from woswoar.report import Check, Notice
 
 from . import support
@@ -268,29 +268,26 @@ class TestDoctorDecidesWithoutPrinting(WoswoarTestCase):
         recording and looks healthy, while whatever sync arrangement that
         version had is what it still does. It was reachable only through stdout.
         """
-        from woswoar import __main__ as main_module
         from woswoar import store
 
         support.run_cli("install")
-        hook = store.data_dir() / main_module.HOOKS["bash"]
+        hook = store.data_dir() / install.HOOKS["bash"]
         hook.write_bytes(b"# an older woswoar wrote this\n")
-        stale = [c for c in main_module._hook_checks() if c.label == "hook"]
+        stale = [c for c in install.hook_checks() if c.label == "hook"]
         self.assertTrue(stale, "no hook check was produced")
         self.assertFalse(stale[0].ok)
         self.assertIn("woswoar install", stale[0].detail)
 
     def test_a_current_hook_passes(self) -> None:
         """Without this the test above passes on a check that always fails."""
-        from woswoar import __main__ as main_module
 
         support.run_cli("install")
-        hook = [c for c in main_module._hook_checks() if c.label == "hook"]
+        hook = [c for c in install.hook_checks() if c.label == "hook"]
         self.assertTrue(hook[0].ok, hook[0].detail)
 
     def test_the_shell_check_names_the_shell_and_its_floor(self) -> None:
-        from woswoar import __main__ as main_module
 
-        checks = main_module._shell_checks()
+        checks = install.shell_checks()
         self.assertTrue(checks, "no shell was reported")
         self.assertIn("required", checks[0].detail)
 

@@ -25,13 +25,16 @@ entry, errors        the record format, and the exception every layer raises
   crypto             age and ssh-keygen
   credentials
     importer         bash, zsh, atuin
+  install            which shells get a hook, and keeping it current
+    setup            what the guided first run asks
 deps, progress,      leaves: asked things by anyone, knowing nobody
 report
 
 sync      <- archive, crypto, progress, report, store, entry, errors
 doctor    <- report, search, cache, crypto, deps, store, entry, errors
 prove     <- sync, and everything sync is made of, plus deps and report
-__main__  <- search, cache, importer, report, store, entry, errors
+__main__  <- search, cache, importer, install, setup, report, store,
+             entry, errors
              (sync, crypto, archive, doctor and prove only inside the
               commands that need them -- see "Two costs shape everything")
 ```
@@ -41,8 +44,8 @@ __main__  <- search, cache, importer, report, store, entry, errors
 | format | `entry`, `errors` | nothing else in the package |
 | platform | `store`, `crypto`, `deps`, `progress`, `report`, `credentials` | the format layer |
 | derived | `cache`, `archive` | the two above |
-| domains | `search`, `sync`, `importer` | everything below, and **never each other** |
-| composition | `doctor`, `prove`, `__main__` | everything |
+| domains | `search`, `sync`, `importer`, `install` | everything below, and **never each other** |
+| composition | `setup`, `doctor`, `prove`, `__main__` | everything |
 
 `store` and `archive` are the two halves of the filesystem: `store` owns
 ``logs/`` — the plaintext truth — plus the primitives and machine identity;
@@ -85,7 +88,8 @@ interpreter, so anything imported at the top of the CLI module is paid for on
 every search — about 29 ms of a ~105 ms total. That is why `sync` is imported
 inside fourteen functions rather than at the top of `__main__.py`, why
 `store.write_atomic` imports `tempfile` at the point of use (3.1 ms), why
-`_hook_bytes` reaches `importlib.resources` only as a fallback (8.7 ms), and why
+`install.hook_bytes` reaches `importlib.resources` only as a fallback
+(8.7 ms), and why
 `cache.Cache` is a plain class rather than a dataclass (~4 ms, via `inspect`).
 Each of those has its measurement in the comment beside it;
 `tests/test_architecture.py` pins the ones that are otherwise only a convention,
@@ -206,13 +210,30 @@ and one call site, so each slice #201 carves out of this module takes its own
 kinds with it instead of leaving a 143-line method behind that binds all five
 concerns at once.
 
-**`__main__.py` is 1813 lines and inverts pattern 4 in two places.** An installer
-(`installed_shells`, `detect_shells`, `shells_from`, `_hook_bytes`,
-`_write_block`, `_stale_hooks`, `_refresh_hook`) and a setup wizard
-(`_importable`, `_untouched`, `_offer_imports`, `_offer_remote`) are both
-subsystems living in the argparse module, reachable by a test only through
-stdout. The wizard builds `argparse.Namespace` objects by hand to call sibling
-commands, which is the CLI using its own argument format as an internal API.
+**`__main__.py` was 1813 lines and inverted pattern 4 in two places.** #202 has
+split both out. `install.py` owns which shells woswoar is responsible for, what
+their hooks contain and how they are kept current — including `refresh_hook`,
+which is policy that runs unattended from a background sync and was held up by a
+single test asserting on stdout.
+
+`setup.py` is smaller than its name suggests, and the boundary is worth stating
+because the obvious reading is wrong. It holds what the wizard works out *without
+asking* — which histories exist, whether anything is set up here, which rule
+picked the shells — plus the two `input` primitives. The questions' wording and
+the four numbered steps stay in `__main__`, because a dialog prints each
+paragraph before the `input` under it: its prose and its control flow are one
+thing. Separating them needs the four commands passed in as callables, which is a
+different change from this one.
+
+What stayed is the dispatch: `cmd_setup` still calls install, import, init and
+sync in order, because running CLI commands is the CLI's job and a module below
+it that called back up would be a cycle. What is gone is the way it called them —
+four hand-built `argparse.Namespace` objects, where a flag added to `install`
+had to be remembered three screens away and `getattr(args, "shell", None)`
+swallowed the omission. Each command now has a keyword-argument half that
+`cmd_setup` and the command itself both go through, so mypy names the call site
+that forgot one. The test for the wizard was forging a namespace too, and had
+been missing `shell` entirely since it was written.
 
 **`store.py` used to carry three vocabularies** — paths under `logs/`, paths
 under `history/`, and the filesystem primitives — so everything that wanted
@@ -263,5 +284,5 @@ first because they make the expensive one smaller.
 |---|---|
 | 1 | ~~[#200](https://github.com/martinus/woswoar/issues/200) — split the repo layout out of `store.py`~~ — **done**, as `woswoar/archive.py`. |
 | 2 | ~~[#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting~~ — **done**, in three parts: `report.Check`, `report.Notice`, and `sync.Outcome` collapsing `Report`'s seventeen fields to seven. |
-| 3 | [#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`. |
+| 3 | ~~[#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`~~ — **done**, as `woswoar/install.py` and `woswoar/setup.py`. |
 | 4 | [#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above. |

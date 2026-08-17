@@ -9,12 +9,16 @@ is nobody to ask.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 from unittest import mock
 
 from woswoar import __main__ as main_module
+from woswoar import importer, install, setup, store
 
 from . import support
 from .support import WoswoarTestCase
@@ -72,11 +76,34 @@ class SetupTestCase(WoswoarTestCase):
         self.rcfile = Path(self.root) / "bashrc"
         self.rcfile.write_text("# existing\n", encoding="utf-8")
 
-    def run_setup(self, *replies: str) -> Answers:
+    def run_setup(self, *replies: str, flags: tuple[str, ...] = ()) -> Answers:
         answers = Answers(*replies)
         with mock.patch("builtins.input", answers):
-            main_module.cmd_setup(argparse.Namespace(rcfile=str(self.rcfile)))
+            main_module.cmd_setup(self.setup_args(*flags))
         return answers
+
+    def setup_args(self, *extra: str) -> argparse.Namespace:
+        """`setup`'s arguments as the CLI would really parse them.
+
+        Through `build_parser`, not an `argparse.Namespace` literal. The literal
+        here was missing `shell` entirely and nothing said so, because the code
+        read it with `getattr(args, "shell", None)` and took the absence for
+        "auto" -- the same defect #202 describes in the wizard, in the test that
+        was supposed to be holding the wizard up. Parsing means a flag added to
+        `setup` arrives here with its real default, and one that is misspelled is
+        an error rather than a silent None.
+        """
+        argv = ["setup", "--rcfile", str(self.rcfile), *extra]
+        return main_module.build_parser().parse_args(argv)
+
+
+class Imported(NamedTuple):
+    """One `_import` call the wizard made, as it made it."""
+
+    kind: str
+    path: Path | None
+    dry_run: bool
+    this_host_only: bool
 
 
 def _never_asks(prompt: str = "") -> str:
@@ -138,17 +165,99 @@ class TestWhatItOffersToImport(SetupTestCase):
     def test_only_histories_that_exist_and_hold_something(self) -> None:
         (Path.home() / ".bash_history").write_text("echo hi\n", encoding="utf-8")
         (Path.home() / ".zsh_history").write_text("", encoding="utf-8")  # empty
-        kinds = [kind for kind, _, _ in main_module._importable()]
+        kinds = [kind for kind, _, _ in setup.importable()]
         self.assertEqual(kinds, ["bash"], "an empty history is not worth offering")
 
     def test_the_biggest_is_offered_first(self) -> None:
         (Path.home() / ".bash_history").write_text("x\n", encoding="utf-8")
         (Path.home() / ".zsh_history").write_text("y" * 5000, encoding="utf-8")
-        self.assertEqual([kind for kind, _, _ in main_module._importable()], ["zsh", "bash"])
+        self.assertEqual([kind for kind, _, _ in setup.importable()], ["zsh", "bash"])
 
     def test_nothing_found_is_not_a_failure(self) -> None:
         answers = self.run_setup("")  # only the repository URL is asked
         self.assertEqual(len(answers.asked), 1)
+
+
+class TestSetupAndInstallShareTheirFlags(unittest.TestCase):
+    """What `add_install_flags` is for. No fixture: this only parses argv.
+
+    `--shell` and `--rcfile` were declared twice, six identical lines each, and a
+    flag that reaches `install` but not `setup` leaves the wizard unable to pass
+    something the command accepts -- the forged-namespace defect of #202 one level
+    further down, in the parser. Asserted through parsing rather than by comparing
+    the two `add_argument` calls, so it holds however they are declared.
+    """
+
+    def parse(self, *argv: str) -> argparse.Namespace:
+        return main_module.build_parser().parse_args(list(argv))
+
+    def test_both_commands_take_the_same_shell_values(self) -> None:
+        for shell in ("auto", "bash", "zsh", "both"):
+            with self.subTest(shell=shell):
+                installed = self.parse("install", "--shell", shell, "--rcfile", "/tmp/rc")
+                wizard = self.parse("setup", "--shell", shell, "--rcfile", "/tmp/rc")
+                self.assertEqual((installed.shell, installed.rcfile), (wizard.shell, wizard.rcfile))
+
+    def test_both_default_to_auto(self) -> None:
+        """The default is what `shells_from` reads as "decide for me", so a
+        subcommand that defaulted to None instead would take a different path
+        through it without saying so."""
+        self.assertEqual(self.parse("install").shell, "auto")
+        self.assertEqual(self.parse("setup").shell, "auto")
+
+    def test_both_refuse_a_shell_they_have_no_hook_for(self) -> None:
+        """The `choices` list is the only thing standing between `--shell fish`
+        and `shells_from` quietly falling back to detection -- which installs for
+        a shell the person did not name and reports success."""
+        for command in ("install", "setup"):
+            # argparse writes usage to stderr before exiting; swallowed so a
+            # passing run does not print a fake error.
+            with (
+                self.subTest(command=command),
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.parse(command, "--shell", "fish")
+
+
+class TestWhichShellStepTwoInstalls(SetupTestCase):
+    """`setup` chooses shells through the same rule `install` does, and says which.
+
+    Untested until #202, and a mutation proved it: replacing the wizard's
+    `shells_from(args.shell, args.rcfile)` with a bare `detect_shells()` left the
+    whole suite green, because every fixture here happened to have one shell and
+    no `--shell`. The reason line matters as much as the choice -- a hook written
+    into the shell you do not use looks exactly like a hook that works.
+    """
+
+    def test_shell_zsh_installs_zsh_and_says_that_is_why(self) -> None:
+        self.run_setup("", flags=("--shell", "zsh"))
+        self.assertTrue((store.data_dir() / install.HOOKS["zsh"]).is_file())
+        self.assertFalse(
+            (store.data_dir() / install.HOOKS["bash"]).is_file(),
+            "step 2 installed a shell nobody asked for",
+        )
+
+    def test_the_reason_reaches_the_screen_with_the_flag_in_it(self) -> None:
+        """Through the CLI, so the wiring is in scope.
+
+        The two below call `why_those_shells` directly and would pass against a
+        `cmd_setup` that handed it nothing -- a mutation proved exactly that. This
+        is the one that fails when the arguments stop being threaded.
+        """
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", Answers("")),
+        ):
+            ran = support.run_cli("setup", "--rcfile", str(self.rcfile), "--shell", "zsh")
+        self.assertEqual(ran.code, 0)
+        self.assertIn("zsh -- --shell zsh", ran.out)
+
+    def test_the_reason_names_the_rcfile_when_that_decided(self) -> None:
+        self.assertEqual(
+            setup.why_those_shells(None, "/somewhere/.zshrc", ["zsh"]),
+            "from the name of .zshrc",
+        )
 
 
 class TestTheAtuinQuestion(SetupTestCase):
@@ -166,13 +275,20 @@ class TestTheAtuinQuestion(SetupTestCase):
         db = Path.home() / ".local/share/atuin/history.db"
         db.parent.mkdir(parents=True, exist_ok=True)
         db.write_bytes(b"x" * 4096)
-        self.imported: list[argparse.Namespace] = []
+        self.imported: list[Imported] = []
 
-        def record(args: argparse.Namespace) -> int:
-            self.imported.append(args)
+        def record(
+            kind: importer.Kind, path: Path | None, *, dry_run: bool, this_host_only: bool
+        ) -> int:
+            self.imported.append(Imported(kind, path, dry_run, this_host_only))
             return 0
 
-        patched = mock.patch.object(main_module, "cmd_import", record)
+        # `_import`, not `cmd_import`: the wizard calls the typed half now, and
+        # the recorded arguments are the ones it really passed rather than an
+        # `argparse.Namespace` it built to look like a command line. A keyword
+        # that stops being passed is a TypeError here, where the Namespace this
+        # replaced would have silently recorded an object without the attribute.
+        patched = mock.patch.object(main_module, "_import", record)
         patched.start()
         self.addCleanup(patched.stop)
 
@@ -220,7 +336,7 @@ class TestItIsSafeToRunTwice(SetupTestCase):
         self.run_setup("")
         self.run_setup("")
         text = self.rcfile.read_text(encoding="utf-8")
-        self.assertEqual(text.count(main_module._BEGIN), 1)
+        self.assertEqual(text.count(install.BEGIN), 1)
 
 
 class TestTheBareCommandOnAFreshMachine(SetupTestCase):
@@ -236,7 +352,7 @@ class TestTheBareCommandOnAFreshMachine(SetupTestCase):
     def test_a_hook_alone_is_enough_to_be_reported_on_instead(self) -> None:
         """Someone who ran `install` and nothing else has set something up, and
         running `setup` at them would answer a question they did not ask."""
-        hook = Path(os.environ["WOSWOAR_DIR"]) / main_module.HOOKS["bash"]
+        hook = Path(os.environ["WOSWOAR_DIR"]) / install.HOOKS["bash"]
         hook.parent.mkdir(parents=True, exist_ok=True)
         hook.write_text("#", encoding="utf-8")
 

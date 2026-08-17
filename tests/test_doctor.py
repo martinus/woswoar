@@ -16,8 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from woswoar import __main__ as main_module
-from woswoar import crypto, report, store
+from woswoar import crypto, install, report, store
 
 from . import support
 from .support import WoswoarTestCase, requires_age
@@ -200,7 +199,7 @@ class TestAHookLeftBehindByAnUpgrade(WoswoarTestCase):
     """
 
     def hook(self) -> Path:
-        path = store.data_dir() / main_module.HOOKS["bash"]
+        path = store.data_dir() / install.HOOKS["bash"]
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -289,7 +288,7 @@ class TestDoctorReportsTheShellsThisMachineUses(WoswoarTestCase):
 
 class TestReadingThePackagedHook(unittest.TestCase):
     def test_the_fast_path_and_the_fallback_agree(self) -> None:
-        """`_hook_bytes` reads the file beside the module and only falls back to
+        """`install.hook_bytes` reads the file beside the module and only falls back to
         `importlib.resources` when there is none -- 8.7 ms saved on a sync that
         now runs once a minute. Two routes to one file is two chances to read a
         different one, and the fallback is exercised by nothing else here: it is
@@ -297,10 +296,8 @@ class TestReadingThePackagedHook(unittest.TestCase):
         """
         from importlib import resources
 
-        via_resources = (
-            resources.files("woswoar") / "shell" / main_module.HOOKS["bash"]
-        ).read_bytes()
-        self.assertEqual(main_module._hook_bytes("bash"), via_resources)
+        via_resources = (resources.files("woswoar") / "shell" / install.HOOKS["bash"]).read_bytes()
+        self.assertEqual(install.hook_bytes("bash"), via_resources)
         self.assertTrue(via_resources.startswith(b"# woswoar"), "that is not the hook")
 
 

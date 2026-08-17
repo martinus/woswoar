@@ -16,7 +16,7 @@ somebody trying to move a module, months later.
 holds because the expensive things are imported lazily, at the call site, each
 with a measured comment beside it -- ``sync`` inside each of the fourteen
 commands in `__main__` that need it, ``tempfile`` in `store.write_atomic`
-(3.1 ms), ``importlib.resources`` in `__main__._hook_bytes` (8.7 ms), and
+(3.1 ms), ``importlib.resources`` in `install.hook_bytes` (8.7 ms), and
 ``dataclasses`` avoided outright in `cache.Cache` (~4 ms, via ``inspect``).
 Every one of those is a comment asking a future reader to remember something.
 `tests/test_perf.py` measures the *result* and would catch a regression as a
@@ -63,9 +63,17 @@ LAYERS: dict[str, set[str]] = {
     "crypto": {"errors"},
     "store": {"entry"},
     "archive": {"entry", "store"},
+    #: The installer decides and the CLI prints, so this reaches `report` for
+    #: `Check` and nothing else above `store`. `subprocess` is asked for inside
+    #: `shell_version`, because `__main__` imports this module at the top for the
+    #: parser and a keypress must not pay for a fork it will not make.
+    "install": {"entry", "errors", "report", "store"},
     "cache": {"entry", "store"},
     "search": {"cache", "entry", "store"},
     "importer": {"credentials", "entry", "errors", "store"},
+    #: `importer` and `sync` are deliberately absent: the wizard asks about them
+    #: inside the two functions that need them.
+    "setup": {"entry", "errors", "install", "report", "store"},
     "sync": {"archive", "crypto", "entry", "errors", "progress", "report", "store"},
     #: `sync` is deliberately absent: `doctor` reaches it inside the two checks
     #: that need it, so asking what is wrong with an installation does not pay
@@ -88,6 +96,13 @@ LAYERS: dict[str, set[str]] = {
         "entry",
         "errors",
         "importer",
+        #: `install` and not `setup`: the parser reads `install.HOOKS` for the
+        #: `--shell` choices, so a keypress pays for that module whatever it
+        #: does. Nothing needs `setup` until a command runs, so the four
+        #: functions that want it say so themselves -- 90 us that Ctrl-R does
+        #: not spend. Measured while reviewing #202, which had it at the top
+        #: with a comment claiming the parser needed it.
+        "install",
         "report",
         "search",
         "store",
@@ -204,7 +219,7 @@ class TestTheSearchPathStaysCheap(unittest.TestCase):
     def test_the_cli_does_not_import_the_expensive_stdlib(self) -> None:
         """Each of these is deferred at a call site with its cost written beside
         it -- `tempfile` 3.1 ms in `store.write_atomic`, `importlib.resources`
-        8.7 ms in `__main__._hook_bytes`, `dataclasses` ~4 ms avoided in
+        8.7 ms in `install.hook_bytes`, `dataclasses` ~4 ms avoided in
         `cache.Cache`. A top-level import of any of them is invisible in review
         and shows up as a slower keypress."""
         _, stdlib = _imported_by("__main__")
