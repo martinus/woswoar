@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from woswoar import cache, install, store
 from woswoar.__main__ import main
@@ -191,6 +192,27 @@ class TestPrivateByDefault(WoswoarTestCase):
         store.write_atomic(borrowed / "note", b"hello")
         self.assertEqual(borrowed.stat().st_mode & 0o777, 0o755)
         self.assertEqual((borrowed / "note").stat().st_mode & 0o777, 0o600)
+
+    def test_a_failed_write_leaves_no_scratch_file(self) -> None:
+        """The branch whose comment says "Never leave the scratch file next to
+        the real one" -- and which nothing executed.
+
+        It matters because the scratch name is `.<name>-<random>.tmp` in the
+        *same* directory as the real file, so a leaked one sits inside `logs/`
+        or `history/` looking like data. `iter_log_files` and `chunk_names`
+        filter by suffix and would ignore it, but `doctor`'s private-mode walk
+        and any human reading the directory would not.
+
+        The write is made to fail rather than mocked away: a real `OSError` out
+        of `handle.write` is what a full disk gives.
+        """
+        target = store.data_dir() / "atomic" / "note"
+        boom = OSError("no space left on device")
+        with mock.patch("os.fdopen", side_effect=boom), self.assertRaises(OSError):
+            store.write_atomic(target, b"hello")
+        self.assertFalse(target.exists(), "the real file must not appear")
+        leftovers = [p.name for p in target.parent.iterdir()]
+        self.assertEqual(leftovers, [], f"scratch file left behind: {leftovers}")
 
     def test_doctor_reports_an_exposed_history(self) -> None:
         self.first_run()
