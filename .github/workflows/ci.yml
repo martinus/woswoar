@@ -484,12 +484,22 @@ jobs:
     # `tools/run_tests.py` packs them with the same rule it uses for the
     # processes inside a shard, and `--no-skips` still applies per shard.
     #
-    # Three, not more. The macOS job is the whole workflow's critical path only
-    # until it drops under the Linux `test` matrix at ~63 s, and on Linux -- the
-    # only place the curve could be measured per shard -- the suite goes 43 s
-    # whole, 26.7 s at two shards, 19.7 s at three, 16.9 s at four. The fourth
-    # shard buys a number nothing waits on, and GitHub allows five concurrent
-    # macOS jobs on this plan, which `macos` above already spends one of.
+    # Three, not more, and the honest version of why. Measured on the runners
+    # after this change: the shards' suite steps are 58 s, 42 s and 62 s, their
+    # jobs 71 s, 57 s and 73 s once ~11 s of checkout and brew are counted, and
+    # the whole workflow 80 s against 151 s before. So macOS is still the
+    # critical path, by about ten seconds over the Linux `test` matrix -- the
+    # prediction that three shards would take it *under* that line was wrong.
+    #
+    # A fourth would recover most of those ten seconds: on Linux, where the
+    # curve could be measured per shard, the suite goes 43 s whole, 26.7 s at
+    # two, 19.7 s at three, 16.9 s at four. It is not taken because GitHub
+    # allows five concurrent macOS jobs on this plan and `macos` above already
+    # spends one, so four shards sits exactly on the cap -- and a shard that
+    # queues costs a whole job's wait to save eight seconds. The remaining
+    # imbalance (42 s against 62 s) is a better place to look first: `pack`
+    # weighs classes by test count, and these classes differ by ~7x in seconds
+    # per test.
     #
     # Linux is deliberately left alone. Its `sync` job is 49 s inside a workflow
     # that finishes in about 65 s, so sharding it would spend runners to move a
