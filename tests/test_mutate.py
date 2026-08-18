@@ -1112,6 +1112,7 @@ class TestAMutantThatEatsMemory(MutateTestCase):
         self.assertIn("ran out of memory", report.results[0].verdict.detail)
 
 
+@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
 class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     """The intersection of the two cases above, which neither of them covers.
 
@@ -1125,6 +1126,12 @@ class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     `caught`: a test credited with a guard it does not have, which is the exact
     lie #220 removed one level down. This repository uses `subTest` in more than
     twenty places, so the intersection is reachable rather than theoretical.
+
+    Gated on `enforced()` for the same reason as its sibling, which CI taught
+    twice: macOS does not apply `RLIMIT_AS`, so the 800 MiB simply succeeds
+    there, `clamp` returns a large number, the subtest notices it and the row
+    reads `caught`. The first version of this test copied the fixture and not
+    the gate.
     """
 
     def subtesting_package(self) -> None:
