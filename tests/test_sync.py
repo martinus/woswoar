@@ -1983,6 +1983,80 @@ class TestCompact(SyncTestCase):
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
 
 
+class TestPushRetriesWhenAPeerGotThereFirst(SyncTestCase):
+    """`gitrepo.push`'s `except SyncError:` branch, which nothing executed.
+
+    Found by crossing coverage with the mutation run: dropping either the
+    `fetch_and_rebase` or the second `git push` survived the whole suite,
+    because no test ever made the first push fail. Every other test fetches and
+    rebases before pushing, so the remote has never moved underneath one.
+
+    That is the normal multi-machine case, not an exotic error -- two machines
+    syncing on a timer race exactly here, in the window between this machine's
+    fetch and its push, and without the retry the loser reports a failed sync
+    and publishes nothing until the next run.
+
+    The *race* is injected, not the failure: a real peer really pushes into that
+    window, so `git` really rejects a non-fast-forward and the recovery path
+    runs for real. Patching `git` to raise would assert that the code handles an
+    exception it was written next to, which is the restatement rule 3 warns of.
+    """
+
+    def peer_publishes(self) -> str:
+        """A second clone commits and pushes, as another machine would."""
+
+        def run(*argv: str) -> None:
+            subprocess.run(list(argv), check=True, timeout=60, capture_output=True)
+
+        work = self.root / "peer-clone"
+        if not work.exists():
+            run("git", "clone", "--quiet", str(self.origin), str(work))
+            run("git", "-C", str(work), "config", "user.name", "peer")
+            run("git", "-C", str(work), "config", "user.email", "peer@example.com")
+        marker = f"peer-{secrets.token_hex(4)}.txt"
+        (work / marker).write_text("published by someone else\n", encoding="utf-8")
+        run("git", "-C", str(work), "add", marker)
+        run("git", "-C", str(work), "commit", "--quiet", "-m", f"peer adds {marker}")
+        run("git", "-C", str(work), "push", "--quiet", "origin", "HEAD")
+        return marker
+
+    def test_a_push_that_loses_the_race_still_publishes(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()  # establishes the branch on the origin
+
+            alpha.record("2023-11-14", 1_700_000_002, "git commit")
+            real = gitrepo.git
+            pushes: list[int] = []
+            marker: list[str] = []
+
+            def racing(*argv: str, **kwargs: object) -> str:
+                if argv[:1] == ("push",):
+                    pushes.append(1)
+                    if len(pushes) == 1:
+                        # The window: a peer publishes between our fetch and our
+                        # push, so this very call is rejected non-fast-forward.
+                        marker.append(self.peer_publishes())
+                return real(*argv, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(gitrepo, "git", racing):
+                report = sync.run()
+
+        self.assertTrue(report.pushed, "the retry did not publish")
+        self.assertEqual(len(pushes), 2, "the first push must fail and the second succeed")
+
+        published = subprocess.run(
+            ["git", "-C", str(self.origin), "ls-tree", "-r", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        self.assertIn(marker[0], published, "the peer's commit was discarded by our retry")
+        self.assertIn("hosts/", published, "our own history never reached the remote")
+
+
 class TestTrustStatus(SyncTestCase):
     """`doctor`'s third key verdict, and the one nothing reached.
 
