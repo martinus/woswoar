@@ -103,6 +103,14 @@ def cap(limit: int) -> None:
     forks. That is intended -- they are equally capable of running away -- and
     it is why `mutate.MEMORY`, which supplies `limit`, is a measured margin over
     an observed whole-suite peak rather than a round number.
+
+    **It bounds one process, and inheritance is not a total.** Each of those
+    children gets its own allowance of this size rather than a share of one, so
+    a mutation that spawns processes is unbounded here however small `limit` is:
+    the crash that prompted `mutate._Lanes` was 4,340 of them holding 26 GB
+    between them, none within two orders of magnitude of this ceiling. Nothing
+    in this function can see that, which is why the guard against it is a
+    sampler one level up rather than another rlimit here.
     """
     if limit <= 0:
         # 0 is "no cap", as `--memory 0` promises and as `--limit 0` beside it

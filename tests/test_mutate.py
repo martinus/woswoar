@@ -14,12 +14,14 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1026,6 +1028,474 @@ class TestHowManyLanesFitInMemory(unittest.TestCase):
 
         with mock.patch.object(Path, "read_text", missing):
             self.assertGreater(mutate._visible_memory(), 0)
+
+
+class TestTheShareOneLaneGets(unittest.TestCase):
+    """Lanes and ceiling are one decision, because the machine feels the product.
+
+    #232: sixteen lanes at a 4 GiB ceiling is 64 GiB of promises on a 63 GiB
+    machine, and the kernel collected on them three times. Each half was
+    defensible alone -- which is why what is asserted here is the product, and
+    why the class above it, asserting the lane count on its own, was green
+    throughout.
+    """
+
+    def share(self, visible: int, wanted: int = 16, memory: int = MEMORY) -> mutate.Share:
+        with mock.patch.object(mutate, "_visible_memory", return_value=visible):
+            return mutate._share(wanted, memory)
+
+    def test_the_product_stays_inside_the_budget(self) -> None:
+        # From a small CI runner to a large server. Every size below has room
+        # for at least one lane at the floor, so the budget is a real bound
+        # here; the machine that has not is the test after this one.
+        for gib in (8, 16, 32, 63, 128, 512):
+            with self.subTest(gib=gib):
+                lanes, memory = self.share(gib << 30)
+                self.assertLessEqual(lanes * memory, (gib << 30) // 2)
+
+    def test_a_machine_too_small_for_one_honest_lane_still_gets_one(self) -> None:
+        """And gets the floor, over budget, on purpose.
+
+        The alternative is a ceiling under what an honest suite needs, which
+        does not fail as "too small to run": it fails as `ran out of memory`
+        against whichever test was running, which reads as a finding.
+        """
+        lanes, memory = self.share(2 << 30)
+        self.assertEqual(lanes, 1)
+        self.assertEqual(memory, mutate._FLOOR)
+
+    def test_the_ceiling_gives_way_before_the_lanes_do(self) -> None:
+        """A big machine keeps its parallelism and stops over-promising.
+
+        Sixteen lanes is what this box ran before #232 and what it runs after;
+        the difference is the ceiling each was told it could reach.
+        """
+        lanes, memory = self.share(63 << 30)
+        self.assertGreaterEqual(lanes, 8)
+        self.assertLess(memory, MEMORY)
+
+    def test_a_laptop_is_not_cut_to_the_pathological_case(self) -> None:
+        """#227's complaint, which the first fix for this would have brought back.
+
+        Dividing the budget by `MEMORY` gave a 16 GiB machine two lanes, to
+        bound a case the ceiling already truncates within seconds.
+        """
+        lanes, _ = self.share(16 << 30)
+        self.assertGreater(lanes, 2)
+
+    def test_the_ceiling_never_falls_under_the_floor(self) -> None:
+        for gib in (2, 8, 16, 63, 512):
+            with self.subTest(gib=gib):
+                self.assertGreaterEqual(self.share(gib << 30).memory, mutate._FLOOR)
+
+    def test_no_cap_is_left_uncapped(self) -> None:
+        """`--memory 0` is a promise the flag makes; there is no product to bound."""
+        self.assertEqual(self.share(63 << 30, memory=0).memory, 0)
+
+    def test_an_explicit_ceiling_under_the_floor_is_the_callers_own(self) -> None:
+        """Reproducing a small machine on purpose is a real reason to ask."""
+        lanes, memory = self.share(63 << 30, memory=256 << 20)
+        self.assertEqual(memory, 256 << 20)
+        self.assertLessEqual(lanes * memory, (63 << 30) // 2)
+
+    def test_asking_for_more_lanes_does_not_conjure_memory(self) -> None:
+        lanes, memory = self.share(8 << 30, wanted=64)
+        self.assertLessEqual(lanes * memory, (8 << 30) // 2)
+
+    def test_a_pinned_lane_count_is_kept_and_the_ceiling_gives_way(self) -> None:
+        """`--workers` is a count a caller has reasons to fix, and this cannot
+        see them. It is also what the class above uses to assert that mutations
+        overlap at all -- lowering it there would have turned a test of the pool
+        into a test of the machine, which is the failure its own comment names.
+
+        A pinned run is not unbounded: `_Lanes` measures what the lanes hold
+        rather than predicting it, and that is the guard a wrong prediction
+        leaves standing.
+        """
+        with mock.patch.object(mutate, "_visible_memory", return_value=2 << 30):
+            pinned = mutate._share(4, MEMORY, pinned=True)
+            asked = mutate._share(4, MEMORY)
+        self.assertEqual(pinned, mutate.Share(4, mutate._FLOOR))
+        self.assertEqual(asked.lanes, 1, "unpinned, the machine decides")
+
+
+class TestAHarnessRunningInsideALane(unittest.TestCase):
+    """`tests/test_mutate.py` starts this module, so a lane mutating `tools/`
+    hosts a second harness -- which sized itself for the whole host, sixteen
+    lanes deep, until the budget was passed down."""
+
+    def test_an_inherited_budget_is_a_limit_like_the_cgroup(self) -> None:
+        with mock.patch.dict(os.environ, {mutate._BUDGET: str(3 << 30)}):
+            self.assertEqual(mutate._visible_memory(), 3 << 30)
+
+    def test_it_can_only_lower(self) -> None:
+        """A lane cannot be given more memory than the machine has by saying so."""
+        with mock.patch.dict(os.environ, {mutate._BUDGET: str(1 << 60)}):
+            self.assertLess(mutate._visible_memory(), 1 << 60)
+
+    def test_nonsense_is_ignored_rather_than_raised(self) -> None:
+        for said in ("", "lots", "-1", "0"):
+            with self.subTest(said=said), mock.patch.dict(os.environ, {mutate._BUDGET: said}):
+                self.assertGreater(mutate._visible_memory(), 0)
+
+
+class TestALaneCarriesItsShareIntoTheProbe(MutateTestCase):
+    """The wire between the two halves: `_share` decides, and the probe has to
+    be *told*, or an inner harness reads the host's memory and sizes itself for
+    a machine it does not have.
+
+    The variable is spelled out here rather than taken from `mutate._BUDGET`
+    on purpose. It is a name two processes agree on, so a test that reads it
+    from the same constant the code does would pass through any rename --
+    including one that changed only the half that writes it.
+    """
+
+    def test_the_probe_is_told_what_it_may_spend(self) -> None:
+        share = 1 << 30
+        self.write(
+            "test_budget.py",
+            f"""
+            import os
+            import unittest
+
+
+            class T(unittest.TestCase):
+                def test_the_lane_said_so(self) -> None:
+                    self.assertEqual(os.environ.get("WOSWOAR_MUTATE_BUDGET"), "{share}")
+            """,
+        )
+        verdict = mutate._run(["test_budget"], self.root, memory=share)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
+
+class TestCountingWhatALaneHolds(unittest.TestCase):
+    """Both readers, on every platform, because one of them is macOS's only guard."""
+
+    def test_ps_sees_this_process_group(self) -> None:
+        self.assertGreater(mutate._from_ps().get(os.getpgrp(), 0), 1 << 20)
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "no /proc on this platform")
+    def test_proc_sees_this_process_group(self) -> None:
+        self.assertGreater(mutate._from_proc().get(os.getpgrp(), 0), 1 << 20)
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "no /proc on this platform")
+    def test_the_two_readers_agree_about_this_group(self) -> None:
+        """Not to the byte -- `ps` and `/proc` count shared pages differently and
+        the suite allocates between the two calls -- but within a factor, which
+        is what a ceiling comparison actually needs."""
+        ours = os.getpgrp()
+        from_proc, from_ps = mutate._from_proc()[ours], mutate._from_ps()[ours]
+        self.assertLess(max(from_proc, from_ps) / min(from_proc, from_ps), 4)
+
+
+def reap(pid: int) -> None:
+    """Kill `pid` if it is still there.
+
+    For cleanups: a test whose complaint is that a process survived must not
+    leave that process behind when it makes it.
+    """
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def outliving(pids: Sequence[int], seconds: float) -> list[int]:
+    """Which of `pids` are still there after up to `seconds`.
+
+    Polled rather than slept, and the polling is the point: a `killpg` and the
+    kernel reaping what it killed are not the same instant, so a fixed sleep
+    guesses at a race in both directions -- too short and it reports survivors
+    that are already gone, too long and every green run pays for it.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        left = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:  # pragma: no cover - the id belongs elsewhere now
+                pass
+            left.append(pid)
+        if not left or time.monotonic() > deadline:
+            return left
+        time.sleep(0.1)
+
+
+class TestNoCapMeansNoWatcher(MutateTestCase):
+    """`--memory 0` promises no cap, and a ceiling of zero is the opposite of one.
+
+    Registered rather than skipped, a lane at zero is over its share the moment
+    it has a page, so every row of a `--memory 0` run would be killed and
+    reported unanswered -- the flag doing precisely what it says it does not.
+    """
+
+    def test_a_lane_with_no_ceiling_is_not_killed(self) -> None:
+        self.write("mod.py", CLAMP)
+        self.write(
+            "test_mod.py",
+            """
+            import time
+            import unittest
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    # Longer than one sample, or a lane that finishes before the
+                    # watcher has looked once proves nothing about being watched.
+                    time.sleep(2)
+                    self.assertEqual(mod.clamp(-5), 0)
+            """,
+        )
+        verdict = mutate._run(["test_mod"], self.root, memory=0, timeout=60.0)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
+
+class TestItSaysWhatItGaveTheLanes(MutateTestCase):
+    """A share lowered in silence reads as a slow tool rather than a bounded one,
+    and it is what makes a later `ran out of memory` row inexplicable. Same
+    argument as `--limit` printing what it dropped."""
+
+    def running(self, visible: int, workers: int | None = None) -> str:
+        self.package(guarded=True)
+        said = io.StringIO()
+        with (
+            mock.patch.object(mutate, "_visible_memory", return_value=visible),
+            contextlib.redirect_stdout(said),
+        ):
+            run(
+                [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+                baseline=False,
+                workers=workers,
+            )
+        return said.getvalue()
+
+    def test_a_machine_that_cannot_afford_what_was_asked_is_told_so(self) -> None:
+        said = self.running(2 << 30)
+        self.assertIn("lane(s) at", said)
+        self.assertIn("_share", said)
+
+    def test_a_machine_with_room_is_not_lectured(self) -> None:
+        self.assertNotIn("lane(s) at", self.running(512 << 30))
+
+    def test_a_pinned_run_hears_about_its_ceiling(self) -> None:
+        """The half that only a pinned run reaches: the lane count is exactly
+        what was asked for and the *ceiling* is what gave way, so a condition
+        that wants both to have changed says nothing at all."""
+        self.assertIn("lane(s) at", self.running(2 << 30, workers=1))
+
+
+class TestTheSamplerAndTheLanesItHasLeft(unittest.TestCase):
+    """What a mutation table found unguarded: `_Lanes`' own bookkeeping.
+
+    The storm test above drives one lane from beginning to end, and a sweep of
+    this file showed what that cannot see -- a `release` that forgets to
+    unregister, or that stops the sampler while other lanes are still running,
+    leaves every assertion in that test passing on a harness that has silently
+    stopped guarding anything after the first row.
+    """
+
+    def holding(self, bytes_held: int) -> subprocess.Popen[bytes]:
+        """A process in a session of its own, holding `bytes_held`, for 30s.
+
+        Its own session because that is what a lane is: `_Lanes` counts by
+        process group, so a fixture sharing this one's group would be asking a
+        different question -- and would put this suite's own pid in the table.
+        """
+        held = subprocess.Popen(
+            [sys.executable, "-c", f"import time; held = bytearray({bytes_held}); time.sleep(30)"],
+            start_new_session=True,
+        )
+        self.addCleanup(reap, held.pid)
+        self.addCleanup(mutate._WATCHED.release, held.pid)
+        return held
+
+    def test_releasing_one_lane_leaves_the_others_watched(self) -> None:
+        over = self.holding(64 << 20)
+        under = self.holding(1 << 20)
+        mutate._WATCHED.watch(under.pid, 512 << 20)
+        mutate._WATCHED.watch(over.pid, 8 << 20)
+        mutate._WATCHED.release(under.pid)
+        self.assertKilled(over, "the sampler stopped when the first lane was released")
+        self.assertGreater(mutate._WATCHED.release(over.pid), 8 << 20)
+
+    def test_the_sampler_comes_back_after_the_last_lane_goes(self) -> None:
+        """It is stopped when nothing is left to watch, so the next lane has to
+        start it again -- and a run is many lanes, one after another."""
+        first = self.holding(1 << 20)
+        mutate._WATCHED.watch(first.pid, 512 << 20)
+        mutate._WATCHED.release(first.pid)
+
+        later = self.holding(64 << 20)
+        mutate._WATCHED.watch(later.pid, 8 << 20)
+        self.assertKilled(later, "no lane was watched after the sampler had stopped")
+        self.assertGreater(mutate._WATCHED.release(later.pid), 8 << 20)
+
+    def assertKilled(self, held: subprocess.Popen[bytes], why: str) -> None:
+        """Waited on rather than polled with `os.kill(pid, 0)`.
+
+        These children have this process as their parent, so a killed one is a
+        zombie until it is reaped -- and a zombie answers signal 0 exactly like
+        a running process. `outliving` is right for the tests above it, whose
+        children are orphaned by the kill and reaped by init; here it would
+        report a killed child as alive for ever.
+        """
+        try:
+            held.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail(why)
+        self.assertEqual(held.returncode, -signal.SIGKILL, why)
+
+
+class TestReadingPsOutputThatIsNotWhatItExpects(unittest.TestCase):
+    """`ps` is the reader macOS depends on, and the only one with a parser.
+
+    Every line real `ps` prints here is two numbers, so nothing in the suite
+    distinguishes the check from no check at all -- a sweep of this file
+    reported five surviving mutants on that one line. Junk is what it is for:
+    a header, a truncated line, a `?` where a number was expected.
+    """
+
+    def reading(self, said: str) -> dict[int, int]:
+        listed = subprocess.CompletedProcess([""], 0, stdout=said, stderr="")
+        with mock.patch.object(subprocess, "run", return_value=listed):
+            return mutate._from_ps()
+
+    def test_only_lines_of_two_numbers_are_counted(self) -> None:
+        self.assertEqual(
+            self.reading(
+                "  PGID   RSS\n"  # a header, if the `=` suffixes ever stop working
+                "   501  1024\n"
+                "     ?    12\n"  # a field `ps` could not answer
+                "   502\n"  # truncated
+                "   503  4096 stray\n"  # more than was asked for
+                "\n"
+                "   501  2048\n"  # a second process in a group already seen
+            ),
+            {501: 3072 * 1024},
+        )
+
+    def test_kibibytes_are_not_bytes(self) -> None:
+        """The unit `ps` answers in, which is the difference between killing a
+        lane at its share and killing it at a thousandth of it."""
+        self.assertEqual(self.reading("  700  2048\n"), {700: 2 << 20})
+
+
+class TestALaneThatSpawnsProcesses(MutateTestCase):
+    """The failure a per-process ceiling cannot see, at the scale that killed it.
+
+    Sixteen children holding 64 MiB each is a gibibyte between them, and every
+    one of them is far inside the ceiling the lane is given -- exactly the
+    kernel log of #232's last crash, where 4,340 processes held 26 GB and none
+    was within two orders of magnitude of its own limit. So `verdict.cap` cannot
+    fire here by construction: if the lane is not killed, nothing is guarding.
+    """
+
+    def storm(self, children: int, held: int, sleeps: int) -> Path:
+        """A lane spawning `children`, each holding `held` bytes for `sleeps`
+        seconds. Returns the file they list themselves in, because whether they
+        *died* is a question the verdict alone cannot answer."""
+        pids = self.root / "pids.txt"
+        self.write(
+            "test_storm.py",
+            f"""
+            import subprocess
+            import sys
+            import unittest
+            from pathlib import Path
+
+            PIDS = Path({str(pids)!r})
+
+
+            class T(unittest.TestCase):
+                def test_it_spawns(self) -> None:
+                    # `sleeps` is what makes the guard the only thing that can
+                    # end this early, and it is load-bearing. At twenty seconds
+                    # the children outlived the sample and exited on their own,
+                    # so the row came back `broke` from the bookkeeping alone:
+                    # deleting the `killpg` survived a table with every
+                    # assertion below still passing.
+                    kids = [
+                        subprocess.Popen(
+                            [sys.executable, "-c",
+                             "import time; held = bytearray({held}); time.sleep({sleeps})"]
+                        )
+                        for _ in range({children})
+                    ]
+                    PIDS.write_text("\\n".join(str(kid.pid) for kid in kids), encoding="utf-8")
+                    for kid in kids:
+                        kid.wait()
+            """,
+        )
+        return pids
+
+    def test_the_lane_is_killed_whole_and_says_why(self) -> None:
+        pids = self.storm(children=16, held=64 << 20, sleeps=120)
+        # The timeout is the fail-safe here, not the mechanism: a working guard
+        # ends this in about a second, and a broken one reports `timeout` rather
+        # than holding a gibibyte for two minutes.
+        verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=20.0)
+        self.assertEqual(verdict.outcome, "broke", verdict.detail)
+        self.assertIn("held", verdict.detail)
+        self.assertIn("share", verdict.detail)
+
+        # And they are *gone*, which the verdict above cannot tell you. Deleting
+        # the `killpg` and keeping the bookkeeping leaves every assertion before
+        # this one passing on a run that still takes the machine -- a mutation
+        # table said exactly that, and this block is what it bought.
+        children = [int(said) for said in pids.read_text(encoding="utf-8").split()]
+        for child in children:
+            self.addCleanup(reap, child)
+        self.assertEqual(outliving(children, 5.0), [], "children outlived the killed lane")
+
+    def test_a_lane_that_stays_inside_its_share_is_left_alone(self) -> None:
+        """The other half, and the one that fails if the ceiling is read as a
+        threshold to kill at rather than a ceiling to stay under."""
+        self.storm(children=2, held=8 << 20, sleeps=1)
+        verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=90.0)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
+
+class TestATimeoutEndsTheWholeSession(MutateTestCase):
+    """A killed lane must not leave its children behind.
+
+    `subprocess.run(timeout=...)` kills the process it holds a handle to, and
+    the suite forks `git`, `age`, `bash` and `python -m woswoar`. Those are
+    reparented to init, hold what they held, and are invisible to the run that
+    started them -- the slow half of #232, where a sweep with enough timeouts
+    accumulates them until the machine is gone.
+    """
+
+    def test_a_child_does_not_outlive_the_lane(self) -> None:
+        ledger = self.root / "child.pid"
+        self.write(
+            "test_hang.py",
+            f"""
+            import subprocess
+            import sys
+            import time
+            import unittest
+            from pathlib import Path
+
+
+            class T(unittest.TestCase):
+                def test_it_hangs(self) -> None:
+                    kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+                    Path({str(ledger)!r}).write_text(str(kid.pid), encoding="utf-8")
+                    time.sleep(120)
+            """,
+        )
+        verdict = mutate._run(["test_hang"], self.root, timeout=5.0)
+        self.assertEqual(verdict.outcome, "timeout", verdict.detail)
+        orphan = int(ledger.read_text(encoding="utf-8"))
+        # Whatever this test concludes, it leaves no sleeping process behind --
+        # including when it fails, which is the case where there is one.
+        self.addCleanup(reap, orphan)
+        self.assertEqual(
+            outliving([orphan], 10.0), [], "the child outlived the lane that started it"
+        )
 
 
 def enforced() -> bool:

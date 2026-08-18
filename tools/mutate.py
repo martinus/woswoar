@@ -65,7 +65,15 @@ time here:
   That is also what makes the mutations run **in parallel**. They are
   independent by construction, each is mostly waiting on a subprocess, and the
   suite a mutation runs is plain serial ``unittest`` rather than the sharded
-  runner -- so there is no nested pool to oversubscribe. Measured as
+  runner. That last clause used to end "so there is no nested pool to
+  oversubscribe", which is true of every file in ``woswoar/`` and false of three
+  in ``tools/``: `tests/test_mutate.py` starts this harness twenty-two times and
+  `tests/test_run_tests.py` starts the sharded runner, so a lane mutating those
+  hosts a pool of its own -- sixteen lanes each hosting sixteen, which is how
+  4,340 processes came to be alive at once and how a 63 GiB machine was
+  OOM-killed three times (#232). `_share`, `_BUDGET` and `_Lanes` are what that
+  cost; the sentence is left here rather than deleted because a comment that
+  reassures is worse than none. Measured as
   ``workers=1`` against the default, same design either way: four mutations
   against ``tests.test_sync`` went 197.5 s to 51.5 s, and eleven against the
   faster modules 2.4 s to 0.5 s. Both figures are serial-versus-parallel, not
@@ -95,6 +103,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
@@ -137,7 +146,36 @@ LIMIT = 200
 #: 317 MB resident and 1537 MB of address space, so this leaves a 2.7x margin
 #: over the thing it must never interrupt. If a legitimate suite ever reports
 #: `ran out of memory`, raise it -- the message names the test on purpose.
+#:
+#: What a lane is actually given is `_share`'s answer rather than this, because
+#: sixteen lanes promised four gigabytes each is 64 GiB of promises on a 63 GiB
+#: machine. This stays the ceiling a lane may *ask* for; `_FLOOR` is the point
+#: below which the answer stops being safe to give.
 MEMORY = 4 << 30
+
+#: The smallest ceiling `_share` hands a lane before it takes a *lane* away
+#: instead. `MEMORY` is what one runaway may reach; this is what an honest run
+#: needs, and keeping them as two numbers is the whole fix for #232. Dividing a
+#: small machine's budget by the ceiling was the over-restriction #227 removed
+#: (a 16 GiB laptop dropped to two lanes); multiplying the lane count back up
+#: without lowering the ceiling was the over-commitment that replaced it, at 16
+#: lanes x 4 GiB = 64 GiB on a 63 GiB machine. One number cannot answer both.
+#:
+#: Measured, and by running the thing rather than reasoning about it: one
+#: whole-suite probe peaks at 838 MiB of address space here, and survives a cap
+#: of 1 GiB but not 768 MiB. Twice the smallest cap that works, so the margin is
+#: a stated factor rather than a number that happens to be round.
+_FLOOR = 2 << 30
+
+#: How a lane tells a harness it starts itself what it may spend.
+#: `tests/test_mutate.py` starts this module 22 times and `tests/test_run_tests.py`
+#: starts the sharded runner, so a lane mutating `tools/` hosts a second harness --
+#: which, reading the host's memory as its own, sizes itself for a machine it does
+#: not have. Sixteen lanes each hosting sixteen is how 4,340 processes came to be
+#: alive at once. Carried in the environment because that is what survives
+#: ``python -c``, and read back by `_visible_memory` as one limit among the
+#: cgroup's.
+_BUDGET = "WOSWOAR_MUTATE_BUDGET"
 
 #: Names never copied into a mutation's sandbox. ``.git`` because it is large and
 #: nothing under test reads it; the caches because a stale one is the trap this
@@ -264,6 +302,186 @@ def _signalled(returncode: int) -> str:
     return f"the probe was killed by {name}{killed}"
 
 
+#: How often `_Lanes` counts what the lanes are holding. Seconds rather than
+#: minutes: the storm that prompted this reached 26 GB inside a single 20-second
+#: gap between two `free` readings. One pass over `/proc` and no fork, so the
+#: sample is cheap enough to take at this rate for the length of a sweep.
+_SAMPLE = 1.0
+
+
+def _resident_by_group() -> dict[int, int]:
+    """Resident bytes held by each process group, for everything this user can see.
+
+    Resident rather than address space, because resident is what the OOM killer
+    counts and what a fork storm actually spends. The one that took this machine
+    down was 4,340 processes holding 26 GB of RSS between them and 961 GB of
+    address space, and only one of those two numbers is a reason to intervene.
+
+    Two readers rather than one, and `/proc` first: reading it forks nothing,
+    while `ps` is a fork that can fail at exactly the moment its answer matters.
+    macOS has no `/proc`, so there it is `ps` or nothing -- and there it is also
+    the *only* one of this module's two guards that works at all, since that
+    kernel ignores the `RLIMIT_AS` `verdict.cap` asks for. Both are exercised by
+    the tests on every platform for that reason: the fallback must not be
+    discovered to be broken on the machine that has nothing else.
+    """
+    return _from_proc() if Path("/proc/self/stat").exists() else _from_ps()
+
+
+def _from_proc() -> dict[int, int]:
+    """`_resident_by_group` where there is a `/proc`. Reads, never forks."""
+    total: dict[int, int] = {}
+    page = os.sysconf("SC_PAGE_SIZE")
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            said = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Exited between the listing and the read, or belongs to another
+            # user. Both are ordinary, and both are why this is a loop with a
+            # `try` in it rather than a comprehension.
+            continue
+        # Everything after the comm field, which is the one that may itself
+        # contain spaces and brackets -- so the split starts past its closing
+        # one rather than at the beginning of the line. Counting from `pid`,
+        # `pgrp` is the fifth field and `rss` the twenty-fourth, which is why
+        # the indices below are those minus the three that come first.
+        fields = said.rpartition(") ")[2].split()
+        if len(fields) < 22:
+            continue
+        with suppress(ValueError):
+            group = int(fields[2])
+            total[group] = total.get(group, 0) + int(fields[21]) * page
+    return total
+
+
+def _from_ps() -> dict[int, int]:
+    """`_resident_by_group` where there is no `/proc`, which is macOS."""
+    total: dict[int, int] = {}
+    listed = subprocess.run(
+        ["ps", "-eo", "pgid=,rss="], capture_output=True, text=True, check=False
+    )
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            # Kibibytes, which POSIX does not promise and both platforms do.
+            total[int(fields[0])] = total.get(int(fields[0]), 0) + int(fields[1]) * 1024
+    return total
+
+
+class _Lanes:
+    """Kills a lane whose process *tree* outgrows its share, which no rlimit can.
+
+    `verdict.cap` bounds one process's address space, and that is the wrong
+    shape for the failure that actually took this machine down. From the kernel
+    log of the last one: 4,340 python processes alive at once, six megabytes of
+    resident memory each, 26 GB between them -- and not one of them within two
+    orders of magnitude of its own 4 GiB ceiling. Nothing ran away. There were
+    simply thousands of them, because a lane mutating `tools/` hosts a harness
+    that starts lanes of its own.
+
+    A per-process limit cannot see that, and cannot be made to: the mutation
+    under test is what decides how many processes the lane starts, so a limit it
+    inherits is beside the point. `_BUDGET` shrinks an honest nested harness;
+    this is what answers a mutant that ignores it.
+
+    Counted by process group, which is why `_run` gives each probe its own
+    session. Everything the suite forks -- `git`, `age`, `bash`, a nested
+    harness and its probes -- inherits the group, so one number covers the
+    subtree and one `killpg` ends all of it. A grandchild that calls `setsid`
+    leaves the group and is no longer counted; that is a real hole and a small
+    one, since the thing that does it is a nested `_run`, which arrives already
+    bounded by the share it inherited.
+
+    Sampling rather than a cgroup, for the reasons `verdict.cap` gives for
+    `RLIMIT_AS` over `systemd-run --scope -p MemoryMax=`: no root, no delegated
+    controller, nothing to configure, and it exists on macOS. What sampling buys
+    over both is that it needs no cooperation from the code under test.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        #: What each watched group may hold.
+        self._ceilings: dict[int, int] = {}
+        #: What a group was holding when this killed it, until `release` says it.
+        self._killed: dict[int, int] = {}
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def watch(self, group: int, ceiling: int) -> None:
+        """Count `group` against `ceiling` from now on. ``0`` is no cap."""
+        if ceiling <= 0:
+            return
+        with self._lock:
+            self._ceilings[group] = ceiling
+            if self._thread is None:
+                # One sampler for every lane, started with the first and stopped
+                # with the last. Per-lane threads would each walk the whole
+                # process table, and the table is longest exactly when a storm
+                # makes the walk expensive.
+                self._stop = threading.Event()
+                self._thread = threading.Thread(
+                    target=self._sample, args=(self._stop,), name="mutate-lanes", daemon=True
+                )
+                self._thread.start()
+
+    def release(self, group: int) -> int:
+        """Stop counting, and say what it held if this is what killed it."""
+        with self._lock:
+            self._ceilings.pop(group, None)
+            held = self._killed.pop(group, 0)
+            if not self._ceilings and self._thread is not None:
+                self._stop.set()
+                self._thread = None
+        return held
+
+    def _sample(self, stop: threading.Event) -> None:
+        """Every `_SAMPLE` seconds until the last lane is released."""
+        while not stop.wait(_SAMPLE):
+            with self._lock:
+                watched = dict(self._ceilings)
+            if not watched:
+                continue
+            held = _resident_by_group()
+            for group, ceiling in watched.items():
+                if held.get(group, 0) <= ceiling:
+                    continue
+                with self._lock:
+                    # Re-checked under the lock: `release` may have run while
+                    # the process table was being read, and a `killpg` after
+                    # that names a group id the kernel is free to have reused.
+                    if group not in self._ceilings:
+                        continue
+                    self._killed[group] = held[group]
+                    with suppress(OSError):
+                        os.killpg(group, signal.SIGKILL)
+
+
+#: One per process, because `_run` is what registers and it has no run-wide
+#: object to hang this on -- `run` is a function, and a lane borrowed by
+#: `verify` or by a test goes through the same door.
+_WATCHED = _Lanes()
+
+
+def _end(probe: subprocess.Popen[bytes]) -> None:
+    """End a lane: the whole session, not just the process this holds a handle to.
+
+    `subprocess.run(timeout=...)` kills the child and returns, which for a suite
+    that forks `git`, `age`, `bash` and `python -m woswoar` leaves the
+    grandchildren running -- reparented to init, holding whatever they held, and
+    invisible to the run that started them. A sweep that times out often enough
+    accumulates them until the machine is gone, which is the slow half of #232;
+    the fast half is `_Lanes`.
+    """
+    with suppress(OSError):
+        os.killpg(probe.pid, signal.SIGKILL)
+    with suppress(OSError):
+        probe.kill()  # if the session is somehow gone, at least reap this one
+    with suppress(subprocess.TimeoutExpired):
+        probe.wait(timeout=_SAMPLE * 5)
+
+
 def _run(
     tests: Sequence[str],
     root: Path,
@@ -286,6 +504,12 @@ def _run(
     A timeout is its own outcome rather than an exception. A generated mutant can
     turn a loop bound into one that never fires, and with no limit here that
     holds a lane for the rest of the run.
+
+    Three limits, and each answers a failure the other two cannot see. `timeout`
+    is "this mutation never finishes"; `memory`, through `verdict.cap`, is "this
+    process never stops allocating"; and `_Lanes`, through the session started
+    here, is "this mutation spawns processes" -- which is neither of the others
+    and is the one that reached the OOM killer.
     """
     _clear_bytecode(root)
     # Both files land outside the sandbox on purpose: the copy is what the
@@ -294,39 +518,69 @@ def _run(
     with tempfile.TemporaryDirectory(prefix="woswoar-verdict-") as box:
         report = Path(box) / "verdict.json"
         noise = Path(box) / "stderr.txt"
+        with noise.open("w", encoding="utf-8") as spill:
+            probe = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    _probe(),
+                    str(report),
+                    "1" if failfast else "0",
+                    str(memory),
+                    *tests,
+                ],
+                cwd=root,
+                # `-B` covers this process; `PYTHONDONTWRITEBYTECODE` covers the
+                # real `age`, `git` and `bash` the suite spawns, which would
+                # otherwise leave a `.pyc` in a sandbox that a later mutation
+                # reuses. `_BUDGET` covers the *harness* the suite may spawn: a
+                # row mutating `tools/` runs tests that start this module again,
+                # and without it the inner one sizes itself for the whole host.
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    _BUDGET: str(memory),
+                },
+                # A file rather than a pipe, and this is not a style choice. The
+                # suite's `python -m woswoar` grandchildren inherit the write
+                # end, so anything that drains a pipe before reaping -- which is
+                # what `subprocess.run` does on a timeout -- waits for *them*
+                # rather than for the probe. With a file there is nothing to
+                # drain, so `_end` can kill the session and be done.
+                stdout=subprocess.DEVNULL,
+                stderr=spill,
+                # Its own session, so this pid is also the group id and every
+                # process the suite forks is inside it -- which is what makes
+                # both `_Lanes`' count and `_end`'s kill cover the tree rather
+                # than the one process. `start_new_session` rather than a
+                # `preexec_fn` doing the same thing: `run` drives its lanes from
+                # threads, and this one is done in C between fork and exec.
+                start_new_session=True,
+            )
+        _WATCHED.watch(probe.pid, memory)
         try:
-            with noise.open("w", encoding="utf-8") as spill:
-                finished = subprocess.run(
-                    [
-                        sys.executable,
-                        "-B",
-                        "-c",
-                        _probe(),
-                        str(report),
-                        "1" if failfast else "0",
-                        str(memory),
-                        *tests,
-                    ],
-                    cwd=root,
-                    # `-B` covers this process; the variable covers the real
-                    # `age`, `git` and `bash` the suite spawns, which would
-                    # otherwise leave a `.pyc` in a sandbox that a later mutation
-                    # reuses.
-                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                    # A file rather than a pipe, and this is not a style choice.
-                    # On a timeout `subprocess.run` kills the child and then
-                    # drains the pipes with `communicate()` and *no* limit --
-                    # and the suite's `python -m woswoar` grandchildren inherit
-                    # the write end, so that drain waits for them. A hung
-                    # grandchild would hold the lane long past `timeout`, which
-                    # is the one thing this outcome exists to prevent.
-                    stdout=subprocess.DEVNULL,
-                    stderr=spill,
-                    check=False,
-                    timeout=timeout,
-                )
+            probe.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            _end(probe)
             return Verdict("timeout", f"no answer within {timeout:g}s")
+        finally:
+            # In a `finally` so that no path leaves a group registered: a
+            # `KeyboardInterrupt` here would otherwise leave the sampler holding
+            # a pid the kernel is free to hand to something else.
+            held = _WATCHED.release(probe.pid)
+        if held:
+            # Before the report is read, not after. A killed lane may well have
+            # written one -- the kill lands on whichever process is running, and
+            # the probe's own `except BaseException` may have got there first --
+            # and reading it would report a verdict about a run that was
+            # stopped, which is the "broke counted as an answer" failure this
+            # module exists to prevent.
+            return Verdict(
+                "broke",
+                f"this lane's processes held {held >> 20} MiB between them, over the "
+                f"{memory >> 20} MiB share it was given, so the whole session was killed",
+            )
 
         try:
             written = json.loads(report.read_text(encoding="utf-8"))
@@ -337,7 +591,7 @@ def _run(
             # at all. It is exactly the case a host OOM-kill produces, which is
             # the failure this file now has a limit for, so it must not be the
             # one that says nothing.
-            return Verdict("broke", _tail(noise) or _signalled(finished.returncode))
+            return Verdict("broke", _tail(noise) or _signalled(probe.returncode))
         if not written["loaded"]:
             # The recorded traceback first. `verdict.main` writes it deliberately
             # and `_tail` is whatever happened to reach stderr, so preferring the
@@ -478,9 +732,26 @@ def _visible_memory() -> int:
         # way to tell that from a real limit.
         if said.isdigit():
             limits.append(int(said))
+    # A lane's share, when this harness is itself running inside one. Same
+    # question as the cgroup file above -- "how much may *this* process use" --
+    # and the same answer shape, which is why it is a limit here rather than a
+    # branch somewhere in `run`.
+    inherited = os.environ.get(_BUDGET, "")
+    if inherited.isdigit() and int(inherited) > 0:
+        limits.append(int(inherited))
     with suppress(AttributeError, OSError, ValueError):  # not POSIX
         limits.append(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
     return min(limits) if limits else _LANES * _LANE
+
+
+def _budget() -> int:
+    """What this run may spend in total.
+
+    Half of visible memory, because the other half belongs to whoever is using
+    the machine. Mutation testing is a background chore and has no claim on the
+    whole box.
+    """
+    return _visible_memory() // 2
 
 
 def _affordable() -> int:
@@ -494,11 +765,6 @@ def _affordable() -> int:
     crash was diagnosed, three of four lanes were running away simultaneously,
     all on the same source line.
 
-    Half of visible memory, because the other half belongs to whoever is using
-    the machine. Mutation testing is a background chore and has no claim on the
-    whole box; an explicit `--workers` still overrides this, as it overrides
-    every other bound below.
-
     Divided by `_LANE` -- what a lane is measured to *use* -- and not by
     `MEMORY`, which is the ceiling on what one may reach before being killed.
     Dividing by the ceiling was the first shape and it assumed every lane is
@@ -506,9 +772,67 @@ def _affordable() -> int:
     lanes to two, and a 7 GiB CI runner to one, to bound a case that the ceiling
     already truncates within seconds. The ceiling stops a runaway; this number
     decides how many honest lanes fit.
+
+    It is half the answer. `_share` is the other half, and the reason this one
+    is no longer wrong on its own: what the machine feels is lanes *times*
+    ceiling, and nothing here can see the ceiling.
     """
-    budget = _visible_memory() // 2
-    return max(1, budget // _LANE)
+    return max(1, _budget() // _LANE)
+
+
+class Share(NamedTuple):
+    """How many lanes run at once, and what each one may occupy."""
+
+    lanes: int
+    memory: int
+
+
+def _share(wanted: int, memory: int, pinned: bool = False) -> Share:
+    """Pick both together, so that their product is something the machine has.
+
+    `verdict.cap` bounds one lane and `_affordable` counts lanes, and for one
+    release each was defensible while the pair was not: sixteen lanes at a 4 GiB
+    ceiling is 64 GiB on a 63 GiB machine, so a table could drive the host into
+    the OOM killer with every individual limit respected. That is #232, and it
+    happened three times.
+
+    The order of concessions is the argument:
+
+    - lanes first, from `_affordable`, because a lane's *measured* use is the
+      honest cost of running one and CPU is what the wall clock is made of;
+    - then the ceiling, lowered to the share that many lanes leaves, because a
+      ceiling is headroom for a pathological row rather than something an honest
+      one spends;
+    - and only when that share would fall under `_FLOOR` -- below which honest
+      runs start being killed -- are lanes given up instead.
+
+    So a big machine keeps its sixteen lanes and simply stops promising each of
+    them four gigabytes it cannot deliver, and a small one loses lanes rather
+    than reliability.
+
+    ``pinned`` is an explicit `--workers`, and it keeps the lane count it asked
+    for. The ceiling still shrinks around it, which is the part worth having; it
+    is the *count* that a caller has reasons to fix that this cannot see.
+    `tests.test_mutate.TestItRunsThemInParallel` is the case that made this
+    concrete -- it pins four lanes to assert that mutations overlap at all, and
+    on a machine with too little memory to afford four it would otherwise assert
+    the machine rather than the mechanism, which is what its own comment says it
+    is pinned to avoid. The bound that still holds for a pinned run is `_Lanes`,
+    which measures rather than predicts.
+
+    ``memory <= 0`` is `--memory 0`, "no cap", and it passes straight through.
+    There is no product to bound once one factor is infinite, and quietly
+    imposing one would be the flag lying.
+    """
+    if memory <= 0:
+        return Share(max(1, wanted), memory)
+    budget = _budget()
+    # An explicit `--memory` under the floor is the caller's call, not a mistake
+    # to correct: they may be reproducing a small machine on purpose. It still
+    # sets how many lanes fit.
+    floor = min(memory, _FLOOR)
+    lanes = max(1, wanted if pinned else min(wanted, _affordable(), budget // floor))
+    return Share(lanes, min(memory, max(floor, budget // lanes)))
 
 
 def run(
@@ -543,6 +867,7 @@ def run(
     table = list(mutations)
     if not table:
         return Report([])
+    asked = memory
     for mutation in table:
         check(mutation)
 
@@ -557,7 +882,18 @@ def run(
     # regressed). An earlier `cpu // 2` here gave two lanes on a four-core runner
     # and was 1.76x slower than this for eight runs. A sandbox is ~1 ms, so a lane
     # is nearly free.
-    lanes = workers or min(len(table) + len(shards), usable_cpus() * 2, _LANES, _affordable())
+    wanted = workers or min(len(table) + len(shards), usable_cpus() * 2, _LANES)
+    lanes, memory = _share(wanted, memory, pinned=workers is not None)
+    if lanes != wanted or memory != asked:
+        # Said out loud, for the reason `--limit` says what it dropped: a run
+        # that quietly took fewer lanes than the machine has cores reads as a
+        # slow tool rather than as a bounded one, and a ceiling lowered in
+        # silence is how the row that reports `ran out of memory` becomes
+        # inexplicable.
+        print(
+            f"{lanes} lane(s) at {memory >> 20} MiB each, from {_budget() >> 20} MiB "
+            f"of usable memory -- see tools.mutate._share."
+        )
 
     results: list[Result] = []
     red = False
