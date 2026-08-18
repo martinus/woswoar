@@ -1836,6 +1836,50 @@ class TestTheScriptEntryPoint(MutateTestCase):
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertNotIn("defines no MUTATIONS", finished.stderr)
 
+    def test_two_tables_are_both_the_verdict(self) -> None:
+        """The half of #213 its own test could not see.
+
+        `main` reduces a spec's exit status over *every* table the script ran,
+        and the guard for that is `all(...)` rather than the last report. A spec
+        with one table cannot tell the two apart, and one table is what the test
+        above it writes -- so the row `all` becomes `any` came back SURVIVED
+        from the first full sweep of `tools/`, on the line whose comment says
+        reverting it is #213's own symptom reintroduced.
+
+        Survivors first and clean second, because that is the order that exits
+        zero when the reduction is wrong. Reversed, both readings agree.
+        """
+        self.package(guarded=False)  # a test that cannot see its mutation
+        self.write(
+            "test_seen.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    self.assertEqual(mod.clamp(-5), 0)
+            """,
+        )
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation, verify
+
+            gone = "if value < 0:"
+            verify([Mutation("nothing sees this", "mod.py", gone, "if False:", "test_mod")])
+            verify([Mutation("but this is caught", "mod.py", gone, "if False:", "test_seen")])
+            """,
+        )
+        finished = self.drive("spec.py")
+        self.assertIn("SURVIVED", finished.stdout)
+        self.assertIn("caught", finished.stdout)
+        self.assertEqual(
+            finished.returncode, 1, f"the clean second table decided it: {finished.stdout}"
+        )
+
     def test_a_script_that_does_both_runs_the_table_once(self) -> None:
         """The quieter half of #213: minutes of wall clock, silently doubled."""
         self.package(guarded=True)
