@@ -2177,7 +2177,11 @@ def choose_identity(new_identity: bool = False, explicit: Path | None = None) ->
 
     identity = crypto.generate_identity()
     store.write_atomic(dedicated, identity.secret.encode("utf-8"))
-    dedicated.chmod(0o600)
+    # Belt and braces, and unobservable: `write_atomic` creates through
+    # `tempfile.mkstemp`, which is 0600 before the `os.replace`, so removing this
+    # changes no mode any test could read. Kept because the mode of a file woswoar
+    # creates should not depend on another module's implementation of "atomic".
+    dedicated.chmod(0o600)  # pragma: no mutate
     return dedicated
 
 
@@ -3114,7 +3118,13 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
             # any of those must not merge this as if it were new history, and it
             # cannot work that out from the bytes -- the lines are the same ones.
             listed[merged.name] = manifest.ManifestEntry(
-                manifest.digest_of(sealed), tuple(sorted(chunk.name for chunk in chunks))
+                # `sorted` is defensive and no test can see it: `chunks` arrives
+                # from `archive.iter_chunks`, which lists via `chunk_names` --
+                # already sorted. It stays because these bytes are *signed*, and
+                # manifest determinism must not depend on the iteration order of
+                # another module.
+                manifest.digest_of(sealed),
+                tuple(sorted(chunk.name for chunk in chunks)),  # pragma: no mutate
             )
             manifest.write(known, day, listed)
             days += 1

@@ -984,6 +984,34 @@ class TestGrantConfirmation(SyncTestCase):
         self.assertEqual(marked, [mine])
 
 
+class TestRevokeSaysWhatItDid(SyncTestCase):
+    """The CLI half of revoke, which nothing drove.
+
+    `sync.revoke` is well covered below; `cmd_revoke` was not reached by any
+    test at all, so the mutation deleting its confirmation line survived. That
+    line is the only signal a user gets that a *security* operation happened --
+    the command otherwise succeeds in silence, and "did that work?" is the
+    question someone answers by revoking a second time.
+    """
+
+    def test_it_reports_the_revocation_and_the_resealing(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(name="old-laptop")
+            fingerprint = crypto.fingerprint(gone)
+
+        ran = self.run_cli(alpha, "revoke", fingerprint, "--yes")
+        self.assertEqual(ran.code, 0, ran.out + ran.err)
+        self.assertIn("revoked", ran.out)
+        self.assertIn("re-sealed", ran.out)
+        # Not merely "it printed something": the count is the part that says
+        # whether the day keys were actually rewritten for the remaining readers.
+        self.assertRegex(ran.out, r"re-sealed \d+ key file\(s\)")
+
+        with alpha.active():
+            self.assertNotIn(gone, sync.recipients())
+
+
 class TestRevokeSubtraction(SyncTestCase):
     """A withdrawal has to survive `merge=union`, which never deletes a line."""
 
@@ -1953,6 +1981,74 @@ class TestCompact(SyncTestCase):
         with beta.active():
             sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
+
+
+class TestSigningStatus(SyncTestCase):
+    """The other half of what `doctor` says about this machine's keys.
+
+    `TestIdentityStatus` below has covered its neighbour since #201; this had
+    nothing. A whole-package mutation run put 13 survivors in this one function
+    -- every failure branch could `return None` and the suite stayed green --
+    which is the same shape `tests/test_manifest.py` was written for: a `doctor`
+    verdict a user reads, on a path where the machine keeps recording, looks
+    healthy, and publishes history no peer will ever accept.
+    """
+
+    def test_a_healthy_signing_key_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            status = sync.signing_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn(str(store.signing_key_file()), status.detail)
+
+    def test_a_missing_signing_key_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            store.signing_key_file().unlink()
+            status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("missing", status.detail)
+            self.assertIn("woswoar init", status.detail)
+
+    def test_a_key_that_signs_but_does_not_verify_is_reported(self) -> None:
+        """The failure the round trip exists for.
+
+        Not "the file is absent" and not "signing raised" -- a key that produces
+        a signature this machine then refuses. Forced by making the round trip
+        answer False, because manufacturing a real one means corrupting
+        ssh-keygen's own output in a way it would reject earlier.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(manifest, "signs_and_verifies", return_value=False):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("does not verify", status.detail)
+
+    def test_a_key_that_cannot_sign_at_all_is_reported(self) -> None:
+        """`WoswoarError` out of the round trip, not an escape."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            boom = errors.WoswoarError("ssh-keygen said no")
+            with mock.patch.object(crypto, "signing_public", side_effect=boom):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("cannot sign", status.detail)
+            self.assertIn("ssh-keygen said no", status.detail)
+
+    def test_no_ssh_keygen_at_all_is_reported(self) -> None:
+        """The branch a machine without ssh-keygen takes.
+
+        Patched rather than skipped: every machine that runs this suite has
+        ssh-keygen (`requires_ssh_keygen`), so the branch is unreachable here by
+        construction and would otherwise never be executed anywhere.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(crypto, "signing_available", return_value=False):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("ssh-keygen is not installed", status.detail)
 
 
 class TestIdentityStatus(SyncTestCase):
