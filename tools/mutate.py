@@ -88,6 +88,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import runpy
 import shutil
 import signal
@@ -790,6 +791,39 @@ def _bytes(said: str) -> int:
     return value
 
 
+def _persist(report: Report, where: Path) -> None:
+    """The run's answers, as `tools/reached.py` reads them.
+
+    Written because a survivor list is not the end of the analysis. Crossing
+    these outcomes with a coverage map is what separates "no test reaches this"
+    from "a test reaches it and asserts nothing", and that cannot be done from
+    the printed table -- which is prose, in table order, with no line numbers.
+
+    `line` is parsed back out of the label rather than carried on `Mutation`,
+    because a hand-written row has no position at all, and the label is the one
+    place both kinds already agree on how to say where they are.
+    """
+    rows = []
+    for result in report.results:
+        found = re.match(r"\S+?:(\d+) ", result.mutation.label)
+        rows.append(
+            {
+                "label": result.mutation.label,
+                "path": result.mutation.path,
+                "line": int(found.group(1)) if found else None,
+                "tests": result.mutation.tests,
+                "operator": result.mutation.operator,
+                "outcome": result.verdict.outcome,
+                "detail": result.verdict.detail,
+            }
+        )
+    where.write_text(
+        json.dumps({"baseline_red": report.baseline_red, "results": rows}, indent=1),
+        encoding="utf-8",
+    )
+    print(f"\nwrote {len(rows)} row(s) to {where}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tools.mutate",
@@ -824,6 +858,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-confirm",
         action="store_true",
         help="do not re-run survivors against the whole suite",
+    )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        metavar="PATH",
+        help="write the outcomes here, for `python -m tools.reached`",
     )
     args = parser.parse_args(argv)
 
@@ -860,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
             print("\n--no-confirm: survivors below were not re-run against the whole suite,")
             print("so one may simply have been run against tests that cannot see it.")
         _summarise(report.results)
+        if args.json:
+            _persist(report, args.json)
         return 0 if report.clean else 1
 
     already = len(_RUNS)

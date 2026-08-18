@@ -8,6 +8,9 @@ which is what happened before there was a harness to share.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import subprocess
 import sys
@@ -16,9 +19,10 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
-from tools import mutate
+from tools import mutate, reached
 from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -760,6 +764,66 @@ class TestAnUnanswerableRowNeedNotEndTheRun(MutateTestCase):
                 [Mutation("bad", "mod.py", "import json", "import nope_xyz", "test_mod")],
                 baseline=False,
             )
+
+
+class TestTheJsonReport(unittest.TestCase):
+    """The contract `tools/reached.py` reads, tested from this side of it.
+
+    Both tools would otherwise agree only by coincidence: `reached` parses a
+    shape nothing here promises, and a renamed key would break the analysis
+    with a `KeyError` in a different file at the end of a run measured in
+    hours.
+    """
+
+    def report(self) -> Report:
+        rows = [
+            Mutation(
+                "mod.py:7 in f() -- `<` becomes `<=`",
+                "mod.py",
+                "a",
+                "b",
+                "test_mod",
+                operator="boundary",
+            ),
+            Mutation("written by hand", "mod.py", "c", "d", "test_mod"),
+        ]
+        return Report(
+            [
+                Result(rows[0], Verdict("survived")),
+                Result(rows[1], Verdict("broke", "it fell over")),
+            ]
+        )
+
+    def written(self) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as box:
+            where = Path(box) / "out.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                mutate._persist(self.report(), where)
+            loaded: dict[str, Any] = json.loads(where.read_text(encoding="utf-8"))
+        return loaded
+
+    def test_every_key_reached_needs_is_present(self) -> None:
+        first = self.written()["results"][0]
+        self.assertEqual(first["path"], "mod.py")
+        self.assertEqual(first["line"], 7, "the line is parsed out of the label")
+        self.assertEqual(first["outcome"], "survived")
+        self.assertEqual(first["operator"], "boundary")
+
+    def test_a_hand_written_row_has_no_line_rather_than_a_wrong_one(self) -> None:
+        """`reached` skips these. Inventing a line would file a spec row under
+        whichever source line happened to be first."""
+        self.assertIsNone(self.written()["results"][1]["line"])
+
+    def test_outcomes_that_asked_nothing_are_kept(self) -> None:
+        """`broke` is not a survivor and not a catch, and `reached` needs to see
+        it to leave it out of the partition rather than guess."""
+        self.assertEqual(self.written()["results"][1]["outcome"], "broke")
+
+    def test_it_round_trips_through_reached(self) -> None:
+        """The actual contract: what one writes, the other reads."""
+        rows = reached.rows_from(self.written())
+        self.assertEqual([r.line for r in rows], [7], "only positioned rows survive the read")
+        self.assertTrue(rows[0].survived)
 
 
 class TestHowManyLanesFitInMemory(unittest.TestCase):

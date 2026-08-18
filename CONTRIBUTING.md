@@ -88,6 +88,28 @@ OOM-killed the session twice before 300 s was anywhere in sight. Lanes are
 capped by memory as well as by cores, because the per-row limit bounds one lane
 and not their product.
 
+A survivor list is not a finding, and reading one unaided is how two confident
+wrong triages happened here. Cross it with coverage:
+
+```sh
+python -m tools.mutate --base main --json results.json
+coverage run --source=woswoar -m unittest discover -s . -t . -p 'test_*.py'
+coverage json -o coverage.json
+python -m tools.reached results.json coverage.json --list
+```
+
+That splits survivors in two, and the halves mean opposite things. A survivor on
+a line **no test executes** is a missing test. A survivor on a line the suite
+**does** execute is a weak fixture or an equivalent mutant — rule 3's "suspect
+the fixture", and much the larger half: 590 of 751 on the run this was built
+for. Conflating them is what makes a survivor list read as hundreds of bugs.
+
+Both inputs must come from the same tree; a fix that shifts line numbers
+silently unmatches them. `coverage` is not a dependency and is not imported —
+`tools/reached.py` only reads the JSON. It also folds *caught* mutants back into
+the map, because a caught mutation proves its line ran and in-process coverage
+cannot see the lines this suite reaches by running a real `bash`.
+
 Running out of memory is reported `BROKE`, never `caught`. It arrives as a
 `MemoryError` inside whichever test was running, which by protocol looks exactly
 like that test noticing — and crediting a test with a guard it does not have is
