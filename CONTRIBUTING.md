@@ -103,15 +103,25 @@ without its mode, which is what `docs/security.md` rests on. `encoding` fails
 the second half and was removed: dropping it is a real defect under a non-UTF-8
 locale, and unkillable in a suite that never runs under one.
 
-A generated mutant can also fail to *stop*. Two bounds are enforced per row, and
-they answer different questions: `--timeout` (300 s) for a mutation that never
-finishes, and `--memory` (4 GiB of address space) for one that never finishes
-*while allocating*. The second is not a refinement of the first — a timeout
-cannot fire on a machine that is already out of memory. An `at -= …` generated
-for this repository's own `line_starts` reached 15.5 GB in 73 seconds and
-OOM-killed the session twice before 300 s was anywhere in sight. Lanes are
-capped by memory as well as by cores, because the per-row limit bounds one lane
-and not their product.
+A generated mutant can also fail to *stop*, and there are three ways rather than
+one. `--timeout` (300 s) answers a mutation that never finishes. `--memory`
+(4 GiB of address space, per process) answers one that never finishes *while
+allocating* — not a refinement of the first, because a timeout cannot fire on a
+machine that is already out of memory: an `at -= …` generated for this
+repository's own `line_starts` reached 15.5 GB in 73 seconds and OOM-killed the
+session twice before 300 s was anywhere in sight.
+
+The third is a mutation that spawns *processes*, which neither of the others can
+see. `tools/mutate.py` and `tools/run_tests.py` are themselves things a sweep
+mutates, and a mutant in either decides how many processes its lane starts. The
+sweep that found this had 4,340 alive at once holding 26 GB between them, six
+megabytes each and none within two orders of magnitude of its own ceiling, and
+it took the machine down three times (#232). So each probe now runs in its own
+session, its whole process group is counted once a second against the share
+`_share` gave it, and a group over that share is killed whole and reported
+`BROKE`. Lanes and the ceiling are chosen together for the same reason: what the
+machine feels is their product, and sixteen lanes promised 4 GiB each is 64 GiB
+of promises on a 63 GiB box.
 
 A survivor list is not a finding, and reading one unaided is how two confident
 wrong triages happened here. Cross it with coverage:

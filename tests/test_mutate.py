@@ -1100,6 +1100,22 @@ class TestTheShareOneLaneGets(unittest.TestCase):
         lanes, memory = self.share(8 << 30, wanted=64)
         self.assertLessEqual(lanes * memory, (8 << 30) // 2)
 
+    def test_a_pinned_lane_count_is_kept_and_the_ceiling_gives_way(self) -> None:
+        """`--workers` is a count a caller has reasons to fix, and this cannot
+        see them. It is also what the class above uses to assert that mutations
+        overlap at all -- lowering it there would have turned a test of the pool
+        into a test of the machine, which is the failure its own comment names.
+
+        A pinned run is not unbounded: `_Lanes` measures what the lanes hold
+        rather than predicting it, and that is the guard a wrong prediction
+        leaves standing.
+        """
+        with mock.patch.object(mutate, "_visible_memory", return_value=2 << 30):
+            pinned = mutate._share(4, MEMORY, pinned=True)
+            asked = mutate._share(4, MEMORY)
+        self.assertEqual(pinned, mutate.Share(4, mutate._FLOOR))
+        self.assertEqual(asked.lanes, 1, "unpinned, the machine decides")
+
 
 class TestAHarnessRunningInsideALane(unittest.TestCase):
     """`tests/test_mutate.py` starts this module, so a lane mutating `tools/`
@@ -1119,6 +1135,35 @@ class TestAHarnessRunningInsideALane(unittest.TestCase):
         for said in ("", "lots", "-1", "0"):
             with self.subTest(said=said), mock.patch.dict(os.environ, {mutate._BUDGET: said}):
                 self.assertGreater(mutate._visible_memory(), 0)
+
+
+class TestALaneCarriesItsShareIntoTheProbe(MutateTestCase):
+    """The wire between the two halves: `_share` decides, and the probe has to
+    be *told*, or an inner harness reads the host's memory and sizes itself for
+    a machine it does not have.
+
+    The variable is spelled out here rather than taken from `mutate._BUDGET`
+    on purpose. It is a name two processes agree on, so a test that reads it
+    from the same constant the code does would pass through any rename --
+    including one that changed only the half that writes it.
+    """
+
+    def test_the_probe_is_told_what_it_may_spend(self) -> None:
+        share = 1 << 30
+        self.write(
+            "test_budget.py",
+            f"""
+            import os
+            import unittest
+
+
+            class T(unittest.TestCase):
+                def test_the_lane_said_so(self) -> None:
+                    self.assertEqual(os.environ.get("WOSWOAR_MUTATE_BUDGET"), "{share}")
+            """,
+        )
+        verdict = mutate._run(["test_budget"], self.root, memory=share)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
 
 
 class TestCountingWhatALaneHolds(unittest.TestCase):

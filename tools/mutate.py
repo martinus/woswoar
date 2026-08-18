@@ -784,7 +784,7 @@ class Share(NamedTuple):
     memory: int
 
 
-def _share(wanted: int, memory: int) -> Share:
+def _share(wanted: int, memory: int, pinned: bool = False) -> Share:
     """Pick both together, so that their product is something the machine has.
 
     `verdict.cap` bounds one lane and `_affordable` counts lanes, and for one
@@ -805,9 +805,17 @@ def _share(wanted: int, memory: int) -> Share:
 
     So a big machine keeps its sixteen lanes and simply stops promising each of
     them four gigabytes it cannot deliver, and a small one loses lanes rather
-    than reliability. An explicit `--workers` is still the caller's to set, and
-    it enters as `wanted`: it can ask for fewer lanes than the machine affords,
-    and asking for more still cannot conjure memory that is not there.
+    than reliability.
+
+    ``pinned`` is an explicit `--workers`, and it keeps the lane count it asked
+    for. The ceiling still shrinks around it, which is the part worth having; it
+    is the *count* that a caller has reasons to fix that this cannot see.
+    `tests.test_mutate.TestItRunsThemInParallel` is the case that made this
+    concrete -- it pins four lanes to assert that mutations overlap at all, and
+    on a machine with too little memory to afford four it would otherwise assert
+    the machine rather than the mechanism, which is what its own comment says it
+    is pinned to avoid. The bound that still holds for a pinned run is `_Lanes`,
+    which measures rather than predicts.
 
     ``memory <= 0`` is `--memory 0`, "no cap", and it passes straight through.
     There is no product to bound once one factor is infinite, and quietly
@@ -820,7 +828,7 @@ def _share(wanted: int, memory: int) -> Share:
     # to correct: they may be reproducing a small machine on purpose. It still
     # sets how many lanes fit.
     floor = min(memory, _FLOOR)
-    lanes = max(1, min(wanted, _affordable(), budget // floor))
+    lanes = max(1, wanted if pinned else min(wanted, _affordable(), budget // floor))
     return Share(lanes, min(memory, max(floor, budget // lanes)))
 
 
@@ -872,7 +880,7 @@ def run(
     # and was 1.76x slower than this for eight runs. A sandbox is ~1 ms, so a lane
     # is nearly free.
     wanted = workers or min(len(table) + len(shards), usable_cpus() * 2, _LANES)
-    lanes, memory = _share(wanted, memory)
+    lanes, memory = _share(wanted, memory, pinned=workers is not None)
     if lanes != wanted or memory != asked:
         # Said out loud, for the reason `--limit` says what it dropped: a run
         # that quietly took fewer lanes than the machine has cores reads as a
