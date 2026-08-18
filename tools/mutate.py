@@ -563,9 +563,12 @@ def _run(
             probe.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _end(probe)
-            _WATCHED.release(probe.pid)
             return Verdict("timeout", f"no answer within {timeout:g}s")
-        held = _WATCHED.release(probe.pid)
+        finally:
+            # In a `finally` so that no path leaves a group registered: a
+            # `KeyboardInterrupt` here would otherwise leave the sampler holding
+            # a pid the kernel is free to hand to something else.
+            held = _WATCHED.release(probe.pid)
         if held:
             # Before the report is read, not after. A killed lane may well have
             # written one -- the kill lands on whichever process is running, and
