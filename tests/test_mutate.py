@@ -17,7 +17,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tools.mutate import Mutation, Report, Result, Verdict, run, verify
+from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -493,6 +493,190 @@ class TestAMutationThatBreaksTheSuiteIsNotCaught(MutateTestCase):
         )
 
 
+class TestASpanPicksOneOfSeveralIdenticalLines(MutateTestCase):
+    """What a generated row needs that a hand-written one never did.
+
+    `if value < 0:` twice in a file is an error in a hand table -- `check`
+    refuses it, because the edit could land on either. A generated row means a
+    specific one, and says which by character offset. Watched from inside the
+    sandbox, because "the right one changed" is not visible from the outcome:
+    both mutations make the suite fail, so a run that edited the wrong function
+    reports `caught` just as loudly.
+    """
+
+    def test_the_second_occurrence_is_the_one_that_changes(self) -> None:
+        witness = self.root / "seen.txt"
+        body = (
+            "def first(value: int) -> int:\n"
+            "    if value < 0:\n"
+            "        return 0\n"
+            "    return value\n"
+            "\n"
+            "\n"
+            "def second(value: int) -> int:\n"
+            "    if value < 0:\n"
+            "        return 0\n"
+            "    return value\n"
+        )
+        self.write("mod.py", body)
+        self.write(
+            "test_mod.py",
+            f"""
+            import unittest
+            from pathlib import Path
+
+            import mod
+
+            SEEN = Path({str(witness)!r})
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    SEEN.write_text(f"{{mod.first(-5)}},{{mod.second(-5)}}", encoding="utf-8")
+            """,
+        )
+        # The *second* `if value < 0:`. Both spellings are identical, so nothing
+        # but the offsets distinguishes them.
+        at = body.index("if value < 0:", body.index("def second"))
+        run(
+            [
+                Mutation(
+                    "the second guard is gone",
+                    "mod.py",
+                    "if value < 0:",
+                    "if False:",
+                    "test_mod",
+                    span=(at, at + len("if value < 0:")),
+                )
+            ],
+            baseline=False,
+        )
+        self.assertEqual(
+            witness.read_text(encoding="utf-8"),
+            "0,-5",
+            "the mutation landed on the first occurrence, not the one it named",
+        )
+
+
+class TestASpanThatNoLongerHoldsItsText(MutateTestCase):
+    """The generated row's half of "refuse a spec that cannot mean anything".
+
+    A hand-written row is refused when its text matches other than once. A
+    generated row makes the stronger claim -- the text is *here* -- and the file
+    it was generated from can have moved on since: `--list` writes a table, the
+    author edits a line above it, and every offset below shifts. Splicing at a
+    stale offset produces a file that usually still parses and a verdict about
+    whatever now sits there.
+    """
+
+    def test_it_is_refused_before_anything_runs(self) -> None:
+        self.package(guarded=True)
+        before = (self.root / "mod.py").read_text(encoding="utf-8")
+        with self.assertRaises(SystemExit) as refused:
+            verify(
+                [
+                    Mutation(
+                        "the guard is gone",
+                        "mod.py",
+                        "if value < 0:",
+                        "if False:",
+                        "test_mod",
+                        # Off by two characters: the text is in the file, just not
+                        # at the offsets the row names.
+                        span=(
+                            before.index("if value < 0:") + 2,
+                            before.index("if value < 0:") + 15,
+                        ),
+                    )
+                ],
+                baseline=False,
+            )
+        self.assertIn("no longer holds that text", str(refused.exception))
+        self.assertEqual((self.root / "mod.py").read_text(encoding="utf-8"), before)
+
+
+class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
+    """The pass that makes narrow test selection a speed decision, not a wrong one.
+
+    A row run against too few tests survives for the wrong reason, and that error
+    points the expensive way: it sends the author to rewrite a test that was
+    never weak. So every survivor is re-run against everything before it is
+    printed.
+    """
+
+    def two_rows_with_one_label(self) -> list[Mutation]:
+        """Two mutations that share a label, differ only by span, and differ in
+        what the *wider* suite says about them.
+
+        Both must survive the narrow pass, or `confirm` never re-runs them and
+        nothing can spread: a first version of this fixture had one row caught
+        immediately, so `corrected` was empty and the mutation reverting the fix
+        survived the test that was supposed to guard it.
+
+        A shared label is not contrived. `generate` dedupes on `(span, new)`, not
+        on the label, so two `.startswith(...)` calls on one line produce this
+        exactly -- and on the branch that added the generator, 23 labels repeat.
+        """
+        body = "def first():\n    return 1\n\n\ndef second():\n    return 2\n"
+        self.write("mod.py", body)
+        # Narrow: sees neither function, so both rows survive the first pass.
+        self.write(
+            "test_narrow.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Narrow(unittest.TestCase):
+                def test_nothing_in_particular(self) -> None:
+                    self.assertTrue(hasattr(mod, "first"))
+            """,
+        )
+        # Wide: found only by discovery, and sees `first` alone.
+        self.write(
+            "test_wide.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Wide(unittest.TestCase):
+                def test_first(self) -> None:
+                    self.assertEqual(mod.first(), 1)
+            """,
+        )
+        shared = "mod.py:2 in f() -- `1` becomes `9`"
+        at_one = body.index("return 1") + len("return ")
+        at_two = body.index("return 2") + len("return ")
+        return [
+            Mutation(shared, "mod.py", "1", "9", "test_narrow", span=(at_one, at_one + 1)),
+            Mutation(shared, "mod.py", "2", "9", "test_narrow", span=(at_two, at_two + 1)),
+        ]
+
+    def test_a_shared_label_does_not_spread_one_rows_answer_to_another(self) -> None:
+        """Keying the corrections by label wrote the caught row's verdict onto the
+        other, so a genuine survivor was reported as `caught` -- naming a test
+        that had never seen it, and exiting zero. A false `caught` in a pull
+        request is the one outcome this whole module exists to make impossible.
+        """
+        report = run(self.two_rows_with_one_label(), baseline=False, strict=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results],
+            ["survived", "survived"],
+            "precondition: both rows must survive, or nothing is re-run",
+        )
+
+        confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught", "survived"],
+            "one row's confirmation was written onto the other",
+        )
+        self.assertFalse(confirmed.clean)
+
+
 class TestASubTestIsARealAnswer(MutateTestCase):
     """The regression the first version of this classification shipped with.
 
@@ -574,6 +758,90 @@ class TestAnUnanswerableRowNeedNotEndTheRun(MutateTestCase):
                 [Mutation("bad", "mod.py", "import json", "import nope_xyz", "test_mod")],
                 baseline=False,
             )
+
+
+def enforced() -> bool:
+    """Whether this kernel applies the limits `verdict.cap` asks for.
+
+    Asked by trying it, in a subprocess, rather than by reading `sys.platform`.
+    macOS ignores `RLIMIT_AS` -- which CI discovered, not the documentation --
+    and a `skipIf(darwin)` would encode today's answer to a question that is
+    really "does this kernel enforce it", going green on a platform that
+    silently protects nothing and staying skipped if macOS ever starts.
+
+    It sets the limits *directly* rather than calling `verdict.cap`, and that is
+    not a stylistic choice -- mutation testing rejected the first version, which
+    did call it. A skip condition computed from the code under test cannot
+    detect that code being reverted: neutering `cap` made the probe report "not
+    enforced", the test skipped, and the row came back `SURVIVED` from a suite
+    that had simply declined to run it. A guard that switches itself off when
+    the thing it guards breaks is worse than no guard, because it is green.
+    """
+    probe = (
+        "import resource\n"
+        "for which in (resource.RLIMIT_AS, resource.RLIMIT_DATA):\n"
+        "    soft, hard = resource.getrlimit(which)\n"
+        "    try:\n"
+        "        resource.setrlimit(which, (256 * 1024 * 1024, hard))\n"
+        "    except (OSError, ValueError):\n"
+        "        pass\n"
+        "try:\n"
+        "    bytearray(768 * 1024 * 1024)\n"
+        "except MemoryError:\n"
+        "    print('enforced')\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    return "enforced" in done.stdout
+
+
+@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+class TestAMutantThatEatsMemory(MutateTestCase):
+    """The failure `timeout` cannot catch, because the machine goes first.
+
+    A generated mutation does not have to loop forever to hold a lane -- it can
+    loop forever *while appending*. `mutants.line_starts` reduced to `at -= ...`
+    never advances, because a negative index wraps in Python instead of raising,
+    and three lanes reached 15.5 GB, 7.6 GB and 6.4 GB seventy-three seconds in.
+    The 300 s timeout never got to speak: the host OOM-killed the session twice.
+
+    The fixture allocates a *bounded* 800 MiB rather than looping, and that is
+    deliberate. An unbounded fixture would reproduce the crash in the suite that
+    is supposed to prevent it, and -- worse for rule 3 -- it could not be run
+    with the fix reverted, so nobody could check that this test fails without it.
+    Bounded, both states are safe and they differ:
+
+    - with the cap, the allocation raises `MemoryError` and the row is `broke`;
+    - with `cap` reverted, 800 MiB is simply allocated, `clamp(-5)` returns
+      838860800 rather than 0, the assertion fails, and the row reads `caught`;
+    - with `cap` kept but `_exhausted` reverted, the `MemoryError` arrives at
+      `addError` inside a real `TestCase` and reads `caught` as well.
+
+    Both reverts produce the same wrong answer, and it is the dangerous one: a
+    test credited with a guard it does not have.
+    """
+
+    def test_it_is_broke_rather_than_a_test_noticing(self) -> None:
+        self.package(guarded=True)
+        report = run(
+            [
+                Mutation(
+                    "clamp allocates 800 MiB",
+                    "mod.py",
+                    "        return 0",
+                    "        return len(bytearray(800 * 1024 * 1024))",
+                    "test_mod",
+                ),
+                Mutation("the guard goes", "mod.py", "if value < 0:", "if False:", "test_mod"),
+            ],
+            baseline=False,
+            strict=False,
+            # Comfortably above what the two-file fixture suite needs and
+            # comfortably below the 800 MiB above, so neither side is a
+            # near-miss that a different Python could tip over.
+            memory=512 << 20,
+        )
+        self.assertEqual([result.verdict.outcome for result in report.results], ["broke", "caught"])
+        self.assertIn("ran out of memory", report.results[0].verdict.detail)
 
 
 class TestAMutantThatNeverFinishes(MutateTestCase):

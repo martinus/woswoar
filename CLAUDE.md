@@ -51,6 +51,12 @@ reverted**. Verify that, do not assume it:
 `tools/mutate.py` is that loop: write the table of edits, run
 `python -m tools.mutate <spec>.py`, paste the output into the PR.
 
+`python -m tools.mutate --base main` skips the table: it reads the diff,
+generates mutants for the lines the change touched, and runs them. Use it first
+and write rows by hand only for what it cannot reach — a *scope widening* (the
+`source` line searched in the whole rc file rather than the block) has no local
+AST rewrite, so "every generated mutant was caught" is not "the tests are good".
+
 A test that passes either way is decoration, and reading it will not tell you
 which kind you have written. Tests have been added here that looked correct and
 never executed the line they claimed to guard.
@@ -216,7 +222,8 @@ first such change, not during one.
   | a change might have cost time | [`tools/bench.py`](tools/bench.py) |
 
   ```sh
-  python -m tools.mutate <spec>.py
+  python -m tools.mutate --base main        # generated from the diff
+  python -m tools.mutate <spec>.py          # a table you wrote
   python -m tools.compare --base main --show .bashrc install doctor status
   python -m tools.bench --importtime woswoar.__main__ --base main
   ```

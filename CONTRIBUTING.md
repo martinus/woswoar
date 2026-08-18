@@ -50,6 +50,55 @@ of edits, run `python -m tools.mutate <spec>.py`, and paste its output into the
 pull request — verbatim, rather than retyping it, which is how a mutation that
 was never run ended up quoted in a commit message here.
 
+Most of the time you should not write the table at all:
+
+```sh
+python -m tools.mutate --base main          # generate from the diff and run
+python -m tools.mutate --base main --list   # print the table, run nothing
+```
+
+It reads `git diff --merge-base main` — working tree included, so uncommitted
+work counts — and generates mutants for the changed lines of `woswoar/**.py` and
+`tools/**.py` only. Each row runs against the test modules that name or import
+the file, and **every survivor is then re-run against the whole suite** before it
+is reported, so a narrow selection can cost time but cannot produce a false
+`SURVIVED`. On the change that became #216 that pass corrected nine of eleven.
+
+Fourteen operators. Ten rewrite an expression (`<` to `<=`, `and` to `or`,
+`sorted(x)` to `sorted(x, reverse=True)`, `.endswith(...)` to `True`, an `if`
+forced both ways, `+` to `-`, a slice's bounds dropped, a small integer moved by
+one, `return X` to `return None`); two delete a statement.
+
+Deletion is deliberately narrow. `drop-call` removes a call whose value is
+discarded — `path.mkdir()`, `store.flush()` — which is the "the write never
+happened" class, and `drop-assign` removes an assignment **through an attribute
+or a key** — `self.total = ...`, `cache[k] = ...`. Plain `name = ...` is left
+alone on purpose: deleting it leaves a `NameError` further down, which reports
+`BROKE` rather than an answer and costs a whole suite run to find that out.
+`logging` and `progress` calls are never deleted; `print` is, because here the
+printed output is the product.
+
+A generated mutant can also fail to *stop*. Two bounds are enforced per row, and
+they answer different questions: `--timeout` (300 s) for a mutation that never
+finishes, and `--memory` (4 GiB of address space) for one that never finishes
+*while allocating*. The second is not a refinement of the first — a timeout
+cannot fire on a machine that is already out of memory. An `at -= …` generated
+for this repository's own `line_starts` reached 15.5 GB in 73 seconds and
+OOM-killed the session twice before 300 s was anywhere in sight. Lanes are
+capped by memory as well as by cores, because the per-row limit bounds one lane
+and not their product.
+
+Running out of memory is reported `BROKE`, never `caught`. It arrives as a
+`MemoryError` inside whichever test was running, which by protocol looks exactly
+like that test noticing — and crediting a test with a guard it does not have is
+the failure this whole tool exists to prevent.
+
+Write rows by hand for what no operator can reach. Of the four weak fixtures
+below, three are generated; the fourth — a `source` line searched in the whole rc
+file instead of the block — is a *scope widening*, and no local rewrite produces
+it. So "every generated mutant was caught" is not the same claim as "the tests
+are good".
+
 Three verdicts, not two. `caught` means a **test method** noticed; `SURVIVED`
 means none did; `BROKE` and `TIMEOUT` mean the run never got to ask, and are
 counted apart from both. That third category exists because a mutation which

@@ -99,7 +99,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, NamedTuple
 
+from tools import mutants
+from tools.mutants import Mutation, check
 from tools.sandbox import usable_cpus
+
+#: Re-exported, because every spec file and every pasted pull-request output in
+#: this repository's history says `from tools.mutate import Mutation`. The
+#: definition lives with the generator that produces most of them now.
+__all__ = ["Mutation", "Report", "Result", "Verdict", "run", "verify"]
 
 #: Seconds one mutation may take before the run gives up on it. Generous, because
 #: `tests.test_sync` alone is tens of seconds and a loaded machine is slower
@@ -107,32 +114,30 @@ from tools.sandbox import usable_cpus
 #: lane for the rest of the table.
 TIMEOUT = 300.0
 
+#: The most lanes worth running, whatever the machine reports.
+_LANES = 16
+
+#: Address space one mutant may occupy, handed to `verdict.cap`.
+#:
+#: `TIMEOUT` answers "this mutation never finishes"; this answers "this mutation
+#: never finishes *while allocating*", which is a different failure and the more
+#: dangerous one -- a timeout cannot fire on a machine that is already gone.
+#: A generated `at -= ...` in `mutants.line_starts` reached 15.5 GB in 73 s and
+#: OOM-killed the machine twice while this branch was being written, well
+#: inside the 300 s above.
+#:
+#: 4 GiB is measured rather than chosen: one honest whole-suite run peaks at
+#: 317 MB resident and 1537 MB of address space, so this leaves a 2.7x margin
+#: over the thing it must never interrupt. If a legitimate suite ever reports
+#: `ran out of memory`, raise it -- the message names the test on purpose.
+MEMORY = 4 << 30
+
 #: Names never copied into a mutation's sandbox. ``.git`` because it is large and
 #: nothing under test reads it; the caches because a stale one is the trap this
 #: module documents, and the cheapest way to not have it is to not copy it.
 _SKIP = shutil.ignore_patterns(
     ".git", "__pycache__", ".mypy_cache", ".ruff_cache", ".venv", "*.egg-info"
 )
-
-
-class Mutation(NamedTuple):
-    """One edit that some test is supposed to notice."""
-
-    #: What the mutation does, in the words of whoever might reintroduce it.
-    #: Printed, so make it a sentence a reader of the PR would understand.
-    label: str
-    path: str
-    #: Must appear exactly once in the file. Ambiguity is an error rather than a
-    #: guess: replacing the wrong one of two matches quietly tests nothing.
-    old: str
-    new: str
-    #: Whitespace-separated unittest targets, as `python -m unittest` takes them.
-    tests: str
-    #: Say so when the replacement is meant to *contain* the original -- an
-    #: inserted call, an early return in front of code that stays. Otherwise
-    #: `verify` refuses that shape, because it is overwhelmingly a mistake: see
-    #: the check for why, and what it cost before it existed.
-    additive: bool = False
 
 
 #: What one run of the suite under one mutation is allowed to conclude.
@@ -236,7 +241,12 @@ def _clear_bytecode(root: Path) -> None:
 
 
 def _run(
-    tests: Sequence[str], root: Path, *, failfast: bool = False, timeout: float = TIMEOUT
+    tests: Sequence[str],
+    root: Path,
+    *,
+    failfast: bool = False,
+    timeout: float = TIMEOUT,
+    memory: int = MEMORY,
 ) -> Verdict:
     """What the suite concluded about one mutation, and by which route.
 
@@ -270,6 +280,7 @@ def _run(
                         _probe(),
                         str(report),
                         "1" if failfast else "0",
+                        str(memory),
                         *tests,
                     ],
                     cwd=root,
@@ -320,42 +331,6 @@ def _tail(noise: Path) -> str:
     return spoken[-1].strip() if spoken else ""
 
 
-def _check(mutation: Mutation) -> None:
-    """Refuse a spec that cannot mean anything, reading the real file.
-
-    Every mutation is checked before any of them runs -- see `verify`. A typo in
-    the last row of a table used to be found after the first four had each cost a
-    suite run.
-    """
-    original = Path(mutation.path).read_text(encoding="utf-8")
-    found = original.count(mutation.old)
-    if found != 1:
-        raise SystemExit(
-            f"{mutation.label}: {mutation.path} contains the text to replace "
-            f"{found} times, not once. A mutation that matches nothing tests "
-            f"nothing, and one that matches twice tests something else."
-        )
-
-    # The replacement still contains everything it replaced, so the line the
-    # test is supposed to miss is still in the file and the run cannot mean
-    # anything. Always a mistake when the intent was to *move* something --
-    # write the whole span in `old`, including what follows it, or the
-    # original stays put underneath the edit.
-    #
-    # Three of these went out in one session before this check existed. Each
-    # cost a full suite run and read as "caught" when nothing had changed;
-    # the tell is that a mutation meant to break an invariant reports the
-    # same result as one that does nothing, and there is no way to see which
-    # from the output.
-    if not mutation.additive and mutation.old in mutation.new:
-        raise SystemExit(
-            f"{mutation.label}: the text to replace survives verbatim inside "
-            f"the replacement, so the code under test does not change and "
-            f"'caught' would mean nothing. If the point really is to insert "
-            f"something in front of code that stays, pass additive=True."
-        )
-
-
 @contextmanager
 def _sandboxes(count: int) -> Iterator[queue.Queue[Path]]:
     """``count`` borrowable copies of the working tree, lent out one at a time.
@@ -385,7 +360,9 @@ def _sandboxes(count: int) -> Iterator[queue.Queue[Path]]:
         yield available
 
 
-def _borrow(available: queue.Queue[Path], tests: Sequence[str], timeout: float) -> Verdict:
+def _borrow(
+    available: queue.Queue[Path], tests: Sequence[str], timeout: float, memory: int
+) -> Verdict:
     """Run ``tests`` unmutated in a borrowed sandbox. One shard of the baseline.
 
     Never `failfast`: a red baseline is a thing you want the whole of, and a
@@ -393,28 +370,73 @@ def _borrow(available: queue.Queue[Path], tests: Sequence[str], timeout: float) 
     """
     root = available.get()
     try:
-        return _run(tests, root, timeout=timeout)
+        return _run(tests, root, timeout=timeout, memory=memory)
     finally:
         available.put(root)
 
 
+def _applied(original: str, mutation: Mutation) -> str:
+    """The file with one mutation in it.
+
+    Two ways, because the two kinds of row promise different things. A
+    hand-written `old` is unique in the file -- `check` refused it otherwise --
+    so `replace` cannot land anywhere else. A generated one usually is *not*
+    unique (`if not path.exists():` appears many times), so it carries the
+    offsets it applies at and the text is spliced there. `check` has already
+    confirmed those offsets still hold the text the row quotes.
+    """
+    if mutation.span is None:
+        return original.replace(mutation.old, mutation.new)
+    start, end = mutation.span
+    return original[:start] + mutation.new + original[end:]
+
+
 def _attempt(
-    mutation: Mutation, available: queue.Queue[Path], failfast: bool, timeout: float
+    mutation: Mutation,
+    available: queue.Queue[Path],
+    failfast: bool,
+    timeout: float,
+    memory: int,
 ) -> Verdict:
     """Apply one mutation in a borrowed sandbox and report what the suite said."""
     root = available.get()
     try:
         source = root / mutation.path
         original = source.read_text(encoding="utf-8")
-        source.write_text(original.replace(mutation.old, mutation.new), encoding="utf-8")
+        source.write_text(_applied(original, mutation), encoding="utf-8")
         try:
-            return _run(mutation.tests.split(), root, failfast=failfast, timeout=timeout)
+            return _run(
+                mutation.tests.split(), root, failfast=failfast, timeout=timeout, memory=memory
+            )
         finally:
             # Into the sandbox, not the working tree. Only so the next mutation
             # to borrow this copy starts from clean source.
             source.write_text(original, encoding="utf-8")
     finally:
         available.put(root)
+
+
+def _affordable(memory: int) -> int:
+    """How many lanes fit in memory, which is a different question from cores.
+
+    `verdict.cap` bounds one lane; it does not bound their product, and the
+    product is what the host feels. Sixteen lanes at 4 GiB is 64 GiB on a 62 GiB
+    machine, so a table can still drive it into swap with every individual cap
+    respected -- and a *generated* table is the shape that does it, because it
+    walks a file in order and its runaway rows are therefore adjacent. When this
+    crash was diagnosed, three of four lanes were running away simultaneously,
+    all on the same source line.
+
+    Half of physical memory, because the other half belongs to whoever is using
+    the machine. Mutation testing is a background chore and has no claim on the
+    whole box; an explicit `--workers` still overrides this, as it overrides
+    every other bound below.
+    """
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):  # pragma: no cover - not POSIX
+        return _LANES
+    return max(1, total // 2 // memory)
 
 
 def run(
@@ -425,6 +447,8 @@ def run(
     strict: bool = True,
     failfast: bool = False,
     timeout: float = TIMEOUT,
+    memory: int = MEMORY,
+    summarise: bool = True,
 ) -> Report:
     """Apply each mutation in its own copy of the tree; report what each answered.
 
@@ -448,31 +472,32 @@ def run(
     if not table:
         return Report([])
     for mutation in table:
-        _check(mutation)
+        check(mutation)
 
     # One shard per target rather than one serial run over the union. Measured on
     # four pinned cores with eight `tests.test_sync` classes: the mutation phase
     # took 2.35 s across eight lanes while a single-run baseline took 6.75 s, so
     # the check meant to cost nothing was two thirds of the wall clock and got
     # worse as the table grew -- mutations fan out, a union sums.
-    shards = sorted({test for mutation in table for test in mutation.tests.split()})
+    shards = sorted({mutation.tests for mutation in table})
     # Twice the usable cores, which is what `tools/run_tests.py` measured for this
     # same subprocess-wait-bound work (jobs=8 beat jobs=4 by ~9%, jobs=16
     # regressed). An earlier `cpu // 2` here gave two lanes on a four-core runner
     # and was 1.76x slower than this for eight runs. A sandbox is ~1 ms, so a lane
     # is nearly free.
-    lanes = workers or min(len(table) + len(shards), usable_cpus() * 2, 16)
+    lanes = workers or min(len(table) + len(shards), usable_cpus() * 2, _LANES, _affordable(memory))
 
     results: list[Result] = []
     red = False
     with _sandboxes(lanes) as available, ThreadPoolExecutor(max_workers=lanes) as pool:
         checking = (
-            [pool.submit(_borrow, available, [shard], timeout) for shard in shards]
+            [pool.submit(_borrow, available, shard.split(), timeout, memory) for shard in shards]
             if baseline
             else []
         )
         futures = [
-            pool.submit(_attempt, mutation, available, failfast, timeout) for mutation in table
+            pool.submit(_attempt, mutation, available, failfast, timeout, memory)
+            for mutation in table
         ]
         for mutation, future in zip(table, futures, strict=True):
             verdict = future.result()
@@ -513,7 +538,7 @@ def run(
                 red = True
                 break
 
-    if not red:
+    if not red and summarise:
         _summarise(results)
     report = Report(results, red)
     _RUNS.append(report)
@@ -552,13 +577,200 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
     return sum(1 for result in report.results if result.verdict.outcome == "survived")
 
 
+#: What a row runs when selection could not name a target: everything. Empty
+#: rather than `"tests"`, because a package name is not discovery -- `unittest`
+#: imports the package, finds no tests in it, and reports a green run of nothing.
+#: Not a fallback of convenience either: see `mutants.targets_for`, and the row
+#: says out loud when it happens.
+WHOLE_SUITE = ""
+
+
+def confirm(report: Report, workers: int | None, timeout: float, memory: int) -> Report:
+    """Re-run every survivor against the whole suite, and correct the ones caught.
+
+    This is what makes per-file test selection a *speed* decision rather than a
+    correctness one. A survivor reported from a narrow target may simply have
+    been run against the wrong tests, and that error points the expensive way:
+    it sends the author to rewrite a test that was never weak, which is the
+    failure rule 3 exists to prevent, inverted.
+
+    Only survivors, because they are the minority and the only ones whose answer
+    can be wrong in that direction -- a `caught` row was caught by a real test,
+    and no wider suite makes that less true.
+    """
+    # Positions, not labels. Two generated rows share a label whenever they touch
+    # the same line with the same operator -- `generate` dedupes on `(span, new)`,
+    # and `mutable()` alone has two `.startswith(...)` calls on one line. Keying
+    # the corrections by label wrote one row's `caught` onto every row spelled the
+    # same way, so a genuine survivor was reported as caught, naming a test that
+    # had never seen it. On this branch's own diff, 23 labels are duplicated.
+    #
+    # `run` appends in table order, and with `strict=False` there is no early
+    # exit, so `again.results` is positionally aligned with `widened`.
+    survivors = [
+        (where, result)
+        for where, result in enumerate(report.results)
+        if result.verdict.outcome == "survived"
+    ]
+    if not survivors:
+        return report
+    print(f"\nconfirming {len(survivors)} survivor(s) against the whole suite...")
+    widened = [result.mutation._replace(tests=WHOLE_SUITE) for _, result in survivors]
+    again = run(
+        widened,
+        baseline=False,
+        workers=workers,
+        strict=False,
+        timeout=timeout,
+        memory=memory,
+        summarise=False,
+    )
+
+    # Only `caught` corrects a survivor. A confirmation that broke or timed out
+    # answered nothing, and folding it in would print "caught by a test the
+    # selection had not run" about a run in which no test ran at all -- the
+    # exact false `caught` this module was rewritten to make impossible, one
+    # level up. It happened here on the first end-to-end run.
+    corrected = {
+        where: found.verdict
+        for (where, _), found in zip(survivors, again.results, strict=True)
+        if found.verdict.outcome == "caught"
+    }
+    unsure = sum(1 for found in again.results if not found.verdict.answered)
+    if unsure:
+        print(f"{unsure} confirmation(s) could not be answered; those rows stand as reported.")
+    if not corrected:
+        return report
+    print(f"{len(corrected)} of them were caught by a test the selection had not run.")
+    return Report(
+        [
+            Result(result.mutation, corrected.get(where, result.verdict))
+            for where, result in enumerate(report.results)
+        ],
+        report.baseline_red,
+    )
+
+
+def generated(args: argparse.Namespace) -> list[Mutation]:
+    """The table the diff implies, printed about before any of it runs."""
+    root = Path.cwd()
+    touched = mutants.changed_lines(args.base, root)
+    if args.only:
+        touched = {
+            path: lines
+            for path, lines in touched.items()
+            if any(wanted in path for wanted in args.only)
+        }
+    if not touched:
+        raise SystemExit(
+            f"nothing mutable changed against {args.base}. Only woswoar/**.py and "
+            f"tools/**.py are generated from; a change to tests/ is not a fix to test."
+        )
+
+    index = mutants.importers(root)
+    table: list[Mutation] = []
+    for path in sorted(touched):
+        tests = mutants.targets_for(path, root, index) or WHOLE_SUITE
+        table.extend(
+            mutants.generate(
+                (root / path).read_text(encoding="utf-8"),
+                path,
+                touched[path],
+                tests=tests,
+                operators=args.operator or None,
+            )
+        )
+        if tests == WHOLE_SUITE:
+            print(f"note: nothing imports {path}, so its rows run the whole suite.")
+
+    print(
+        f"{len(touched)} file(s), {sum(len(lines) for lines in touched.values())} changed "
+        f"lines -> {len(table)} mutants"
+    )
+    kept, dropped = mutants.cap(table, args.limit)
+    if dropped:
+        # Said out loud, because a silent cap reads as "everything was covered"
+        # and the count would look right either way -- CLAUDE.md is explicit.
+        share: dict[str, int] = {}
+        for row in dropped:
+            share[row.path] = share.get(row.path, 0) + 1
+        listed = ", ".join(f"{path} {count}" for path, count in sorted(share.items()))
+        print(f"--limit {args.limit}: {len(dropped)} not run ({listed}).")
+        print("Counts below are out of what ran, not out of what the diff implies.")
+    return kept
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tools.mutate",
-        description="Run a script that defines MUTATIONS, and report which are caught.",
+        description="Run a table of mutations -- from a spec file, or from a diff.",
     )
-    parser.add_argument("script", help="a Python file defining MUTATIONS: list[Mutation]")
+    parser.add_argument(
+        "script", nargs="?", help="a Python file defining MUTATIONS: list[Mutation]"
+    )
+    parser.add_argument(
+        "--base", help="generate mutants for every line changed against this revision"
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="print the generated table and run nothing"
+    )
+    parser.add_argument(
+        "--only", action="append", default=[], metavar="PATH", help="restrict to matching paths"
+    )
+    parser.add_argument(
+        "--operator", action="append", default=[], metavar="NAME", help="use only this operator"
+    )
+    parser.add_argument("--limit", type=int, default=200, help="cap the table (0 for no cap)")
+    parser.add_argument("--timeout", type=float, default=TIMEOUT, help="seconds per mutation")
+    parser.add_argument(
+        "--memory",
+        type=int,
+        default=MEMORY,
+        help="bytes of address space one mutation may occupy",
+    )
+    parser.add_argument("--workers", type=int, help="lanes to run in parallel")
+    parser.add_argument("--no-baseline", action="store_true", help="skip the untouched-suite check")
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="do not re-run survivors against the whole suite",
+    )
     args = parser.parse_args(argv)
+
+    if bool(args.script) == bool(args.base):
+        parser.error("give a spec file or --base, not both and not neither")
+
+    if args.base:
+        table = generated(args)
+        if args.list:
+            for row in table:
+                print(f"  {row.operator:16} {row.label}")
+            return 0
+        report = run(
+            table,
+            baseline=not args.no_baseline,
+            workers=args.workers,
+            # A generated row that breaks collection is not a mistake anyone
+            # made; discarding two hundred paid-for answers because of it would
+            # be. The row is reported and the run goes on.
+            strict=False,
+            summarise=False,
+            # Worth having here and not for a hand table: `caught` is the
+            # expected outcome for most generated rows, and without this each
+            # one runs the rest of its target after the answer is known. An
+            # average, not a bound -- `unittest` runs classes alphabetically, so
+            # a mutant caught only by the last of them still pays for nearly all.
+            failfast=True,
+            timeout=args.timeout,
+            memory=args.memory,
+        )
+        if not args.no_confirm:
+            report = confirm(report, args.workers, args.timeout, args.memory)
+        else:
+            print("\n--no-confirm: survivors below were not re-run against the whole suite,")
+            print("so one may simply have been run against tests that cannot see it.")
+        _summarise(report.results)
+        return 0 if report.clean else 1
 
     already = len(_RUNS)
     namespace = runpy.run_path(args.script)
