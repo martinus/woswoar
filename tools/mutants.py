@@ -179,6 +179,11 @@ class Offsets:
         )
 
 
+def _trimmed(text: str, width: int) -> str:
+    """`text` cut to `width` with an ellipsis. Prose for a label, never a rewrite."""
+    return text if len(text) <= width else text[: width - 1] + "\N{HORIZONTAL ELLIPSIS}"
+
+
 def _rewritten(node: ast.AST, change: Callable[[ast.AST], None]) -> str:
     """`node` with `change` applied to a copy, unparsed and spliceable.
 
@@ -398,6 +403,69 @@ def drop_call(node: ast.AST) -> Iterator[Edit]:
     yield Edit(node, "pass", f"the call to `{shown}(...)` never happens")
 
 
+#: Keywords `drop-kwarg` may remove, and what each one is holding up.
+#:
+#: A table rather than "drop any keyword", because a blanket version is mostly
+#: noise and this was measured before it was written. Of 281 keyword arguments
+#: in `woswoar/`, the commonest are *required* parameters passed by name --
+#: `ok=` is a `Check` field, `cwd=` and `ts=` are `Entry` fields -- and dropping
+#: one raises `TypeError`, which is `BROKE` rather than an answer and costs a
+#: whole suite run to discover. That is the argument `drop_assign` already makes
+#: for leaving plain `name = ...` alone. Nine more pass `check=False`, which is
+#: `subprocess.run`'s own default, so removing it changes nothing and the row is
+#: an unkillable equivalent mutant.
+#:
+#: Optional-versus-required is not decidable from the AST; it needs the callee's
+#: signature. So the rule is inverted: a keyword not named here is never
+#: dropped, and the list holds the ones whose absence *silently weakens a
+#: guarantee* rather than breaking anything.
+_DROPPABLE = {
+    #: `mkdir(mode=0o700)`, `chmod` -- the mode is the guarantee. `docs/security.md`
+    #: claims are meant to be backed by tests, and nothing could generate this.
+    "mode",
+    #: `subprocess.run(check=True)` -- dropped, a failing command reads as success.
+    #: Only when it is `True`; `check=False` is the default and unkillable.
+    "check",
+    #: `open(encoding="utf-8")` -- dropped, the locale decides, and it differs
+    #: between a developer's shell and a systemd timer.
+    "encoding",
+    #: The symlink and permission flags, same class as `mode`.
+    "follow_symlinks",
+    "exist_ok",
+}
+
+
+def drop_kwarg(node: ast.AST) -> Iterator[Edit]:
+    """One keyword argument removed, where its absence weakens a guarantee.
+
+    Narrow on purpose -- see `_DROPPABLE`. The failure this reaches is the one
+    that leaves no trace: `mkdir(..., mode=0o700)` without its mode still makes
+    the directory, still returns, and still passes every test that only asks
+    whether the path exists.
+    """
+    if not isinstance(node, ast.Call) or not node.keywords:
+        return
+    for at, keyword in enumerate(node.keywords):
+        # No `arg is None` guard: `_DROPPABLE` holds strings, so a `**spread`
+        # (whose `arg` is `None`) already fails the membership test. A guard
+        # nothing can reach is one nobody can trust -- as `every_line` says.
+        if keyword.arg not in _DROPPABLE:
+            continue
+        if keyword.arg == "check" and not (
+            isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+        ):
+            # `check=False` is `subprocess.run`'s default: dropping it changes
+            # nothing, and a row that changes nothing can only ever survive.
+            continue
+
+        def without(clone: ast.AST, index: int = at) -> None:
+            assert isinstance(clone, ast.Call)
+            del clone.keywords[index]
+
+        trimmed = _trimmed(ast.unparse(keyword.value), 20)
+        yield Edit(node, _rewritten(node, without), f"`{keyword.arg}={trimmed}` is dropped")
+
+
 def off_by_one(node: ast.AST) -> Iterator[Edit]:
     """Small integer literals, moved by one. Index and threshold arithmetic."""
     if not isinstance(node, ast.Constant) or not isinstance(node.value, int):
@@ -425,8 +493,7 @@ def return_value(node: ast.AST) -> Iterator[Edit]:
         node.value.value is None or isinstance(node.value.value, bool)
     ):
         return
-    shown = ast.unparse(node.value)
-    trimmed = shown if len(shown) <= 30 else shown[:29] + "\N{HORIZONTAL ELLIPSIS}"
+    trimmed = _trimmed(ast.unparse(node.value), 30)
     yield Edit(node.value, "None", f"returns `None` instead of `{trimmed}`")
 
 
@@ -523,6 +590,7 @@ OPERATORS: tuple[Operator, ...] = (
     Operator("return-constant", return_constant),
     Operator("drop-call", drop_call),
     Operator("drop-assign", drop_assign),
+    Operator("drop-kwarg", drop_kwarg),
     Operator("off-by-one", off_by_one),
     Operator("return-value", return_value),
     Operator("arith", arith),
@@ -655,7 +723,9 @@ def label(path: str, line: int, where: str, prose: str, inside_callable: bool = 
     return f"{place} in {where}{'()' if inside_callable else ''} -- {prose}"
 
 
-def _chosen(operators: Sequence[str] | None) -> tuple[Operator, ...]:
+def _chosen(
+    operators: Sequence[str] | None, skip: Sequence[str] | None = None
+) -> tuple[Operator, ...]:
     """The operators to run, refusing a name that is not one.
 
     Decided once per file rather than re-tested per node per operator, and
@@ -664,17 +734,28 @@ def _chosen(operators: Sequence[str] | None) -> tuple[Operator, ...]:
     exited 0. A run that asked nothing must not read as a run that found
     nothing -- the same argument `--limit` makes when it says out loud how many
     rows it dropped.
+
+    `skip` is the escape hatch for an equivalent mutant whose operator is
+    otherwise worth running -- the one `# pragma: no mutate` cannot serve,
+    because a pragma suppresses a *line* and this suppresses a *kind*. It
+    subtracts after `operators` selects, so naming a name in both is an empty
+    selection, which is refused for the reason above.
     """
-    if not operators:
-        return OPERATORS
-    known = {op.name: op for op in OPERATORS}
-    unknown = sorted(set(operators) - set(known))
+    known = {op.name for op in OPERATORS}
+    asked, skipped = set(operators or ()), set(skip or ())
+    unknown = sorted((asked | skipped) - known)
     if unknown:
         raise SystemExit(
             f"no such operator: {', '.join(unknown)}. Available: "
             f"{', '.join(op.name for op in OPERATORS)}"
         )
-    return tuple(op for op in OPERATORS if op.name in set(operators))
+    wanted = (asked or known) - skipped
+    if not wanted:
+        raise SystemExit(
+            "every operator was skipped, so nothing would be generated. "
+            "Drop a --skip-operator, or say what you did want with --operator."
+        )
+    return tuple(op for op in OPERATORS if op.name in wanted)
 
 
 def generate(
@@ -683,12 +764,13 @@ def generate(
     lines: set[int],
     tests: str = "",
     operators: Sequence[str] | None = None,
+    skip: Sequence[str] | None = None,
 ) -> list[Mutation]:
     """Every mutant the operators can make on the changed lines of one file."""
     tree = ast.parse(source)
     offsets = Offsets(source)
     blocked = _pragma_lines(source, offsets)
-    chosen = _chosen(operators)
+    chosen = _chosen(operators, skip)
 
     seen: set[tuple[tuple[int, int], str]] = set()
     out: list[Mutation] = []
@@ -868,6 +950,36 @@ def changed_lines(base: str, root: Path) -> dict[str, set[int]]:
             body = (root / name).read_text(encoding="utf-8").splitlines()
             changed.setdefault(name, set()).update(range(1, len(body) + 1))
     return changed
+
+
+def every_line(root: Path) -> dict[str, set[int]]:
+    """Every line of every mutable file. What `--all` means.
+
+    Enumerated rather than diffed against the repository's first commit. Those
+    two agreed exactly when it was checked, but only because this repository's
+    root commit happens to be near-empty -- a fact about its history rather than
+    about what "everything" means. No absolute count is quoted here on purpose:
+    it moves with every commit, and a stale one reads as a promise.
+
+    `git` is not consulted at all, so an unstaged or untracked file counts the
+    same as a committed one. That matches `changed_lines`, which folds untracked
+    files in for the same reason: a brand-new module with no mutants reads
+    exactly like a covered one.
+    """
+    found: dict[str, set[int]] = {}
+    for prefix in MUTABLE:
+        # No `mutable(name)` filter: walking `MUTABLE` for `*.py` already
+        # satisfies both halves of it, so the check could never be false. A
+        # mutation removing it survived, and this module deletes a guard nothing
+        # can reach rather than keeping one nobody can trust -- as it does for
+        # the `tests/` conjunct in `mutable` and the `/dev/null` case in
+        # `parse_hunks`.
+        for path in sorted((root / prefix).rglob("*.py")):
+            name = path.relative_to(root).as_posix()
+            body = path.read_text(encoding="utf-8").splitlines()
+            if body:
+                found[name] = set(range(1, len(body) + 1))
+    return found
 
 
 # --- which tests to run it against ----------------------------------------

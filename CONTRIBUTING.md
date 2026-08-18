@@ -55,7 +55,19 @@ Most of the time you should not write the table at all:
 ```sh
 python -m tools.mutate --base main          # generate from the diff and run
 python -m tools.mutate --base main --list   # print the table, run nothing
+python -m tools.mutate --all --json out.json  # every line of every mutable file
 ```
+
+`--all` is the whole package rather than a diff — several thousand mutants and
+hours — so it batches by file and writes `--json` as each one lands: a crash
+costs one file, and re-running with the same `--json` skips what is already
+recorded. There is no `--resume` flag; the report *is* the resume state.
+`--batch` asks for the same behaviour on a large `--base` diff. `--all` also
+drops the default `--limit`, which is sized for a diff and would otherwise run
+a twentieth of the table.
+
+Confirmation is pooled to the end rather than run per batch, because per batch
+a file with one survivor pays a whole suite run with fifteen lanes idle.
 
 It reads `git diff --merge-base main` — working tree included, so uncommitted
 work counts — and generates mutants for the changed lines of `woswoar/**.py` and
@@ -64,10 +76,13 @@ the file, and **every survivor is then re-run against the whole suite** before i
 is reported, so a narrow selection can cost time but cannot produce a false
 `SURVIVED`. On the change that became #216 that pass corrected nine of eleven.
 
-Fourteen operators. Ten rewrite an expression (`<` to `<=`, `and` to `or`,
-`sorted(x)` to `sorted(x, reverse=True)`, `.endswith(...)` to `True`, an `if`
-forced both ways, `+` to `-`, a slice's bounds dropped, a small integer moved by
-one, `return X` to `return None`); two delete a statement.
+Fifteen operators, and `--skip-operator NAME` drops one — the escape hatch for
+an equivalent mutant a whole operator keeps producing, where `# pragma: no
+mutate` only suppresses a line. Twelve rewrite an expression (`<` to `<=`, `and`
+to `or`, `sorted(x)` to `sorted(x, reverse=True)`, `.endswith(...)` to `True`, an
+`if` forced both ways, `+` to `-`, a slice's bounds dropped, a small integer
+moved by one, `return X` to `return None`); two delete a statement, and one
+drops a keyword argument.
 
 Deletion is deliberately narrow. `drop-call` removes a call whose value is
 discarded — `path.mkdir()`, `store.flush()` — which is the "the write never
@@ -78,6 +93,15 @@ alone on purpose: deleting it leaves a `NameError` further down, which reports
 `logging` and `progress` calls are never deleted; `print` is, because here the
 printed output is the product.
 
+`drop-kwarg` removes a keyword argument, and only from a named list —
+`mode`, `check=True`, `encoding`, `exist_ok`, `follow_symlinks`. Blanket
+dropping was measured first and is mostly noise: of 281 keyword arguments in
+`woswoar/`, the commonest are *required* parameters passed by name, where
+dropping one is a `TypeError` and so `BROKE` rather than an answer. The list
+holds the ones whose absence silently weakens a guarantee instead — it is the
+only way to generate `mkdir(..., mode=0o700)` without its mode, which is what
+`docs/security.md` rests on.
+
 A generated mutant can also fail to *stop*. Two bounds are enforced per row, and
 they answer different questions: `--timeout` (300 s) for a mutation that never
 finishes, and `--memory` (4 GiB of address space) for one that never finishes
@@ -87,6 +111,28 @@ for this repository's own `line_starts` reached 15.5 GB in 73 seconds and
 OOM-killed the session twice before 300 s was anywhere in sight. Lanes are
 capped by memory as well as by cores, because the per-row limit bounds one lane
 and not their product.
+
+A survivor list is not a finding, and reading one unaided is how two confident
+wrong triages happened here. Cross it with coverage:
+
+```sh
+python -m tools.mutate --base main --json results.json
+coverage run --source=woswoar -m unittest discover -s . -t . -p 'test_*.py'
+coverage json -o coverage.json
+python -m tools.reached results.json coverage.json --list
+```
+
+That splits survivors in two, and the halves mean opposite things. A survivor on
+a line **no test executes** is a missing test. A survivor on a line the suite
+**does** execute is a weak fixture or an equivalent mutant — rule 3's "suspect
+the fixture", and much the larger half: 590 of 751 on the run this was built
+for. Conflating them is what makes a survivor list read as hundreds of bugs.
+
+Both inputs must come from the same tree; a fix that shifts line numbers
+silently unmatches them. `coverage` is not a dependency and is not imported —
+`tools/reached.py` only reads the JSON. It also folds *caught* mutants back into
+the map, because a caught mutation proves its line ran and in-process coverage
+cannot see the lines this suite reaches by running a real `bash`.
 
 Running out of memory is reported `BROKE`, never `caught`. It arrives as a
 `MemoryError` inside whichever test was running, which by protocol looks exactly

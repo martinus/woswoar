@@ -157,6 +157,7 @@ _FIRES: dict[str, tuple[str, list[str]]] = {
     ),
     "drop-call": ("path.mkdir()\n", ["the call to `path.mkdir(...)` never happens"]),
     "drop-assign": ("self.total = 1\n", ["`self.total` is never assigned"]),
+    "drop-kwarg": ("path.mkdir(mode=0o700)\n", ["`mode=448` is dropped"]),
     "off-by-one": ("x = items[1]\n", ["`1` becomes `2`", "`1` becomes `0`"]),
     "return-value": (
         "def f():\n    return compute(x)\n",
@@ -189,6 +190,9 @@ _QUIET: dict[str, str] = {
     # A plain name: deleting it leaves a NameError further down, which reports
     # BROKE -- not an answer, and a whole suite run to learn that.
     "drop-assign": "plain = 3\n",
+    # `ok=` is a required field, not an optional guarantee: dropping it is a
+    # `TypeError`, which is BROKE rather than an answer.
+    "drop-kwarg": 'Check(label="x", ok=True)\n',
     # Big enough that +-1 is arbitrary rather than a boundary.
     "off-by-one": "x = items[97]\n",
     # `return None` is already what the mutation would produce -- and `return
@@ -350,6 +354,107 @@ class TestLineEndingsThatAreNotNewline(unittest.TestCase):
         start, end = row.span or (0, 0)
         self.assertEqual(source[start:end], "a < b")
         self.assertEqual(row.old, "a < b")
+
+
+class TestDroppingAKeywordArgument(unittest.TestCase):
+    """The operator written for `mkdir(..., mode=0o700)`.
+
+    Deliberately narrow. A blanket "drop any keyword" was measured first: of 281
+    keyword arguments in `woswoar/`, the commonest are *required* parameters
+    passed by name, and dropping one raises `TypeError` -- `BROKE` rather than
+    an answer, at the price of a whole suite run. `_DROPPABLE` inverts the rule
+    so that a keyword nobody argued for is never dropped.
+    """
+
+    def dropped(self, body: str) -> list[str]:
+        rows = mutants.generate(body, "w/t.py", {1}, tests="t", operators=["drop-kwarg"])
+        return [row.label.split(" -- ")[-1] for row in rows]
+
+    def test_a_mode_is_droppable(self) -> None:
+        """The case it exists for: the directory is still made, still returns,
+        and every test that only asks whether the path exists still passes."""
+        self.assertEqual(
+            self.dropped("path.mkdir(parents=True, mode=0o700)\n"), ["`mode=448` is dropped"]
+        )
+
+    def test_check_true_is_droppable(self) -> None:
+        self.assertEqual(
+            self.dropped("subprocess.run(argv, check=True)\n"), ["`check=True` is dropped"]
+        )
+
+    def test_check_false_is_not(self) -> None:
+        """It is `subprocess.run`'s own default, so removing it changes nothing
+        and the row could only ever be an unkillable survivor."""
+        self.assertEqual(self.dropped("subprocess.run(argv, check=False)\n"), [])
+
+    def test_a_keyword_nobody_argued_for_is_left_alone(self) -> None:
+        """`ok=` is a required `Check` field: dropping it is a `TypeError`."""
+        self.assertEqual(self.dropped('Check(label="x", ok=True)\n'), [])
+
+    def test_a_star_star_spread_is_not_a_keyword_to_drop(self) -> None:
+        self.assertEqual(self.dropped("f(**options)\n"), [])
+
+    def test_the_replacement_actually_omits_it(self) -> None:
+        """The prose could be right while the edit is not."""
+        rows = mutants.generate(
+            'p.read_text(encoding="utf-8")\n', "w/t.py", {1}, tests="t", operators=["drop-kwarg"]
+        )
+        self.assertNotIn("encoding", rows[0].new)
+
+    def test_each_droppable_keyword_is_reachable(self) -> None:
+        """Otherwise a name can sit in `_DROPPABLE` spelled wrongly for ever."""
+        for name in sorted(mutants._DROPPABLE):
+            with self.subTest(keyword=name):
+                value = "True" if name in ("check", "exist_ok", "follow_symlinks") else "0"
+                self.assertEqual(len(self.dropped(f"f(a, {name}={value})\n")), 1)
+
+
+class TestSkippingAnOperator(unittest.TestCase):
+    """`--skip-operator`, the escape hatch a pragma cannot serve.
+
+    A pragma suppresses a *line*; this suppresses a *kind*, which is what an
+    equivalent mutant produced by one operator over and over needs.
+    """
+
+    def test_it_subtracts_from_the_default_set(self) -> None:
+        every = mutants.generate("x = a < b\n", "w/t.py", {1}, tests="t")
+        fewer = mutants.generate("x = a < b\n", "w/t.py", {1}, tests="t", skip=["boundary"])
+        self.assertTrue(any(row.operator == "boundary" for row in every))
+        self.assertFalse(any(row.operator == "boundary" for row in fewer))
+        self.assertLess(len(fewer), len(every))
+
+    def test_an_unknown_name_is_refused(self) -> None:
+        with self.assertRaises(SystemExit) as refused:
+            mutants.generate("x = a < b\n", "w/t.py", {1}, skip=["boundry"])
+        self.assertIn("no such operator: boundry", str(refused.exception))
+
+    def test_skipping_everything_is_refused_rather_than_silent(self) -> None:
+        """An empty selection generates nothing and would exit 0 -- a run that
+        asked nothing reading as a run that found nothing."""
+        with self.assertRaises(SystemExit) as refused:
+            mutants.generate(
+                "x = a < b\n", "w/t.py", {1}, operators=["boundary"], skip=["boundary"]
+            )
+        self.assertIn("every operator was skipped", str(refused.exception))
+
+
+class TestEveryLine(unittest.TestCase):
+    """What `--all` means, enumerated rather than diffed against the first commit."""
+
+    def test_it_finds_the_mutable_files_and_all_their_lines(self) -> None:
+        found = mutants.every_line(REPO_ROOT)
+        self.assertIn("tools/mutants.py", found)
+        self.assertIn("woswoar/sync.py", found)
+        body = (REPO_ROOT / "woswoar/sync.py").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(max(found["woswoar/sync.py"]), len(body))
+        self.assertEqual(min(found["woswoar/sync.py"]), 1)
+
+    def test_it_holds_nothing_that_is_not_mutable(self) -> None:
+        for path in mutants.every_line(REPO_ROOT):
+            self.assertTrue(mutants.mutable(path), path)
+
+    def test_tests_are_not_swept(self) -> None:
+        self.assertFalse(any(p.startswith("tests/") for p in mutants.every_line(REPO_ROOT)))
 
 
 class TestChoosingOperators(unittest.TestCase):
