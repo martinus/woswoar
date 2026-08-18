@@ -39,7 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -125,13 +125,11 @@ def partition(rows: list[Row], executed: dict[str, set[int]]) -> Split:
 
 
 def _summarise(rows: list[Row], split: Split, corrected: int) -> None:
-    answered = [r for r in rows if r.answered]
-    caught = sum(1 for r in rows if r.outcome == "caught")
+    counts = Counter(row.outcome for row in rows)
     print(f"{'ALL':<46}{len(rows):>6}")
-    print(f"{'  caught':<46}{caught:>6}")
+    print(f"{'  caught':<46}{counts['caught']:>6}")
     for outcome in ("broke", "timeout"):
-        count = sum(1 for r in rows if r.outcome == outcome)
-        if count:
+        if count := counts[outcome]:
             print(f"{'  ' + outcome + ' (asked nothing)':<46}{count:>6}")
     print(f"{'  SURVIVED':<46}{split.total:>6}")
     print(f"{'    on a line NO test executes  (missing test)':<46}{len(split.unreached):>6}")
@@ -144,15 +142,16 @@ def _summarise(rows: list[Row], split: Split, corrected: int) -> None:
             f"\n{corrected} line(s) had a caught mutation but were absent from the "
             "coverage map,\nso the suite reaches them through a subprocess. Folded in."
         )
-    if not answered:
+    if not any(row.answered for row in rows):
         print("\nnothing was answered: no partition is possible.")
 
 
 def _by_file(rows: list[Row]) -> None:
-    counts: dict[str, int] = defaultdict(int)
-    for row in rows:
-        counts[row.path] += 1
-    for path, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+    # `sorted` rather than `most_common`, which does not tie-break by path and
+    # would make two runs of the same state print in different orders.
+    for path, n in sorted(
+        Counter(row.path for row in rows).items(), key=lambda kv: (-kv[1], kv[0])
+    ):
         print(f"  {n:5d}  {path}")
 
 

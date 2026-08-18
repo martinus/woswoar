@@ -211,7 +211,7 @@ first such change, not during one.
   `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
   serially, and takes about three times as long.
 
-- Three tools in `tools/` exist because the same mistake was made more than
+- Four tools in `tools/` exist because the same mistake was made more than
   once. Each one's module docstring carries the full argument for why it is
   shaped as it is; reach for them rather than writing the loop again.
 

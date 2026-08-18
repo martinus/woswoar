@@ -119,6 +119,11 @@ TIMEOUT = 300.0
 #: The most lanes worth running, whatever the machine reports.
 _LANES = 16
 
+#: Rows a generated table runs before it stops, when nobody said otherwise.
+#: Sized for a diff; `--all` resets it, because a cap meant to keep one
+#: change's table readable turns a whole-package sweep into 4% of itself.
+LIMIT = 200
+
 #: Address space one mutant may occupy, handed to `verdict.cap`.
 #:
 #: `TIMEOUT` answers "this mutation never finishes"; this answers "this mutation
@@ -725,7 +730,7 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
 def generated(args: argparse.Namespace) -> list[Mutation]:
     """The table the diff implies, printed about before any of it runs."""
     root = Path.cwd()
-    touched = mutants.changed_lines(args.base, root)
+    touched = mutants.every_line(root) if args.all else mutants.changed_lines(args.base, root)
     if args.only:
         touched = {
             path: lines
@@ -734,7 +739,9 @@ def generated(args: argparse.Namespace) -> list[Mutation]:
         }
     if not touched:
         raise SystemExit(
-            f"nothing mutable changed against {args.base}. Only woswoar/**.py and "
+            "no mutable files at all under woswoar/ or tools/."
+            if args.all
+            else f"nothing mutable changed against {args.base}. Only woswoar/**.py and "
             f"tools/**.py are generated from; a change to tests/ is not a fix to test."
         )
 
@@ -749,14 +756,16 @@ def generated(args: argparse.Namespace) -> list[Mutation]:
                 touched[path],
                 tests=tests,
                 operators=args.operator or None,
+                skip=args.skip_operator or None,
             )
         )
         if tests == WHOLE_SUITE:
             print(f"note: nothing imports {path}, so its rows run the whole suite.")
 
+    counted = sum(len(lines) for lines in touched.values())
     print(
-        f"{len(touched)} file(s), {sum(len(lines) for lines in touched.values())} changed "
-        f"lines -> {len(table)} mutants"
+        f"{len(touched)} file(s), {counted} {'' if args.all else 'changed '}lines "
+        f"-> {len(table)} mutants"
     )
     kept, dropped = mutants.cap(table, args.limit)
     if dropped:
@@ -815,6 +824,14 @@ def _persist(report: Report, where: Path) -> None:
                 "operator": result.mutation.operator,
                 "outcome": result.verdict.outcome,
                 "detail": result.verdict.detail,
+                # Enough to rebuild the row, not just to read about it. Without
+                # `old`/`new` a resumed sweep could skip a file but never
+                # re-confirm its survivors, and `CONTRIBUTING.md` promises every
+                # survivor is re-run against the whole suite before it is
+                # reported. A resume must not quietly drop that guarantee.
+                "old": result.mutation.old,
+                "new": result.mutation.new,
+                "span": list(result.mutation.span) if result.mutation.span else None,
             }
         )
     where.write_text(
@@ -822,6 +839,111 @@ def _persist(report: Report, where: Path) -> None:
         encoding="utf-8",
     )
     print(f"\nwrote {len(rows)} row(s) to {where}")
+
+
+def _run_generated(rows: Sequence[Mutation], args: argparse.Namespace) -> Report:
+    """One batch of generated rows. Both the whole table and `sweep` use this.
+
+    `strict=False`: a generated row that breaks collection is not a mistake
+    anyone made, and discarding two hundred paid-for answers because of it would
+    be. The row is reported and the run goes on.
+
+    `failfast=True`: worth having for a generated table and not for a hand
+    table, because `caught` is the expected outcome for most generated rows and
+    without it each one runs the rest of its target after the answer is known.
+    An average, not a bound -- `unittest` runs classes alphabetically, so a
+    mutant caught only by the last of them still pays for nearly all.
+    """
+    return run(
+        rows,
+        baseline=not args.no_baseline,
+        workers=args.workers,
+        strict=False,
+        summarise=False,
+        failfast=True,
+        timeout=args.timeout,
+        memory=args.memory,
+    )
+
+
+def _recorded(where: Path | None) -> list[Result]:
+    """Every row a previous `--json` report holds, rebuilt.
+
+    Rebuilt rather than merely counted, because `sweep` has to do three things
+    with them and only one is "skip". They must stay in the file it rewrites --
+    the first version returned labels only, so a resumed run persisted just the
+    batches it had run and *deleted* the answers it had decided to skip, which
+    is the recovery mechanism eating the thing it recovers. They must reach
+    `confirm`, or a resumed sweep reports a survivor that was never re-run
+    against the whole suite. And they must reach `_summarise` and the exit
+    status, or a resume whose new batches are all caught exits 0 while recorded
+    survivors go unmentioned.
+
+    A half-written file resumes as nothing: re-running everything is the safe
+    reading of a crash mid-write.
+    """
+    if where is None or not where.is_file():
+        return []
+    try:
+        saved = json.loads(where.read_text(encoding="utf-8"))
+        return [
+            Result(
+                Mutation(
+                    row["label"],
+                    row["path"],
+                    row["old"],
+                    row["new"],
+                    row["tests"],
+                    span=(row["span"][0], row["span"][1]) if row.get("span") else None,
+                    operator=row.get("operator", ""),
+                ),
+                Verdict(row["outcome"], row.get("detail", "")),
+            )
+            for row in saved.get("results", [])
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def sweep(table: Sequence[Mutation], args: argparse.Namespace) -> Report:
+    """Run a large table a file at a time, writing answers out as they land.
+
+    One table of three thousand rows reports nothing until it ends, and the run
+    it was written for took 151 minutes and was killed twice by an out-of-memory
+    machine before the guard in #223 existed. A crash then cost the afternoon.
+    Batched by file, a crash costs one file, and re-running with the same
+    `--json` skips what is already recorded -- there is no separate flag.
+
+    Confirmation is pooled to the end rather than run per batch, and that is not
+    an optimisation detail: per batch, a file with a single survivor pays a whole
+    suite run with fifteen lanes idle. Measured on the first sweep here,
+    `credentials.py` spent 68 s on 13 mutants, almost all of it confirming one
+    row.
+    """
+    collected = _recorded(args.json)
+    # Keyed by file, not by row: `_persist` writes after a whole batch, so a
+    # file is recorded entirely or not at all, and a label is not unique anyway
+    # -- 7 are duplicated in the `--all` table, for the reason `confirm`'s
+    # docstring gives.
+    done = {result.mutation.path for result in collected}
+    by_file: dict[str, list[Mutation]] = {}
+    for row in table:
+        by_file.setdefault(row.path, []).append(row)
+
+    red = False
+    order = sorted(by_file, key=lambda path: len(by_file[path]))
+    for at, path in enumerate(order, start=1):
+        if path in done:
+            print(f"[{at}/{len(order)}] {path}: already recorded, skipping")
+            continue
+        rows = by_file[path]
+        print(f"\n[{at}/{len(order)}] {path}: {len(rows)} mutant(s)")
+        batch = _run_generated(rows, args)
+        red |= batch.baseline_red
+        collected.extend(batch.results)
+        if args.json:
+            _persist(Report(collected, red), args.json)
+    return Report(collected, red)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -844,7 +966,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--operator", action="append", default=[], metavar="NAME", help="use only this operator"
     )
-    parser.add_argument("--limit", type=int, default=200, help="cap the table (0 for no cap)")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="every line of every mutable file, rather than a diff",
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="run a file at a time, writing --json as each lands (implied by --all)",
+    )
+    parser.add_argument(
+        "--skip-operator",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="run every operator but this one",
+    )
+    parser.add_argument("--limit", type=int, default=LIMIT, help="cap the table (0 for no cap)")
     parser.add_argument("--timeout", type=float, default=TIMEOUT, help="seconds per mutation")
     parser.add_argument(
         "--memory",
@@ -867,8 +1006,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.all and args.base:
+        parser.error("--all is every line; --base is what changed. Not both.")
+    if args.all:
+        # Downstream only asks "generated or a spec file?", and `--all` is the
+        # generated path with a wider net rather than a third kind of run.
+        args.base = "--all"
+        if args.limit == LIMIT:
+            # The default cap is sized for a diff. Left alone it turned the
+            # documented `--all` into 200 of 4451 rows -- and, because the cap
+            # spreads across files, into batches of seven, so batching,
+            # incremental `--json` and resume all did nothing on the one command
+            # line anybody would type. An explicit `--limit` is still honoured.
+            args.limit = 0
     if bool(args.script) == bool(args.base):
-        parser.error("give a spec file or --base, not both and not neither")
+        parser.error("give a spec file, --base or --all")
 
     if args.base:
         table = generated(args)
@@ -876,24 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
             for row in table:
                 print(f"  {row.operator:16} {row.label}")
             return 0
-        report = run(
-            table,
-            baseline=not args.no_baseline,
-            workers=args.workers,
-            # A generated row that breaks collection is not a mistake anyone
-            # made; discarding two hundred paid-for answers because of it would
-            # be. The row is reported and the run goes on.
-            strict=False,
-            summarise=False,
-            # Worth having here and not for a hand table: `caught` is the
-            # expected outcome for most generated rows, and without this each
-            # one runs the rest of its target after the answer is known. An
-            # average, not a bound -- `unittest` runs classes alphabetically, so
-            # a mutant caught only by the last of them still pays for nearly all.
-            failfast=True,
-            timeout=args.timeout,
-            memory=args.memory,
-        )
+        report = sweep(table, args) if args.all or args.batch else _run_generated(table, args)
         if not args.no_confirm:
             report = confirm(report, args.workers, args.timeout, args.memory)
         else:
