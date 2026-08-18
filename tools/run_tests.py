@@ -2,17 +2,17 @@
 
 The suite is dominated by `tests.test_sync`, which spends about 88% of its wall
 clock waiting on real `git`, `age` and `ssh-keygen` -- 5400 git invocations for
-one serial run. That is latency, not CPU, so it shards across processes almost
+one serial run. That is latency, not CPU, so it splits across processes almost
 linearly: 21s serially, 6.7s on a four-core runner.
 
-Sharding is by test *class*: classes are the unit that shares `setUpClass`, so
+Splitting is by test *class*: classes are the unit that shares `setUpClass`, so
 splitting one would run its fixture twice. Classes are then packed into batches,
 a few per worker rather than one process per class -- 71 interpreter starts cost
 about 5.6s of import CPU between them, which is most of what parallelism had
 just bought.
 
 What this adds over `python -m unittest discover` is an accounting check. A
-parallel runner has a failure mode a serial one does not: a shard that dies
+parallel runner has a failure mode a serial one does not: a batch that dies
 before it reports, leaving a run that is green because nothing ran. So every id
 handed to a batch must come back in that batch's report, by name:
 
@@ -23,6 +23,19 @@ Two honest limits on that. It is a closed loop -- both sides come from the same
 stays green, exactly as it would under plain unittest. And when a batch dies the
 ids come back as never-run, which is the point, but the diagnosis of *why* is in
 that batch's own stderr rather than in the summary.
+
+There are two splits, and they compose. Batches divide a suite over the
+processes of one machine, which is what the paragraphs above are about.
+`--shard I/N` divides it over N machines, each of which then batches its own
+share. The second exists for macOS: `tests.test_sync` is 17,651 process spawns,
+and each costs about four times there what it costs on Linux -- uniformly so
+across `git add`, `commit`, `push`, `fetch` and `clone`, which is what says it is
+the spawning rather than any one operation. That one suite was 115s of the macOS
+job's 145s while taking 38s on Linux. The measurements, and why neither `--jobs`
+nor `core.fsync` was the answer, are in `.github/workflows/ci.yml` beside the
+job that spends them. Nothing about the accounting changes -- each shard checks
+that the ids *it* was given all reported -- and `pack` does both splits, so the
+machines are balanced by the rule that already balanced the processes.
 
 `pytest -n auto --dist loadscope` would cover most of this in two dev
 dependencies. It is not used because the project carries no runtime dependencies
@@ -106,6 +119,21 @@ def pack(classes: dict[str, list[str]], bins: int) -> list[list[str]]:
     return batches
 
 
+def shard_of(spec: str) -> tuple[int, int]:
+    """Parse ``I/N`` into a zero-based index and a count.
+
+    Raises `ValueError` with the text a caller should print. Separate from
+    `main` so the parsing has a test that does not need a suite to run.
+    """
+    index, sep, total = spec.partition("/")
+    if not sep or not index.strip().isdigit() or not total.strip().isdigit():
+        raise ValueError(f"--shard wants I/N, got {spec!r}")
+    got, count = int(index), int(total)
+    if count < 1 or not 1 <= got <= count:
+        raise ValueError(f"--shard {spec} is out of range: I must be 1..N and N at least 1")
+    return got - 1, count
+
+
 class _Recorder(unittest.TextTestResult):
     """A result that remembers which ids ran, not just how many."""
 
@@ -161,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
         help="skip this module or class entirely; repeatable, and each pattern must "
         "match. For a suite that cannot run somewhere, so the rest keeps --no-skips",
     )
+    parser.add_argument(
+        "--shard",
+        default="",
+        metavar="I/N",
+        help="run only shard I of N, for splitting one suite over N machines. "
+        "The batches below split a suite over the processes of one machine; this "
+        "splits it over the machines, and the two compose",
+    )
     parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     parser.add_argument("--out", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -187,6 +223,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::error::no test class matches --exclude {pattern!r}")
             return 1
         classes = kept
+    if args.shard:
+        try:
+            index, count = shard_of(args.shard)
+        except ValueError as exc:
+            print(f"::error::{exc}")
+            return 1
+        # `pack` is reused rather than a slice of the sorted names, so the
+        # machines get comparable amounts of work for the same reason the
+        # processes do -- and so that one balancing rule is tested once.
+        #
+        # More shards than classes is fatal rather than an empty green run. An
+        # empty shard reports "Ran 0 tests" and exits 0, which is precisely the
+        # partial run that is green because nothing happened -- the thing this
+        # script exists to refuse. It can only come from a matrix that outgrew
+        # the suite, so it is the CI config that is wrong, and silence there
+        # would spread to every shard as classes were removed.
+        if count > len(classes):
+            print(f"::error::--shard {args.shard} wants more shards than there are classes")
+            return 1
+        chosen = pack(classes, count)[index]
+        classes = {name: classes[name] for name in chosen}
     expected = {tid for ids in classes.values() for tid in ids}
 
     # Twice the CPUs, because the work is subprocess wait rather than CPU:
@@ -197,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     # others rather than deciding the wall clock on its own.
     batches = pack(classes, jobs * 2)
 
-    with tempfile.TemporaryDirectory(prefix="woswoar-shards-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="woswoar-batches-") as tmp:
 
         def run(indexed: tuple[int, list[str]]) -> dict[str, Any]:
             index, names = indexed
@@ -210,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Killed by the OOM killer, a segfault in a C extension, a crash
                 # in setUpClass: no report, so nothing it would have said can be
                 # believed. Its ids come out below as never-run.
-                print(f"::error::shard died without reporting, exit {proc.returncode}: {names}")
+                print(f"::error::batch died without reporting, exit {proc.returncode}: {names}")
                 return {"ran": [], "failures": [], "errors": list(names), "skipped": []}
             loaded: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
             return loaded
@@ -223,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
     errors = [tid for report in reports for tid in report["errors"]]
     skipped = [pair for report in reports for pair in report["skipped"]]
 
-    print(f"\nRan {len(ran)} tests in {len(batches)} batches on {jobs} workers")
+    where = f" (shard {args.shard})" if args.shard else ""
+    print(f"\nRan {len(ran)} tests in {len(batches)} batches on {jobs} workers{where}")
     for label, ids in (("FAIL", failures), ("ERROR", errors)):
         for tid in ids:
             print(f"  {label}: {tid}")  # the traceback is already above, from the batch
