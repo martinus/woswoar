@@ -14,12 +14,14 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1186,6 +1188,40 @@ class TestCountingWhatALaneHolds(unittest.TestCase):
         self.assertLess(max(from_proc, from_ps) / min(from_proc, from_ps), 4)
 
 
+def reap(pid: int) -> None:
+    """Kill `pid` if it is still there.
+
+    For cleanups: a test whose complaint is that a process survived must not
+    leave that process behind when it makes it.
+    """
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def outliving(pids: Sequence[int], seconds: float) -> list[int]:
+    """Which of `pids` are still there after up to `seconds`.
+
+    Polled rather than slept, and the polling is the point: a `killpg` and the
+    kernel reaping what it killed are not the same instant, so a fixed sleep
+    guesses at a race in both directions -- too short and it reports survivors
+    that are already gone, too long and every green run pays for it.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        left = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:  # pragma: no cover - the id belongs elsewhere now
+                pass
+            left.append(pid)
+        if not left or time.monotonic() > deadline:
+            return left
+        time.sleep(0.1)
+
+
 class TestALaneThatSpawnsProcesses(MutateTestCase):
     """The failure a per-process ceiling cannot see, at the scale that killed it.
 
@@ -1196,43 +1232,67 @@ class TestALaneThatSpawnsProcesses(MutateTestCase):
     fire here by construction: if the lane is not killed, nothing is guarding.
     """
 
-    def storm(self, children: int, held: int) -> None:
+    def storm(self, children: int, held: int, sleeps: int) -> Path:
+        """A lane spawning `children`, each holding `held` bytes for `sleeps`
+        seconds. Returns the file they list themselves in, because whether they
+        *died* is a question the verdict alone cannot answer."""
+        pids = self.root / "pids.txt"
         self.write(
             "test_storm.py",
             f"""
             import subprocess
             import sys
             import unittest
+            from pathlib import Path
+
+            PIDS = Path({str(pids)!r})
 
 
             class T(unittest.TestCase):
                 def test_it_spawns(self) -> None:
-                    # Each child leaves on its own after twenty seconds, so a
-                    # guard that is not working costs this test its assertion
-                    # and the machine a gibibyte briefly -- not the session.
+                    # `sleeps` is what makes the guard the only thing that can
+                    # end this early, and it is load-bearing. At twenty seconds
+                    # the children outlived the sample and exited on their own,
+                    # so the row came back `broke` from the bookkeeping alone:
+                    # deleting the `killpg` survived a table with every
+                    # assertion below still passing.
                     kids = [
                         subprocess.Popen(
                             [sys.executable, "-c",
-                             "import time; held = bytearray({held}); time.sleep(20)"]
+                             "import time; held = bytearray({held}); time.sleep({sleeps})"]
                         )
                         for _ in range({children})
                     ]
+                    PIDS.write_text("\\n".join(str(kid.pid) for kid in kids), encoding="utf-8")
                     for kid in kids:
                         kid.wait()
             """,
         )
+        return pids
 
     def test_the_lane_is_killed_whole_and_says_why(self) -> None:
-        self.storm(children=16, held=64 << 20)
-        verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=90.0)
+        pids = self.storm(children=16, held=64 << 20, sleeps=120)
+        # The timeout is the fail-safe here, not the mechanism: a working guard
+        # ends this in about a second, and a broken one reports `timeout` rather
+        # than holding a gibibyte for two minutes.
+        verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=20.0)
         self.assertEqual(verdict.outcome, "broke", verdict.detail)
         self.assertIn("held", verdict.detail)
         self.assertIn("share", verdict.detail)
 
+        # And they are *gone*, which the verdict above cannot tell you. Deleting
+        # the `killpg` and keeping the bookkeeping leaves every assertion before
+        # this one passing on a run that still takes the machine -- a mutation
+        # table said exactly that, and this block is what it bought.
+        children = [int(said) for said in pids.read_text(encoding="utf-8").split()]
+        for child in children:
+            self.addCleanup(reap, child)
+        self.assertEqual(outliving(children, 5.0), [], "children outlived the killed lane")
+
     def test_a_lane_that_stays_inside_its_share_is_left_alone(self) -> None:
         """The other half, and the one that fails if the ceiling is read as a
         threshold to kill at rather than a ceiling to stay under."""
-        self.storm(children=2, held=8 << 20)
+        self.storm(children=2, held=8 << 20, sleeps=1)
         verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=90.0)
         self.assertEqual(verdict.outcome, "survived", verdict.detail)
 
@@ -1271,26 +1331,10 @@ class TestATimeoutEndsTheWholeSession(MutateTestCase):
         orphan = int(ledger.read_text(encoding="utf-8"))
         # Whatever this test concludes, it leaves no sleeping process behind --
         # including when it fails, which is the case where there is one.
-        self.addCleanup(self.reap, orphan)
-        self.assertFalse(self.waits_out(orphan), "the child outlived the lane that started it")
-
-    def reap(self, pid: int) -> None:
-        with contextlib.suppress(OSError):
-            os.kill(pid, 9)
-
-    def waits_out(self, pid: int, seconds: float = 10.0) -> bool:
-        """Whether `pid` is still there after up to `seconds`. Polled, because a
-        `killpg` and the kernel reaping what it killed are not the same instant."""
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:  # pragma: no cover - not ours any more
-                return True
-            time.sleep(0.1)
-        return True
+        self.addCleanup(reap, orphan)
+        self.assertEqual(
+            outliving([orphan], 10.0), [], "the child outlived the lane that started it"
+        )
 
 
 def enforced() -> bool:
