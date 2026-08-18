@@ -102,11 +102,11 @@ def tampering(mutate: Callable[[list[str]], list[str]]) -> Iterator[None]:
 
 
 class TestDiscovery(unittest.TestCase):
-    def test_every_test_is_assigned_to_exactly_one_shard(self) -> None:
-        """The sharding must partition the real suite -- no gaps, no double runs."""
+    def test_every_test_is_assigned_to_exactly_one_batch(self) -> None:
+        """The batching must partition the real suite -- no gaps, no double runs."""
         classes = run_tests.discover()
         ids = [tid for group in classes.values() for tid in group]
-        self.assertEqual(len(ids), len(set(ids)), "a test landed in two shards")
+        self.assertEqual(len(ids), len(set(ids)), "a test landed in two batches")
 
         serial = unittest.defaultTestLoader.discover(
             str(ROOT), pattern="test_*.py", top_level_dir=str(ROOT)
@@ -142,6 +142,77 @@ class TestPacking(unittest.TestCase):
         self.assertTrue(run_tests.selects("tests.test_sync", "tests.test_sync"))
         self.assertTrue(run_tests.selects("tests.test_sync.TestX", "tests.test_sync"))
         self.assertFalse(run_tests.selects("tests.test_sync_chunks.TestX", "tests.test_sync"))
+
+
+class TestShardingSplitsOneSuiteOverSeveralMachines(unittest.TestCase):
+    """`--shard I/N` is what stops one slow suite from being a job's whole cost.
+
+    The property to hold is coverage, not speed: run every shard of a split and
+    each test must have run exactly once. A test that only checked "a shard runs
+    fewer tests" would pass against a partition that dropped a class on the
+    floor -- and that failure is green, which is the one this file exists for.
+
+    Driven through classes that *fail* on purpose, because the summary names the
+    ids it failed and so says which tests actually ran. Counting them would not:
+    two shards running the same four tests and two shards splitting eight both
+    add up to eight.
+    """
+
+    def failures(self, text: str) -> list[str]:
+        return [line.split("FAIL: ")[1] for line in text.splitlines() if "FAIL: " in line]
+
+    def test_the_shards_together_run_every_test_exactly_once(self) -> None:
+        seen: list[str] = []
+        with fixture(FAILS, FAILS, FAILS, FAILS) as classes:
+            for index in (1, 2, 3):
+                code, text = run_main("--jobs", "2", "--shard", f"{index}/3")
+                self.assertEqual(code, 1, text)
+                # No shard may be empty either: one that ran nothing is the
+                # partial run that passes, and here it would hide in the union.
+                self.assertTrue(self.failures(text), f"shard {index}/3 ran nothing:\n{text}")
+                seen.extend(self.failures(text))
+        self.assertEqual(len(seen), len(set(seen)), f"a test ran in two shards: {seen}")
+        self.assertEqual({tid.rsplit(".", 1)[0] for tid in seen}, set(classes))
+
+    def test_one_shard_runs_less_than_the_whole(self) -> None:
+        """Otherwise the union above is satisfied by a --shard that does nothing."""
+        with fixture(PASSES, PASSES, PASSES, PASSES):
+            code, whole = run_main("--jobs", "2")
+            _, part = run_main("--jobs", "2", "--shard", "1/4")
+        self.assertEqual(code, 0, whole)
+        self.assertIn("Ran 4 tests", whole)
+        self.assertIn("Ran 1 tests in", part)
+        # Named in the summary: four green jobs that each ran a quarter of the
+        # suite read exactly like four that each ran all of it.
+        self.assertIn("(shard 1/4)", part)
+
+    def test_more_shards_than_classes_is_fatal_rather_than_an_empty_green_run(self) -> None:
+        """A matrix that outgrew the suite must be red, not quietly idle."""
+        with fixture(PASSES, PASSES):
+            code, text = run_main("--jobs", "2", "--shard", "3/3")
+        self.assertEqual(code, 1, text)
+        self.assertIn("more shards than there are classes", text)
+
+    def test_a_malformed_or_out_of_range_shard_is_fatal(self) -> None:
+        for spec in ("1", "0/2", "3/2", "1/0", "one/two", "/2", "2/"):
+            with self.subTest(spec=spec), fixture(PASSES, PASSES):
+                code, text = run_main("--jobs", "2", "--shard", spec)
+            self.assertEqual(code, 1, text)
+            self.assertIn("--shard", text)
+
+    def test_sharding_composes_with_only_and_no_skips(self) -> None:
+        """The macOS job passes all three at once, so the combination is the case.
+
+        The skipping class is selected *into* the shard being run, so --no-skips
+        still has something to catch -- a shard that quietly dropped it would
+        otherwise turn this green.
+        """
+        with fixture(SKIPS, SKIPS) as classes:
+            code, text = run_main(
+                "--jobs", "2", "--no-skips", "--only", classes[0], "--shard", "1/1"
+            )
+        self.assertEqual(code, 1, text)
+        self.assertIn("tests were skipped", text)
 
 
 class TestExclusionKeepsTheRestUnderNoSkips(unittest.TestCase):
@@ -202,7 +273,7 @@ class TestABatchThatDies(unittest.TestCase):
 
         self.assertEqual(code, 1, "a run whose batches all died reported success")
         self.assertIn("never ran", text)
-        self.assertIn("shard died without reporting", text)
+        self.assertIn("batch died without reporting", text)
 
     def test_a_worker_that_reports_fewer_tests_than_it_was_given_fails_the_run(self) -> None:
         """The count is not enough: the ids must match by name.

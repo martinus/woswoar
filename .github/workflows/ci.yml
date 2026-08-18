@@ -356,10 +356,11 @@ jobs:
 
   macos:
     # macOS arrives through zsh: it ships bash 3.2, which is below the hook's
-    # floor and refused, and zsh 5.9, which is not. So this job runs the suite,
-    # the sync ceremony and a real first-run install on a Mac -- everything
-    # except the two things that platform cannot answer, each excluded by name
-    # rather than by dropping a guard.
+    # floor and refused, and zsh 5.9, which is not. So this job runs the suite
+    # and a real first-run install on a Mac -- everything except the two things
+    # that platform cannot answer, each excluded by name rather than by dropping
+    # a guard. The sync ceremony is the `macos-sync` job below; it left this one
+    # because it was 115 s of its 145 s.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -386,12 +387,13 @@ jobs:
           floor = search.TRANSFORM_SINCE
           assert got is not None and got >= floor, f'fzf {got} is below {floor}'
           "
-      # The four modules below are re-run immediately afterwards under
-      # `--no-skips`, so running them here as well is 79% of this job's work
-      # done twice -- `test_sync` alone is 75 s of the suite's 95 s. Measured:
-      # 11.8 s to 8.3 s wall, 174 s to 96 s of CPU, on a runner with three cores
-      # to absorb it. Nothing is lost; every exclusion here reappears below
-      # under a strictly stronger flag.
+      # The four modules below are re-run under `--no-skips` -- three in the
+      # steps just after this one, and `test_sync` in the `macos-sync` job --
+      # so running them here as well is 79% of this job's work done twice.
+      # Measured when all four were re-run in this job: 11.8 s to 8.3 s wall,
+      # 174 s to 96 s of CPU, on a runner with three cores to absorb it.
+      # Nothing is lost; every exclusion here reappears under a strictly
+      # stronger flag, `test_sync`'s on another machine.
       - run: |
           python -m tools.run_tests \
             --exclude tests.test_shell_hook_zsh \
@@ -423,7 +425,8 @@ jobs:
             --exclude tests.test_shell_hook_zsh.TestForkFree \
             --exclude tests.test_shell_hook_zsh.TestAZshAndABashShellShareOneHistory
       - run: python -m tools.run_tests --only tests.test_search --no-skips
-      - run: python -m tools.run_tests --only tests.test_sync --no-skips
+      # `tests.test_sync` is not here: it is the `macos-sync` job below, which
+      # runs it in shards. It stays excluded from the whole-suite step above.
       # Same reason as the zsh suite above: the both-shells class needs a bash 5.
       - run: |
           python -m tools.run_tests --only tests.test_install --no-skips \
@@ -455,3 +458,75 @@ jobs:
           # exit is a regression on the platform this job exists to cover, and
           # masking it would leave the line asserting nothing.
           woswoar doctor
+
+  macos-sync:
+    # `tests.test_sync` was 115 s of the macOS job's 145 s, against 38 s for the
+    # same suite in the Linux `sync` job. Almost none of that gap is the suite:
+    # it is one serial run of 17,651 process spawns -- 11,696 `git`, 3,612
+    # `age`, 1,544 `ssh-keygen`, 799 `age-keygen` -- and every one of them costs
+    # about four times as much on this runner. Measured on both, 30 iterations
+    # of the shapes this suite actually runs, ms per call, macOS against Linux:
+    #
+    #     add 8.96/2.27   commit 19.10/5.15   push 63.56/16.45
+    #     fetch 34.62/8.77   clone 60.09/14.61
+    #
+    # Uniformly ~3.9x, which is what says it is the spawning and not any one
+    # operation. Three cores rather than four accounts for part of the rest.
+    #
+    # Two things it is not, both measured rather than assumed. It is not fsync
+    # on APFS: `core.fsync=none` changed nothing on either platform. And it is
+    # not the worker count -- a sweep of `--jobs` over 6, 10, 16 and 24 on the
+    # macOS runner spanned 155.4 s to 130.9 s with the default at 139.6 s, which
+    # is noise around a flat line, so there is nothing there to tune.
+    #
+    # What is left is to stop one machine carrying all of it. Each shard runs a
+    # disjoint share of the classes and together they run every one:
+    # `tools/run_tests.py` packs them with the same rule it uses for the
+    # processes inside a shard, and `--no-skips` still applies per shard.
+    #
+    # Three, not more, and the honest version of why. Measured on the runners
+    # after this change: the shards' suite steps are 58 s, 42 s and 62 s, their
+    # jobs 71 s, 57 s and 73 s once ~11 s of checkout and brew are counted, and
+    # the whole workflow 80 s against 151 s before. So macOS is still the
+    # critical path, by about ten seconds over the Linux `test` matrix -- the
+    # prediction that three shards would take it *under* that line was wrong.
+    #
+    # A fourth would recover most of those ten seconds: on Linux, where the
+    # curve could be measured per shard, the suite goes 43 s whole, 26.7 s at
+    # two, 19.7 s at three, 16.9 s at four. It is not taken because GitHub
+    # allows five concurrent macOS jobs on this plan and `macos` above already
+    # spends one, so four shards sits exactly on the cap -- and a shard that
+    # queues costs a whole job's wait to save eight seconds. The remaining
+    # imbalance (42 s against 62 s) is a better place to look first: `pack`
+    # weighs classes by test count, and these classes differ by ~7x in seconds
+    # per test.
+    #
+    # Linux is deliberately left alone. Its `sync` job is 49 s inside a workflow
+    # that finishes in about 65 s, so sharding it would spend runners to move a
+    # number nothing waits on.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # Same reason as the `macos` job: the system python3 is 3.9.
+          python-version: "3.12"
+      - name: install age
+        # No fzf, unlike the `macos` job: nothing in `tests.test_sync` reaches
+        # for it. git, ssh-keygen and zsh are already on the runner.
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install age
+          age --version && git --version && command -v ssh-keygen
+      # `strategy.job-total` rather than a repeated literal: the shard count is
+      # then the length of the matrix above and nowhere else, so raising it
+      # cannot leave a shard of the suite that no job runs. Out-of-range and
+      # more-shards-than-classes are both fatal in the runner rather than a
+      # green run of nothing, which is the failure this whole file guards.
+      - name: sync suite, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+        run: |
+          python -m tools.run_tests --only tests.test_sync --no-skips \
+            --shard ${{ matrix.shard }}/${{ strategy.job-total }}
