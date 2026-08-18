@@ -1983,6 +1983,59 @@ class TestCompact(SyncTestCase):
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
 
 
+class TestTrustStatus(SyncTestCase):
+    """`doctor`'s third key verdict, and the one nothing reached.
+
+    Found the same way as `TestSigningStatus` next to it -- and found *late*,
+    because the first triage pass fixed `signing_status` and walked past its
+    neighbour in the same file with the same caller. 10 of its 11 mutants
+    survived: `!=` becoming `==` puts this machine in its own "other machines"
+    list, and `not in` becoming `in` swaps accepted for waiting. Either way
+    `doctor` reports a trust state that is not the one the repository is in,
+    which is the whole of what this line is for.
+    """
+
+    def test_no_repository_yet_is_not_a_failure(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(gitrepo, "is_repo", return_value=False):
+                status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("no history repo", status.detail)
+
+    def test_a_lone_machine_does_not_count_itself_as_an_other(self) -> None:
+        """`host != known.id` -- flip it and the only machine present becomes an
+        unaccepted stranger, so a healthy single-machine install reports FAIL."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("0 of 0", status.detail)
+
+    def test_an_unaccepted_peer_is_reported_as_waiting(self) -> None:
+        alpha, _beta = self.history_across_days(days=1, per_day=1)
+        with alpha.active():
+            sync.run()
+            status = sync.trust_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("0 of 1", status.detail)
+            self.assertIn("woswoar trust", status.detail)
+
+    def test_an_accepted_peer_stops_being_waiting(self) -> None:
+        """The counting half. `0 of 1` and `1 of 1` are the two answers, and a
+        fixture with no peer at all cannot tell them apart."""
+        alpha, _beta = self.history_across_days(days=1, per_day=1)
+        with alpha.active():
+            sync.run()
+        self.run_cli(alpha, "trust", "--yes")
+        with alpha.active():
+            status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("1 of 1", status.detail)
+            self.assertNotIn("woswoar trust", status.detail)
+
+
 class TestSigningStatus(SyncTestCase):
     """The other half of what `doctor` says about this machine's keys.
 

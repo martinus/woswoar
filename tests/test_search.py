@@ -589,6 +589,28 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
         with redirect_stdout(io.StringIO()):
             self.assertIsNone(search.interactive("global"))
 
+    def test_the_cli_exit_code_says_whether_anything_was_chosen(self) -> None:
+        """`cmd_search` is five lines and every one of its 11 mutants survived.
+
+        It is the only place the picker's outcome becomes an exit status, and
+        that status is a shell contract: the hook and any script wrapping
+        `woswoar search` branch on it. Both directions are asserted here because
+        a test of one alone passes against `return 0` unconditionally.
+        """
+        # History first, for both halves: with none, `interactive` declines to
+        # open a picker at all and returns 1 without the branch under test ever
+        # being reached -- the cancel half would pass for the wrong reason.
+        self.some_history()
+        self.fake_fzf("import sys\nsys.exit(130)\n")
+        with redirect_stdout(io.StringIO()) as cancelled:
+            self.assertEqual(main(["search"]), 1, "cancelling must not read as success")
+        self.assertEqual(cancelled.getvalue(), "", "nothing was chosen, so nothing is printed")
+
+        self.fake_fzf("import sys\nprint(sys.stdin.readline().rstrip('\\n'))\n")
+        with redirect_stdout(io.StringIO()) as chosen:
+            self.assertEqual(main(["search"]), 0)
+        self.assertNotEqual(chosen.getvalue().strip(), "", "a choice must reach stdout")
+
     def test_a_machine_with_no_history_opens_no_picker(self) -> None:
         """Ctrl-R on a fresh install did nothing, and must keep doing nothing
         rather than opening an empty picker to escape out of.
