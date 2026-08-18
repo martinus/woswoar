@@ -417,8 +417,18 @@ def drop_call(node: ast.AST) -> Iterator[Edit]:
 #:
 #: Optional-versus-required is not decidable from the AST; it needs the callee's
 #: signature. So the rule is inverted: a keyword not named here is never
-#: dropped, and the list holds the ones whose absence *silently weakens a
-#: guarantee* rather than breaking anything.
+#: dropped, and the list holds the ones whose absence silently weakens a
+#: guarantee *and that a test can notice*. Both halves matter, and the second
+#: was learned the expensive way.
+#:
+#: `encoding` was here and is not any more. Dropping `encoding="utf-8"` is a
+#: real defect -- under `LC_ALL=C` the same read raises `UnicodeDecodeError`,
+#: checked -- but this suite runs in a UTF-8 locale on every machine and in CI,
+#: where `read_text()` and `read_text(encoding="utf-8")` are the same call. The
+#: first sweep with this operator produced 41 of them, all unkillable, against
+#: 3 caught rows in the whole package: a permanent survivor list that buries the
+#: rows that mean something. The class is real and untested, which is what
+#: issues are for; it is not what a generator should keep asking about.
 _DROPPABLE = {
     #: `mkdir(mode=0o700)`, `chmod` -- the mode is the guarantee. `docs/security.md`
     #: claims are meant to be backed by tests, and nothing could generate this.
@@ -426,9 +436,6 @@ _DROPPABLE = {
     #: `subprocess.run(check=True)` -- dropped, a failing command reads as success.
     #: Only when it is `True`; `check=False` is the default and unkillable.
     "check",
-    #: `open(encoding="utf-8")` -- dropped, the locale decides, and it differs
-    #: between a developer's shell and a systemd timer.
-    "encoding",
     #: The symlink and permission flags, same class as `mode`.
     "follow_symlinks",
     "exist_ok",
