@@ -94,13 +94,14 @@ alone on purpose: deleting it leaves a `NameError` further down, which reports
 printed output is the product.
 
 `drop-kwarg` removes a keyword argument, and only from a named list —
-`mode`, `check=True`, `encoding`, `exist_ok`, `follow_symlinks`. Blanket
+`mode`, `check=True`, `exist_ok`, `follow_symlinks`. Blanket
 dropping was measured first and is mostly noise: of 281 keyword arguments in
 `woswoar/`, the commonest are *required* parameters passed by name, where
-dropping one is a `TypeError` and so `BROKE` rather than an answer. The list
-holds the ones whose absence silently weakens a guarantee instead — it is the
-only way to generate `mkdir(..., mode=0o700)` without its mode, which is what
-`docs/security.md` rests on.
+dropping one is a `TypeError` and so `BROKE` rather than an answer. The list holds the ones whose absence silently weakens a guarantee *and that a
+test can notice* — it is the only way to generate `mkdir(..., mode=0o700)`
+without its mode, which is what `docs/security.md` rests on. `encoding` fails
+the second half and was removed: dropping it is a real defect under a non-UTF-8
+locale, and unkillable in a suite that never runs under one.
 
 A generated mutant can also fail to *stop*. Two bounds are enforced per row, and
 they answer different questions: `--timeout` (300 s) for a mutation that never

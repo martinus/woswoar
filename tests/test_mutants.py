@@ -397,9 +397,14 @@ class TestDroppingAKeywordArgument(unittest.TestCase):
     def test_the_replacement_actually_omits_it(self) -> None:
         """The prose could be right while the edit is not."""
         rows = mutants.generate(
-            'p.read_text(encoding="utf-8")\n', "w/t.py", {1}, tests="t", operators=["drop-kwarg"]
+            "p.mkdir(mode=0o700, parents=True)\n",
+            "w/t.py",
+            {1},
+            tests="t",
+            operators=["drop-kwarg"],
         )
-        self.assertNotIn("encoding", rows[0].new)
+        self.assertNotIn("mode", rows[0].new)
+        self.assertIn("parents", rows[0].new, "only the named keyword goes")
 
     def test_each_droppable_keyword_is_reachable(self) -> None:
         """Otherwise a name can sit in `_DROPPABLE` spelled wrongly for ever."""
@@ -407,6 +412,18 @@ class TestDroppingAKeywordArgument(unittest.TestCase):
             with self.subTest(keyword=name):
                 value = "True" if name in ("check", "exist_ok", "follow_symlinks") else "0"
                 self.assertEqual(len(self.dropped(f"f(a, {name}={value})\n")), 1)
+
+    def test_encoding_is_not_droppable(self) -> None:
+        """It was, and the first whole-package sweep with this operator said so:
+        41 unkillable rows against 3 caught in the entire package.
+
+        Dropping `encoding="utf-8"` is a real defect -- under `LC_ALL=C` the same
+        read raises `UnicodeDecodeError` -- but this suite runs in a UTF-8 locale
+        everywhere, so `read_text()` and `read_text(encoding="utf-8")` are the
+        same call and no fixture can tell them apart. A row that can only ever
+        survive is not a question worth asking every run.
+        """
+        self.assertEqual(self.dropped('p.read_text(encoding="utf-8")\n'), [])
 
 
 class TestSkippingAnOperator(unittest.TestCase):
