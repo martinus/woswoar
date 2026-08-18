@@ -343,7 +343,7 @@ def generate_signing_key(path: Path) -> str:
     # whatever the umask, so removing this line changes nothing observable and
     # no test can catch it. Kept anyway, because the mode of a file woswoar
     # creates should not depend on another tool's habits.
-    path.chmod(0o600)
+    path.chmod(0o600)  # pragma: no mutate - see above: ssh-keygen already writes 0600
     public_half(path).chmod(0o600)
     return signing_public(path)
 

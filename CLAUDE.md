@@ -211,19 +211,21 @@ first such change, not during one.
   `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
   serially, and takes about three times as long.
 
-- Three tools in `tools/` exist because the same mistake was made more than
+- Four tools in `tools/` exist because the same mistake was made more than
   once. Each one's module docstring carries the full argument for why it is
   shaped as it is; reach for them rather than writing the loop again.
 
   | when | tool |
   |---|---|
   | a fix needs a test that fails without it (rule 3) | [`tools/mutate.py`](tools/mutate.py) |
+  | a mutation run left more survivors than you can read | [`tools/reached.py`](tools/reached.py) |
   | a refactor is supposed to change no output | [`tools/compare.py`](tools/compare.py) |
   | a change might have cost time | [`tools/bench.py`](tools/bench.py) |
 
   ```sh
   python -m tools.mutate --base main        # generated from the diff
   python -m tools.mutate <spec>.py          # a table you wrote
+  python -m tools.reached r.json c.json     # which survivors are missing tests
   python -m tools.compare --base main --show .bashrc install doctor status
   python -m tools.bench --importtime woswoar.__main__ --base main
   ```

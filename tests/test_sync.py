@@ -984,6 +984,34 @@ class TestGrantConfirmation(SyncTestCase):
         self.assertEqual(marked, [mine])
 
 
+class TestRevokeSaysWhatItDid(SyncTestCase):
+    """The CLI half of revoke, which nothing drove.
+
+    `sync.revoke` is well covered below; `cmd_revoke` was not reached by any
+    test at all, so the mutation deleting its confirmation line survived. That
+    line is the only signal a user gets that a *security* operation happened --
+    the command otherwise succeeds in silence, and "did that work?" is the
+    question someone answers by revoking a second time.
+    """
+
+    def test_it_reports_the_revocation_and_the_resealing(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            gone = alpha.append_recipient(name="old-laptop")
+            fingerprint = crypto.fingerprint(gone)
+
+        ran = self.run_cli(alpha, "revoke", fingerprint, "--yes")
+        self.assertEqual(ran.code, 0, ran.out + ran.err)
+        self.assertIn("revoked", ran.out)
+        self.assertIn("re-sealed", ran.out)
+        # Not merely "it printed something": the count is the part that says
+        # whether the day keys were actually rewritten for the remaining readers.
+        self.assertRegex(ran.out, r"re-sealed \d+ key file\(s\)")
+
+        with alpha.active():
+            self.assertNotIn(gone, sync.recipients())
+
+
 class TestRevokeSubtraction(SyncTestCase):
     """A withdrawal has to survive `merge=union`, which never deletes a line."""
 
@@ -1953,6 +1981,201 @@ class TestCompact(SyncTestCase):
         with beta.active():
             sync.run()
             self.assertEqual(beta.commands(), {"command 0", "command 1", "command 2"})
+
+
+class TestPushRetriesWhenAPeerGotThereFirst(SyncTestCase):
+    """`gitrepo.push`'s `except SyncError:` branch, which nothing executed.
+
+    Found by crossing coverage with the mutation run: dropping either the
+    `fetch_and_rebase` or the second `git push` survived the whole suite,
+    because no test ever made the first push fail. Every other test fetches and
+    rebases before pushing, so the remote has never moved underneath one.
+
+    That is the normal multi-machine case, not an exotic error -- two machines
+    syncing on a timer race exactly here, in the window between this machine's
+    fetch and its push, and without the retry the loser reports a failed sync
+    and publishes nothing until the next run.
+
+    The *race* is injected, not the failure: a real peer really pushes into that
+    window, so `git` really rejects a non-fast-forward and the recovery path
+    runs for real. Patching `git` to raise would assert that the code handles an
+    exception it was written next to, which is the restatement rule 3 warns of.
+    """
+
+    def peer_publishes(self) -> str:
+        """A second clone commits and pushes, as another machine would."""
+
+        def run(*argv: str) -> None:
+            subprocess.run(list(argv), check=True, timeout=60, capture_output=True)
+
+        work = self.root / "peer-clone"
+        if not work.exists():
+            run("git", "clone", "--quiet", str(self.origin), str(work))
+            run("git", "-C", str(work), "config", "user.name", "peer")
+            run("git", "-C", str(work), "config", "user.email", "peer@example.com")
+        marker = f"peer-{secrets.token_hex(4)}.txt"
+        (work / marker).write_text("published by someone else\n", encoding="utf-8")
+        run("git", "-C", str(work), "add", marker)
+        run("git", "-C", str(work), "commit", "--quiet", "-m", f"peer adds {marker}")
+        run("git", "-C", str(work), "push", "--quiet", "origin", "HEAD")
+        return marker
+
+    def test_a_push_that_loses_the_race_still_publishes(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()  # establishes the branch on the origin
+
+            alpha.record("2023-11-14", 1_700_000_002, "git commit")
+            real = gitrepo.git
+            pushes: list[int] = []
+            marker: list[str] = []
+
+            def racing(*argv: str, **kwargs: object) -> str:
+                if argv[:1] == ("push",):
+                    pushes.append(1)
+                    if len(pushes) == 1:
+                        # The window: a peer publishes between our fetch and our
+                        # push, so this very call is rejected non-fast-forward.
+                        marker.append(self.peer_publishes())
+                return real(*argv, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(gitrepo, "git", racing):
+                report = sync.run()
+
+        self.assertTrue(report.pushed, "the retry did not publish")
+        self.assertEqual(len(pushes), 2, "the first push must fail and the second succeed")
+
+        published = subprocess.run(
+            ["git", "-C", str(self.origin), "ls-tree", "-r", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        self.assertIn(marker[0], published, "the peer's commit was discarded by our retry")
+        self.assertIn("hosts/", published, "our own history never reached the remote")
+
+
+class TestTrustStatus(SyncTestCase):
+    """`doctor`'s third key verdict, and the one nothing reached.
+
+    Found the same way as `TestSigningStatus` next to it -- and found *late*,
+    because the first triage pass fixed `signing_status` and walked past its
+    neighbour in the same file with the same caller. 10 of its 11 mutants
+    survived: `!=` becoming `==` puts this machine in its own "other machines"
+    list, and `not in` becoming `in` swaps accepted for waiting. Either way
+    `doctor` reports a trust state that is not the one the repository is in,
+    which is the whole of what this line is for.
+    """
+
+    def test_no_repository_yet_is_not_a_failure(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(gitrepo, "is_repo", return_value=False):
+                status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("no history repo", status.detail)
+
+    def test_a_lone_machine_does_not_count_itself_as_an_other(self) -> None:
+        """`host != known.id` -- flip it and the only machine present becomes an
+        unaccepted stranger, so a healthy single-machine install reports FAIL."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("0 of 0", status.detail)
+
+    def test_an_unaccepted_peer_is_reported_as_waiting(self) -> None:
+        alpha, _beta = self.history_across_days(days=1, per_day=1)
+        with alpha.active():
+            sync.run()
+            status = sync.trust_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("0 of 1", status.detail)
+            self.assertIn("woswoar trust", status.detail)
+
+    def test_an_accepted_peer_stops_being_waiting(self) -> None:
+        """The counting half. `0 of 1` and `1 of 1` are the two answers, and a
+        fixture with no peer at all cannot tell them apart."""
+        alpha, _beta = self.history_across_days(days=1, per_day=1)
+        with alpha.active():
+            sync.run()
+        self.run_cli(alpha, "trust", "--yes")
+        with alpha.active():
+            status = sync.trust_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn("1 of 1", status.detail)
+            self.assertNotIn("woswoar trust", status.detail)
+
+
+class TestSigningStatus(SyncTestCase):
+    """The other half of what `doctor` says about this machine's keys.
+
+    `TestIdentityStatus` below has covered its neighbour since #201; this had
+    nothing. A whole-package mutation run put 13 survivors in this one function
+    -- every failure branch could `return None` and the suite stayed green --
+    which is the same shape `tests/test_manifest.py` was written for: a `doctor`
+    verdict a user reads, on a path where the machine keeps recording, looks
+    healthy, and publishes history no peer will ever accept.
+    """
+
+    def test_a_healthy_signing_key_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            status = sync.signing_status(store.machine())
+            self.assertTrue(status.ok, status.detail)
+            self.assertIn(str(store.signing_key_file()), status.detail)
+
+    def test_a_missing_signing_key_is_reported(self) -> None:
+        alpha = self.machine("alpha")
+        with alpha.active():
+            store.signing_key_file().unlink()
+            status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("missing", status.detail)
+            self.assertIn("woswoar init", status.detail)
+
+    def test_a_key_that_signs_but_does_not_verify_is_reported(self) -> None:
+        """The failure the round trip exists for.
+
+        Not "the file is absent" and not "signing raised" -- a key that produces
+        a signature this machine then refuses. Forced by making the round trip
+        answer False, because manufacturing a real one means corrupting
+        ssh-keygen's own output in a way it would reject earlier.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(manifest, "signs_and_verifies", return_value=False):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("does not verify", status.detail)
+
+    def test_a_key_that_cannot_sign_at_all_is_reported(self) -> None:
+        """`WoswoarError` out of the round trip, not an escape."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            boom = errors.WoswoarError("ssh-keygen said no")
+            with mock.patch.object(crypto, "signing_public", side_effect=boom):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("cannot sign", status.detail)
+            self.assertIn("ssh-keygen said no", status.detail)
+
+    def test_no_ssh_keygen_at_all_is_reported(self) -> None:
+        """The branch a machine without ssh-keygen takes.
+
+        Patched rather than skipped: every machine that runs this suite has
+        ssh-keygen (`requires_ssh_keygen`), so the branch is unreachable here by
+        construction and would otherwise never be executed anywhere.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            with mock.patch.object(crypto, "signing_available", return_value=False):
+                status = sync.signing_status(store.machine())
+            self.assertIs(status.ok, False)
+            self.assertIn("ssh-keygen is not installed", status.detail)
 
 
 class TestIdentityStatus(SyncTestCase):

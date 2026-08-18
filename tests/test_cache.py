@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import pathlib
 import pickle
+import tempfile
 import unittest
+from pathlib import Path
 
 from woswoar import cache, store
 from woswoar.entry import Entry, format_line
@@ -369,6 +371,55 @@ class TestEntriesLeaveTheCacheInert(WoswoarTestCase):
         warm = self.loaded(self.HOSTILE).cmd
         store.cache_file().unlink()
         self.assertEqual(cache.load_entries()[0].cmd, warm)
+
+
+class TestReadTailReturnsWholeLinesOnly(unittest.TestCase):
+    """The incremental reader every export and cache rebuild sits on.
+
+    8 of its 17 mutants survived the whole-package run, and the interesting one
+    is `cut < 0` becoming `cut <= 0`: with a tail whose *first* byte is a
+    newline, `rfind` can legitimately return 0, and the mutant then reports "no
+    complete line here" and leaves the offset where it was. That line is read
+    again next time or never, depending on what follows -- which is a history
+    file silently losing or repeating a command.
+
+    No fixture in the suite started a tail with a newline, so nothing could see
+    it. Driven against real files, since the whole function is file offsets.
+    """
+
+    def tail(self, body: bytes, offset: int = 0) -> tuple[bytes, int]:
+        with tempfile.TemporaryDirectory() as box:
+            path = Path(box) / "log"
+            path.write_bytes(body)
+            return store.read_tail(path, offset)
+
+    def test_a_tail_that_begins_with_a_newline(self) -> None:
+        """`rfind` returns 0 here, which is a real cut, not "not found"."""
+        data, offset = self.tail(b"\n")
+        self.assertEqual(data, b"\n")
+        self.assertEqual(offset, 1)
+
+    def test_a_partial_final_line_is_left_for_next_time(self) -> None:
+        data, offset = self.tail(b"one\ntwo\nthre")
+        self.assertEqual(data, b"one\ntwo\n")
+        self.assertEqual(offset, 8, "the partial line must not be consumed")
+
+    def test_no_newline_at_all_consumes_nothing(self) -> None:
+        data, offset = self.tail(b"incomplete")
+        self.assertEqual((data, offset), (b"", 0))
+
+    def test_it_resumes_from_the_offset_it_returned(self) -> None:
+        """The contract the caller relies on: reading twice yields each line
+        once. A fixture that only ever reads from 0 cannot check it."""
+        body = b"one\ntwo\n"
+        first, offset = self.tail(body)
+        second, final = self.tail(body, offset)
+        self.assertEqual(first, body)
+        self.assertEqual((second, final), (b"", len(body)))
+
+    def test_a_missing_file_is_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as box:
+            self.assertEqual(store.read_tail(Path(box) / "absent", 0), (b"", 0))
 
 
 if __name__ == "__main__":

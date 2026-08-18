@@ -8,7 +8,12 @@ which is what happened before there was a harness to share.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,9 +21,10 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
-from tools import mutate
+from tools import mutate, reached
 from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -760,6 +766,208 @@ class TestAnUnanswerableRowNeedNotEndTheRun(MutateTestCase):
                 [Mutation("bad", "mod.py", "import json", "import nope_xyz", "test_mod")],
                 baseline=False,
             )
+
+
+class TestTheJsonReport(unittest.TestCase):
+    """The contract `tools/reached.py` reads, tested from this side of it.
+
+    Both tools would otherwise agree only by coincidence: `reached` parses a
+    shape nothing here promises, and a renamed key would break the analysis
+    with a `KeyError` in a different file at the end of a run measured in
+    hours.
+    """
+
+    def report(self) -> Report:
+        rows = [
+            Mutation(
+                "mod.py:7 in f() -- `<` becomes `<=`",
+                "mod.py",
+                "a",
+                "b",
+                "test_mod",
+                operator="boundary",
+            ),
+            Mutation("written by hand", "mod.py", "c", "d", "test_mod"),
+        ]
+        return Report(
+            [
+                Result(rows[0], Verdict("survived")),
+                Result(rows[1], Verdict("broke", "it fell over")),
+            ]
+        )
+
+    def written(self) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as box:
+            where = Path(box) / "out.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                mutate._persist(self.report(), where)
+            loaded: dict[str, Any] = json.loads(where.read_text(encoding="utf-8"))
+        return loaded
+
+    def test_every_key_reached_needs_is_present(self) -> None:
+        first = self.written()["results"][0]
+        self.assertEqual(first["path"], "mod.py")
+        self.assertEqual(first["line"], 7, "the line is parsed out of the label")
+        self.assertEqual(first["outcome"], "survived")
+        self.assertEqual(first["operator"], "boundary")
+
+    def test_a_hand_written_row_has_no_line_rather_than_a_wrong_one(self) -> None:
+        """`reached` skips these. Inventing a line would file a spec row under
+        whichever source line happened to be first."""
+        self.assertIsNone(self.written()["results"][1]["line"])
+
+    def test_outcomes_that_asked_nothing_are_kept(self) -> None:
+        """`broke` is not a survivor and not a catch, and `reached` needs to see
+        it to leave it out of the partition rather than guess."""
+        self.assertEqual(self.written()["results"][1]["outcome"], "broke")
+
+    def test_it_round_trips_through_reached(self) -> None:
+        """The actual contract: what one writes, the other reads."""
+        rows = reached.rows_from(self.written())
+        self.assertEqual([r.line for r in rows], [7], "only positioned rows survive the read")
+        self.assertTrue(rows[0].survived)
+
+
+class TestAllDropsTheDiffSizedCap(unittest.TestCase):
+    """`--limit`'s default is sized for one change's table.
+
+    Left in place it turned the documented `--all` into 200 rows of several
+    thousand -- and, because the cap spreads across files, into batches of about
+    seven, so batching, incremental `--json` and resume all did nothing on the
+    one command line anybody would type. Driven through `main` rather than the
+    parser, because the reset happens after parsing and `--list` runs nothing.
+    """
+
+    def listed(self, *argv: str) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mutate.main([*argv, "--list"])
+        return out.getvalue()
+
+    def test_all_runs_the_whole_table(self) -> None:
+        self.assertNotIn("not run", self.listed("--all"))
+
+    def test_an_explicit_limit_is_still_honoured(self) -> None:
+        """Reset, not ignored: someone who says `--limit 50` means it."""
+        self.assertIn("--limit 50:", self.listed("--all", "--limit", "50"))
+
+    def test_a_diff_run_keeps_the_default(self) -> None:
+        """The default exists for this shape and must not be collateral."""
+        self.assertEqual(mutate.LIMIT, 200)
+
+
+class TestResumingASweep(unittest.TestCase):
+    """What a resumed sweep must keep, not just what it may skip.
+
+    `sweep` had no test at all, and that is exactly why it shipped losing data:
+    a resume rewrote `--json` with only the batches it had run, deleting the
+    answers it had decided to skip. Recovery eating the thing it recovers is
+    invisible unless something drives the round trip.
+    """
+
+    def rows(self, *labels: str) -> list[Result]:
+        return [
+            Result(
+                Mutation(label, label.split(":")[0], "a", "b", "test_mod", operator="boundary"),
+                Verdict("survived"),
+            )
+            for label in labels
+        ]
+
+    def persisted(self, results: list[Result]) -> Path:
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        where = Path(box) / "out.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            mutate._persist(Report(results), where)
+        return where
+
+    def test_a_recorded_row_comes_back_whole(self) -> None:
+        """Not just its label: `confirm` needs `old` and `new` to re-run it."""
+        back = mutate._recorded(self.persisted(self.rows("mod.py:1 -- x")))
+        self.assertEqual(len(back), 1)
+        self.assertEqual(back[0].mutation.old, "a")
+        self.assertEqual(back[0].mutation.new, "b")
+        self.assertEqual(back[0].verdict.outcome, "survived")
+
+    def test_a_resumed_sweep_keeps_what_it_skipped(self) -> None:
+        """The bug this class exists for. Sweep a second file against a report
+        that already holds the first, and the first must still be there."""
+        where = self.persisted(self.rows("a.py:1 -- one", "a.py:2 -- two"))
+        # `a.py` is in the table too, or there would be nothing to skip and the
+        # test would pass against a sweep that simply never saw it.
+        table = [
+            Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod"),
+            Mutation("b.py:1 -- three", "b.py", "c", "d", "test_mod"),
+        ]
+        args = argparse.Namespace(
+            json=where,
+            no_baseline=True,
+            workers=1,
+            timeout=30.0,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+        )
+        # `run` is stubbed: `sweep`'s job is the bookkeeping around it -- which
+        # files to skip, what to keep, what to write -- and running a real
+        # mutation would test `run`, which has its own tests above.
+        answered = Report([Result(table[1], Verdict("caught"))])
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as said,
+            mock.patch.object(mutate, "run", return_value=answered),
+        ):
+            report = mutate.sweep(table, args)
+
+        self.assertIn("a.py: already recorded, skipping", said.getvalue())
+        paths = sorted({result.mutation.path for result in report.results})
+        self.assertEqual(paths, ["a.py", "b.py"], "the skipped file left the report")
+        on_disk = json.loads(where.read_text(encoding="utf-8"))
+        self.assertEqual(len(on_disk["results"]), 3, "a resume must not shorten the report")
+
+    def test_the_skipped_rows_still_reach_the_summary(self) -> None:
+        """A resume whose new batches are all caught would otherwise print a
+        clean summary and exit 0 while recorded survivors went unmentioned."""
+        where = self.persisted(self.rows("a.py:1 -- survivor"))
+        args = argparse.Namespace(
+            json=where,
+            no_baseline=True,
+            workers=1,
+            timeout=30.0,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = mutate.sweep([], args)
+        self.assertFalse(report.clean, "a recorded survivor still counts against the run")
+
+    def test_a_missing_file_is_not_an_error(self) -> None:
+        """The first run of a sweep has nothing to resume from."""
+        with tempfile.TemporaryDirectory() as box:
+            self.assertEqual(mutate._recorded(Path(box) / "absent.json"), [])
+
+    def test_no_file_asked_for_at_all(self) -> None:
+        self.assertEqual(mutate._recorded(None), [])
+
+    def test_a_corrupt_report_resumes_from_nothing_rather_than_dying(self) -> None:
+        """A half-written file is what a crash mid-write leaves, and re-running
+        everything is the safe reading of it."""
+        with tempfile.TemporaryDirectory() as box:
+            where = Path(box) / "half.json"
+            where.write_text('{"results": [{"label": "one",', encoding="utf-8")
+            self.assertEqual(mutate._recorded(where), [])
+
+    def test_a_report_missing_the_rebuild_fields_resumes_from_nothing(self) -> None:
+        """An older report has no `old`/`new`. Re-running is right: a row that
+        cannot be rebuilt cannot be confirmed either."""
+        with tempfile.TemporaryDirectory() as box:
+            where = Path(box) / "old.json"
+            where.write_text(
+                json.dumps({"results": [{"label": "x", "path": "a.py", "outcome": "caught"}]}),
+                encoding="utf-8",
+            )
+            self.assertEqual(mutate._recorded(where), [])
 
 
 class TestHowManyLanesFitInMemory(unittest.TestCase):

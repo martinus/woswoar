@@ -55,5 +55,60 @@ class TestTheSigningSelfTest(unittest.TestCase):
             self.assertFalse(manifest.signs_and_verifies(mine, other_public))
 
 
+class TestTheSignedBytesAreDeterministic(unittest.TestCase):
+    """The claim `_body` makes about itself, which nothing was checking.
+
+    Its docstring says "Sorted, so the same set of chunks always produces
+    byte-identical output and a sync that adds nothing rewrites nothing." That
+    sort survived mutation to both `list(...)` and `reversed(...)` against the
+    whole suite, because until now no test built a manifest at all -- the two
+    tests above cover signing and never reach `_body`.
+
+    Why it matters more than tidiness: these bytes are what `crypto.sign`
+    covers. Lose the order and the same chunk set signs differently on each
+    run, so a sync with nothing to say rewrites and re-signs every manifest it
+    touches, and every peer sees churn it must re-verify.
+
+    This is the first entry on `CLAUDE.md`'s weak-fixture list -- "two day
+    directories cannot distinguish a sorted walk from a reversed one" -- which
+    is why the fixture below uses three names whose insertion order is neither
+    sorted nor its reverse. Two would pass against `reversed()` half the time.
+    """
+
+    def entries(self, names: list[str]) -> dict[str, manifest.ManifestEntry]:
+        return {name: manifest.ManifestEntry(digest=f"d-{name}") for name in names}
+
+    def test_insertion_order_does_not_change_the_bytes(self) -> None:
+        scrambled = self.entries(["b.age", "c.age", "a.age"])
+        ordered = self.entries(["a.age", "b.age", "c.age"])
+        self.assertNotEqual(list(scrambled), list(ordered), "precondition: the dicts differ")
+        self.assertEqual(
+            manifest._body("host", "2026-08-18", scrambled),
+            manifest._body("host", "2026-08-18", ordered),
+        )
+
+    def test_the_order_is_sorted_and_not_merely_stable(self) -> None:
+        """`list(...)` would satisfy the test above whenever both dicts agree.
+
+        So this one pins the actual sequence: a fixture inserted in reverse must
+        still come out ascending.
+        """
+        body = manifest._body("host", "2026-08-18", self.entries(["c.age", "b.age", "a.age"]))
+        names = [line.split(" ", 1)[0] for line in body.splitlines()[1:]]
+        self.assertEqual(names, ["a.age", "b.age", "c.age"])
+
+    def test_subsumes_is_ordered_too(self) -> None:
+        """`sync.compact` builds this tuple, and `_body` writes it into the
+        signed line. Unsorted there moves the churn one level in, where the
+        entry looks identical but its bytes are not."""
+        one = manifest.ManifestEntry(digest="d", subsumes=("b.age", "a.age"))
+        other = manifest.ManifestEntry(digest="d", subsumes=("a.age", "b.age"))
+        self.assertNotEqual(
+            manifest._body("host", "2026-08-18", {"merged.age": one}),
+            manifest._body("host", "2026-08-18", {"merged.age": other}),
+            "if this ever passes, _body sorts subsumes itself and compact need not",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
