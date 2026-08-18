@@ -1112,6 +1112,70 @@ class TestAMutantThatEatsMemory(MutateTestCase):
         self.assertIn("ran out of memory", report.results[0].verdict.detail)
 
 
+@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+class TestASubTestThatRunsOutOfMemory(MutateTestCase):
+    """The intersection of the two cases above, which neither of them covers.
+
+    `TestASubTestIsARealAnswer` drives an assertion inside `with
+    self.subTest(...)`; `TestAMutantThatEatsMemory` drives a `MemoryError` in a
+    plain test. `Verdicts.addSubTest` has a branch for both at once, and the
+    whole-package sweep of `tools/` found it unreached -- the only real gap that
+    sweep turned up, and it is in the code that decides what `caught` means.
+
+    Reverted, a memory-exhausted subtest is filed as `noticed` and the row reads
+    `caught`: a test credited with a guard it does not have, which is the exact
+    lie #220 removed one level down. This repository uses `subTest` in more than
+    twenty places, so the intersection is reachable rather than theoretical.
+
+    Gated on `enforced()` for the same reason as its sibling, which CI taught
+    twice: macOS does not apply `RLIMIT_AS`, so the 800 MiB simply succeeds
+    there, `clamp` returns a large number, the subtest notices it and the row
+    reads `caught`. The first version of this test copied the fixture and not
+    the gate.
+    """
+
+    def subtesting_package(self) -> None:
+        """`CLAMP`, and a test whose every assertion is inside a `subTest`."""
+        self.write("mod.py", CLAMP)
+        self.write(
+            "test_mod.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_it(self) -> None:
+                    for value in (-5, -1):
+                        with self.subTest(value=value):
+                            self.assertEqual(mod.clamp(value), 0)
+            """,
+        )
+
+    def test_it_is_broke_rather_than_the_subtest_noticing(self) -> None:
+        self.subtesting_package()
+        report = run(
+            [
+                Mutation(
+                    "clamp allocates 800 MiB inside a subTest",
+                    "mod.py",
+                    "        return 0",
+                    "        return len(bytearray(800 * 1024 * 1024))",
+                    "test_mod",
+                ),
+                # The sibling row proves the fixture's subTest route really does
+                # report a catch, so "broke" above is not simply a broken fixture.
+                Mutation("the guard goes", "mod.py", "if value < 0:", "if False:", "test_mod"),
+            ],
+            baseline=False,
+            strict=False,
+            memory=512 << 20,
+        )
+        self.assertEqual([result.verdict.outcome for result in report.results], ["broke", "caught"])
+        self.assertIn("ran out of memory", report.results[0].verdict.detail)
+
+
 class TestAMutantThatNeverFinishes(MutateTestCase):
     """A generated mutant can turn a loop bound into one that never fires.
 
