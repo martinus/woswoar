@@ -221,3 +221,9 @@ __marimo__/
 # once put a 3.7 MB shellcheck wheel in a commit. dist/ and build/ above do
 # not cover a wheel dropped in the repo root.
 *.whl
+
+# Mutation specs. Throwaway by design -- the table is written for one change and
+# is meaningless against the next, so it is deliberately not kept (see the commit
+# that removed spec_201.py). Ignored rather than merely uncommitted, because
+# `*.spec` above is PyInstaller's and matches none of these.
+spec_*.py

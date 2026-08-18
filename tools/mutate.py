@@ -4,26 +4,29 @@ A test that passes whether or not the fix is present is decoration, and reading
 it will not tell you which kind you have. The only way to know is to break the
 code and watch. This does that, for a table of edits:
 
-    from tools.mutate import Mutation, verify
+    from tools.mutate import Mutation
 
-    verify(
-        [
-            Mutation(
-                "the guard is gone",
-                "woswoar/sync.py",
-                "if stamp is not None and settled:",
-                "if True:",
-                "tests.test_sync.TestSkippingAnUnchangedDay",
-            ),
-        ]
-    )
+    MUTATIONS = [
+        Mutation(
+            "the guard is gone",
+            "woswoar/sync.py",
+            "if stamp is not None and settled:",
+            "if True:",
+            "tests.test_sync.TestSkippingAnUnchangedDay",
+        ),
+    ]
 
-Run it with ``python -m tools.mutate <script>``, or import `verify` from a
-throwaway script of your own. Either way the point is that the *table* is the
-new work and everything below is not. Paths are relative to the working
-directory, so run it from the repo root, as with `tools.run_tests`.
+Run it with ``python -m tools.mutate <script>``. The *table* is the new work and
+everything below is not. Paths are relative to the working directory, so run it
+from the repo root, as with `tools.run_tests`.
 
-Two things it does that a hand-rolled loop forgets, both of which have cost real
+``MUTATIONS`` at module level is the shape, and this example used to show a
+`verify(...)` call instead -- which works, and then exited non-zero with "defines
+no MUTATIONS" printed *above* its own green results (#213). Calling `verify`
+yourself is still supported and still correct; it is simply no longer what the
+documentation teaches, because the two shapes in one file run the table twice.
+
+Four things it does that a hand-rolled loop forgets, all of which have cost real
 time here:
 
 - **The bytecode cache lies.** A ``.pyc`` is validated against
@@ -42,6 +45,16 @@ time here:
   mean to relocate -- and it shipped three times in one session before this
   check. Pass ``additive=True`` for the rare edit that really does mean to insert
   in front of code that stays.
+- **"caught" means a test method noticed, and nothing else.** A mutation that
+  turns a working import into a failing one exits non-zero and leaves ``Ran 1
+  test`` behind, exactly like a test catching it -- so a check reading the exit
+  status and the count reported ``caught`` about a test that never executed.
+  That shipped. The only fixture guarding it used a *syntax* error, which
+  ``unittest.loader`` does not wrap and which therefore takes a different path
+  entirely, so the check passed while the case it was named for went unasked --
+  the too-weak fixture CLAUDE.md rule 3 warns about, in the harness that exists
+  to find them. `_PROBE` now classifies where the result objects still are, and
+  a run that could not put the question says ``BROKE`` rather than either answer.
 - **Your working tree is never edited.** Each mutation is applied to a throwaway
   copy, so a kill at the wrong moment cannot leave a mutated source behind --
   the state CLAUDE.md rule 6 is about, and one this used to guard against with a
@@ -72,9 +85,9 @@ a surviving mutation means a weak test.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
-import re
 import runpy
 import shutil
 import subprocess
@@ -84,9 +97,15 @@ from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from tools.sandbox import usable_cpus
+
+#: Seconds one mutation may take before the run gives up on it. Generous, because
+#: `tests.test_sync` alone is tens of seconds and a loaded machine is slower
+#: still; the point is only that a mutant which never terminates cannot hold a
+#: lane for the rest of the table.
+TIMEOUT = 300.0
 
 #: Names never copied into a mutation's sandbox. ``.git`` because it is large and
 #: nothing under test reads it; the caches because a stale one is the trap this
@@ -116,9 +135,89 @@ class Mutation(NamedTuple):
     additive: bool = False
 
 
+#: What one run of the suite under one mutation is allowed to conclude.
+#:
+#: `broke` and `timeout` are not answers. They say the run could not ask the
+#: question, and they must never be folded into either real verdict -- a
+#: `broke` counted as `caught` blesses a test that never executed, which is the
+#: failure this module's own docstring calls indistinguishable from a real one.
+Outcome = Literal["caught", "survived", "broke", "timeout"]
+
+
+class Verdict(NamedTuple):
+    outcome: Outcome
+    #: The first test that noticed, or the reason nothing could. Printed for
+    #: everything except a plain `caught`, where the label already says it.
+    detail: str = ""
+
+    @property
+    def answered(self) -> bool:
+        """Was a question put at all?
+
+        One definition, because three sites need it and the run, the summary and
+        the exit status each spelled it differently -- and one of the three said
+        something subtly other than the other two.
+        """
+        return self.outcome in ("caught", "survived")
+
+
 class Result(NamedTuple):
     mutation: Mutation
-    caught: bool
+    verdict: Verdict
+
+
+class Report(NamedTuple):
+    results: list[Result]
+    #: Nothing in `results` means anything when this is set: a suite that already
+    #: fails catches every mutation, including the ones no test can see.
+    baseline_red: bool = False
+
+    @property
+    def clean(self) -> bool:
+        """Every row caught, and the baseline green. The definition of done.
+
+        Here rather than in the CLI helper that used to own it, because `verify`
+        and any generated-table driver need the same answer and only one of them
+        had a way to ask. A row that broke or timed out is not clean: it is a
+        question the run failed to put, and calling it green would report the
+        table as smaller than it was while claiming it was complete.
+        """
+        return not self.baseline_red and all(
+            result.verdict.outcome == "caught" for result in self.results
+        )
+
+
+#: Every table `run` has finished in this process, in order.
+#:
+#: Only `main` reads it, and only to tell "the script defined nothing" apart from
+#: "the script did the work itself". Before this existed, a spec written exactly
+#: as the docstring showed it ran correctly and *then* exited 1 with
+#: "defines no MUTATIONS" -- printed above its own green results, because stderr
+#: is not line-buffered against stdout (#213).
+_RUNS: list[Report] = []
+
+#: Nine wide, as before. `caught` stays lowercase and everything else shouts,
+#: because the eye scanning a pasted table is looking for the rows that are not
+#: the good news.
+_HEADLINE: dict[str, str] = {
+    "caught": "caught",
+    "survived": "SURVIVED",
+    "broke": "BROKE",
+    "timeout": "TIMEOUT",
+}
+
+
+def _probe() -> str:
+    """`tools/verdict.py`, read from *this* tree rather than the sandbox's copy.
+
+    Handed to ``python -c``, which is what puts the sandbox on ``sys.path`` so its
+    test modules import at all. Reading it from `__file__`'s directory is the
+    whole isolation property: `tools/**.py` is itself something a table may
+    mutate, and a verdict loaded out of the copy would let a mutation grade its
+    own exam. See that module's docstring for why the classification lives there
+    and not in a string constant here.
+    """
+    return (Path(__file__).resolve().with_name("verdict.py")).read_text(encoding="utf-8")
 
 
 def _clear_bytecode(root: Path) -> None:
@@ -136,36 +235,89 @@ def _clear_bytecode(root: Path) -> None:
         shutil.rmtree(cache, ignore_errors=True)
 
 
-def _run(tests: Sequence[str], root: Path) -> bool:
-    """Whether the suite failed, which for a mutation is the good answer.
+def _run(
+    tests: Sequence[str], root: Path, *, failfast: bool = False, timeout: float = TIMEOUT
+) -> Verdict:
+    """What the suite concluded about one mutation, and by which route.
 
-    A non-zero exit is not enough on its own, and this is the one hazard here
-    that produces a wrong answer in the direction a reader believes. A mutation
-    that makes the module unimportable, or breaks a `setUpClass`, also exits
-    non-zero -- so it would print `caught` while the test whose name is in the row
-    never ran. So the count `unittest` prints is checked too: no "Ran N" line, or
-    "Ran 0", means the mutation broke collection rather than being noticed.
+    The verdict used to be "the exit status was non-zero, and `Ran N` said N was
+    not zero". That is wrong in the direction a reader believes, and it shipped:
+    a mutation that turns a working import into a failing one leaves `Ran 1
+    test`, `errors=1` and a non-zero exit, exactly like a test noticing. The only
+    fixture guarding it used a *syntax* error, which takes a different path
+    through `unittest.loader` and produces no count at all -- so the check passed
+    while the case it named went unasked. `_PROBE` is the answer: classify where
+    the result objects still exist.
+
+    A timeout is its own outcome rather than an exception. A generated mutant can
+    turn a loop bound into one that never fires, and with no limit here that
+    holds a lane for the rest of the run.
     """
     _clear_bytecode(root)
-    finished = subprocess.run(
-        [sys.executable, "-B", "-m", "unittest", *tests],
-        cwd=root,
-        # `-B` covers this process; the variable covers the real `age`, `git` and
-        # `bash` the suite spawns, which would otherwise leave a `.pyc` in a
-        # sandbox that a later mutation reuses.
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    ran = re.search(r"^Ran (\d+) tests? in ", finished.stderr, re.MULTILINE)
-    if ran is None or ran.group(1) == "0":
-        raise SystemExit(
-            f"{' '.join(tests)} ran no tests under this mutation, so 'caught' would "
-            f"mean 'the suite could not start' rather than 'a test noticed'. The "
-            f"mutation probably broke an import.\n{finished.stderr[-2000:]}"
-        )
-    return finished.returncode != 0
+    # Both files land outside the sandbox on purpose: the copy is what the
+    # mutation edits, and a report written into it is one `open()` away from
+    # being the mutation's to write.
+    with tempfile.TemporaryDirectory(prefix="woswoar-verdict-") as box:
+        report = Path(box) / "verdict.json"
+        noise = Path(box) / "stderr.txt"
+        try:
+            with noise.open("w", encoding="utf-8") as spill:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        _probe(),
+                        str(report),
+                        "1" if failfast else "0",
+                        *tests,
+                    ],
+                    cwd=root,
+                    # `-B` covers this process; the variable covers the real
+                    # `age`, `git` and `bash` the suite spawns, which would
+                    # otherwise leave a `.pyc` in a sandbox that a later mutation
+                    # reuses.
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    # A file rather than a pipe, and this is not a style choice.
+                    # On a timeout `subprocess.run` kills the child and then
+                    # drains the pipes with `communicate()` and *no* limit --
+                    # and the suite's `python -m woswoar` grandchildren inherit
+                    # the write end, so that drain waits for them. A hung
+                    # grandchild would hold the lane long past `timeout`, which
+                    # is the one thing this outcome exists to prevent.
+                    stdout=subprocess.DEVNULL,
+                    stderr=spill,
+                    check=False,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired:
+            return Verdict("timeout", f"no answer within {timeout:g}s")
+
+        try:
+            written = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # The probe was killed before it could write anything at all. Rare
+            # and always worth the tail, because nothing else says why.
+            return Verdict("broke", _tail(noise))
+        if not written["loaded"]:
+            return Verdict("broke", _tail(noise) or str(written.get("why", "")).strip())
+
+    if written["broke"]:
+        return Verdict("broke", str(written["broke"][0]))
+    if written["noticed"]:
+        return Verdict("caught", str(written["noticed"][0]))
+    if not written["ran"]:
+        return Verdict("broke", "the targets held no tests")
+    return Verdict("survived")
+
+
+def _tail(noise: Path) -> str:
+    """The last line the run managed to say. Empty when it said nothing."""
+    try:
+        spoken = noise.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError:
+        return ""
+    return spoken[-1].strip() if spoken else ""
 
 
 def _check(mutation: Mutation) -> None:
@@ -233,24 +385,30 @@ def _sandboxes(count: int) -> Iterator[queue.Queue[Path]]:
         yield available
 
 
-def _borrow(available: queue.Queue[Path], tests: Sequence[str]) -> bool:
-    """Run ``tests`` unmutated in a borrowed sandbox. One shard of the baseline."""
+def _borrow(available: queue.Queue[Path], tests: Sequence[str], timeout: float) -> Verdict:
+    """Run ``tests`` unmutated in a borrowed sandbox. One shard of the baseline.
+
+    Never `failfast`: a red baseline is a thing you want the whole of, and a
+    green one never stops early anyway, so there is nothing to buy.
+    """
     root = available.get()
     try:
-        return _run(tests, root)
+        return _run(tests, root, timeout=timeout)
     finally:
         available.put(root)
 
 
-def _attempt(mutation: Mutation, available: queue.Queue[Path]) -> bool:
-    """Apply one mutation in a borrowed sandbox and report whether it was caught."""
+def _attempt(
+    mutation: Mutation, available: queue.Queue[Path], failfast: bool, timeout: float
+) -> Verdict:
+    """Apply one mutation in a borrowed sandbox and report what the suite said."""
     root = available.get()
     try:
         source = root / mutation.path
         original = source.read_text(encoding="utf-8")
         source.write_text(original.replace(mutation.old, mutation.new), encoding="utf-8")
         try:
-            return _run(mutation.tests.split(), root)
+            return _run(mutation.tests.split(), root, failfast=failfast, timeout=timeout)
         finally:
             # Into the sandbox, not the working tree. Only so the next mutation
             # to borrow this copy starts from clean source.
@@ -259,8 +417,16 @@ def _attempt(mutation: Mutation, available: queue.Queue[Path]) -> bool:
         available.put(root)
 
 
-def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | None = None) -> int:
-    """Apply each mutation in its own copy of the tree; return how many survived.
+def run(
+    mutations: Iterable[Mutation],
+    baseline: bool = True,
+    workers: int | None = None,
+    *,
+    strict: bool = True,
+    failfast: bool = False,
+    timeout: float = TIMEOUT,
+) -> Report:
+    """Apply each mutation in its own copy of the tree; report what each answered.
 
     Prints one line per mutation, in the order the table gives them and not the
     order they finish, so that the output is the same every run and can be pasted
@@ -271,10 +437,16 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
     everything. Its targets are sharded and queued alongside the mutations rather
     than run as one serial pass, because a single pass over the union of every
     target was measured at two thirds of the wall clock.
+
+    ``strict`` decides what an unanswerable row does. For a hand-written table it
+    should stop the run: a row that breaks collection is a mistake in the table,
+    and the other rows will still be there once it is fixed. For a generated one
+    it must not, because a single non-viable mutant out of two hundred would
+    throw away every answer already paid for.
     """
     table = list(mutations)
     if not table:
-        return 0
+        return Report([])
     for mutation in table:
         _check(mutation)
 
@@ -291,27 +463,93 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
     # is nearly free.
     lanes = workers or min(len(table) + len(shards), usable_cpus() * 2, 16)
 
-    survivors: list[Result] = []
+    results: list[Result] = []
+    red = False
     with _sandboxes(lanes) as available, ThreadPoolExecutor(max_workers=lanes) as pool:
         checking = (
-            [pool.submit(_borrow, available, [shard]) for shard in shards] if baseline else []
+            [pool.submit(_borrow, available, [shard], timeout) for shard in shards]
+            if baseline
+            else []
         )
-        futures = [pool.submit(_attempt, mutation, available) for mutation in table]
+        futures = [
+            pool.submit(_attempt, mutation, available, failfast, timeout) for mutation in table
+        ]
         for mutation, future in zip(table, futures, strict=True):
-            caught = future.result()
-            print(f"  {'caught' if caught else 'SURVIVED':9} {mutation.label}")
-            if not caught:
-                survivors.append(Result(mutation, caught))
-        if any(future.result() for future in checking):
-            print("  BASELINE RED -- the suite fails untouched, so nothing above means anything")
-            return len(table)
+            verdict = future.result()
+            results.append(Result(mutation, verdict))
+            print(f"  {_HEADLINE[verdict.outcome]:9} {mutation.label}")
+            if verdict.answered:
+                continue
+            if strict:
+                # Cancel first, or the `with` block's `shutdown(wait=True)` runs
+                # every remaining row to completion and discards its verdict
+                # unprinted -- so "stopping" would cost the whole table it was
+                # meant to save. Only the rows not yet started can go; the
+                # `lanes` already in flight are paid for either way.
+                for pending in futures:
+                    pending.cancel()
+                raise SystemExit(
+                    f"{mutation.label}: this mutation broke collection rather than being "
+                    f"noticed, so neither 'caught' nor 'SURVIVED' would mean anything "
+                    f"about {mutation.tests}. {verdict.detail}"
+                )
+            # Not indented under the row by accident: an unanswered row must not
+            # be skimmable as one of the two real verdicts.
+            print(f"           -- {verdict.detail}")
+        # After the rows, not before, so a red baseline never costs the reader the
+        # results they were waiting for -- they are simply told to disbelieve them.
+        for future in checking:
+            baseline_verdict = future.result()
+            if baseline_verdict.outcome != "survived":
+                # `survived` is the untouched suite passing, which is the one
+                # place the mutation vocabulary reads backwards. A shard that
+                # broke or timed out is red too, and its reason is the only clue
+                # to why -- the old wording asserted a failure that may not have
+                # happened.
+                print(
+                    f"  BASELINE NOT GREEN ({baseline_verdict.outcome}) -- the suite does not "
+                    f"pass untouched, so nothing above means anything: {baseline_verdict.detail}"
+                )
+                red = True
+                break
 
+    if not red:
+        _summarise(results)
+    report = Report(results, red)
+    _RUNS.append(report)
+    return report
+
+
+def _summarise(results: Sequence[Result]) -> None:
+    """The part a pull request quotes when the news is bad."""
+    survivors = [result for result in results if result.verdict.outcome == "survived"]
+    unanswered = [result for result in results if not result.verdict.answered]
     if survivors:
         print(f"\n{len(survivors)} survived. A test that cannot see the fix removed is decoration:")
         for result in survivors:
             print(f"  - {result.mutation.label} ({result.mutation.tests})")
         print("Suspect the fixture before the mutation -- see CLAUDE.md rule 3.")
-    return len(survivors)
+    if unanswered:
+        # Counted separately and never as survivors: these rows asked nothing, and
+        # rolling them into either verdict is the error this module exists to
+        # avoid, one level up.
+        print(
+            f"\n{len(unanswered)} asked nothing, so the table is that much smaller than it looks:"
+        )
+        for result in unanswered:
+            print(f"  - {result.mutation.label}: {result.verdict.detail}")
+
+
+def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | None = None) -> int:
+    """`run`, reduced to the number of survivors. The shape spec files call.
+
+    Strict, because a spec file is hand-written: a row that cannot be answered is
+    a mistake in the table, and stopping is what gets it fixed.
+    """
+    report = run(mutations, baseline, workers)
+    if report.baseline_red:
+        return len(report.results)
+    return sum(1 for result in report.results if result.verdict.outcome == "survived")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,12 +560,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("script", help="a Python file defining MUTATIONS: list[Mutation]")
     args = parser.parse_args(argv)
 
+    already = len(_RUNS)
     namespace = runpy.run_path(args.script)
+    # Every table the script ran, not just the last: a spec calling `verify`
+    # twice would otherwise have its exit status decided by the second, so a
+    # first table full of survivors followed by a clean one exits zero. That is
+    # #213's own symptom -- a run reported as the opposite of what it was --
+    # reintroduced by the fix for it.
+    mine = _RUNS[already:]
+    ran_itself = bool(mine)
     mutations = namespace.get("MUTATIONS")
-    if not mutations:
-        raise SystemExit(f"{args.script} defines no MUTATIONS")
-    return 1 if verify(mutations) else 0
+
+    if mutations and ran_itself:
+        # Both shapes in one file. Re-running the table would cost the same
+        # minutes for the same answer and print it twice with nothing to say
+        # which pass a reader is looking at, so take the one that already ran.
+        print(
+            f"{args.script} defines MUTATIONS *and* calls verify(); the results above "
+            f"are the run it did itself. Delete one of the two.",
+            file=sys.stderr,
+        )
+    if ran_itself:
+        return 0 if all(report.clean for report in mine) else 1
+    if mutations:
+        return 0 if run(mutations).clean else 1
+    raise SystemExit(
+        f"{args.script} defines no MUTATIONS and never called verify(), so there was "
+        f"nothing to run. The shape this takes is `MUTATIONS = [Mutation(...), ...]` "
+        f"at module level."
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Deliberately not `main()`. `python -m tools.mutate` runs this file as
+    # `__main__`, and the spec it then executes does `from tools.mutate import
+    # verify` -- which imports the file a *second* time, as a different module
+    # object with its own `_RUNS`. The local `main` would look at a list the
+    # spec's `verify` never appended to, and report a script that had just run a
+    # green table as one that defined nothing. Which is #213 again, by a
+    # different route.
+    from tools.mutate import main as _main
+
+    raise SystemExit(_main())

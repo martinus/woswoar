@@ -70,7 +70,9 @@ line-length = 100
 target-version = "py310"
 # Recent ruff formats fenced code blocks inside markdown; the design document
 # contains illustrative snippets that are not meant to be valid modules.
-extend-exclude = ["*.md"]
+# Mutation specs are throwaway tables of source text, and the source they quote
+# is not theirs to reformat -- a wrapped `old` string no longer matches the file.
+extend-exclude = ["*.md", "spec_*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

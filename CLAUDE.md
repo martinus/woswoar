@@ -142,9 +142,12 @@ each destroyed uncommitted work here. There is no reflog for a tree that was
 never committed, so the only recovery is to write it again from memory — the
 single largest waste of a session so far, twice over.
 
-- Commit a checkpoint before anything that rewrites files in bulk. Mutation
-  testing especially: it edits sources in a loop and restores them in a
-  `finally`, and an interrupted run leaves the tree mutated.
+- Commit a checkpoint before anything that rewrites files in bulk. Not
+  `tools/mutate.py`, which since #212 edits only a throwaway copy — this bullet
+  said otherwise for months after that stopped being true, and a stale warning
+  here is worse than none: believing the tool leaves a mutated tree behind is
+  exactly what would justify reaching for `git checkout --` to tidy up, which is
+  the operation this rule exists to prevent.
 - To undo your own edit, rewrite the text you changed. Do not discard the file.
 - Tell subagents explicitly when they may not write. A review agent asked only
   to *read* a diff has reverted the tree on its own initiative; verify the tree
