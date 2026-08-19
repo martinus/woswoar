@@ -230,6 +230,13 @@ first such change, not during one.
   python -m tools.bench --importtime woswoar.__main__ --base main
   ```
 
+  **The generated sweep goes last.** Implement, write the hand table, preflight,
+  run `/simplify` *and apply it*, and only then `--base main`. The table is
+  generated from the lines as they stand, so any edit after it invalidates every
+  row — and a review that lands after the sweep always edits something. Three
+  sweeps were re-run for that reason in one session, at ten to thirty-five
+  minutes each.
+
   Three things to carry into a pull request, because they are about what you
   write rather than what the tool does:
 

@@ -52,6 +52,7 @@ import copy
 import re
 import subprocess
 from collections.abc import Callable, Iterator, Sequence
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import NamedTuple
 
@@ -855,6 +856,31 @@ def cap(mutations: Sequence[Mutation], limit: int) -> tuple[list[Mutation], list
     return kept, dropped
 
 
+def _near_miss(original: str, wanted: str) -> str:
+    """The closest line in the file, when a hand-written row matches nothing.
+
+    Almost always the same cause: an edit moved the line by a word since the row
+    was written, and the row is now quoting the file's past. Without this the
+    author greps for a string they believe is there, which is the one search
+    that cannot work. With it the answer is in the refusal.
+
+    Only for a single-line `old`, and only when something is close enough to be
+    worth printing: a multi-line span has no "nearest line", and a suggestion
+    that is not the intended line is worse than none.
+    """
+    first = wanted.strip().splitlines()
+    if len(first) != 1 or not first[0]:
+        return ""
+    best, score = "", 0.0
+    for line in original.splitlines():
+        ratio = SequenceMatcher(None, first[0], line.strip()).ratio()
+        if ratio > score:
+            best, score = line, ratio
+    if score < 0.6:
+        return ""
+    return f"\n\nThe closest line there is:\n    {best.strip()}"
+
+
 def check(mutation: Mutation) -> None:
     """Refuse a row that cannot mean anything, reading the real file.
 
@@ -873,6 +899,7 @@ def check(mutation: Mutation) -> None:
                 f"{mutation.label}: {mutation.path} contains the text to replace "
                 f"{found} times, not once. A mutation that matches nothing tests "
                 f"nothing, and one that matches twice tests something else."
+                + _near_miss(original, mutation.old)
             )
     else:
         start, end = mutation.span

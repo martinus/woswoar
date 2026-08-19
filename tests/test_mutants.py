@@ -432,6 +432,46 @@ class TestDroppingAKeywordArgument(unittest.TestCase):
         self.assertEqual(self.dropped('p.read_text(encoding="utf-8")\n'), [])
 
 
+class TestARowThatMatchesNothingSaysWhatIsClose(unittest.TestCase):
+    """The refusal is right and used to end the search there.
+
+    A hand-written row that matches nothing is almost always quoting the file's
+    past: an edit moved the line by a word after the row was written. The author
+    then greps for a string they believe is present, which is the one search
+    that cannot succeed. Five rows in one session ended that way.
+    """
+
+    def refusal(self, old: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mod.py"
+            path.write_text("def clamp(value: int) -> int:\n    return value\n", encoding="utf-8")
+            with self.assertRaises(SystemExit) as refused:
+                mutants.check(Mutation("x", str(path), old, "pass", "t"))
+        return str(refused.exception)
+
+    def test_it_offers_the_closest_line(self) -> None:
+        said = self.refusal("def clamp(value: int) -> int :")
+        self.assertIn("closest line", said)
+        self.assertIn("def clamp(value: int) -> int:", said)
+
+    def test_it_offers_nothing_when_nothing_is_close(self) -> None:
+        """A suggestion that is not the intended line is worse than none."""
+        self.assertNotIn("closest line", self.refusal("import antigravity"))
+
+    def test_a_multi_line_row_gets_no_guess(self) -> None:
+        """There is no "nearest line" to a span, and picking one of its lines
+        would point at the half that still matches.
+
+        The first line here is deliberately *close* to a real one. With
+        something unlike the file, the distance check refuses it anyway and this
+        test passes whether or not the span check exists -- which is exactly
+        what it did until a mutation said so.
+        """
+        self.assertNotIn(
+            "closest line", self.refusal("def clamp(value: int) -> int :\n    return value\n")
+        )
+
+
 class TestSkippingAnOperator(unittest.TestCase):
     """`--skip-operator`, the escape hatch a pragma cannot serve.
 
