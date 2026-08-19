@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, codec, crypto, fleet, gitrepo, manifest, progress, store
+from . import archive, codec, crypto, fleet, forget, gitrepo, manifest, progress, store
 from .entry import make_inert
 from .errors import SyncError, WoswoarError
 from .report import Check, Notice
@@ -1573,10 +1573,16 @@ def merge(known: Machine, state: State, report: Report) -> None:
     # rather than skipped in the loop: the phase names the machine being read,
     # and `_merge_host` counts that machine's days underneath it.
     others = [host for host in archive.repo_hosts() if host != known.id]
+    # Read once for the whole merge rather than per host or per chunk. A chunk
+    # keeps a forgotten row for ever -- history is append-only, which is the
+    # point -- so the only place to stop it is here, on every sync, for as long
+    # as the chunk exists. Empty on every machine that has never run `forget`,
+    # and `forget.surviving` returns its argument unchanged for that case.
+    suppressed = frozenset(forget.load_digests())
     for host_id in others:
         progress.phase(f"reading history from {name_for(host_id).text}")
         report.hosts_seen.add(host_id)
-        _merge_host(known, host_id, state, report)
+        _merge_host(known, host_id, state, report, suppressed)
         _merge_name(known, host_id)
 
 
@@ -1629,7 +1635,13 @@ def _stamp(state: State, key: str, stamp: int | None, settled: bool) -> None:
         state.merged_at[key] = stamp
 
 
-def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> None:
+def _merge_host(
+    known: Machine,
+    host_id: str,
+    state: State,
+    report: Report,
+    suppressed: frozenset[str] = frozenset(),
+) -> None:
     verify_key = _trusted_signer(host_id, state, report)
     if verify_key is None:
         return
@@ -1708,7 +1720,7 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
             continue
 
         listed = manifest.read(host_id, chunk_day, verify_key)
-        day = _Day(host_id, chunk_day, listed, already)
+        day = _Day(host_id, chunk_day, listed, already, suppressed)
         pending = names if day.rewrite else fresh
         directory = archive.chunk_dir(host_id, chunk_day)
         #: Chunk names whose plaintext reached `day`.
@@ -1855,8 +1867,10 @@ class _Day:
         day: str,
         listed: dict[str, manifest.ManifestEntry],
         already: frozenset[str],
+        suppressed: frozenset[str] = frozenset(),
     ) -> None:
         self.host_id = host_id
+        self.suppressed = suppressed
         self.day = day
         self.listed = listed
         self.compacted = {name for name, entry in listed.items() if entry.subsumes}
@@ -1892,6 +1906,19 @@ class _Day:
         self._bytes = 0
 
     def add(self, plaintext: bytes, report: Report) -> None:
+        # Filtered here rather than after the day is assembled, because a
+        # rewrite replaces the file from the chunks alone: anything let through
+        # is what the day *becomes*. `state.merged` already stops a chunk being
+        # read twice, so on an ordinary machine this only ever sees new lines --
+        # but a re-merge, a fresh clone or a compaction rebuild sends the whole
+        # day back through here, which is exactly when a forgotten row would
+        # otherwise return.
+        plaintext = forget.surviving(plaintext, self.suppressed)
+        if not plaintext:
+            # Every line in this chunk was forgotten. Recording no block keeps
+            # `flush` from replacing a day with nothing on a rewrite whose only
+            # chunk was entirely suppressed.
+            return
         self._blocks.append(plaintext)
         self._bytes += len(plaintext)
         if self._bytes > FLUSH_BYTES and not self.rewrite:

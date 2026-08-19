@@ -17,6 +17,7 @@ from .errors import WoswoarError
 from .report import Check, paragraphs
 
 if TYPE_CHECKING:  # `sync` is imported lazily; only the annotations need it.
+    from .forget import Match
     from .sync import Failure, Reader, ReencryptReport
 
 
@@ -1207,6 +1208,94 @@ def cmd_compact(args: argparse.Namespace) -> int:
     return 0
 
 
+#: How much of a command a `forget` listing shows. Long enough that two similar
+#: rows are told apart, short enough that fifty of them are still a list. The
+#: full text is in the log until the moment `--yes` is given, so nothing is lost
+#: by clipping the preview -- and the row a person is about to delete is one
+#: they typed, so the beginning is the half that identifies it.
+FORGET_PREVIEW = 96
+
+
+def _forget_row(found: Match) -> str:
+    """One line of the listing: where it was recorded, when, and what it says."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(found.record.ts))
+    who = store.host_name(found.host_id) or found.host_id
+    # `make_inert` for the same reason the picker uses it: a recorded command
+    # can contain escape sequences, and this listing is read on a terminal
+    # immediately before somebody answers a question about it.
+    shown = make_inert(found.record.cmd)
+    if len(shown) > FORGET_PREVIEW:
+        shown = shown[:FORGET_PREVIEW] + "..."
+    mark = "published" if found.published else "local only"
+    return f"  {who}  {when}  [{mark}]  {shown}"
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """Remove recorded commands from this machine, and keep them removed."""
+    from . import forget, sync
+
+    state = sync.State.load()
+    try:
+        matches = forget.find(
+            args.pattern or "",
+            only_credentials=args.credentials,
+            exported=state.exported,
+        )
+    except ValueError as exc:
+        print(f"woswoar: {exc}", file=sys.stderr)
+        return 2
+
+    if not matches:
+        what = "look like credentials" if args.credentials else f"contain {args.pattern!r}"
+        print(f"nothing recorded here seems to {what}")
+        return 0
+
+    print(f"{len(matches)} matching command(s):\n")
+    for match in matches:
+        print(_forget_row(match))
+
+    published = sorted({match.day for match in matches if match.published})
+    if published:
+        # Before the prompt rather than after, as `revoke` argues: this is the
+        # reason somebody might answer no and go and rotate a key first, so
+        # printing it alongside the result would be printing it too late to act
+        # on.
+        print(
+            f"\n{sum(1 for m in matches if m.published)} of these have already been published,"
+            f"\non {', '.join(published)}. Published chunks are never rewritten -- history"
+            "\nis append-only and every peer's signature rests on that -- so those rows"
+            "\nstay in the repository and on every machine that has merged them."
+            "\nIf one of them is a credential, rotate it: that is the only thing that"
+            "\nactually takes it out of use."
+        )
+
+    if not args.yes:
+        it = "them" if len(matches) > 1 else "it"
+        print(f"\nNothing was changed. Re-run with --yes to remove {it} from this machine.")
+        return 0
+
+    # Under the sync lock: a sync running alongside this would either seal the
+    # rows being removed or merge into a file being replaced, and both races end
+    # with the forgotten row still on a machine.
+    with sync.lock():
+        # Re-read inside the lock. The listing above was taken outside it, and a
+        # sync that ran in between moves `state.exported` -- which is the number
+        # the rewrite adjusts.
+        state = sync.State.load()
+        removal = forget.apply(
+            forget.find(
+                args.pattern or "", only_credentials=args.credentials, exported=state.exported
+            ),
+            state.exported,
+        )
+        state.exported.update(removal.exported)
+        state.save()
+
+    print(f"\nremoved {removal.rows} row(s) from {removal.files} day file(s)")
+    print("the parse cache was dropped; the next search rebuilds it")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="woswoar",
@@ -1605,6 +1694,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_compact.add_argument("--before", help="only days before this YYYY-MM-DD (default: today)")
     p_compact.set_defaults(func=cmd_compact)
+
+    p_forget = sub(
+        "forget",
+        "remove recorded commands from this machine",
+        """
+        For when a secret is typed and the credential filter misses it. The
+        matching rows are removed from the plaintext logs, so they stop being
+        offered by Ctrl-R and stop being counted in stats, and their digests are
+        remembered so that a later sync cannot merge them back.
+
+        It prints what it would remove and changes nothing until you pass --yes.
+        The pattern is a plain substring of the command, not a regular
+        expression: logs/ is the only copy of anything this machine has not
+        published yet, and a mistyped .* there is not recoverable.
+
+        What it cannot do is un-publish. Chunks are never rewritten -- every
+        peer's signature depends on that -- so a row that has already been
+        synced stays in the repository and on every machine that merged it. The
+        listing says which rows those are. If one is a credential, rotate it.
+        """,
+    )
+    p_forget.add_argument(
+        "pattern", nargs="?", help="substring of the command to remove (case-sensitive)"
+    )
+    p_forget.add_argument(
+        "--credentials",
+        action="store_true",
+        help="select every recorded command that looks like it carries a secret",
+    )
+    # Not `_confirm`'s flag. There it means "skip the prompt"; here it is what
+    # makes the command do anything at all, because a dry run that has to be
+    # asked for is a dry run nobody gets when they most need one.
+    p_forget.add_argument("--yes", action="store_true", help="actually remove them")
+    p_forget.set_defaults(func=cmd_forget)
 
     return parser
 

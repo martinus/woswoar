@@ -593,6 +593,27 @@ def state_file() -> Path:
     return data_dir() / "state.json"
 
 
+def forgotten_file() -> Path:
+    """Digests of rows `forget` removed, so a re-merge cannot bring them back.
+
+    Its own file rather than a field in `state.json`, and that is the whole
+    reason it works. `state.json` is progress: rule 8 says losing it costs a
+    re-merge and an export, never a command, and `State.load` degrades every
+    unreadable value to a safe default on purpose. A suppression list cannot
+    live under that promise -- losing it silently un-forgets everything, on the
+    one path (a fresh clone, a restored machine) where somebody is least likely
+    to look. Outside the repository too: what this machine chose to forget is
+    not something the remote needs to know, and publishing it would publish the
+    fact and the time that something was forgotten.
+
+    Not a JSON object either. It is appended to and read whole, one lowercase
+    sha256 per line, so a truncated write costs the last digest rather than the
+    file -- which is the failure mode `write_atomic` exists to avoid for
+    everything that is rewritten instead.
+    """
+    return data_dir() / "forgotten"
+
+
 def sync_stamp_file() -> Path:
     """When a sync was last *started*, as decimal seconds on one line.
 
