@@ -306,6 +306,20 @@ class TestASimulatedMachineIsAWholeWorld(SyncTestCase):
         with self.machine("alpha").active():
             self.assertEqual(os.environ["PATH"], outside)
 
+    def test_a_machine_carries_every_name_a_sandbox_cannot_invent(self) -> None:
+        """The general form of the test above. `PATH` broke and `PATH` was
+        asserted; the other four names in `store.SANDBOX_CARRIES` were guarded
+        by nothing, and three of them are unset on an ordinary machine, so they
+        are planted rather than read (#251).
+
+        The `Fake` is built before the planting: constructing one writes files
+        and the planted `PATH` points nowhere real.
+        """
+        fake = self.machine("alpha")
+        with mock.patch.dict(os.environ, support.PLANTED), fake.active():
+            inside = dict(os.environ)
+        support.assert_carried(self, inside)
+
     def test_one_machine_does_not_see_another_ones_session(self) -> None:
         """`WOSWOAR_SESSION` used to be popped by name here; a wholesale replace
         is what makes that true of every name rather than of the one that was

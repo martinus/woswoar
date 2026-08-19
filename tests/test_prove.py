@@ -111,6 +111,17 @@ class TestTheProofRunsInAWorldOfItsOwn(ProveTestCase):
         with prove._sandbox():
             self.assertEqual(os.environ["PATH"], outside)
 
+    def test_the_sandbox_carries_every_name_a_sandbox_cannot_invent(self) -> None:
+        """The general form of the test above, and the reason it is a second
+        one: `PATH` was the name that broke, so `PATH` is what got asserted --
+        leaving the other four in `store.SANDBOX_CARRIES` guarded by nothing.
+        Three of them are unset on an ordinary machine, so they are planted
+        here rather than read. See `support.assert_carried` (#251).
+        """
+        with mock.patch.dict(os.environ, support.PLANTED), prove._sandbox():
+            inside = dict(os.environ)
+        support.assert_carried(self, inside)
+
     def test_a_name_the_sandbox_invents_does_not_outlive_it(self) -> None:
         """The half that restoring by `update` cannot do.
 

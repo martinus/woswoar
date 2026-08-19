@@ -15,7 +15,7 @@ import tempfile
 import termios
 import time
 import unittest
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from typing import NamedTuple
@@ -32,6 +32,64 @@ MACHINE_ID = "0123456789abcdef"
 #: forgotten in the other.
 requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
+
+
+#: A value for every name a sandbox has to carry, planted in the ambient
+#: environment before one is built from it.
+#:
+#: Planted rather than read, because on a developer's machine only `PATH` and
+#: sometimes `TMPDIR` are set -- so a carry assertion that looked at what
+#: happened to be there checked `PATH` and called it a property. Every carry
+#: assertion in this repository did exactly that, which is #251.
+#:
+#: **Written out rather than derived from `store.SANDBOX_CARRIES`**, and that
+#: is the whole of what makes it work. Derived was the first version of this
+#: and it was worth nothing: deleting `PYTHONWARNINGS` from `SANDBOX_CARRIES`
+#: shrank the expectation by the same name, and the full suite stayed green --
+#: 1213 tests, 0 failures -- against a mutant that silently stops carrying CI's
+#: ``error::DeprecationWarning`` into every child process. That is the shape
+#: #251's own text warns about, found by running the mutation rather than by
+#: reading the assertion, which reads correctly either way.
+#:
+#: `TestTheSuiteCannotReachTheMachineItRunsOn` asserts these are the same names
+#: `store.SANDBOX_CARRIES` holds, so the copy cannot drift in silence.
+PLANTED = {
+    "PATH": "/planted/bin",
+    "TMPDIR": "/planted/tmp",
+    # Values a real one could have, since nothing stops a future caller of this
+    # from spawning an interpreter that reads them.
+    "PYTHONWARNINGS": "always::DeprecationWarning",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPYCACHEPREFIX": "/planted/pycache",
+}
+
+
+def assert_carried(
+    case: unittest.TestCase,
+    built: Mapping[str, str],
+    *,
+    overridden: Collection[str] = (),
+) -> None:
+    """Assert a sandbox built under `PLANTED` carried what it cannot invent.
+
+    The direction an *empty* environment satisfies for free, which is why it
+    cannot be folded into the leak assertions beside it: those pass on whatever
+    is missing, and a sandbox that carries nothing is missing everything. #237
+    shipped that shape -- two builders called `store.sandbox_environ` after
+    `os.environ.clear()`, carried nothing, and stayed green on Linux because
+    `shutil.which` falls back to ``confstr("CS_PATH")`` and finds an
+    apt-installed `age` in `/usr/bin`. Homebrew does not put it there: 7
+    failures in `test_prove` and 87 errors in one `test_sync` shard, against a
+    fully green Linux run.
+
+    `overridden` names what a builder sets for itself instead of carrying. It
+    is a parameter rather than a subtraction made here because the caller has
+    to *say* which names, and then assert what they were set to -- an exception
+    nobody states is a hole, and one this function decided for itself would
+    make the assertion a restatement of the code it is checking.
+    """
+    expected = {name: value for name, value in PLANTED.items() if name not in overridden}
+    case.assertEqual({name: built.get(name) for name in expected}, expected)
 
 
 def child_env(**extra: str) -> dict[str, str]:

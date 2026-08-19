@@ -32,6 +32,8 @@ from tools.sandbox import (
 )
 from woswoar import store
 
+from . import support
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -103,6 +105,19 @@ class TestTheEnvironmentIsBuiltNotInherited(unittest.TestCase):
     def test_path_is_carried_because_age_and_git_have_to_be_found(self) -> None:
         env = sandbox_env(REPO, Path("/tmp/sandbox-home"))
         self.assertEqual(env["PATH"], os.environ["PATH"])
+
+    def test_everything_a_sandbox_cannot_invent_is_carried(self) -> None:
+        """The general form of the test above (#251).
+
+        `PYTHONPYCACHEPREFIX` is the one exception, and it is named rather than
+        skipped: this builder deliberately redirects it into the sandbox, which
+        `TestBytecodeStaysOutOfTheTree` below asserts and explains. Carrying the
+        caller's would put the comparison's bytecode wherever the developer
+        keeps theirs, which is the opposite of what that class is for.
+        """
+        with mock.patch.dict(os.environ, support.PLANTED):
+            env = sandbox_env(REPO, Path("/tmp/sandbox-home"))
+        support.assert_carried(self, env, overridden={"PYTHONPYCACHEPREFIX"})
 
     def test_the_home_is_where_woswoar_will_look(self) -> None:
         home = Path("/tmp/sandbox-home")

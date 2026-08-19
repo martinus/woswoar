@@ -129,6 +129,18 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         self.assertEqual(os.environ.get("PATH"), self._outer_path)
         self.assertIsNotNone(shutil.which("git"), "the suite runs a real git")
 
+    def test_the_planted_names_are_the_names_a_sandbox_carries(self) -> None:
+        """`support.PLANTED` is a hand-written copy of `store.SANDBOX_CARRIES`,
+        and this is what keeps the copy honest.
+
+        Deriving it was the obvious version and it guarded nothing: an
+        expectation built from the list under test shrinks whenever the list
+        does, so removing a carried name passed 1213 tests. Written out, the
+        removal fails three carry assertions -- and this one, which is the only
+        place that says *why* they now disagree.
+        """
+        self.assertEqual(set(support.PLANTED), set(store.SANDBOX_CARRIES))
+
     def test_home_is_the_sandbox(self) -> None:
         self.assertEqual(Path.home(), self.home)
         self.assertEqual(install.rcfile_for("bash").parent, self.home)
