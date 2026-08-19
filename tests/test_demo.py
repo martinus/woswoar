@@ -11,6 +11,7 @@ watched by a person -- that is what `tools/demo/record.sh` is for.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -22,7 +23,7 @@ from unittest import mock
 
 from tools import mutants
 from tools.demo import seed
-from woswoar import search
+from woswoar import search, store
 
 REPO = Path(__file__).resolve().parent.parent
 README = REPO / "README.md"
@@ -35,6 +36,102 @@ _CTRL = re.compile(r"^Ctrl\+(\w)$", re.M)
 #: The `raw.githubusercontent.com` form the README embeds the GIF with, and the
 #: repo-relative path at the end of it.
 _RAW = re.compile(r"https://raw\.githubusercontent\.com/[^/]+/[^/]+/[^/]+/(\S+?\.gif)")
+
+
+def _in_the_sandbox(root: Path, *argv: str) -> subprocess.CompletedProcess[str]:
+    """Run `argv` with the demo sandbox as its **whole** environment.
+
+    The seeder was spawned here with no `env=` at all, so it began life holding
+    the developer's real `WOSWOAR_DIR`, `HOME` and `XDG_*`, and the only thing
+    between this suite and a live installation was `seed.build`'s own
+    `os.environ.clear()` -- one line of the very file a mutation sweep rewrites.
+    That is the arrangement that produced #245, and #246's guard is a second
+    lock on the same door rather than a reason to leave the first one open. So
+    the child now starts inside the sandbox and `build` merely confirms it.
+
+    `store.sandbox_environ` rather than the five literals `listed` built by
+    hand, for the reason `tools/sandbox.py` gives: a hand-kept list falls behind
+    `store.ENV_KEYS` and a "sandbox" quietly points somewhere real. That one
+    named three of the six -- it set `WOSWOAR_DIR`, so the missing
+    `XDG_DATA_HOME` never decided anything, which is exactly why nothing said so.
+
+    `cwd` is the repo because `-m tools.demo.seed` has to find `tools`, and
+    `PATH` keeps `bin/woswoar` first so the sandbox's wrapper wins over any
+    installed release.
+    """
+    env = store.sandbox_environ(root, root / "home")
+    env["PATH"] = f"{root / 'bin'}:{env.get('PATH', '/usr/bin:/bin')}"
+    return subprocess.run(argv, cwd=REPO, env=env, check=True, capture_output=True, text=True)
+
+
+class TestTheChildrenOfThisSuiteStartInsideTheSandbox(unittest.TestCase):
+    """What `_in_the_sandbox` actually hands a child, asked of a real one.
+
+    Driving a child rather than reading the dict back, because the dict is not
+    what decides: dropping `env=` from the `subprocess.run` above leaves the
+    dict correct and the child holding the developer's environment, and only a
+    process can tell those two apart.
+    """
+
+    #: A `WOSWOAR_DIR` that is not the developer's and not the sandbox's, so
+    #: that "the child saw the parent" and "the child saw nothing" are distinct
+    #: answers. A real one would make this pass on a machine with no woswoar.
+    DECOY = "/nonexistent/a-real-looking-installation"
+
+    def child_environment(self, root: Path) -> dict[str, str]:
+        dumped = _in_the_sandbox(
+            root, sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"
+        )
+        # Annotated rather than asserted: `python -O` strips an `assert`, and
+        # `tests/support.py` carries the same note for the same reason.
+        loaded: dict[str, str] = json.loads(dumped.stdout)
+        return loaded
+
+    def test_it_carries_nothing_of_the_environment_it_was_spawned_from(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            with mock.patch.dict(
+                os.environ, {"WOSWOAR_DIR": self.DECOY, "HOME": self.DECOY, "WOSWOAR_SESSION": "s"}
+            ):
+                inherited = self.child_environment(root)
+        # Names, never values. This assertion firing prints its container, and
+        # the container is a real environment: the run that first proved this
+        # test works spilled an ssh-agent socket, an Atlassian token and an
+        # Anthropic session key into the log. A CI log is public.
+        self.assertEqual(
+            sorted(name for name, value in inherited.items() if self.DECOY in value),
+            [],
+            "the child was handed the environment this suite was spawned from",
+        )
+        self.assertNotIn("WOSWOAR_SESSION", sorted(inherited))
+
+    def test_it_still_carries_what_a_sandbox_cannot_invent(self) -> None:
+        """The direction an *empty* environment also passes, which is why it is
+        a separate assertion (#251): a sandbox has no answer for where `env`,
+        `git` and `age` live, and `bin/woswoar` is a `/bin/sh` script that
+        `exec env`. Dropping `PATH` fails on a machine whose tools are outside
+        `/usr/bin` -- Homebrew, Nix, most containers -- and nowhere else, which
+        in this repository means macOS CI against a green local run.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            inherited = self.child_environment(Path(tmp).resolve())
+        for name in store.SANDBOX_CARRIES:
+            if name not in os.environ:
+                continue
+            # `in` rather than `==` for the one name this file prefixes: `PATH`
+            # arrives with the sandbox's own `bin` in front of what it had.
+            self.assertIn(os.environ[name], inherited.get(name, ""), f"{name} was dropped")
+
+    def test_every_store_path_the_child_resolves_is_inside_the_sandbox(self) -> None:
+        """The other half: not merely *different* from the parent's, but under
+        the directory this suite is about to delete."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inherited = self.child_environment(root)
+            with mock.patch.dict(os.environ, inherited, clear=True):
+                resolved = [store.data_dir(), store.config_dir(), store.logs_dir()]
+            for where in resolved:
+                self.assertTrue(where.resolve().is_relative_to(root), f"{where} is outside {root}")
 
 
 class TestTheSeederCannotReachARealStore(unittest.TestCase):
@@ -204,14 +301,11 @@ class TestTheSandboxIsBuiltAndSearchable(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.root = Path(tempfile.mkdtemp(prefix="woswoar-demo-test-"))
+        cls.root = Path(tempfile.mkdtemp(prefix="woswoar-demo-test-")).resolve()
         # Small: this is a test of the plumbing, not of the 54,000-command
         # default, which takes a second to write and proves nothing more.
-        subprocess.run(
-            [sys.executable, "-m", "tools.demo.seed", str(cls.root), "--entries", "400"],
-            cwd=REPO,
-            check=True,
-            capture_output=True,
+        _in_the_sandbox(
+            cls.root, sys.executable, "-m", "tools.demo.seed", str(cls.root), "--entries", "400"
         )
 
     @classmethod
@@ -219,18 +313,8 @@ class TestTheSandboxIsBuiltAndSearchable(unittest.TestCase):
         __import__("shutil").rmtree(cls.root, ignore_errors=True)
 
     def listed(self, scope: str = "global") -> list[str]:
-        done = subprocess.run(
-            [str(self.root / "bin" / "woswoar"), "list", "--scope", scope],
-            env={
-                "HOME": str(self.root / "home"),
-                "PATH": f"{self.root / 'bin'}:/usr/bin:/bin",
-                "WOSWOAR_DIR": str(self.root / "data"),
-                "XDG_CONFIG_HOME": str(self.root / "config"),
-                "XDG_CACHE_HOME": str(self.root / "cache"),
-            },
-            check=True,
-            capture_output=True,
-            text=True,
+        done = _in_the_sandbox(
+            self.root, str(self.root / "bin" / "woswoar"), "list", "--scope", scope
         )
         return list(done.stdout.splitlines())
 
