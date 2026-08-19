@@ -201,6 +201,31 @@ passed review, and guarded nothing:
 Prefer driving the real thing over asserting on a mock. The suite already runs a
 real `bash` for the shell hook and real `age` and `git` for sync; follow that.
 
+**Four reasons a row survives, and the tell for each.** "Suspect the fixture" is
+true and not actionable; these are the four that keep happening, each drawn from
+a row that survived here. Check them in this order — the first two are the ones
+that look most like a passing test.
+
+| the row survived because | the tell |
+|---|---|
+| the test drives the **guard**, not its call site | the guard's own test passes while deleting the call from the caller survives. `_refuse_a_real_store` had a test; `build` calling it did not, and the call is the whole protection. |
+| the fixture has a **second way** to produce the same observable | the assertion holds for a reason you did not intend. Storm children exited on their own after twenty seconds, so "the lane was killed" and "the lane finished" looked identical, and deleting the `killpg` survived. |
+| the hostile input **never reaches** the code | the row is about a path the fixture does not enter. A forged `accepts.age` from a host the reader had *pinned* was refused for its signature before the check under test ran; and a host that has recorded nothing is not a row at all, so the file was never read. |
+| the mutation is **equivalent by construction** | no input can distinguish the two. `bytes.decode()` is UTF-8 whatever the locale says, so mutating a locale-sensitive read that decodes bytes proves nothing; `<` against `<=` on a byte-exact comparison is the same. Say so in the pull request rather than inventing a fixture. |
+
+A fifth, rarer: a mutation that removes one half of a **union** survives when the
+fixture cannot separate the halves. `_lane` is a process group *plus* the
+descendants that left it, and every child in the first fixtures was both — it
+took a grandchild orphaned into the group to tell them apart.
+
+**Guards about isolation need both directions.** A sandbox that carries
+*nothing* satisfies every "the developer's variables are gone" assertion. Assert
+what must arrive as well as what must not: `PATH` with the value it had outside,
+and a tool the suite really runs still findable. That one cost a red macOS CI
+run against a green Linux one, because `shutil.which` falls back to
+`confstr("CS_PATH")` and found an apt-installed `age` where Homebrew's was
+invisible.
+
 ## Before moving code
 
 [`docs/architecture.md`](docs/architecture.md) is the map: which module may
