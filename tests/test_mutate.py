@@ -1171,21 +1171,32 @@ class TestALaneCarriesItsShareIntoTheProbe(MutateTestCase):
 class TestCountingWhatALaneHolds(unittest.TestCase):
     """Both readers, on every platform, because one of them is macOS's only guard."""
 
+    def held(self, table: dict[int, mutate.Process]) -> int:
+        ours = os.getpgrp()
+        return sum(row.resident for row in table.values() if row.group == ours)
+
     def test_ps_sees_this_process_group(self) -> None:
-        self.assertGreater(mutate._from_ps().get(os.getpgrp(), 0), 1 << 20)
+        self.assertGreater(self.held(mutate._from_ps()), 1 << 20)
 
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "no /proc on this platform")
     def test_proc_sees_this_process_group(self) -> None:
-        self.assertGreater(mutate._from_proc().get(os.getpgrp(), 0), 1 << 20)
+        self.assertGreater(self.held(mutate._from_proc()), 1 << 20)
 
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "no /proc on this platform")
     def test_the_two_readers_agree_about_this_group(self) -> None:
         """Not to the byte -- `ps` and `/proc` count shared pages differently and
         the suite allocates between the two calls -- but within a factor, which
         is what a ceiling comparison actually needs."""
-        ours = os.getpgrp()
-        from_proc, from_ps = mutate._from_proc()[ours], mutate._from_ps()[ours]
+        from_proc, from_ps = self.held(mutate._from_proc()), self.held(mutate._from_ps())
         self.assertLess(max(from_proc, from_ps) / min(from_proc, from_ps), 4)
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "no /proc on this platform")
+    def test_the_two_readers_agree_about_who_is_whose_parent(self) -> None:
+        """`_lane` walks parents, so the field `ps` reports has to mean what the
+        one `/proc` reports means -- and only one of the two is ever read on the
+        machine this is developed on."""
+        self.assertEqual(mutate._from_ps()[os.getpid()].parent, os.getppid())
+        self.assertEqual(mutate._from_proc()[os.getpid()].parent, os.getppid())
 
 
 def reap(pid: int) -> None:
@@ -1352,35 +1363,41 @@ class TestTheSamplerAndTheLanesItHasLeft(unittest.TestCase):
 class TestReadingPsOutputThatIsNotWhatItExpects(unittest.TestCase):
     """`ps` is the reader macOS depends on, and the only one with a parser.
 
-    Every line real `ps` prints here is two numbers, so nothing in the suite
+    Every line real `ps` prints here is four numbers, so nothing in the suite
     distinguishes the check from no check at all -- a sweep of this file
     reported five surviving mutants on that one line. Junk is what it is for:
     a header, a truncated line, a `?` where a number was expected.
     """
 
-    def reading(self, said: str) -> dict[int, int]:
+    def reading(self, said: str) -> dict[int, mutate.Process]:
         listed = subprocess.CompletedProcess([""], 0, stdout=said, stderr="")
         with mock.patch.object(subprocess, "run", return_value=listed):
             return mutate._from_ps()
 
-    def test_only_lines_of_two_numbers_are_counted(self) -> None:
+    def test_only_lines_of_four_numbers_are_counted(self) -> None:
         self.assertEqual(
             self.reading(
-                "  PGID   RSS\n"  # a header, if the `=` suffixes ever stop working
-                "   501  1024\n"
-                "     ?    12\n"  # a field `ps` could not answer
-                "   502\n"  # truncated
-                "   503  4096 stray\n"  # more than was asked for
+                "  PID  PPID  PGID   RSS\n"  # a header, if the `=` suffixes stop working
+                "  501   500   501  1024\n"
+                "  502   501     ?    12\n"  # a field `ps` could not answer
+                "  503   501\n"  # truncated
+                "  504   501   501  4096 stray\n"  # more than was asked for
                 "\n"
-                "   501  2048\n"  # a second process in a group already seen
+                "  505   501   501  2048\n"
             ),
-            {501: 3072 * 1024},
+            {
+                501: mutate.Process(parent=500, group=501, resident=1024 * 1024),
+                505: mutate.Process(parent=501, group=501, resident=2048 * 1024),
+            },
         )
 
     def test_kibibytes_are_not_bytes(self) -> None:
         """The unit `ps` answers in, which is the difference between killing a
         lane at its share and killing it at a thousandth of it."""
-        self.assertEqual(self.reading("  700  2048\n"), {700: 2 << 20})
+        self.assertEqual(
+            self.reading("  700   699   700  2048\n"),
+            {700: mutate.Process(parent=699, group=700, resident=2 << 20)},
+        )
 
 
 class TestALaneThatSpawnsProcesses(MutateTestCase):
@@ -1456,6 +1473,133 @@ class TestALaneThatSpawnsProcesses(MutateTestCase):
         self.storm(children=2, held=8 << 20, sleeps=1)
         verdict = mutate._run(["test_storm"], self.root, memory=512 << 20, timeout=90.0)
         self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
+
+class TestALaneThatLeavesItsOwnGroup(MutateTestCase):
+    """#234: a process group is not the whole lane.
+
+    `start_new_session` is what makes a lane's group cover the `git`, `age` and
+    `bash` a suite forks -- and a *nested* `_run` gives its own probes the same
+    treatment, which takes them out of the outer lane's group. Those were
+    counted by nobody and reached by no `killpg`: one was found alive eleven
+    minutes into a sweep whose per-row bound is 300 seconds, reparented to
+    init, with no process left that knew it was meant to stop.
+
+    Both halves are asserted here, because they fail apart. Counting an escapee
+    is what makes the lane go over its share at all; reaching it is what the
+    kill has to do afterwards.
+    """
+
+    def escaping(self, holds: int, sleeps: int, children: int = 1) -> Path:
+        """A lane whose children put themselves in sessions of their own."""
+        pids = self.root / "pids.txt"
+        self.write(
+            "test_escape.py",
+            f"""
+            import subprocess
+            import sys
+            import unittest
+            from pathlib import Path
+
+            PIDS = Path({str(pids)!r})
+
+
+            class T(unittest.TestCase):
+                def test_it_escapes(self) -> None:
+                    # `start_new_session`, exactly as `mutate._run` does it for
+                    # its own probes -- which is what a lane mutating `tools/`
+                    # ends up hosting, and why this is not a contrived shape.
+                    kids = [
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-c",
+                                "import time; held = bytearray({holds}); time.sleep({sleeps})",
+                            ],
+                            start_new_session=True,
+                        )
+                        for _ in range({children})
+                    ]
+                    PIDS.write_text("\\n".join(str(kid.pid) for kid in kids), encoding="utf-8")
+                    for kid in kids:
+                        kid.wait()
+            """,
+        )
+        return pids
+
+    def escapees(self, pids: Path) -> list[int]:
+        found = [int(said) for said in pids.read_text(encoding="utf-8").split()]
+        for pid in found:
+            self.addCleanup(reap, pid)
+        return found
+
+    def test_what_an_escapee_holds_is_still_the_lanes_problem(self) -> None:
+        # Three at 200 MiB is 600 MiB against a 512 MiB share, and every one of
+        # them is outside the group -- so counting the group alone leaves the
+        # lane looking idle while the machine is not.
+        pids = self.escaping(holds=200 << 20, sleeps=120, children=3)
+        verdict = mutate._run(["test_escape"], self.root, memory=512 << 20, timeout=25.0)
+        self.assertEqual(verdict.outcome, "broke", verdict.detail)
+        self.assertIn("held", verdict.detail)
+        self.assertEqual(outliving(self.escapees(pids), 5.0), [], "an escapee outlived the kill")
+
+    def orphaning(self, holds: int, children: int) -> Path:
+        """A lane whose grandchildren outlive the child that started them.
+
+        The mirror of `escaping`, and the reason a lane is the *union* of two
+        answers: these stay in the group and stop being anyone's descendant, so
+        a walk down the tree misses exactly the ones `killpg` catches, and a
+        group sum misses exactly the ones the walk catches. A suite that
+        backgrounds a job in a shell that then exits produces this shape without
+        trying.
+
+        The launcher writes the pids to a file rather than to a pipe, and that
+        is not incidental: the processes it starts inherit its stdout, so a
+        `communicate()` on that pipe waits for *them* and the fixture hangs for
+        as long as the holders sleep. Same trap `_run` documents for its own
+        stderr, met again one level down.
+        """
+        pids = self.root / "pids.txt"
+        holder = f"import time; held = bytearray({holds}); time.sleep(120)"
+        launcher = (
+            "import subprocess, sys\n"
+            f"kids = [subprocess.Popen([sys.executable, '-c', {holder!r}],\n"
+            "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"        for _ in range({children})]\n"
+            f"open({str(pids)!r}, 'w').write('\\n'.join(str(kid.pid) for kid in kids))\n"
+        )
+        self.write(
+            "test_orphan.py",
+            f"""
+            import subprocess
+            import sys
+            import time
+            import unittest
+
+
+            class T(unittest.TestCase):
+                def test_it_orphans(self) -> None:
+                    subprocess.run([sys.executable, "-c", {launcher!r}], check=True, timeout=30)
+                    # The launcher has exited, so what it started belongs to
+                    # init now -- and still to this lane's process group.
+                    time.sleep(60)
+            """,
+        )
+        return pids
+
+    def test_an_orphan_that_stayed_in_the_group_is_still_the_lanes(self) -> None:
+        pids = self.orphaning(holds=200 << 20, children=3)
+        verdict = mutate._run(["test_orphan"], self.root, memory=512 << 20, timeout=25.0)
+        self.assertEqual(verdict.outcome, "broke", verdict.detail)
+        self.assertEqual(outliving(self.escapees(pids), 5.0), [], "an orphan outlived the kill")
+
+    def test_a_timeout_reaches_them_too(self) -> None:
+        """The other route in, and the one that produced the eleven-minute
+        orphan: nothing here is over its share, the row simply does not finish."""
+        pids = self.escaping(holds=1 << 20, sleeps=120)
+        verdict = mutate._run(["test_escape"], self.root, timeout=5.0)
+        self.assertEqual(verdict.outcome, "timeout", verdict.detail)
+        self.assertEqual(outliving(self.escapees(pids), 10.0), [], "an escapee outlived the lane")
 
 
 class TestATimeoutEndsTheWholeSession(MutateTestCase):

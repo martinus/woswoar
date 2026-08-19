@@ -294,11 +294,22 @@ def _signalled(returncode: int) -> str:
     macOS case the cap's own docstring admits to. Naming it is the difference
     between a row that reports nothing and a row that says the machine, not the
     mutation, ended the run.
+
+    It names two causes rather than one because a sweep of this module produced
+    the second: a mutation to `_lane` makes the *nested* harness inside a lane
+    compute the wrong membership and kill the session hosting it, and the row
+    then reported an out-of-memory that had not happened. A message that names
+    the wrong cause costs more than one that names none.
     """
     if returncode >= 0:
         return f"the probe exited {returncode} without writing a report"
     name = signal.Signals(-returncode).name if -returncode in set(signal.Signals) else "?"
-    killed = " -- the host ran out of memory, and this lane was chosen" if name == "SIGKILL" else ""
+    killed = (
+        " -- either the host ran out of memory and this lane was chosen, or a harness "
+        "running inside it killed the session it was in"
+        if name == "SIGKILL"
+        else ""
+    )
     return f"the probe was killed by {name}{killed}"
 
 
@@ -309,8 +320,16 @@ def _signalled(returncode: int) -> str:
 _SAMPLE = 1.0
 
 
-def _resident_by_group() -> dict[int, int]:
-    """Resident bytes held by each process group, for everything this user can see.
+class Process(NamedTuple):
+    """One row of the process table, in the three fields a lane cares about."""
+
+    parent: int
+    group: int
+    resident: int
+
+
+def _processes() -> dict[int, Process]:
+    """Every process this user can see, by pid.
 
     Resident rather than address space, because resident is what the OOM killer
     counts and what a fork storm actually spends. The one that took this machine
@@ -328,9 +347,9 @@ def _resident_by_group() -> dict[int, int]:
     return _from_proc() if Path("/proc/self/stat").exists() else _from_ps()
 
 
-def _from_proc() -> dict[int, int]:
-    """`_resident_by_group` where there is a `/proc`. Reads, never forks."""
-    total: dict[int, int] = {}
+def _from_proc() -> dict[int, Process]:
+    """`_processes` where there is a `/proc`. Reads, never forks."""
+    table: dict[int, Process] = {}
     page = os.sysconf("SC_PAGE_SIZE")
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -345,29 +364,79 @@ def _from_proc() -> dict[int, int]:
         # Everything after the comm field, which is the one that may itself
         # contain spaces and brackets -- so the split starts past its closing
         # one rather than at the beginning of the line. Counting from `pid`,
-        # `pgrp` is the fifth field and `rss` the twenty-fourth, which is why
-        # the indices below are those minus the three that come first.
+        # `ppid` is the fourth field, `pgrp` the fifth and `rss` the
+        # twenty-fourth, which is why the indices below are those minus three.
         fields = said.rpartition(") ")[2].split()
         if len(fields) < 22:
             continue
         with suppress(ValueError):
-            group = int(fields[2])
-            total[group] = total.get(group, 0) + int(fields[21]) * page
-    return total
+            table[int(entry.name)] = Process(
+                parent=int(fields[1]), group=int(fields[2]), resident=int(fields[21]) * page
+            )
+    return table
 
 
-def _from_ps() -> dict[int, int]:
-    """`_resident_by_group` where there is no `/proc`, which is macOS."""
-    total: dict[int, int] = {}
+def _from_ps() -> dict[int, Process]:
+    """`_processes` where there is no `/proc`, which is macOS."""
+    table: dict[int, Process] = {}
     listed = subprocess.run(
-        ["ps", "-eo", "pgid=,rss="], capture_output=True, text=True, check=False
+        ["ps", "-eo", "pid=,ppid=,pgid=,rss="], capture_output=True, text=True, check=False
     )
     for line in listed.stdout.splitlines():
         fields = line.split()
-        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+        if len(fields) == 4 and all(field.isdigit() for field in fields):
+            pid, parent, group, resident = (int(field) for field in fields)
             # Kibibytes, which POSIX does not promise and both platforms do.
-            total[int(fields[0])] = total.get(int(fields[0]), 0) + int(fields[1]) * 1024
-    return total
+            table[pid] = Process(parent=parent, group=group, resident=resident * 1024)
+    return table
+
+
+def _lane(leader: int, table: dict[int, Process]) -> set[int]:
+    """Every process belonging to the lane `leader` started.
+
+    Two answers unioned, because neither is enough on its own and the gap
+    between them is #234:
+
+    - everything in `leader`'s **process group**, which is what `start_new_session`
+      buys and covers the `git`, `age` and `bash` a suite forks;
+    - every **descendant** of `leader`, which is what catches a grandchild that
+      called `setsid` and thereby left that group. A nested `_run` does exactly
+      that, and one was found alive eleven minutes into a sweep whose per-row
+      bound is 300 seconds, reparented to init and counted by nobody.
+
+    A descendant whose parent has already died is in neither set: init has
+    adopted it and the link is gone. That is why callers enumerate *before*
+    killing rather than after -- while the lane is alive, the tree is still
+    connected.
+    """
+    kids: dict[int, list[int]] = {}
+    for pid, row in table.items():
+        kids.setdefault(row.parent, []).append(pid)
+    found = {pid for pid, row in table.items() if row.group == leader}
+    stack = [leader]
+    while stack:
+        pid = stack.pop()
+        if pid in found and pid != leader:
+            continue
+        found.add(pid)
+        stack.extend(kids.get(pid, ()))
+    return found & set(table)
+
+
+def _end_lane(leader: int, members: Iterable[int]) -> None:
+    """Kill the group, then everything that left it.
+
+    The group first because it is one syscall for most of the lane, and the
+    stragglers by pid because they are exactly the processes `killpg` cannot
+    reach. `members` is enumerated by the caller beforehand: after the first
+    kill the tree is no longer connected, so a walk done here would find less
+    than a walk done a moment earlier.
+    """
+    with suppress(OSError):
+        os.killpg(leader, signal.SIGKILL)
+    for pid in members:
+        with suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
 
 
 class _Lanes:
@@ -386,13 +455,13 @@ class _Lanes:
     inherits is beside the point. `_BUDGET` shrinks an honest nested harness;
     this is what answers a mutant that ignores it.
 
-    Counted by process group, which is why `_run` gives each probe its own
-    session. Everything the suite forks -- `git`, `age`, `bash`, a nested
-    harness and its probes -- inherits the group, so one number covers the
-    subtree and one `killpg` ends all of it. A grandchild that calls `setsid`
-    leaves the group and is no longer counted; that is a real hole and a small
-    one, since the thing that does it is a nested `_run`, which arrives already
-    bounded by the share it inherited.
+    What counts as the lane is `_lane`: its process group, plus any descendant
+    that left that group by starting a session of its own. The group alone was
+    the first shape and it left a hole (#234) -- a nested `_run` gives its own
+    probes their own sessions, so those escaped both the count and the kill, and
+    one was found alive eleven minutes into a sweep whose per-row bound is 300
+    seconds. Counting the union is also what makes an escaped probe's memory
+    the lane's problem rather than nobody's.
 
     Sampling rather than a cgroup, for the reasons `verdict.cap` gives for
     `RLIMIT_AS` over `systemd-run --scope -p MemoryMax=`: no root, no delegated
@@ -443,19 +512,20 @@ class _Lanes:
                 watched = dict(self._ceilings)
             if not watched:
                 continue
-            held = _resident_by_group()
-            for group, ceiling in watched.items():
-                if held.get(group, 0) <= ceiling:
+            table = _processes()
+            for leader, ceiling in watched.items():
+                members = _lane(leader, table)
+                held = sum(table[pid].resident for pid in members)
+                if held <= ceiling:
                     continue
                 with self._lock:
                     # Re-checked under the lock: `release` may have run while
-                    # the process table was being read, and a `killpg` after
-                    # that names a group id the kernel is free to have reused.
-                    if group not in self._ceilings:
+                    # the process table was being read, and a kill after that
+                    # names ids the kernel is free to have reused.
+                    if leader not in self._ceilings:
                         continue
-                    self._killed[group] = held[group]
-                    with suppress(OSError):
-                        os.killpg(group, signal.SIGKILL)
+                    self._killed[leader] = held
+                _end_lane(leader, members)
 
 
 #: One per process, because `_run` is what registers and it has no run-wide
@@ -473,9 +543,14 @@ def _end(probe: subprocess.Popen[bytes]) -> None:
     invisible to the run that started them. A sweep that times out often enough
     accumulates them until the machine is gone, which is the slow half of #232;
     the fast half is `_Lanes`.
+
+    The walk happens *before* the first kill, which is #234: a grandchild that
+    started a session of its own is outside the group, so `killpg` never reaches
+    it -- and once its parent is dead it is no longer a descendant either, so a
+    walk done afterwards would not find it. Between those two moments is the
+    only time anything can see it.
     """
-    with suppress(OSError):
-        os.killpg(probe.pid, signal.SIGKILL)
+    _end_lane(probe.pid, _lane(probe.pid, _processes()))
     with suppress(OSError):
         probe.kill()  # if the session is somehow gone, at least reap this one
     with suppress(subprocess.TimeoutExpired):
