@@ -67,6 +67,83 @@ ENV_KEYS = (
 )
 
 
+#: The only names an isolated run carries over from the machine it runs on.
+#:
+#: `PATH` because a sandbox has no answer for where `git`, `age`, `bash` and
+#: `ssh-keygen` live, and `TMPDIR` because those need somewhere of their own to
+#: write scratch files -- on macOS that is a per-user directory rather than
+#: `/tmp`, so dropping it moves their temporary files somewhere the platform
+#: does not use.
+#:
+#: The three `PYTHON*` names are here because they configure the interpreter a
+#: run spawns rather than describing the machine it runs on, and each one is a
+#: guard that would go quiet rather than red. CI exports
+#: ``PYTHONWARNINGS=error::DeprecationWarning`` for the whole workflow, so
+#: dropping it downgrades every warning in a child process back to a warning;
+#: `tools/mutate` exports the other two so that the real `age`, `git` and `bash`
+#: a suite forks cannot leave a `.pyc` in a sandbox that a later mutation
+#: reuses, which is the ``(mtime, size)`` collision that module's docstring is
+#: about.
+SANDBOX_CARRIES = (
+    "PATH",
+    "TMPDIR",
+    "PYTHONWARNINGS",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPYCACHEPREFIX",
+)
+
+
+def sandbox_environ(root: Path, home: Path) -> dict[str, str]:
+    """The whole environment for a run that must not touch this machine.
+
+    Built from **nothing**, and that is the entire point: the alternative is to
+    take `os.environ` and remove a list of names, which fails towards the real
+    installation every time the list falls behind. `ENV_KEYS`' own comment
+    already says so for the six names it holds -- "a variable added here but
+    missed in a hand-kept copy would silently point a 'sandbox' at the real
+    installation, with nothing failing" -- and this is that argument applied to
+    the variables woswoar does *not* own.
+
+    It has been paid for twice. `HOME` joined the suite's scrub list only after
+    two tests wrote a woswoar block into the maintainer's real `~/.bashrc` and
+    `~/.zshrc`, pointing them at a directory the next line deleted: a shell that
+    printed `No such file or directory` at every start and recorded nothing,
+    found months later. `SHELL` joined it in the same change, because `install`
+    falls back to `$SHELL` when there is no rc file to read. Both were found by
+    an incident rather than by the list, which is how a list of names grows.
+
+    Names still inherited before this existed, each with a route into a run:
+    `ZDOTDIR`, which is where zsh looks for its rc file and the zsh hook tests
+    drive a real zsh; `BASH_ENV`, which non-interactive bash sources; every
+    `GIT_*`, against a suite that runs real `git`; `EDITOR`, `PAGER`, `LANG` and
+    `LC_ALL`, which decide the shape of output that assertions read.
+
+    `USER` and `LOGNAME` are pinned rather than carried or dropped.
+    `default_machine_name` reads them, so carried, a record written on a
+    developer's machine and one written in CI differ by the developer's name;
+    dropped, every caller exercises the ``"user"`` fallback and nothing
+    exercises the path a real installation takes.
+    """
+    built = {name: os.environ[name] for name in SANDBOX_CARRIES if name in os.environ}
+    built.update(
+        {
+            "HOME": str(home),
+            # `install`'s `auto` falls back to this when there is no rc file to
+            # go on, so an inherited one answers differently on a developer's
+            # zsh box than in CI. A caller that is *about* the fallback sets it
+            # to what it needs.
+            "SHELL": "/bin/bash",
+            "USER": "tester",
+            "LOGNAME": "tester",
+            "WOSWOAR_DIR": str(root / "data"),
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_CACHE_HOME": str(root / "cache"),
+            "XDG_DATA_HOME": str(root / "data"),
+        }
+    )
+    return built
+
+
 def _xdg(env_var: str, default: str) -> Path:
     value = os.environ.get(env_var)
     base = Path(value) if value else Path.home() / default

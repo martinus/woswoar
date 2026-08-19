@@ -47,11 +47,6 @@ from woswoar.sync import _GRANT_REMEDY
 from . import support
 from .support import requires_age, requires_git, requires_ssh_keygen
 
-#: One authoritative list, plus the HOME these tests give each machine of its
-#: own -- `WoswoarTestCase` redirects it once for the whole suite, and here
-#: every simulated machine needs a different one.
-_ENV = (*support.ENV_KEYS, "HOME")
-
 #: `gc --auto` runs after a commit and after a push, and `gc.autoDetach` sends
 #: it to the background -- so it is still repacking while the *next* git command
 #: runs. A real installation wants exactly that. These tests want a repo that
@@ -83,34 +78,33 @@ class Fake:
         self.root = root / name
         self.name = name
         self._id: str | None = None
-        for sub in ("data", "conf", "cache"):
+        for sub in ("data", "config", "cache"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
         # This machine's HOME, so its clone inherits it.
         (self.root / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
 
     @property
     def env(self) -> dict[str, str]:
-        return {
-            "HOME": str(self.root),
-            "WOSWOAR_DIR": str(self.root / "data"),
-            "XDG_CONFIG_HOME": str(self.root / "conf"),
-            "XDG_CACHE_HOME": str(self.root / "cache"),
-        }
+        """This machine's whole world, built by the same function the suite's
+        own sandbox uses. Its `HOME` is the machine root rather than a
+        subdirectory of it, because a simulated machine *is* a home."""
+        return store.sandbox_environ(self.root, self.root)
 
     @contextmanager
     def active(self) -> Iterator[Fake]:
         """Run a block as if we were sitting at this machine."""
-        saved = {k: os.environ.get(k) for k in _ENV}
-        os.environ.pop("WOSWOAR_SESSION", None)
+        # Replaced wholesale, which is also what drops the ambient
+        # `WOSWOAR_SESSION`: this used to update a list of names and pop that
+        # one by hand, so anything a future check reads and this list does not
+        # name would cross from one simulated machine to the next.
+        saved = dict(os.environ)
+        os.environ.clear()
         os.environ.update(self.env)
         try:
             yield self
         finally:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            os.environ.clear()
+            os.environ.update(saved)
 
     # -- convenience, all assuming `active()` is held ----------------------
 

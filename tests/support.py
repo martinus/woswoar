@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from typing import NamedTuple
+from unittest import mock
 
 from woswoar import crypto, store
 from woswoar.__main__ import main
@@ -345,37 +346,30 @@ class WoswoarTestCase(unittest.TestCase):
         self.root = Path(self._tmp.name).resolve()
         self.addCleanup(self._tmp.cleanup)
 
-        self._saved = {key: os.environ.get(key) for key in (*ENV_KEYS, "HOME", "SHELL")}
-        self.addCleanup(self._restore_env)
-
-        for key in ENV_KEYS:
-            os.environ.pop(key, None)
         # A directory of its own rather than `self.root`: `install` writes into
         # `$HOME` and so does the importer, and a test asserting on what is in
         # the sandbox root should not have to know which of those put it there.
         self.home = self.root / "home"
         self.home.mkdir()
-        os.environ["HOME"] = str(self.home)
-        # For the same reason, one variable further out: `install`'s `auto` falls
-        # back to `$SHELL` when there is no rc file to go on, so a developer
-        # whose login shell is zsh would otherwise get a different answer from
-        # CI. A test that is *about* that fallback sets it to what it needs.
-        os.environ["SHELL"] = "/bin/bash"
-        os.environ["WOSWOAR_DIR"] = str(self.root / "data")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root / "config")
-        os.environ["XDG_CACHE_HOME"] = str(self.root / "cache")
+
+        # `clear=True`, so what a test can see is what `sandbox_environ` builds
+        # and nothing else. This used to save six names, `HOME` and `SHELL`, and
+        # leave the rest of the developer's environment in place -- and both of
+        # those two joined the list only after an incident, which is how a list
+        # of names grows. `ZDOTDIR`, `BASH_ENV` and every `GIT_*` were still
+        # inherited by a suite that drives a real zsh, a real bash and a real
+        # git. See `store.sandbox_environ` for why the shape rather than the
+        # length of that list was the problem.
+        patched = mock.patch.dict(
+            os.environ, store.sandbox_environ(self.root, self.home), clear=True
+        )
+        patched.start()
+        self.addCleanup(patched.stop)
 
         (store.config_dir()).mkdir(parents=True, exist_ok=True)
         (store.config_dir() / "machine").write_text(
             f"id={MACHINE_ID}\nname=test@machine\n", encoding="utf-8"
         )
-
-    def _restore_env(self) -> None:
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     def write_log(self, host: str, day: str, lines: list[str]) -> Path:
         """Write raw log lines for ``host`` on ``day`` and return the path."""

@@ -38,11 +38,6 @@ from .entry import Entry
 from .errors import WoswoarError
 from .report import Check
 
-#: `store.ENV_KEYS` is everything woswoar itself resolves paths from; HOME is
-#: for git, which reads ``~/.gitconfig``, whose hooks and filters must neither
-#: run against the sandbox nor colour the proof.
-_ENV_KEYS = (*store.ENV_KEYS, "HOME")
-
 #: git's background `gc --auto` detaches and keeps repacking after the command
 #: that triggered it returns -- so it would still be rewriting a short-lived
 #: repository while a scan reads it and the cleanup deletes it. The sync test
@@ -100,7 +95,7 @@ def _sandbox() -> Iterator[Path]:
     not make parents -- everything else woswoar creates itself, owner-only,
     exactly as it would on a real machine.
     """
-    saved = {key: os.environ.get(key) for key in _ENV_KEYS}
+    saved = dict(os.environ)
     tmp = tempfile.mkdtemp(prefix="woswoar-prove-")
     try:
         # Resolved, which is nothing on Linux and load-bearing on macOS: there
@@ -115,24 +110,18 @@ def _sandbox() -> Iterator[Path]:
         root = Path(tmp).resolve()
         (root / "home").mkdir()
         (root / "home" / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
-        for key in _ENV_KEYS:
-            os.environ.pop(key, None)
-        os.environ.update(
-            {
-                "HOME": str(root / "home"),
-                "WOSWOAR_DIR": str(root / "data"),
-                "XDG_CONFIG_HOME": str(root / "conf"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "XDG_DATA_HOME": str(root / "data"),
-            }
-        )
+        # Replaced wholesale rather than overridden, and through the same
+        # builder the suite's own sandbox uses: this used to remove
+        # `store.ENV_KEYS` plus `HOME` and leave everything else the user's, so
+        # a `ZDOTDIR`, a `GIT_CONFIG_GLOBAL` or an inherited `SHELL` reached the
+        # proof. `store.sandbox_environ` says why a list of names is the wrong
+        # shape for that question.
+        os.environ.clear()
+        os.environ.update(store.sandbox_environ(root, root / "home"))
         yield root
     finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        os.environ.clear()
+        os.environ.update(saved)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

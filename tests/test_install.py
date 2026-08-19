@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from typing import Any, ClassVar
 from unittest import mock
 
 from woswoar import cache, install, store
@@ -47,14 +48,75 @@ class TestPortableHookPath(unittest.TestCase):
         )
 
 
-class TestTheSuiteCannotReachTheRealHome(WoswoarTestCase):
-    """The guard for `WoswoarTestCase`'s `$HOME` redirect -- see its docstring
-    for the incident, which is one this file's tests caused.
+class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
+    """The guard for `WoswoarTestCase`'s sandbox -- see `store.sandbox_environ`
+    for the incidents, one of which this file's tests caused.
 
     It belongs here because `install` is the command that made it reachable:
     `rcfile_for` is `Path.home() / ".bashrc"`, the one path in woswoar with no
-    XDG variable in front of it.
+    XDG variable in front of it. What is asserted is no longer two names,
+    though. The harness used to remove a list and leave the rest of the
+    developer's environment in place, so the guard could only ever say that the
+    names already on the list were on it -- green for exactly the variables
+    nobody had been bitten by yet.
     """
+
+    #: Exported by a plausible developer, and each with a route into a test:
+    #: where zsh looks for its rc file, against a suite that drives a real zsh;
+    #: what non-interactive bash sources, against one that spawns many; a git
+    #: config whose hooks and filters would run inside the sandbox; and two that
+    #: decide the shape of output an assertion then reads.
+    LEAKS: ClassVar[dict[str, str]] = {
+        "ZDOTDIR": "/somewhere/else",
+        "BASH_ENV": "/somewhere/else/env.sh",
+        "GIT_CONFIG_GLOBAL": "/somewhere/else/gitconfig",
+        "EDITOR": "vi-from-the-developer",
+        "LC_ALL": "tr_TR.UTF-8",
+    }
+
+    #: The patcher itself, declared so that `mypy` can see a class attribute
+    #: assigned in `setUpClass` rather than in `__init__`.
+    _exported: ClassVar[Any]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Started here rather than in `setUp`, so that these are part of the
+        # environment the harness is then asked to replace -- `setUpClass` runs
+        # first. Setting them inside a test would prove nothing: by then the
+        # sandbox is already built.
+        super().setUpClass()
+        cls._exported = mock.patch.dict(os.environ, cls.LEAKS)
+        cls._exported.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._exported.stop()
+        super().tearDownClass()
+
+    def test_nothing_the_developer_exported_reaches_a_test(self) -> None:
+        for name in self.LEAKS:
+            with self.subTest(name=name):
+                self.assertNotIn(name, os.environ)
+
+    def test_what_survives_is_what_the_sandbox_built(self) -> None:
+        """The other half, and the reason this is a property rather than a list
+        of names: whatever a test *can* see is either carried on purpose or set
+        on purpose, and adding to either is an edit to `store.sandbox_environ`
+        that lands in this assertion."""
+        carried = {name for name in store.SANDBOX_CARRIES if name in os.environ}
+        self.assertEqual(
+            set(os.environ) - carried,
+            {
+                "HOME",
+                "SHELL",
+                "USER",
+                "LOGNAME",
+                "WOSWOAR_DIR",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+            },
+        )
 
     def test_home_is_the_sandbox(self) -> None:
         self.assertEqual(Path.home(), self.home)
