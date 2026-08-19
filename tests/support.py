@@ -301,13 +301,6 @@ def make_entry(ts: int, cmd: str, host: str = MACHINE_ID, session: str = "s1") -
     return Entry(ts=ts, host=host, session=session, cwd="/tmp", exit_code=0, duration_ms=1, cmd=cmd)
 
 
-#: Every environment variable store.py consults, from the module that owns the
-#: list -- so a variable added there cannot be isolated here and leak in
-#: `prove`'s sandbox, or the reverse. This alias keeps the suite's historical
-#: import path working.
-ENV_KEYS = store.ENV_KEYS
-
-
 class WoswoarTestCase(unittest.TestCase):
     """Runs each test against a throwaway WOSWOAR_DIR and a throwaway ``$HOME``.
 
@@ -356,10 +349,13 @@ class WoswoarTestCase(unittest.TestCase):
         # and nothing else. This used to save six names, `HOME` and `SHELL`, and
         # leave the rest of the developer's environment in place -- and both of
         # those two joined the list only after an incident, which is how a list
-        # of names grows. `ZDOTDIR`, `BASH_ENV` and every `GIT_*` were still
-        # inherited by a suite that drives a real zsh, a real bash and a real
-        # git. See `store.sandbox_environ` for why the shape rather than the
-        # length of that list was the problem.
+        # of names grows. See `store.sandbox_environ` for why the shape rather
+        # than the length of that list was the problem.
+        #
+        # `patch.dict` rather than `store.sandboxed`: this is a `setUp`, so it
+        # needs a start/cleanup pair rather than a block, and `patch.dict`
+        # evaluates its mapping before clearing for the same reason `sandboxed`
+        # builds before it clears.
         patched = mock.patch.dict(
             os.environ, store.sandbox_environ(self.root, self.home), clear=True
         )

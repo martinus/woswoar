@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import ClassVar
 from unittest import mock
 
 from woswoar import cache, install, store
@@ -74,9 +74,8 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         "LC_ALL": "tr_TR.UTF-8",
     }
 
-    #: Declared so that `mypy` can see class attributes assigned in
+    #: Declared so that `mypy` can see a class attribute assigned in
     #: `setUpClass` rather than in `__init__`.
-    _exported: ClassVar[Any]
     _outer_path: ClassVar[str]
 
     @classmethod
@@ -89,15 +88,14 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         # Read before the sandbox exists, so the carry assertion below has
         # something outside it to compare against.
         cls._outer_path = os.environ.get("PATH", "")
-        cls._exported = mock.patch.dict(os.environ, cls.LEAKS)
-        cls._exported.start()
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._exported.stop()
-        super().tearDownClass()
+        exported = mock.patch.dict(os.environ, cls.LEAKS)
+        exported.start()
+        cls.addClassCleanup(exported.stop)
 
     def test_nothing_the_developer_exported_reaches_a_test(self) -> None:
+        """Subsumed by the assertion below -- no leaked name is in
+        `SANDBOX_CARRIES`, so a set difference catches it either way. Kept for
+        what it says when it fails: the name, rather than a diff of two sets."""
         for name in self.LEAKS:
             with self.subTest(name=name):
                 self.assertNotIn(name, os.environ)
@@ -123,17 +121,10 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         )
 
     def test_what_is_carried_actually_arrives(self) -> None:
-        """The other direction, and it is not symmetry for its own sake.
-
-        A sandbox that carries *nothing* satisfies every assertion above: the
-        developer's variables are certainly gone. It cost a red macOS CI run to
-        find that -- `prove` and `test_sync` built their environment after
-        clearing `os.environ`, so `PATH` was carried from an environment that
-        no longer had one. `shutil.which` then falls back to
-        `confstr("CS_PATH")`, which holds `/usr/bin` and finds an
-        apt-installed `age` on Linux while finding no Homebrew one on macOS. So
-        the value, and a tool the suite really runs.
-        """
+        """The other direction, and not symmetry for its own sake: a sandbox
+        that carries *nothing* satisfies every assertion above, because the
+        developer's variables are certainly gone. That shape cost a red macOS
+        CI run -- see `store.SANDBOX_CARRIES`."""
         self.assertEqual(os.environ.get("PATH"), self._outer_path)
         self.assertIsNotNone(shutil.which("git"), "the suite runs a real git")
 

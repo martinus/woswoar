@@ -104,13 +104,9 @@ class TestTheProofRunsInAWorldOfItsOwn(ProveTestCase):
             self.assertEqual(os.environ["GIT_CONFIG_GLOBAL"], exported["GIT_CONFIG_GLOBAL"])
 
     def test_the_sandbox_can_still_find_the_tools_it_needs(self) -> None:
-        """`PATH` is carried, and a proof that cannot find `age` or `git` is not
-        a proof. Asserted as a value rather than as `shutil.which(...)` because
-        the failure this guards hid behind that: with `PATH` unset, `which`
-        falls back to `confstr("CS_PATH")`, which holds `/usr/bin` -- so an
-        apt-installed `age` was still found on Linux while a Homebrew one on
-        macOS was not, and only CI said so.
-        """
+        """A proof that cannot find `age` or `git` is not a proof. Asserted as a
+        value rather than through `shutil.which`, because that is what the
+        failure hid behind -- see `store.SANDBOX_CARRIES`."""
         outside = os.environ["PATH"]
         with prove._sandbox():
             self.assertEqual(os.environ["PATH"], outside)
@@ -237,8 +233,7 @@ class TestTheDocsRecipeStillDecrypts(unittest.TestCase):
             root = Path(tmp)
             (root / "home").mkdir()
             (root / "home" / ".gitconfig").write_text(prove.QUIET_MAINTENANCE, encoding="utf-8")
-            saved = dict(os.environ)
-            try:
+            with mock.patch.dict(os.environ):
                 # The store variables go, and `HOME` is moved: the recipe spells
                 # paths as `~/...`, so the fixture must resolve them the way a
                 # stock install would. Names rather than
@@ -277,6 +272,3 @@ class TestTheDocsRecipeStillDecrypts(unittest.TestCase):
                         break
                 self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
                 self.assertIn("echo docs-recipe-canary", ran.stdout)
-            finally:
-                os.environ.clear()
-                os.environ.update(saved)

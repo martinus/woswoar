@@ -83,13 +83,6 @@ class Fake:
         # This machine's HOME, so its clone inherits it.
         (self.root / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
 
-    @property
-    def env(self) -> dict[str, str]:
-        """This machine's whole world, built by the same function the suite's
-        own sandbox uses. Its `HOME` is the machine root rather than a
-        subdirectory of it, because a simulated machine *is* a home."""
-        return store.sandbox_environ(self.root, self.root)
-
     @contextmanager
     def active(self) -> Iterator[Fake]:
         """Run a block as if we were sitting at this machine."""
@@ -97,18 +90,8 @@ class Fake:
         # `WOSWOAR_SESSION`: this used to update a list of names and pop that
         # one by hand, so anything a future check reads and this list does not
         # name would cross from one simulated machine to the next.
-        saved = dict(os.environ)
-        # `self.env` first: it carries `PATH` from the environment it is built
-        # in, so clearing before building leaves the machine with none. See
-        # `prove._sandbox` for why that is invisible on Linux.
-        built = self.env
-        os.environ.clear()
-        os.environ.update(built)
-        try:
+        with store.sandboxed(self.root, self.root):
             yield self
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
 
     # -- convenience, all assuming `active()` is held ----------------------
 

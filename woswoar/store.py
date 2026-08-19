@@ -70,10 +70,15 @@ ENV_KEYS = (
 #: The only names an isolated run carries over from the machine it runs on.
 #:
 #: `PATH` because a sandbox has no answer for where `git`, `age`, `bash` and
-#: `ssh-keygen` live, and `TMPDIR` because those need somewhere of their own to
-#: write scratch files -- on macOS that is a per-user directory rather than
-#: `/tmp`, so dropping it moves their temporary files somewhere the platform
-#: does not use.
+#: `ssh-keygen` live. Dropping it does not fail where it is easy to see:
+#: `shutil.which` falls back to ``confstr("CS_PATH")``, which holds `/usr/bin`,
+#: so an apt-installed `age` is still found on Linux and a Homebrew one on
+#: macOS is not. That cost a red macOS CI run against a green Linux one, and it
+#: is why `sandboxed` builds before it clears.
+#:
+#: `TMPDIR` because those tools need somewhere of their own to write scratch
+#: files -- on macOS that is a per-user directory rather than `/tmp`, so
+#: dropping it moves their temporary files somewhere the platform does not use.
 #:
 #: The three `PYTHON*` names are here because they configure the interpreter a
 #: run spawns rather than describing the machine it runs on, and each one is a
@@ -118,6 +123,10 @@ def sandbox_environ(root: Path, home: Path) -> dict[str, str]:
     `GIT_*`, against a suite that runs real `git`; `EDITOR`, `PAGER`, `LANG` and
     `LC_ALL`, which decide the shape of output that assertions read.
 
+    Callers want `sandboxed` below rather than this: the environment has to be
+    *built* before `os.environ` is cleared, since the names above are carried
+    out of it, and that ordering is an invariant no caller should have to know.
+
     `USER` and `LOGNAME` are pinned rather than carried or dropped.
     `default_machine_name` reads them, so carried, a record written on a
     developer's machine and one written in CI differ by the developer's name;
@@ -142,6 +151,30 @@ def sandbox_environ(root: Path, home: Path) -> dict[str, str]:
         }
     )
     return built
+
+
+@contextlib.contextmanager
+def sandboxed(root: Path, home: Path) -> Iterator[None]:
+    """Run a block with `sandbox_environ` as the whole environment.
+
+    Built first and cleared second, which is the one ordering that works and
+    the reason this is a function rather than four lines at each caller:
+    `sandbox_environ` carries `PATH` *out of* the environment it is called in,
+    so clearing first carries nothing. Both callers had that the wrong way round
+    and only macOS said so -- see `SANDBOX_CARRIES`.
+
+    Restored wholesale rather than by putting back the names that were
+    overwritten, so a name the sandbox invents does not outlive it either.
+    """
+    saved = dict(os.environ)
+    built = sandbox_environ(root, home)
+    os.environ.clear()
+    os.environ.update(built)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def _xdg(env_var: str, default: str) -> Path:
