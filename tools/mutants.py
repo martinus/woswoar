@@ -105,6 +105,21 @@ NO_MUTATE = re.compile(r"#\s*pragma:\s*no\s+mutate\b")
 #: nothing about the fix, and the run would report the assertion it removed.
 MUTABLE = ("woswoar/", "tools/")
 
+#: Never generated for, whatever `MUTABLE` says. `tools/demo/seed.py` builds a
+#: sandbox and then *writes a woswoar store into it*, so a mutant that breaks
+#: the one line pointing it at that sandbox writes into whatever the ambient
+#: environment names -- which, for a sweep run from a developer's shell, is
+#: their live installation. It did: three fabricated machines in 399 days of
+#: real history, a clobbered `machine` file, and one of them published to a
+#: shared remote (#245).
+#:
+#: `seed.py` also guards itself now, and this is the second lock rather than a
+#: replacement: one mutation can break either, and it takes both to reach a real
+#: store. Nothing is lost by excluding it -- 68 of its rows ran in the sweep
+#: that found this, and every one was an equivalent mutant in a recording script
+#: nothing asserts on.
+UNMUTABLE = ("tools/demo/",)
+
 
 def mutable(path: str) -> bool:
     # No `not path.startswith("tests/")`: `MUTABLE` cannot match a `tests/` path,
@@ -112,7 +127,7 @@ def mutable(path: str) -> bool:
     # module gives twice elsewhere -- a guard nothing can reach is a guard
     # nobody can trust, and `tests/test_mutants.py` was passing off the tuple
     # above rather than off the clause it appeared to be testing.
-    return path.endswith(".py") and path.startswith(MUTABLE)
+    return path.endswith(".py") and path.startswith(MUTABLE) and not path.startswith(UNMUTABLE)
 
 
 def line_starts(source: str) -> list[int]:
@@ -975,14 +990,17 @@ def every_line(root: Path) -> dict[str, set[int]]:
     """
     found: dict[str, set[int]] = {}
     for prefix in MUTABLE:
-        # No `mutable(name)` filter: walking `MUTABLE` for `*.py` already
-        # satisfies both halves of it, so the check could never be false. A
-        # mutation removing it survived, and this module deletes a guard nothing
-        # can reach rather than keeping one nobody can trust -- as it does for
-        # the `tests/` conjunct in `mutable` and the `/dev/null` case in
-        # `parse_hunks`.
+        # The `mutable(name)` filter is back, and the comment that removed it is
+        # why it needs saying. It argued that walking `MUTABLE` for `*.py`
+        # already satisfies both halves, so the check could never be false --
+        # true when `mutable` was two clauses, and false the moment it grew
+        # `UNMUTABLE`. A guard "nothing can reach" stopped being unreachable
+        # without anybody visiting this line, which is how `tools/demo/` stayed
+        # in `--all` after being excluded (#245).
         for path in sorted((root / prefix).rglob("*.py")):
             name = path.relative_to(root).as_posix()
+            if not mutable(name):
+                continue
             body = path.read_text(encoding="utf-8").splitlines()
             if body:
                 found[name] = set(range(1, len(body) + 1))

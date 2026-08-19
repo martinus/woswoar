@@ -429,6 +429,18 @@ class WoswoarTestCase(unittest.TestCase):
         patched.start()
         self.addCleanup(patched.stop)
 
+        # Before the first write, and this is not belt and braces: on 19 August
+        # a `machine` file holding exactly the two lines below turned up in the
+        # maintainer's *real* installation, which reported "no identity
+        # configured" and recorded three hours of commands under a fixture id.
+        # Whatever reached it, a suite that writes a machine identity must fail
+        # loudly rather than land in `~/.config` (#245).
+        for where in (store.config_dir(), store.data_dir(), store.logs_dir()):
+            # `raise`, not `assert`: a guard that `python -O` removes is a guard
+            # that is absent exactly where somebody optimised the run.
+            if not where.resolve().is_relative_to(self.root):
+                raise RuntimeError(f"the sandbox did not take: {where} is outside {self.root}")
+
         (store.config_dir()).mkdir(parents=True, exist_ok=True)
         (store.config_dir() / "machine").write_text(
             f"id={MACHINE_ID}\nname=test@machine\n", encoding="utf-8"

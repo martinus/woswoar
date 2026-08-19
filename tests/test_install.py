@@ -147,6 +147,33 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         self.assertEqual(os.environ["SHELL"], "/bin/bash")
 
 
+class TestTheHarnessRefusesARealStore(unittest.TestCase):
+    """#245: what a sandbox that did not take must do.
+
+    A `machine` file holding this suite's two fixture lines turned up in the
+    maintainer's real installation, which then reported "no identity configured"
+    and recorded three hours of commands under a fixture id. Whatever put it
+    there, a harness that writes a machine identity has to fail its own test
+    rather than land in `~/.config` -- so the check is before the first write,
+    and this drives it by breaking the sandbox the way an accident would.
+    """
+
+    def test_a_sandbox_that_did_not_take_errors_instead_of_writing(self) -> None:
+        class Probe(WoswoarTestCase):
+            def runTest(self) -> None:  # pragma: no cover - setUp is the subject
+                pass
+
+        # The builder hands back the *ambient* environment, so every store path
+        # resolves outside the sandbox -- which is precisely the shape that
+        # reached a real machine.
+        with mock.patch.object(store, "sandbox_environ", lambda root, home: dict(os.environ)):
+            outcome = Probe().run()
+
+        assert outcome is not None
+        self.assertEqual(len(outcome.errors), 1, "the sandbox not taking must be an error")
+        self.assertIn("sandbox did not take", outcome.errors[0][1])
+
+
 class TestWhatASpawnedChildInherits(WoswoarTestCase):
     """The other half of the class above: what a test's *child* can see.
 

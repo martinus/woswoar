@@ -11,13 +11,17 @@ watched by a person -- that is what `tools/demo/record.sh` is for.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from tools import mutants
+from tools.demo import seed
 from woswoar import search
 
 REPO = Path(__file__).resolve().parent.parent
@@ -31,6 +35,106 @@ _CTRL = re.compile(r"^Ctrl\+(\w)$", re.M)
 #: The `raw.githubusercontent.com` form the README embeds the GIF with, and the
 #: repo-relative path at the end of it.
 _RAW = re.compile(r"https://raw\.githubusercontent\.com/[^/]+/[^/]+/[^/]+/(\S+?\.gif)")
+
+
+class TestTheSeederCannotReachARealStore(unittest.TestCase):
+    """#245: this script builds a sandbox and writes a woswoar store into it.
+
+    One line of `_sandbox_env` is what points `store` at that sandbox, and a
+    mutation sweep rewrites this module -- so when that line broke, the seeder
+    wrote into the maintainer's live installation: three fabricated machines in
+    399 days of real history, a `machine` file overwritten with `THIS_HOST`, and
+    one of them published to a shared remote under the real machine's own
+    signing key.
+
+    Asserted against a poisoned environment rather than a broken `_sandbox_env`,
+    because that is the shape the accident had: the environment is what decides,
+    and the guard has to hold whatever put it there.
+    """
+
+    def test_it_refuses_a_store_outside_its_own_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sandbox"
+            root.mkdir()
+            (root / seed.MARKER).touch()
+            elsewhere = Path(tmp) / "a-real-looking-installation"
+            elsewhere.mkdir()
+            with (
+                mock.patch.dict(os.environ, {"WOSWOAR_DIR": str(elsewhere)}),
+                self.assertRaises(SystemExit) as refused,
+            ):
+                seed._refuse_a_real_store(root)
+        self.assertIn("outside", str(refused.exception))
+
+    def test_it_refuses_a_directory_it_did_not_build(self) -> None:
+        """A developer who points `root` at their own store gets the same
+        answer: the marker is written by the run that built the sandbox, so its
+        absence means this is somebody's directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "not-a-sandbox"
+            root.mkdir()
+            with self.assertRaises(SystemExit) as refused:
+                seed._refuse_a_real_store(root)
+        self.assertIn(seed.MARKER, str(refused.exception))
+
+    def test_a_real_sandbox_passes(self) -> None:
+        """The other half, or the guard could be `raise SystemExit` and pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "sandbox"
+            root.mkdir()
+            (root / seed.MARKER).touch()
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "WOSWOAR_DIR": str(root / "data"),
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "HOME": str(root / "home"),
+                },
+            ):
+                seed._refuse_a_real_store(root)
+
+    def test_build_refuses_before_it_writes_anything(self) -> None:
+        """The call site, not just the guard.
+
+        Removing `_refuse_a_real_store(root)` from `build` survived a table that
+        only called the guard directly -- and the call site is the whole of the
+        protection. Driven by breaking `_sandbox_env` the way a mutant does,
+        since with a working one the environment always takes and the guard can
+        never fire.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "a-real-looking-installation"
+            real.mkdir()
+            root = Path(tmp) / "sandbox"
+            leaky = {**os.environ, "WOSWOAR_DIR": str(real)}
+            with (
+                mock.patch.object(seed, "_sandbox_env", lambda root, repo: leaky),
+                self.assertRaises(SystemExit) as refused,
+            ):
+                seed.build(root=root, repo=Path(tmp), entries=1, seed=1, now=1_700_000_000)
+            self.assertIn("outside", str(refused.exception))
+            self.assertEqual(list(real.iterdir()), [], "it wrote before refusing")
+
+
+class TestTheDemoIsNeverMutated(unittest.TestCase):
+    """The second lock, and the reason there are two.
+
+    A mutant can break the guard above as easily as the environment line it
+    guards -- they are both in the file being mutated. So the sweep does not
+    generate rows for `tools/demo/` at all, and nothing is lost: 68 of its rows
+    ran in the sweep that caused #245, and every one was an equivalent mutant in
+    a recording script nothing asserts on.
+    """
+
+    def test_the_demo_is_not_mutable(self) -> None:
+        self.assertFalse(mutants.mutable("tools/demo/seed.py"))
+        self.assertFalse(mutants.mutable("tools/demo/anything_else.py"))
+
+    def test_the_rest_of_tools_still_is(self) -> None:
+        """Excluding a directory must not quietly exclude the package."""
+        self.assertTrue(mutants.mutable("tools/mutate.py"))
+        self.assertTrue(mutants.mutable("woswoar/store.py"))
 
 
 class TestTheTapePressesKeysThePickerBinds(unittest.TestCase):

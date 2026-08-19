@@ -451,6 +451,36 @@ def _clear(root: Path) -> None:
         shutil.rmtree(root / name, ignore_errors=True)
 
 
+def _refuse_a_real_store(root: Path) -> None:
+    """Stop unless every path `store` resolves is inside the sandbox just built.
+
+    The environment is the only thing pointing `store` at that sandbox, and this
+    module is one a mutation sweep rewrites -- so a mutant that drops the
+    `WOSWOAR_DIR` line from `_sandbox_env` sends every write below into the
+    developer's live installation. That is not a hypothesis. It overwrote a real
+    `machine` file with `THIS_HOST`, put three fabricated machines into 399 days
+    of real history, and published one of them to a shared remote, where it
+    carried the real machine's own signing key (#245).
+
+    So the check is here rather than in `_sandbox_env`: one mutation can break
+    the environment or this guard, and it takes both to reach a real store. The
+    marker is required as well as the prefix, because a developer who points
+    `root` at `~/.local/share/woswoar` deserves the same refusal.
+    """
+    inside = root.resolve()
+    if not (root / MARKER).is_file():
+        raise SystemExit(
+            f"{root} has no {MARKER}: this run did not build it, so it is not a sandbox"
+        )
+    for where in (store.data_dir(), store.config_dir(), store.logs_dir()):
+        if not where.resolve().is_relative_to(inside):
+            raise SystemExit(
+                f"refusing to seed: store resolves to {where}, which is outside {inside}. "
+                f"The sandbox environment did not take, and writing there would land in a real "
+                f"installation -- see #245."
+            )
+
+
 def build(root: Path, repo: Path, entries: int, seed: int, now: int) -> None:
     _clear(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -463,9 +493,13 @@ def build(root: Path, repo: Path, entries: int, seed: int, now: int) -> None:
             (home / project.removeprefix("~/")).mkdir(parents=True, exist_ok=True)
 
     env = _sandbox_env(root, repo)
-    # `store` reads the environment at call time, so pointing this process at the
-    # sandbox is all it takes to write the logs in the right place.
+    # Replaced, not updated: `os.environ.update` leaves everything it does not
+    # name, and `WOSWOAR_SESSION` is exported by the installed hook in every
+    # interactive shell -- so a demo recorded from a real terminal inherited the
+    # maintainer's own session id.
+    os.environ.clear()
     os.environ.update(env)
+    _refuse_a_real_store(root)
 
     store.private_dir(store.config_dir())
     store.save_machine(store.Machine(id=THIS_HOST, name=HOSTS[THIS_HOST]))
