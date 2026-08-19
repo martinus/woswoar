@@ -62,7 +62,9 @@ def fixture(*bodies: str) -> Iterator[list[str]]:
         try:
             with (
                 mock.patch.dict(os.environ, {"PYTHONPATH": path}),
-                mock.patch.object(run_tests, "discover", lambda: dict(classes)),
+                mock.patch.object(
+                    run_tests, "discover", lambda: run_tests.Found(dict(classes), {})
+                ),
             ):
                 yield list(classes)
         finally:
@@ -104,7 +106,7 @@ def tampering(mutate: Callable[[list[str]], list[str]]) -> Iterator[None]:
 class TestDiscovery(unittest.TestCase):
     def test_every_test_is_assigned_to_exactly_one_batch(self) -> None:
         """The batching must partition the real suite -- no gaps, no double runs."""
-        classes = run_tests.discover()
+        classes = run_tests.discover().classes
         ids = [tid for group in classes.values() for tid in group]
         self.assertEqual(len(ids), len(set(ids)), "a test landed in two batches")
 
@@ -314,6 +316,92 @@ class TestSkipsCanBeFatal(unittest.TestCase):
         with fixture(SKIPS):
             code, _ = run_main("--jobs", "2")
         self.assertEqual(code, 0)
+
+
+class TestAModuleThatWillNotImport(unittest.TestCase):
+    """#221: "this module contributed nothing" is not "a test failed".
+
+    `unittest.loader` substitutes a synthetic `_FailedTest` for a module it
+    cannot import, and that placeholder **is** a `TestCase` -- so before this it
+    packed into a batch as an ordinary class, ran nothing, and came out the far
+    end as `1 discovered test never ran`, naming `unittest.loader._FailedTest`.
+    Red, which is why nobody was hurt, and wrong about what happened.
+    """
+
+    @contextmanager
+    def tree(self, *modules: str) -> Iterator[Path]:
+        """A throwaway package of test modules, discovered for real.
+
+        For real, rather than through `fixture`'s patched `discover`, because
+        discovery is the thing under test here. In a directory of its own, and
+        that is not fastidiousness: writing a deliberately broken module into
+        this repository's `tests/` would be found by the 64 workers running this
+        very suite.
+        """
+        with tempfile.TemporaryDirectory(prefix="woswoar-unloadable-") as tmp:
+            root = Path(tmp)
+            for index, body in enumerate(modules):
+                (root / f"test_mod{index}.py").write_text(body, encoding="utf-8")
+            yield root
+
+    def test_a_broken_module_is_reported_as_unloadable_not_as_a_test(self) -> None:
+        with self.tree("import nosuchmodule_xyz\n") as root:
+            found = run_tests.discover(root)
+        self.assertEqual(found.classes, {})
+        self.assertEqual(list(found.unloadable), ["test_mod0"])
+        self.assertIn("Failed to import test module", found.unloadable["test_mod0"])
+
+    def test_the_modules_that_did_import_are_still_discovered(self) -> None:
+        """The half that fails if the placeholder is filtered by class rather
+        than by module: everything else must survive the filter."""
+        with self.tree(
+            "import nosuchmodule_xyz\n",
+            f"import unittest\n\n\nclass TestFixture(unittest.TestCase):\n{PASSES}",
+        ) as root:
+            found = run_tests.discover(root)
+        self.assertEqual(list(found.classes), ["test_mod1.TestFixture"])
+        self.assertEqual(list(found.unloadable), ["test_mod0"])
+
+    def test_the_run_is_red_and_says_which_module(self) -> None:
+        with mock.patch.object(
+            run_tests,
+            "discover",
+            lambda: run_tests.Found({}, {"tests.test_gone": "Failed to import test module: x"}),
+        ):
+            code, text = run_main("--jobs", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("could not import tests.test_gone", text)
+        # Not the other thing. A reader who sees this looks for an assertion.
+        self.assertNotIn("never ran", text)
+
+    def test_only_naming_a_broken_module_says_so(self) -> None:
+        """`--only` on a module that will not import used to answer "no test
+        class matches" -- true, and the opposite of what the person typing it is
+        trying to find out."""
+        with mock.patch.object(
+            run_tests,
+            "discover",
+            lambda: run_tests.Found({}, {"tests.test_gone": "Failed to import test module: x"}),
+        ):
+            code, text = run_main("--only", "tests.test_gone", "--jobs", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("could not import tests.test_gone", text)
+        self.assertNotIn("no test class matches", text)
+
+    def test_a_batch_reports_one_that_only_it_can_see(self) -> None:
+        """The belt to discovery's brace: a module can import in the parent and
+        not in the worker, and the batch must still run the classes that loaded.
+        `ran` stays honest -- the placeholder is not a test that ran."""
+        with fixture(PASSES) as names, tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir, "report.json")
+            with redirect_stderr(StringIO()):
+                code = run_tests.run_batch([*names, "zz_no_such_fixture"], out)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertEqual(list(report["unloadable"]), ["zz_no_such_fixture"])
+        self.assertEqual(len(report["ran"]), 1)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["errors"], [])
 
 
 class TestOrdinaryOutcomes(unittest.TestCase):
