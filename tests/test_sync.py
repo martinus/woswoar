@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import secrets
 import shutil
@@ -568,6 +569,59 @@ class TestWhoHasAcceptedWhom(SyncTestCase):
         ran = self.run_cli(beta, "fleet")
         self.assertEqual(ran.code, 0, ran.err)
         self.assertIn("!", ran.out, f"alpha's claim about gamma is disputed:\n{ran.out}")
+
+    def test_reading_a_hostile_row_changes_nothing_this_machine_believes(self) -> None:
+        """The property the whole design rests on, as a guard rather than a
+        claim in a docstring.
+
+        Trust has three writers -- `trust`, a withdrawal, and the TOFU pin at
+        `initialise` -- and none of them is fed by anything published. So a row
+        may say whatever it likes, including that it accepted every machine in
+        the world under keys nobody has seen, and reading it must leave
+        `state.signers` byte-identical. If that ever stops being true, the
+        repository has become the thing that decides trust, which is what this
+        design refuses to allow.
+        """
+        alpha, beta = self.machine("alpha", display="martinus@alpha"), self.machine("beta")
+        with alpha.active():
+            # Something to merge, so that beta knows alpha as a machine at all:
+            # a host with no history is not a row, and a report with no row for
+            # the forged file would pass this test while proving nothing.
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            # Un-pinned first, and that is the whole point of the fixture: a row
+            # from a host this machine *has* accepted is refused outright when
+            # its signature fails, so there would be nothing left for a hostile
+            # reader to act on. The dangerous row is the unverified one -- from
+            # a host nobody here has accepted -- because that is the row the
+            # report shows rather than drops. Reverting the guard survived a
+            # first version of this test for exactly that reason.
+            state = sync.State.load()
+            del state.signers[alpha.id]
+            state.save()
+
+            before = json.dumps(sync.State.load().as_json(), sort_keys=True)
+            # A row claiming a machine nobody has heard of, sealed to this fleet
+            # so it opens, and unsigned so it arrives unverified -- the shape an
+            # attacker with push access can actually produce.
+            forged = fleet.body(alpha.id, {"deadbeefdeadbeef": "SHA256:whatever"}, 1)
+            store.write_atomic(
+                archive.accepts_seal(alpha.id),
+                crypto.encrypt_to_recipients(
+                    ("not-a-signature\n\n" + forged).encode("utf-8"), sync.recipients()
+                ),
+            )
+            ran = self.run_cli(beta, "fleet")
+            after = json.dumps(sync.State.load().as_json(), sort_keys=True)
+
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertEqual(before, after, "reading a published row changed what this machine trusts")
+        self.assertNotIn("deadbeefdeadbeef", ran.out, "an unpinned host is not a column")
 
     def test_nothing_is_republished_when_nothing_changed(self) -> None:
         """It runs on a one-minute timer and changes about once per `accept`.
