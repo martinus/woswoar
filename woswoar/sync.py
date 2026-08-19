@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, codec, crypto, gitrepo, manifest, progress, store
+from . import archive, codec, crypto, fleet, gitrepo, manifest, progress, store
 from .entry import make_inert
 from .errors import SyncError, WoswoarError
 from .report import Check, Notice
@@ -702,6 +702,11 @@ class State:
     #: `hosts/<id>/signer.pub` included, so the key a host is held to has to be
     #: remembered somewhere the remote cannot reach.
     signers: dict[str, str] = field(default_factory=dict)
+    #: The host ids this machine last published in its `accepts.age`, sorted.
+    #: Progress rather than history: losing it costs one extra publish. See
+    #: `publish_accepts` for why the comparison lives here rather than in the
+    #: file.
+    published_accepts: list[str] = field(default_factory=list)
     #: "<host>/<day>" -> the day directory's mtime when every chunk its signed
     #: manifest listed had been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
@@ -722,6 +727,7 @@ class State:
         merged = raw.get("merged", {})
         granted = raw.get("granted", [])
         granted_complete = raw.get("granted_complete", False)
+        published = raw.get("published_accepts", [])
         signers = raw.get("signers", {})
         merged_at = raw.get("merged_at", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
@@ -746,6 +752,9 @@ class State:
             # And a malformed map costs every pin, which refuses every host until
             # a human re-runs `trust` -- also the safe direction, and loud,
             # because `sync` reports the untrusted hosts rather than skipping on.
+            published_accepts=sorted(str(host) for host in published)
+            if isinstance(published, list)
+            else [],
             signers={str(k): str(v) for k, v in signers.items()}
             if isinstance(signers, dict)
             else {},
@@ -770,6 +779,7 @@ class State:
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
             "granted_complete": self.granted_complete,
+            "published_accepts": list(self.published_accepts),
             "signers": dict(self.signers),
             "merged_at": dict(self.merged_at),
         }
@@ -1132,6 +1142,39 @@ def read_signer(host_id: str) -> Signer | None:
     if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
         return None
     return Signer(lines[0].strip(), lines[1].strip())
+
+
+def publish_accepts(known: Machine, state: State, now: int) -> bool:
+    """Publish which hosts this machine has accepted. Says whether it wrote.
+
+    Guarded on what this machine *last published*, kept in `state`, because
+    neither of the two obvious comparisons works: reading the file back means
+    decrypting it, and a machine that cannot -- no identity yet, a key not
+    granted to itself -- would republish on every timer tick; and the ciphertext
+    cannot be compared at all, since age is randomised and two seals of one body
+    never match.
+
+    `State.signers` is the authority for the content, and that is the point:
+    what a machine accepts is a local pin, so it cannot be read back out of the
+    repository it syncs with. See `woswoar/fleet.py`.
+    """
+    if not state.signers:
+        return False
+    if state.published_accepts == sorted(state.signers):
+        return False
+    # Through `signing_public`, which mints the key if it is missing, exactly as
+    # `publish_signer` does. Signing directly would turn "this machine lost its
+    # signing key" from a thing sync recovers from into a crash.
+    signing_public()
+    store.write_atomic(
+        archive.accepts_seal(known.id), fleet.seal(known.id, state.signers, recipients(), now)
+    )
+    # Recorded on the caller's `state`, which is the one `run` saves at the end.
+    # Loading a second copy here and saving it was the first shape, and `run`
+    # then wrote its older copy over the top -- so every sync republished,
+    # committed and pushed, which three of this file's own invariants noticed.
+    state.published_accepts = sorted(state.signers)
+    return True
 
 
 def publish_signer(known: Machine) -> bool:
@@ -1972,9 +2015,21 @@ def run(push: bool = True, now: int | None = None) -> Report:
         report.revoked = _this_machine_revoked(known)
         published = False
         exported = False
+        # One spelling of "now", shared below: two lines apart, `now if now is
+        # not None else int(time.time())` and `int(time.time()) if now is None
+        # else now` made a reader check twice that they meant the same thing.
+        stamp = int(time.time()) if now is None else now
         if not report.revoked:
+            # With `publish_signer` and `export` rather than above them: a
+            # machine on its way out must not sign, seal and push a row about
+            # whom it trusts, and those two are skipped here for the same
+            # reason. It cannot live in `_write_repo_metadata` either -- what a
+            # machine accepts changes with `accept`, long after enrolment -- and
+            # the guard inside makes an idle sync write nothing.
+            if publish_accepts(known, state, stamp):
+                marked = True
             published = publish_signer(known)
-            exported = export(known, state, report, int(time.time()) if now is None else now)
+            exported = export(known, state, report, stamp)
 
         # `git add -A` is a full stat of the working tree -- every chunk this
         # machine has ever published -- and this runs once a minute. On an idle
@@ -2189,6 +2244,15 @@ def initialise(
         if signer is not None and host_id not in state.signers:
             state.signers[host_id] = signer.verify_key
             pinned.append(signer.verify_key)
+
+    # Here, with the pins that were just made, rather than on the first sync.
+    # Publishing is a write, a commit and a push, and doing it on the first sync
+    # would make a machine's opening sync push even when it only received --
+    # which `TestSyncDoesNotForkGitMoreThanItNeedsTo` guards, correctly: that
+    # round trip fires on every machine every time any peer records a command.
+    # Enrolment is already writing and pushing, so it costs nothing here.
+    if publish_accepts(known, state, int(time.time())):
+        gitrepo.commit()
     state.save()
 
     # Publish immediately. Until this machine's public key is on the remote,
@@ -2681,6 +2745,7 @@ def _reseal(identity: Path, keys: list[str]) -> tuple[int, int]:
     for host_id in archive.repo_hosts():
         sealed.extend(archive.iter_day_keys(host_id))
         sealed.append(archive.name_seal(host_id))
+        sealed.append(archive.accepts_seal(host_id))
 
     resealed = skipped = 0
     # Two `age` invocations per file that is ours -- open, then seal to the new

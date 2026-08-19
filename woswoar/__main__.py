@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import textwrap
+import time
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -181,6 +182,96 @@ def _import(kind: importer.Kind, path: Path | None, *, dry_run: bool, this_host_
             "Run 'woswoar import atuin' on each machine to give them all the full set."
         )
     return 0
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """Who has accepted whom, as far as each machine says.
+
+    Rows accept, columns are accepted; the diagonal is blank. Only this
+    machine's row is authoritative -- it is the local pin, and nothing in the
+    repository can change it. See `woswoar/fleet.py` for why every other row is
+    a claim rather than a fact, and why that distinction is the design rather
+    than a caveat on it.
+    """
+    from . import fleet, sync
+
+    known = store.machine()
+    state = sync.State.load()
+    names = store.host_names()
+    if not names:
+        print("No machines yet. 'woswoar sync' once this machine has a remote.")
+        return 0
+
+    # A machine that has not run `init` still has an answer for its own row --
+    # the pin is local -- and cannot open anyone else's, which is the `?` this
+    # report already has a column for. Refusing outright would be telling
+    # someone to run `init` to find out who has accepted them.
+    try:
+        identity: Path | None = sync.identity_path(known)
+    except WoswoarError:
+        identity = None
+
+    hosts = sorted(names)
+    rows = {
+        host: fleet.Accepts(dict(state.signers), int(time.time()), True)
+        if host == known.id
+        else (fleet.published(host, state.signers.get(host), identity) if identity else None)
+        for host in hosts
+    }
+
+    # `search.host_labels` rather than a local spelling: it keeps labels
+    # *distinct* -- two machines of one person differ in the host half, not the
+    # user half -- and it runs them through `make_inert`, which matters more
+    # here than anywhere. A name is read straight out of a `.name` file a peer
+    # wrote, and this is the one table whose whole purpose is being read as a
+    # security check.
+    labels = search.host_labels(set(hosts))
+    width = max(len(label) for label in labels.values())
+
+    print("who accepts whom, as each machine last published it\n")
+    print(" " * (width + 2) + "  ".join(f"{labels[host]:^{width}}" for host in hosts))
+    for host in hosts:
+        said = rows[host]
+        cells = []
+        for other in hosts:
+            cells.append(f"{_cell(said, other, host, state):^{width}}")
+        mark = "" if said is not None and said.verified else "  (unverified)"
+        print(f"{labels[host]:<{width}}  " + "  ".join(cells) + mark)
+
+    print("\nA cell is what that machine says, not what is true: only this")
+    print("machine's row is checked against a key pinned here. Run 'woswoar accept'")
+    print("on a machine to change its row -- reading it here cannot.")
+    whens = [said.when for host, said in rows.items() if said is not None and host != known.id]
+    if whens:
+        print(
+            f"Rows are as fresh as each machine's last push; oldest: {store.day_for(min(whens))}."
+        )
+    return 0
+
+
+def _cell(said: object, other: str, host: str, state: object) -> str:
+    """One cell: what `host` says about `other`.
+
+    `!` is the case the fingerprint in each line exists for. A row names the
+    *key* it accepted, so a machine claiming to accept a host under a key this
+    machine did not pin is saying something about a different machine than the
+    reader thinks -- an attacker who can push may move `signer.pub`, and without
+    this the row would read as a vouch for whatever key sits there now.
+    """
+    from . import crypto, fleet, sync
+
+    assert isinstance(state, sync.State)
+    if other == host:
+        return "."
+    if not isinstance(said, fleet.Accepts):
+        return "?"
+    claimed = said.hosts.get(other)
+    if claimed is None:
+        return "no"
+    pinned = state.signers.get(other)
+    if pinned is not None and claimed != crypto.fingerprint(pinned):
+        return "!"
+    return "yes"
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -1241,6 +1332,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stats.add_argument("--top", type=int, default=10)
     p_stats.set_defaults(func=cmd_stats)
+
+    p_fleet = sub(
+        "fleet",
+        "who has accepted whom",
+        """
+        Accepting is per-machine: enrolling a laptop means running 'woswoar
+        accept' on the laptop and on every machine already syncing. This says
+        how far through that you are.
+
+        Only this machine's row is authoritative. Every other row is what that
+        machine published about itself, and a repository is not where trust
+        lives -- see docs/security.md.
+        """,
+    )
+    p_fleet.set_defaults(func=cmd_fleet)
 
     p_doctor = sub(
         "doctor",

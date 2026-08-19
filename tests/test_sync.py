@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import secrets
 import shutil
@@ -29,6 +30,7 @@ from woswoar import (
     codec,
     crypto,
     errors,
+    fleet,
     gitrepo,
     manifest,
     progress,
@@ -361,6 +363,286 @@ class TestSingleMachine(SyncTestCase):
             # The watermark stops at the last newline, so the half-written record
             # is left for next time rather than sealed into an immutable chunk.
             self.assertEqual(state.exported[relpath], path.stat().st_size - len("1700000002\ts1"))
+
+
+class TestWhoHasAcceptedWhom(SyncTestCase):
+    """#197: a machine you forgot to `accept` on is silent.
+
+    Three machines, not two, and an asymmetric graph -- a two-host fixture
+    cannot tell a matrix from its own transpose, so `A accepts B while B has not
+    accepted A` is the shape that has to be built.
+
+    What is asserted is the published *file*, not the printed table: the file is
+    the protocol between machines, and the table is one reading of it.
+    """
+
+    def published(self, reader: Fake, about: Fake) -> fleet.Accepts | None:
+        with reader.active():
+            state = sync.State.load()
+            return fleet.published(
+                about.id, state.signers.get(about.id), sync.identity_path(store.machine())
+            )
+
+    def test_a_machine_publishes_what_it_has_accepted(self) -> None:
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        said = self.published(beta, alpha)
+        assert said is not None
+        self.assertIn(beta.id, said.hosts)
+        self.assertTrue(said.verified, "beta accepted alpha, so alpha's row is checkable")
+
+    def test_the_graph_is_not_its_own_transpose(self) -> None:
+        """The asymmetry is the point, and it is the one the ceremony creates.
+
+        A machine that clones *after* another enrolled pins it on the spot; the
+        one that was there first has never been told the newcomer exists. So
+        with no `accept` run anywhere, beta's row already holds alpha and
+        alpha's row does not hold beta -- which is precisely the state this
+        report exists to make visible, and a fixture that mirrored one row into
+        the other would show nothing.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.run()
+
+        from_beta = self.published(alpha, beta)
+        assert from_beta is not None
+        self.assertIn(alpha.id, from_beta.hosts, "beta pinned alpha when it cloned")
+
+        from_alpha = self.published(beta, alpha)
+        self.assertTrue(
+            from_alpha is None or beta.id not in from_alpha.hosts,
+            "alpha was there first, so nobody has told it about beta",
+        )
+
+    def test_a_row_from_a_host_this_machine_has_not_accepted_is_unverified(self) -> None:
+        """The distinction the whole design rests on: a file from a host whose
+        key is not pinned here was written by whoever can push, and must not be
+        shown as though it were checked."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            unpinned = fleet.published(alpha.id, None, sync.identity_path(store.machine()))
+        assert unpinned is not None
+        self.assertFalse(unpinned.verified)
+
+    def test_a_forged_row_against_a_pinned_key_is_refused(self) -> None:
+        """Signed under the host's own namespace, so a row that does not verify
+        against the key this machine pinned is not a row at all."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(beta)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            state = sync.State.load()
+            forged = fleet.parse(
+                "not-a-signature\n\n" + fleet.body(alpha.id, {}, 1),
+                alpha.id,
+                state.signers.get(alpha.id),
+            )
+        self.assertIsNone(forged)
+
+    def test_a_file_addressed_to_another_host_is_not_read_as_this_one(self) -> None:
+        """The body names the host that signed it, and the reader checks it.
+
+        Without that, `hosts/A/accepts.age` could be copied to `hosts/B/` by
+        anyone who can push, and B would be shown saying what A said -- a claim
+        about a machine, forged by moving a file rather than by signing
+        anything.
+        """
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            # A sync first, so alpha has fetched beta's recipient, and then
+            # `grant`: that is what makes alpha's row readable by a machine
+            # which joined after it was sealed. `_reseal` re-seals every file
+            # sealed to the recipients, `accepts.age` among them since #197.
+            # Until someone grants, beta sees `?` -- the honest answer rather
+            # than a bug.
+            sync.run()
+            sync.grant()
+            sync.run()
+
+        with beta.active():
+            sync.run()  # fetch the re-sealed file; beta's clone is otherwise stale
+            state = sync.State.load()
+            blob = crypto.decrypt_with_file(
+                archive.accepts_seal(alpha.id).read_bytes(),
+                sync.identity_path(store.machine()),
+            ).decode("utf-8")
+            self.assertIsNotNone(
+                fleet.parse(blob, alpha.id, state.signers.get(alpha.id)), "sanity: it reads"
+            )
+            # `None` for the key, which is the case that needs the check: with
+            # a pinned key the signature refuses the moved file anyway, so the
+            # header is the only thing standing between "unverified row" and "a
+            # claim about beta that alpha signed and somebody relocated".
+            moved = fleet.parse(blob, beta.id, None)
+        self.assertIsNone(moved, "a file addressed to alpha is not beta's row")
+
+    def test_the_report_marks_what_it_could_not_check(self) -> None:
+        """The command, not just the file underneath it.
+
+        The whole design rests on a reader being able to tell a checked row from
+        an unchecked one, so the printing is part of the guarantee rather than
+        decoration on top of it.
+        """
+        alpha, beta = self.machine("alpha", display="martinus@alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.run()
+
+        ran = self.run_cli(beta, "fleet")
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertIn("who accepts whom", ran.out)
+        # beta pinned alpha when it cloned, so alpha's row is checkable here;
+        # what must never be missing is the sentence that says a cell is a
+        # claim rather than a fact.
+        self.assertIn("not what is true", ran.out)
+
+    def test_a_row_naming_a_key_this_machine_did_not_pin_is_disputed(self) -> None:
+        """What the fingerprint beside each host id is for.
+
+        A row says "I accepted host G *under this key*". If the reader pinned a
+        different key for G, the two are not talking about the same machine --
+        an attacker who can push may move `hosts/G/signer.pub`, and without the
+        comparison the cell would read as a plain vouch for whatever sits there
+        now. Three machines, because with two there is no third column for one
+        of them to disagree about.
+        """
+        alpha = self.machine("alpha", display="martinus@alpha")
+        beta = self.machine("beta", display="martinus@beta")
+        gamma = self.machine("gamma", display="martinus@gamma")
+        for machine in (alpha, beta, gamma):
+            with machine.active():
+                sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+            sync.grant()
+            sync.run()
+
+        with beta.active():
+            sync.run()
+            state = sync.State.load()
+            # beta pinned gamma when it cloned; pretend it pinned a different
+            # key, which is what "somebody moved signer.pub" looks like here.
+            state.signers[gamma.id] = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAA"
+            state.save()
+
+        ran = self.run_cli(beta, "fleet")
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertIn("!", ran.out, f"alpha's claim about gamma is disputed:\n{ran.out}")
+
+    def test_reading_a_hostile_row_changes_nothing_this_machine_believes(self) -> None:
+        """The property the whole design rests on, as a guard rather than a
+        claim in a docstring.
+
+        Trust has three writers -- `trust`, a withdrawal, and the TOFU pin at
+        `initialise` -- and none of them is fed by anything published. So a row
+        may say whatever it likes, including that it accepted every machine in
+        the world under keys nobody has seen, and reading it must leave
+        `state.signers` byte-identical. If that ever stops being true, the
+        repository has become the thing that decides trust, which is what this
+        design refuses to allow.
+        """
+        alpha, beta = self.machine("alpha", display="martinus@alpha"), self.machine("beta")
+        with alpha.active():
+            # Something to merge, so that beta knows alpha as a machine at all:
+            # a host with no history is not a row, and a report with no row for
+            # the forged file would pass this test while proving nothing.
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            sync.grant()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            # Un-pinned first, and that is the whole point of the fixture: a row
+            # from a host this machine *has* accepted is refused outright when
+            # its signature fails, so there would be nothing left for a hostile
+            # reader to act on. The dangerous row is the unverified one -- from
+            # a host nobody here has accepted -- because that is the row the
+            # report shows rather than drops. Reverting the guard survived a
+            # first version of this test for exactly that reason.
+            state = sync.State.load()
+            del state.signers[alpha.id]
+            state.save()
+
+            before = json.dumps(sync.State.load().as_json(), sort_keys=True)
+            # A row claiming a machine nobody has heard of, sealed to this fleet
+            # so it opens, and unsigned so it arrives unverified -- the shape an
+            # attacker with push access can actually produce.
+            forged = fleet.body(alpha.id, {"deadbeefdeadbeef": "SHA256:whatever"}, 1)
+            store.write_atomic(
+                archive.accepts_seal(alpha.id),
+                crypto.encrypt_to_recipients(
+                    ("not-a-signature\n\n" + forged).encode("utf-8"), sync.recipients()
+                ),
+            )
+            ran = self.run_cli(beta, "fleet")
+            after = json.dumps(sync.State.load().as_json(), sort_keys=True)
+
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertEqual(before, after, "reading a published row changed what this machine trusts")
+        self.assertNotIn("deadbeefdeadbeef", ran.out, "an unpinned host is not a column")
+
+    def test_nothing_is_republished_when_nothing_changed(self) -> None:
+        """It runs on a one-minute timer and changes about once per `accept`.
+        Compared on the plaintext, because age is randomised -- two seals of one
+        body never match, so comparing ciphertext would rewrite it every minute
+        and commit every minute with it."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+
+        with alpha.active():
+            known = store.machine()
+            state = sync.State.load()
+            self.assertFalse(
+                sync.publish_accepts(known, state, 2), "unchanged, so nothing to write"
+            )
 
 
 class TestTwoMachines(SyncTestCase):
@@ -734,6 +1016,14 @@ class TestImmutability(SyncTestCase):
                 any(part in p for part in allowed)
                 or p.endswith("/name.age")
                 or p.endswith("/signer.pub")
+                # `accepts.age` joins them with #197, and it is the only one of
+                # these that is rewritten more than once in a machine's life: it
+                # changes when this machine accepts another, and again when the
+                # recipient list grows, because a file sealed to yesterday's
+                # fleet cannot be read by a machine that joined today. Listed
+                # here rather than folded into a looser pattern, since the point
+                # of this assertion is that the exceptions are enumerated.
+                or p.endswith("/accepts.age")
                 for p in rewritten
             ),
             f"unexpected rewrites: {sorted(rewritten - chunks)}",
@@ -5708,9 +5998,11 @@ class TestLongCommandsSayWhatTheyAreDoing(SyncTestCase):
                 sync.grant()
 
         self.assertIn("phase:re-sealing the day keys", said)
-        # 25 day keys plus this machine's sealed name.
-        self.assertIn("tick:0/26 keys", said)
-        self.assertIn("tick:25/26 keys", said)
+        # 25 day keys, this machine's sealed name, and its `accepts.age` since
+        # #197 -- every file sealed to the recipients goes through one loop, so
+        # widening access cannot pick some of them up and leave others.
+        self.assertIn("tick:0/27 keys", said)
+        self.assertIn("tick:26/27 keys", said)
 
     def test_an_idle_sync_still_has_nothing_to_count(self) -> None:
         """The timer runs this every minute; the loops must stay skipped."""

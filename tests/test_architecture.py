@@ -62,6 +62,12 @@ LAYERS: dict[str, set[str]] = {
     "progress": set(),
     "report": set(),
     "codec": set(),
+    #: What a host publishes about who it has accepted, and what a reader may
+    #: conclude from someone else's copy. Derived rather than a domain: it holds
+    #: the file's grammar and its signature, and `sync` decides when to write
+    #: one. It never reaches `sync`, which is what keeps the edge one-way --
+    #: `State` is sync's, and the pin it holds is deliberately local.
+    "fleet": {"archive", "crypto", "entry", "errors", "store"},
     "credentials": {"errors"},
     "crypto": {"errors"},
     "store": {"entry"},
@@ -89,6 +95,7 @@ LAYERS: dict[str, set[str]] = {
         "archive",
         "codec",
         "crypto",
+        "fleet",
         "entry",
         "errors",
         "gitrepo",
@@ -114,6 +121,7 @@ LAYERS: dict[str, set[str]] = {
         "deps",
         "entry",
         "errors",
+        "fleet",
         "gitrepo",
         "manifest",
         "progress",
