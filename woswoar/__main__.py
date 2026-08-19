@@ -184,16 +184,46 @@ def _import(kind: importer.Kind, path: Path | None, *, dry_run: bool, this_host_
     return 0
 
 
+#: What a cell can say: the sentence the key under the table prints for it, in
+#: the order it prints them. Three of the five borrow `doctor`'s markers rather
+#: than spelling `yes` and `no`, so that one glance reads the same way in both
+#: reports and `report.markers` decides in one place whether that is a tick or
+#: `[ok]` -- honouring NO_COLOR for this table as it already does for that one.
+#:
+#: The other two are a matrix's own, because `doctor`'s three cannot carry them.
+#: `!` is sharper than "no" rather than a louder version of it, and `?` is not a
+#: verdict at all -- folding either into `fail` would print a machine's silence
+#: as a finding about it, which is the one thing `woswoar/fleet.py` forbids.
+_LEGEND = {
+    "yes": "accepted -- the row's machine merges the column's history",
+    "no": "not accepted -- run 'woswoar accept' on the row's machine",
+    "disputed": "accepted, but under a signing key this machine did not pin",
+    "unknown": "no row this machine can open, so nothing is known either way",
+    "self": "a machine and itself",
+}
+
+#: What a row rather than a cell can be marked with, and what it means. Not in
+#: `_LEGEND`, and not because it would not fit: that dict is what a *cell* can
+#: say, and this is about a whole row -- the difference between "what that
+#: machine says about one column" and "whether that machine is who wrote the
+#: row at all". Printing them as one list would blur exactly that.
+_UNVERIFIED = "(unverified)"
+_UNVERIFIED_MEANS = (
+    "nobody here has accepted that machine, so the row was checked",
+    "against nothing -- it is what somebody published, and no more",
+)
+
+
 def cmd_fleet(args: argparse.Namespace) -> int:
     """Who has accepted whom, as far as each machine says.
 
-    Rows accept, columns are accepted; the diagonal is blank. Only this
-    machine's row is authoritative -- it is the local pin, and nothing in the
-    repository can change it. See `woswoar/fleet.py` for why every other row is
-    a claim rather than a fact, and why that distinction is the design rather
+    Rows accept, columns are accepted; the diagonal is the machine itself. Only
+    this machine's row is authoritative -- it is the local pin, and nothing in
+    the repository can change it. See `woswoar/fleet.py` for why every other row
+    is a claim rather than a fact, and why that distinction is the design rather
     than a caveat on it.
     """
-    from . import fleet, sync
+    from . import fleet, report, sync
 
     known = store.machine()
     state = sync.State.load()
@@ -212,11 +242,15 @@ def cmd_fleet(args: argparse.Namespace) -> int:
         identity = None
 
     hosts = sorted(names)
+    now = int(time.time())
     rows = {
-        host: fleet.Accepts(dict(state.signers), int(time.time()), True)
+        host: fleet.mine(state.signers, now)
         if host == known.id
         else (fleet.published(host, state.signers.get(host), identity) if identity else None)
         for host in hosts
+    }
+    grid = {
+        (host, other): _cell(rows[host], other, host, state) for host in hosts for other in hosts
     }
 
     # `search.host_labels` rather than a local spelling: it keeps labels
@@ -226,17 +260,42 @@ def cmd_fleet(args: argparse.Namespace) -> int:
     # wrote, and this is the one table whose whole purpose is being read as a
     # security check.
     labels = search.host_labels(set(hosts))
-    width = max(len(label) for label in labels.values())
+    symbols = _symbols(report.markers())
+    # Wide enough for the widest marker as well as the widest label. Without
+    # colour a marker is `[FAIL]`, six columns rather than one, so a fleet whose
+    # machines are called `pi` would otherwise print a header that does not sit
+    # over the cells it names.
+    mark_width = max(report.visible(symbol) for symbol in symbols.values())
+    width = max(mark_width, *(len(label) for label in labels.values()))
 
-    print("who accepts whom, as each machine last published it\n")
-    print(" " * (width + 2) + "  ".join(f"{labels[host]:^{width}}" for host in hosts))
+    print("who accepts whom, as each machine last published it")
+    print("rows accept, columns are accepted\n")
+    print((" " * (width + 2) + "  ".join(f"{labels[host]:^{width}}" for host in hosts)).rstrip())
+    unverified = False
     for host in hosts:
         said = rows[host]
-        cells = []
-        for other in hosts:
-            cells.append(f"{_cell(said, other, host, state):^{width}}")
-        mark = "" if said is not None and said.verified else "  (unverified)"
-        print(f"{labels[host]:<{width}}  " + "  ".join(cells) + mark)
+        cells = [report.centred(symbols[grid[host, other]], width) for other in hosts]
+        checked = said is not None and said.verified
+        unverified = unverified or not checked
+        mark = "" if checked else f"  {_UNVERIFIED}"
+        print((f"{labels[host]:<{width}}  " + "  ".join(cells) + mark).rstrip())
+
+    print()
+    shown = set(grid.values())
+    for kind, meaning in _LEGEND.items():
+        # Only the symbols that are on screen. The ordinary table is ticks and
+        # dots, and a five-line key under a three-line table is mostly about
+        # states that are not in it -- which is how a key stops being read.
+        if kind in shown:
+            print(f"  {report.centred(symbols[kind], mark_width)}  {meaning}")
+    if unverified:
+        first, *rest = _UNVERIFIED_MEANS
+        print(f"  {_UNVERIFIED}  {first}")
+        # Under the sentence rather than under the mark: `(unverified)` is a
+        # word, not a one-column symbol, so the hanging indent is its own width
+        # and not `mark_width`.
+        for line in rest:
+            print(" " * (len(_UNVERIFIED) + 4) + line)
 
     print("\nA cell is what that machine says, not what is true: only this")
     print("machine's row is checked against a key pinned here. Run 'woswoar accept'")
@@ -249,28 +308,48 @@ def cmd_fleet(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cell(said: object, other: str, host: str, state: object) -> str:
-    """One cell: what `host` says about `other`.
+def _symbols(marks: dict[str, str]) -> dict[str, str]:
+    """The character each kind of cell prints as.
 
-    `!` is the case the fingerprint in each line exists for. A row names the
-    *key* it accepted, so a machine claiming to accept a host under a key this
-    machine did not pin is saying something about a different machine than the
-    reader thinks -- an attacker who can push may move `signer.pub`, and without
-    this the row would read as a vouch for whatever key sits there now.
+    `marks` is what `doctor` renders with, passed in rather than fetched here so
+    that the width the table is laid out to and the symbols in it cannot come
+    from two different answers to "is this a terminal?".
+    """
+    return {
+        "self": marks["info"],
+        "yes": marks["ok"],
+        "no": marks["fail"],
+        "disputed": "!",
+        "unknown": "?",
+    }
+
+
+def _cell(said: object, other: str, host: str, state: object) -> str:
+    """Which kind of cell `host` says `other` is: a key of `_LEGEND`.
+
+    A kind rather than the character, because the character depends on whether
+    anyone is watching and this does not -- and because the key under the table
+    lists exactly the kinds that came back from here.
+
+    `disputed` is the case the fingerprint in each line exists for. A row names
+    the *key* it accepted, so a machine claiming to accept a host under a key
+    this machine did not pin is saying something about a different machine than
+    the reader thinks -- an attacker who can push may move `signer.pub`, and
+    without this the row would read as a vouch for whatever key sits there now.
     """
     from . import crypto, fleet, sync
 
     assert isinstance(state, sync.State)
     if other == host:
-        return "."
+        return "self"
     if not isinstance(said, fleet.Accepts):
-        return "?"
+        return "unknown"
     claimed = said.hosts.get(other)
     if claimed is None:
         return "no"
     pinned = state.signers.get(other)
     if pinned is not None and claimed != crypto.fingerprint(pinned):
-        return "!"
+        return "disputed"
     return "yes"
 
 
@@ -1340,6 +1419,10 @@ def build_parser() -> argparse.ArgumentParser:
         Accepting is per-machine: enrolling a laptop means running 'woswoar
         accept' on the laptop and on every machine already syncing. This says
         how far through that you are.
+
+        Rows accept, columns are accepted, and a key under the table says what
+        each symbol in it means. They are doctor's, so a tick reads the same
+        way in both reports.
 
         Only this machine's row is authoritative. Every other row is what that
         machine published about itself, and a repository is not where trust

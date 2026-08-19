@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -35,11 +37,12 @@ from woswoar import (
     manifest,
     progress,
     prove,
+    report,
     search,
     store,
     sync,
 )
-from woswoar.__main__ import main
+from woswoar.__main__ import _LEGEND, _UNVERIFIED, main
 from woswoar.entry import Entry, format_line
 from woswoar.gitrepo import COMMIT_MESSAGE as COMMIT
 from woswoar.install import HOOKS
@@ -48,6 +51,11 @@ from woswoar.sync import _GRANT_REMEDY
 
 from . import support
 from .support import requires_age, requires_git, requires_ssh_keygen
+
+#: What a terminal eats before anybody reads a column of `woswoar fleet`. The
+#: tests below measure where a symbol sits, and a coloured one is ten characters
+#: sitting in one column -- so they have to strip what the terminal would.
+_ESCAPES = re.compile("\x1b\\[[0-9;]*m")
 
 #: `gc --auto` runs after a commit and after a push, and `gc.autoDetach` sends
 #: it to the background -- so it is still repacking while the *next* git command
@@ -550,6 +558,146 @@ class TestWhoHasAcceptedWhom(SyncTestCase):
         # claim rather than a fact.
         self.assertIn("not what is true", ran.out)
 
+    def two_machines_neither_of_which_has_accepted_the_other(self) -> tuple[Fake, Fake]:
+        """alpha and beta, read from beta, with one cell of each ordinary kind.
+
+        beta pinned alpha when it cloned and alpha was there first, so beta's
+        own row accepts alpha and alpha's published row does not name beta:
+        `yes`, `no` and the two diagonals, with no `!` and nothing unreadable.
+        That is the fixture the key's *absences* need -- a table already holding
+        every symbol cannot show that one is left out when it does not occur.
+        """
+        alpha = self.machine("alpha", display="martinus@alpha")
+        beta = self.machine("beta", display="martinus@beta")
+        with alpha.active():
+            # Something to publish: a machine that has recorded nothing is not
+            # a column, and a one-column table cannot hold a `yes` or a `no`.
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            # `grant` and then a sync, because alpha sealed its name and its row
+            # before beta existed. Without the re-seal beta cannot open either,
+            # and every cell of alpha's row would be the `?` this fixture is
+            # meant not to have.
+            sync.run()
+            sync.grant()
+            sync.run()
+        with beta.active():
+            sync.run()
+        return alpha, beta
+
+    def test_this_machines_own_row_holds_fingerprints_like_every_other(self) -> None:
+        """`Accepts.hosts` is fingerprints, and `State.signers` is whole keys.
+
+        Every other row comes back from `parse`, which reads what `body` wrote;
+        this machine's own row has no file behind it and was assembled by hand
+        from the pins -- so it carried keys in a field of fingerprints, and
+        `_cell` compared the two and called every machine this one had accepted
+        `!`. The authoritative row, the only one the command promises anything
+        about, disputed itself.
+
+        Asserted against `body`, not against a fingerprint spelled out here: the
+        point is that the two agree, and a literal would pass while they drifted.
+        """
+        alpha, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        with beta.active():
+            state = sync.State.load()
+            own = fleet.mine(state.signers, 1)
+            # Read back the way a peer's row arrives, signature and all -- and
+            # unverified, because what is under test is which strings land in
+            # `hosts` rather than who wrote them.
+            published = fleet.parse(
+                "not-a-signature\n\n" + fleet.body(store.machine().id, state.signers, 1),
+                store.machine().id,
+                None,
+            )
+        assert published is not None
+        self.assertEqual(own.hosts, published.hosts)
+        self.assertIn(alpha.id, own.hosts, "sanity: beta pinned alpha when it cloned")
+
+    def test_a_machine_this_one_accepted_is_not_shown_as_disputed(self) -> None:
+        """The same defect through the command, because the docstring above is
+        about a dict and this is about what a person reads. `!` means "that
+        machine accepted a host under a key I did not pin", which is the alarm
+        this report exists to raise -- so raising it about a machine you
+        accepted yourself is worse than saying nothing.
+        """
+        _, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        ran = self.run_cli(beta, "fleet")
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertNotIn(_LEGEND["disputed"], ran.out, f"beta pinned alpha itself:\n{ran.out}")
+
+    def test_the_table_says_it_in_doctors_markers_not_in_words(self) -> None:
+        """#247 printed `yes` and `no`, which is a fourth vocabulary for the
+        thing `doctor` already has three markers for. `report.markers` decides
+        which pair of forms those are, so the assertion here is on the plain
+        ones -- a captured stream is not a terminal, exactly as a pipe is not.
+        """
+        _, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        ran = self.run_cli(beta, "fleet")
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertIn(report.PLAIN_MARKERS["ok"], ran.out)
+        self.assertIn(report.PLAIN_MARKERS["fail"], ran.out)
+        self.assertNotIn("yes", ran.out, f"a cell is a marker now:\n{ran.out}")
+
+    def test_the_key_explains_the_symbols_that_are_in_the_table(self) -> None:
+        """The half of #247 this is about: a grid of ticks says nothing to
+        somebody who has not read `fleet.py`."""
+        _, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        ran = self.run_cli(beta, "fleet")
+        for kind in ("yes", "no", "self"):
+            with self.subTest(kind=kind):
+                self.assertIn(_LEGEND[kind], ran.out, f"no key for {kind}:\n{ran.out}")
+
+    def test_the_key_leaves_out_the_symbols_that_are_not(self) -> None:
+        """Why the key is filtered rather than printed whole. The ordinary
+        table is ticks and dots, and a five-line key under a three-line table is
+        mostly about states that are not in it -- which is how a key stops being
+        read at all. The fixture has no `!` and nothing unreadable, so those two
+        lines and the `(unverified)` note must not be there.
+        """
+        _, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        ran = self.run_cli(beta, "fleet")
+        for kind in ("disputed", "unknown"):
+            with self.subTest(kind=kind):
+                self.assertNotIn(_LEGEND[kind], ran.out, f"{kind} is not here:\n{ran.out}")
+        self.assertNotIn(_UNVERIFIED, ran.out, f"every row is checked here:\n{ran.out}")
+
+    def test_a_coloured_table_keeps_its_columns(self) -> None:
+        """A cell is a marker now, and on a terminal a marker is ten characters
+        drawing one column. Every ordinary way of padding counts the ten, so a
+        table centred with a format spec is perfectly aligned in the pipe a test
+        captures and collapses into a row of touching symbols on the terminal
+        the user is looking at. Hence `tty=True`, and hence measuring where each
+        symbol sits rather than trusting that something was printed.
+        """
+        _, beta = self.two_machines_neither_of_which_has_accepted_the_other()
+        ran = self.run_cli(beta, "fleet", tty=True)
+        self.assertEqual(ran.code, 0, ran.err)
+        self.assertIn("\x1b[", ran.out, "sanity: this is the coloured rendering")
+
+        lines = _ESCAPES.sub("", ran.out).splitlines()
+        header = next(line for line in lines if line.startswith(" ") and line.strip())
+        body = list(itertools.takewhile(bool, lines[lines.index(header) + 1 :]))
+        self.assertTrue(body, f"no rows under the header:\n{ran.out}")
+
+        # Where each column header sits, in order and without assuming which
+        # machine sorted first.
+        spans, at = [], 0
+        for label in header.split():
+            at = header.index(label, at)
+            spans.append(range(at, at + len(label)))
+            at += len(label)
+
+        for row in body:
+            with self.subTest(row=row):
+                marks = [i for i, char in enumerate(row) if i >= spans[0].start and char != " "]
+                self.assertEqual(len(marks), len(spans), f"one symbol per column:\n{header}\n{row}")
+                for mark, span in zip(marks, spans, strict=True):
+                    self.assertIn(mark, span, f"a symbol left its column:\n{header}\n{row}")
+
     def test_a_row_naming_a_key_this_machine_did_not_pin_is_disputed(self) -> None:
         """What the fingerprint beside each host id is for.
 
@@ -583,6 +731,9 @@ class TestWhoHasAcceptedWhom(SyncTestCase):
         ran = self.run_cli(beta, "fleet")
         self.assertEqual(ran.code, 0, ran.err)
         self.assertIn("!", ran.out, f"alpha's claim about gamma is disputed:\n{ran.out}")
+        # And the key says what that `!` means, because this is the one symbol
+        # in the table whose meaning nobody can guess from the symbol.
+        self.assertIn(_LEGEND["disputed"], ran.out, f"unexplained `!`:\n{ran.out}")
 
     def test_reading_a_hostile_row_changes_nothing_this_machine_believes(self) -> None:
         """The property the whole design rests on, as a guard rather than a

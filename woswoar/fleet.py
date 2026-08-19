@@ -14,11 +14,12 @@ someone else's.
 is deliberately local -- `State.signers` says why, and `trust` repeats it:
 anyone who can push can rewrite `hosts/<id>/signer.pub`, so the key a host is
 held to has to be remembered somewhere the remote cannot reach. A published
-`accepts` file is therefore *advisory*, and the report says so per row: `yes`
-and `no` for a host whose signing key this machine has pinned, `?` for one it
-has not, because there the file's author is "whoever can push". The matrix must
-never become the thing someone checks instead of running `accept`, or the
-repository has made the trust decision the design refuses to let it make.
+`accepts` file is therefore *advisory*, and the report says so per row: a
+verdict -- `doctor`'s own tick or cross -- for a host whose signing key this
+machine has pinned, and `?` for one it has not, because there the file's author
+is "whoever can push". The matrix must never become the thing someone checks
+instead of running `accept`, or the repository has made the trust decision the
+design refuses to let it make.
 
 **Signature inside the sealed file, not beside it.** `manifest` makes this
 argument first and it applies unchanged: a detached pair has a window where one
@@ -64,6 +65,28 @@ class Accepts(NamedTuple):
     #: False means the file parsed and nothing more: its author is whoever can
     #: push. Never let this decide anything except how the row is printed.
     verified: bool
+
+
+def mine(signers: dict[str, str], now: int) -> Accepts:
+    """This machine's own row, from its pins rather than from a published file.
+
+    Through here rather than assembled at the call site, and that is worth a
+    function: `hosts` is fingerprints and `State.signers` is whole keys, so
+    `Accepts(dict(state.signers), ...)` type-checks, reads correctly, and is
+    wrong in the one row nothing can catch it in. Every other row arrives
+    through `parse`, which puts fingerprints there because `body` wrote them;
+    the row a machine keeps about itself is the only one with no file behind it,
+    and it was the only one built by hand -- so `__main__._cell` compared a key
+    with a fingerprint and reported every machine this one had accepted as
+    accepted under a key it had not pinned.
+
+    ``verified`` is `True` and is not a claim about a signature: there is no
+    signature, because there is no file. It is the local pin, which is the one
+    thing in this module that the repository cannot reach.
+    """
+    return Accepts(
+        {host: crypto.fingerprint(key) for host, key in signers.items()}, now, verified=True
+    )
 
 
 def body(host_id: str, accepted: dict[str, str], now: int) -> str:
