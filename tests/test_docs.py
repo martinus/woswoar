@@ -17,6 +17,7 @@ the reader. Two were broken when this file grew its second class.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -178,6 +179,87 @@ def markdown_files() -> list[Path]:
         for p in REPO.glob("**/*.md")
         if not any(part.startswith(".") and part != ".github" for part in p.parts)
     )
+
+
+class TestAQuotedClaimIsReallyThere(unittest.TestCase):
+    """#250: `docs/security.md`'s claims are backed by tests, and code quotes
+    them to justify itself. Nothing checked that a quotation was real.
+
+    `woswoar/codec.py` shipped one that was not: its docstring said the claim
+    reads "a chunk cannot exhaust memory: a decompression bomb is refused at
+    `MAX_CHUNK_BYTES` rather than expanded", where the file says "a chunk that
+    unpacks past the cap is refused and reported, and the peak allocation is
+    measured to stay bounded rather than the payload being materialised first"
+    -- and `MAX_CHUNK_BYTES` appears nowhere in `docs/`. A review agent caught
+    it, not CI.
+
+    A wrong pointer costs more than no pointer: the reader pays for the search
+    *and* for deciding which of the two moved.
+    """
+
+    #: Long enough to be prose rather than a name. `"name.age"` and `"caught"`
+    #: are quoted all over this codebase and are not claims about anything.
+    #:
+    #: It guards against a false *failure*, never a false pass: lowering it only
+    #: widens what is checked. So a surviving mutant here is expected, and is
+    #: the reason this says so rather than someone re-deriving it from a sweep.
+    _PROSE = 24
+
+    def quoting(self) -> list[tuple[str, str]]:
+        """Every long quotation from a docstring that also names the document.
+
+        Docstrings through `ast` rather than a grep of the source, because the
+        source is full of string literals that are code -- an argv, a git
+        subcommand, a test fixture -- and none of them is a claim. Comments are
+        left out for the same reason in reverse: they hold the arguments about
+        *how* rather than the claims about *what*, and reaching them means
+        tokenising for a shape that has never carried one.
+
+        Two things about the scope, both measured rather than assumed:
+
+        `tests/` is not walked, because the only long quotation of the document
+        anywhere under it is the counter-example in this class's own docstring.
+        Including it would make this file its own fixture, and a test whose
+        subject is its own prose is one nobody can safely edit.
+
+        `tools/` is walked and today finds nothing -- dropping that half leaves
+        the suite green. It is a net for a quotation that has not been written
+        yet, not a tested path, and it is said here so that a later sweep
+        reporting it as a survivor does not have to re-derive why.
+        """
+        found = []
+        for path in sorted((REPO / "woswoar").rglob("*.py")) + sorted(
+            (REPO / "tools").rglob("*.py")
+        ):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef):
+                    continue
+                text = ast.get_docstring(node) or ""
+                flat = " ".join(text.split())
+                if "docs/security.md" not in flat:
+                    continue
+                quoted = re.findall(rf'"([^"]{{{self._PROSE},}})"', flat)
+                found += [(str(path.relative_to(REPO)), said) for said in quoted]
+        return found
+
+    def test_every_quotation_appears_in_the_document(self) -> None:
+        claimed = " ".join((DOCS / "security.md").read_text(encoding="utf-8").split())
+        quotations = self.quoting()
+        self.assertTrue(quotations, "nothing quotes the document; this test would pass vacuously")
+        for where, said in quotations:
+            with self.subTest(where=where):
+                # Whitespace-normalised on both sides: the document wraps at 80
+                # columns and a docstring wraps narrower, so a verbatim compare
+                # would fail on line breaks that mean nothing.
+                #
+                # `fail` rather than `assertIn`, because `assertIn` prints its
+                # container and the container is the whole of docs/security.md
+                # -- eleven thousand characters of it, with the one sentence
+                # that matters somewhere inside. What a reader needs is the
+                # quotation and where it came from.
+                if said not in claimed:
+                    self.fail(f"{where} quotes something docs/security.md does not say:\n  {said}")
 
 
 class TestEveryDocumentLinkLandsSomewhere(unittest.TestCase):
