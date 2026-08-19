@@ -16,8 +16,6 @@ So the span assertions here are exact, never "it contains".
 from __future__ import annotations
 
 import ast
-import os
-import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -26,6 +24,7 @@ from pathlib import Path
 from tools import mutants
 from tools.mutants import Mutation
 
+from . import support
 from .support import requires_git
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -746,37 +745,9 @@ class TestReadingARealDiff(unittest.TestCase):
     """
 
     def git(self, *argv: str) -> str:
-        finished = subprocess.run(
-            [
-                "git",
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                *argv,
-            ],
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            check=True,
-            # A maintainer whose global config signs commits or renames the
-            # default branch must not fail this suite for reasons that are not
-            # the code under test.
-            env={
-                # Carried across, not hardcoded: `tools/sandbox.py` gives the
-                # argument -- there is no sandbox-relative answer to where the
-                # real `git` lives, and a machine with git outside `/usr/bin`
-                # (Nix, a Homebrew-first PATH, most containers) would otherwise
-                # fail here for a reason unrelated to the code under test.
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "HOME": str(self.root),
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_CONFIG_SYSTEM": "/dev/null",
-            },
-        )
-        return finished.stdout
+        """`support.git`, bound to this fixture's root. The hardening it carries
+        was written here and moved there when a second fixture needed it."""
+        return support.git(self.root, *argv)
 
     def write(self, name: str, body: str) -> None:
         path = self.root / name
