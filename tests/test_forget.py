@@ -17,7 +17,8 @@ import json
 from pathlib import Path
 from unittest import mock
 
-from woswoar import cache, entry, forget, importer, store, sync
+from woswoar import __main__ as main_module
+from woswoar import cache, entry, forget, importer, search, store, sync
 
 from . import support
 
@@ -399,3 +400,133 @@ class TestTheTwoSpellingsOfTheDigestAgree(support.WoswoarTestCase):
         make a row forgettable and un-suppressable at the same time."""
         line = _line(1_755_600_001, "café ☕ --token=abc")
         self.assertEqual(forget.digest(line), forget._of(line.encode("utf-8", "surrogateescape")))
+
+
+class TestTheListingSaysEnoughToAnswerWith(ForgetTestCase):
+    """What is on screen is the whole basis for a `--yes`, so it is asserted.
+
+    Every one of these was a mutation that survived the first sweep: the count
+    header, the clip, the pluralisation and both summary lines could all be
+    deleted or inverted with the suite still green. A listing nothing checks is
+    a listing that can go wrong in the one place this command asks somebody to
+    make a decision.
+    """
+
+    def test_it_says_how_many_it_found(self) -> None:
+        self.assertIn("1 matching command(s)", support.run_cli("forget", "AWS_SECRET").out)
+
+    def test_one_match_is_singular_and_several_are_not(self) -> None:
+        """Both halves, because a sentence that always says "them" satisfies the
+        first assertion on its own."""
+        self.assertIn("to remove it from", support.run_cli("forget", "AWS_SECRET").out)
+        # "a" is in all three fixture commands.
+        self.assertIn("to remove them from", support.run_cli("forget", "a").out)
+
+    def test_a_long_command_is_clipped_and_says_so(self) -> None:
+        """`FORGET_PREVIEW` characters and the picker's own ellipsis. Clipped from
+        the *end*, unlike `search._clip`: a row somebody is about to delete is one
+        they typed, so the beginning is what identifies it."""
+        long = "curl --header 'authorization: Bearer " + "x" * 200 + "'"
+        self.write_log(support.MACHINE_ID, self.DAY, [_line(1_755_600_001, long)])
+        out = support.run_cli("forget", "Bearer").out
+        self.assertIn(long[: main_module.FORGET_PREVIEW] + search.ELLIPSIS, out)
+        self.assertNotIn(long, out, "the whole command was printed rather than a preview")
+
+    def test_a_short_command_is_not_clipped(self) -> None:
+        """The fixture that stops the assertion above passing on a clip that
+        always fires."""
+        out = support.run_cli("forget", "make -j8").out
+        self.assertIn("make -j8", out)
+        self.assertNotIn(search.ELLIPSIS, out)
+
+    def test_it_says_what_it_removed(self) -> None:
+        out = support.run_cli("forget", "AWS_SECRET", "--yes").out
+        self.assertIn("removed 1 row(s) from 1 day file(s)", out)
+        self.assertIn("cache", out)
+
+
+class TestEveryPublishedDayIsNamed(ForgetTestCase):
+    """One day cannot tell a sorted list from an unsorted one, or from a list
+    that prints only its first entry -- which is `CLAUDE.md` rule 3's first
+    weak-fixture example, one type over."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.later = "2026-08-20"
+        self.other = _line(1_755_690_000, "export AWS_SECRET_ACCESS_KEY=second")
+        self.write_log(support.MACHINE_ID, self.later, [self.other])
+        store.save_json(
+            store.state_file(),
+            {
+                "exported": {
+                    f"hosts/{support.MACHINE_ID}/{self.DAY}.tsv": sum(
+                        len(line) + 1 for line in self.lines
+                    ),
+                    f"hosts/{support.MACHINE_ID}/{self.later}.tsv": len(self.other) + 1,
+                }
+            },
+        )
+
+    def test_both_days_are_listed_in_order(self) -> None:
+        out = support.run_cli("forget", "AWS_SECRET").out
+        self.assertIn(f"on {self.DAY}, {self.later}.", out)
+
+    def test_the_count_matches_the_days(self) -> None:
+        self.assertIn(
+            "2 of these have already been published", support.run_cli("forget", "AWS_SECRET").out
+        )
+
+
+class TestTheWatermarkBoundaryIsInclusive(ForgetTestCase):
+    """A row ending *exactly* at the sealed prefix has been sealed.
+
+    Both `<=` comparisons survived a sweep whose fixtures only ever put a match
+    strictly inside the watermark, which cannot tell `<=` from `<`. One is the
+    line that decides whether somebody is told to rotate a credential; the other
+    is how far the watermark moves.
+    """
+
+    def test_the_last_sealed_row_reads_as_published(self) -> None:
+        self.mark_exported(2)
+        out = support.run_cli("forget", "AWS_SECRET").out
+        self.assertIn("published", out)
+        self.assertIn("rotate", out)
+
+    def test_removing_it_moves_the_watermark_by_its_whole_length(self) -> None:
+        self.mark_exported(2)
+        support.run_cli("forget", "AWS_SECRET", "--yes")
+        self.assertEqual(self.exported(), len(self.lines[0]) + 1)
+
+
+class TestALineThatIsNotARecordIsSkipped(ForgetTestCase):
+    """`parse_line` returns None for a torn line rather than raising, and
+    `find` has to honour that: a shell killed mid-append leaves one, and a
+    `forget` that fell over on it would be unusable exactly when the history is
+    already damaged."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log.write_text(
+            f"not a record at all\n{self.lines[1]}\n\t\t\t\n{self.lines[2]}\n", encoding="utf-8"
+        )
+
+    def test_the_search_still_answers(self) -> None:
+        ran = support.run_cli("forget", "AWS_SECRET")
+        self.assertEqual(ran.code, 0)
+        self.assertIn("1 matching", ran.out)
+
+    def test_the_junk_is_left_where_it_was(self) -> None:
+        support.run_cli("forget", "AWS_SECRET", "--yes")
+        self.assertEqual(self.remaining(), ["not a record at all", "\t\t\t", self.lines[2]])
+
+
+class TestRemovingNothingIsNotAnError(ForgetTestCase):
+    """`forget_rows` intersects with what was shown, so it can legitimately end
+    up with nothing to do -- and `apply`'s early return is what stops the caller
+    updating `state.exported` with a `None`."""
+
+    def test_an_empty_intersection_changes_nothing(self) -> None:
+        before = self.log.read_bytes()
+        self.assertEqual(sync.forget_rows("AWS_SECRET", False, set()), [])
+        self.assertEqual(self.log.read_bytes(), before)
+        self.assertFalse(store.forgotten_file().exists())
