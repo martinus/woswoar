@@ -419,8 +419,15 @@ class TestDroppingAKeywordArgument(unittest.TestCase):
         Dropping `encoding="utf-8"` is a real defect -- under `LC_ALL=C` the same
         read raises `UnicodeDecodeError` -- but this suite runs in a UTF-8 locale
         everywhere, so `read_text()` and `read_text(encoding="utf-8")` are the
-        same call and no fixture can tell them apart. A row that can only ever
-        survive is not a question worth asking every run.
+        same call almost everywhere in it. A row that can only ever survive is
+        not a question worth asking every run.
+
+        "Almost", since #229: `tests/test_locale.py` drives one round trip in a
+        child that prefers ASCII, and the two `encoding=` arguments on that path
+        -- the day file's append and `store.host_name`'s read -- are answerable
+        now. The operator stays off because the other sites carry ids, keys and
+        offsets, which are ASCII by construction: putting it back would restore
+        dozens of unkillable rows to buy two killable ones.
         """
         self.assertEqual(self.dropped('p.read_text(encoding="utf-8")\n'), [])
 
