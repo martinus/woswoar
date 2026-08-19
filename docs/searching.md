@@ -25,6 +25,13 @@ again cycles global → host → session → dir — where **dir** is this direc
 everything below it, on every machine, because `~/src/woswoar` on your laptop and
 on your desktop is the same project.
 
+The prompt says which scope you are in, and for three of the four it also says
+*which one*: the directory for `dir`, the machine for `host`, and for `session`
+how long this shell has been open — `woswoar (session 3h42m)`. That last one is
+the question the scope raises and nothing else on screen answers; the shell's
+id is not shown, because nobody recognises it. The age is a snapshot taken when
+the picker opened, so it does not tick while you are looking at it.
+
 **A short machine name is also an ordinary word.** If yours is `box`, typing it
 finds `sandbox` and `~/dropbox` too — so anchor it: **`^box`** matches only the
 machine, because the search starts at the machine column and `^` sticks to the
