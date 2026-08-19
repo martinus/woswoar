@@ -820,6 +820,46 @@ def lock() -> Iterator[None]:
         handle.close()
 
 
+def forget_rows(needle: str, only_credentials: bool, shown: set[str]) -> list[forget.Match]:
+    """Remove ``shown`` from this machine's logs, and reseat what that moves.
+
+    Here rather than in `forget` because it is one operation and half of it is
+    `sync`'s: `state.exported` is a byte count into a plaintext log that only
+    `export` knows how to read, and `lock` is what every other command that
+    touches `State` already takes. Split across the two modules it was five
+    ordered steps a second caller would have to rediscover from the CLI, and
+    `forget` would have needed an edge back to this module to hold them.
+
+    ``shown`` is the digests of the rows a person was actually shown. The search
+    is run again in here because the listing was taken outside the lock -- a
+    sync since then may have rewritten a peer's day file and moved every offset
+    -- but only rows that were on screen are removed. Without that intersection,
+    a command recorded between the listing and the ``--yes`` could be deleted
+    having never been displayed, which for this command is the one thing that
+    must not happen.
+
+    The files are rewritten before the watermarks are saved, and that order is
+    load-bearing rather than incidental. A crash in between leaves a watermark
+    pointing past a file that is now shorter, so `export` publishes nothing for
+    that day until it grows back -- one line lost, and #262 is about making that
+    unreachable. The other order is worse *for this command specifically*: a
+    watermark saved low with the rows still in `logs/` re-seals and re-publishes
+    them, and the row in question is the one somebody just asked to be rid of.
+    """
+    with lock():
+        state = State.load()
+        matches = [
+            match
+            for match in forget.find(
+                needle, only_credentials=only_credentials, exported=state.exported
+            )
+            if forget.digest(match.line) in shown
+        ]
+        state.exported.update(forget.apply(matches, state.exported))
+        state.save()
+    return matches
+
+
 class Failure(NamedTuple):
     """A recorded sync failure, and when it happened."""
 
@@ -1640,7 +1680,7 @@ def _merge_host(
     host_id: str,
     state: State,
     report: Report,
-    suppressed: frozenset[str] = frozenset(),
+    suppressed: frozenset[str],
 ) -> None:
     verify_key = _trusted_signer(host_id, state, report)
     if verify_key is None:
@@ -1720,7 +1760,7 @@ def _merge_host(
             continue
 
         listed = manifest.read(host_id, chunk_day, verify_key)
-        day = _Day(host_id, chunk_day, listed, already, suppressed)
+        day = _Day(host_id, chunk_day, listed, already)
         pending = names if day.rewrite else fresh
         directory = archive.chunk_dir(host_id, chunk_day)
         #: Chunk names whose plaintext reached `day`.
@@ -1771,7 +1811,19 @@ def _merge_host(
                 report.record(UNREADABLE, key)
                 continue
 
-            day.add(plaintext, report)
+            # Filtered before the day is assembled, not after, because a
+            # rewrite replaces the file from the chunks alone: anything let
+            # through is what the day *becomes*. `state.merged` stops a chunk
+            # being read twice, so on an ordinary machine this only ever sees
+            # new lines -- but a re-merge, a fresh clone or a compaction rebuild
+            # sends the whole day back through here, which is exactly when a
+            # forgotten row would otherwise return.
+            plaintext = forget.surviving(plaintext, suppressed)
+            if plaintext:
+                day.add(plaintext, report)
+            # Outside the guard on purpose: a chunk whose every line was
+            # forgotten has still been read, and leaving it out of `taken` would
+            # re-read it on every sync for as long as the chunk exists.
             taken.append(name)
 
         # A rewrite *replaces* the day's file, so it must not run on a partial
@@ -1867,10 +1919,8 @@ class _Day:
         day: str,
         listed: dict[str, manifest.ManifestEntry],
         already: frozenset[str],
-        suppressed: frozenset[str] = frozenset(),
     ) -> None:
         self.host_id = host_id
-        self.suppressed = suppressed
         self.day = day
         self.listed = listed
         self.compacted = {name for name, entry in listed.items() if entry.subsumes}
@@ -1906,19 +1956,6 @@ class _Day:
         self._bytes = 0
 
     def add(self, plaintext: bytes, report: Report) -> None:
-        # Filtered here rather than after the day is assembled, because a
-        # rewrite replaces the file from the chunks alone: anything let through
-        # is what the day *becomes*. `state.merged` already stops a chunk being
-        # read twice, so on an ordinary machine this only ever sees new lines --
-        # but a re-merge, a fresh clone or a compaction rebuild sends the whole
-        # day back through here, which is exactly when a forgotten row would
-        # otherwise return.
-        plaintext = forget.surviving(plaintext, self.suppressed)
-        if not plaintext:
-            # Every line in this chunk was forgotten. Recording no block keeps
-            # `flush` from replacing a day with nothing on a rewrite whose only
-            # chunk was entirely suppressed.
-            return
         self._blocks.append(plaintext)
         self._bytes += len(plaintext)
         if self._bytes > FLUSH_BYTES and not self.rewrite:

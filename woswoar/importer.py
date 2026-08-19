@@ -415,6 +415,18 @@ def run_atuin(
             )
         entries_by_host[host_id] = fresh
 
+    # Deferred, as `sqlite3` is above and for the same reason: `__main__`
+    # imports this module at the top for the parser, so a keypress would
+    # otherwise pay 295 us of module body for a command it is not running.
+    from . import forget
+
+    # The other door into `logs/`. This deduplicates against
+    # `store.existing_keys`, which reads the log files -- so a row `forget` took
+    # out is no longer seen as already present, and would be written back
+    # verbatim by the next run. See `forget.keep` for what it can and cannot
+    # recognise.
+    entries_by_host = {host: forget.keep(rows) for host, rows in entries_by_host.items()}
+
     imported = sum(len(v) for v in entries_by_host.values())
     if not dry_run:
         for host_id, entries in entries_by_host.items():
@@ -523,6 +535,12 @@ def run(
                 cmd=item.cmd,
             )
         )
+
+    # As in `run_atuin` above, deferred for the same reason: `forget` has to
+    # survive a re-import, and this is the other writer into `logs/`.
+    from . import forget
+
+    entries = forget.keep(entries)
 
     if not dry_run:
         store.append_entries(machine_id, entries)

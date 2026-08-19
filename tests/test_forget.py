@@ -14,8 +14,10 @@ what the listing says about a published row, and the exit code.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest import mock
 
-from woswoar import entry, forget, store
+from woswoar import cache, entry, forget, importer, store, sync
 
 from . import support
 
@@ -198,12 +200,12 @@ class TestTheSelector(ForgetTestCase):
         you mean all of it" that is worth the chance of a yes.
         """
         ran = support.run_cli("forget", "", "--yes")
-        self.assertEqual(ran.code, 2)
+        self.assertEqual(ran.code, 1)
         self.assertEqual(self.remaining(), self.lines)
 
     def test_no_pattern_at_all_is_refused(self) -> None:
         ran = support.run_cli("forget", "--yes")
-        self.assertEqual(ran.code, 2)
+        self.assertEqual(ran.code, 1)
         self.assertEqual(self.remaining(), self.lines)
 
     def test_it_is_a_substring_and_not_a_regex(self) -> None:
@@ -273,3 +275,127 @@ class TestSurvivingIsByteExact(support.WoswoarTestCase):
         every byte of every peer's history, on a one-minute timer."""
         plaintext = b"anything at all\n"
         self.assertIs(forget.surviving(plaintext, set()), plaintext)
+
+
+class TestARowStillBeingWrittenIsNotARow(ForgetTestCase):
+    """`_rows` stops where `store.read_tail` stops, and that is not tidiness.
+
+    The shell hook appends with `>>` on every prompt and takes no lock -- it
+    must not fork on the record path, and CI asserts that. So the last line of
+    a live day file is routinely half there. Treating it as a record lets
+    `forget` offer to delete something still being written, on the primary copy,
+    and leaves the writer's remaining bytes to land on whatever line follows.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Two complete lines and a third with no newline, which is exactly the
+        # shape a `>>` caught mid-write leaves behind.
+        self.log.write_text(
+            f"{self.lines[0]}\n{self.lines[2]}\n{_line(1_755_600_009, 'ssh secret-box')}",
+            encoding="utf-8",
+        )
+
+    def test_it_is_not_offered(self) -> None:
+        ran = support.run_cli("forget", "secret-box")
+        self.assertIn("nothing recorded", ran.out)
+
+    def test_it_survives_a_rewrite_that_removes_a_line_above_it(self) -> None:
+        before = self.log.read_bytes()
+        support.run_cli("forget", "git status", "--yes")
+        self.assertEqual(self.log.read_bytes(), before.replace(f"{self.lines[0]}\n".encode(), b""))
+
+
+class TestACommandRecordedDuringTheRewriteIsNotLost(ForgetTestCase):
+    """The one operation in the tree that can shorten the primary copy.
+
+    `store.write_atomic` replaces the inode, and the hook is appending to the
+    old one without a lock -- so a command typed in that window lands on a file
+    that is about to be unlinked. `apply` holds the handle across the
+    replacement and reads on afterwards, which recovers exactly those bytes:
+    they are well defined because the logs are append-only.
+    """
+
+    LATE = "echo typed while the rewrite was happening"
+
+    def test_the_append_is_recovered(self) -> None:
+        late = _line(1_755_600_004, self.LATE)
+        real = store.write_atomic
+
+        def racing(path: Path, data: bytes) -> None:
+            # Straight onto the old inode, through the same door the hook uses,
+            # in the window between `apply`'s read and its replace.
+            if path == self.log:
+                with store.private_append(path) as hook:
+                    hook.write(f"{late}\n")
+            real(path, data)
+
+        with mock.patch.object(store, "write_atomic", racing):
+            support.run_cli("forget", "AWS_SECRET", "--yes")
+        self.assertEqual(self.remaining(), [self.lines[0], self.lines[2], late])
+
+
+class TestOnlyWhatWasShownIsRemoved(ForgetTestCase):
+    """`sync.forget_rows` searches again under the lock -- a merge may have moved
+    every offset -- but a row recorded since the listing was never on screen, and
+    for a command that deletes history that is the thing that must not happen."""
+
+    def test_a_row_recorded_after_the_listing_is_left_alone(self) -> None:
+        real = sync.forget_rows
+
+        def racing(needle: str, only_credentials: bool, shown: set[str]) -> object:
+            self.write_log(
+                support.MACHINE_ID,
+                self.DAY,
+                [*self.lines, _line(1_755_600_004, "export AWS_SECRET_ACCESS_KEY=later")],
+            )
+            return real(needle, only_credentials, shown)
+
+        with mock.patch.object(sync, "forget_rows", racing):
+            support.run_cli("forget", "AWS_SECRET", "--yes")
+        self.assertIn("AWS_SECRET_ACCESS_KEY=later", self.log.read_text(encoding="utf-8"))
+        self.assertNotIn("wharrgarbl", self.log.read_text(encoding="utf-8"))
+
+
+class TestAReImportDoesNotBringItBack(support.WoswoarTestCase):
+    """`logs/` has two doors and `merge` is only one of them.
+
+    Both importers deduplicate against `store.existing_keys`, which reads the
+    log files -- so once `forget` has taken a row out, an import no longer sees
+    it as already present and writes it back verbatim. The credential filter is
+    the only thing in the way, and it is the filter whose misses this command
+    exists for.
+    """
+
+    HISTORY = "#1753000000\ngit status\n#1753000100\nssh prod -- cat /etc/shadow\n"
+
+    def source(self) -> Path:
+        path = self.root / "history"
+        path.write_text(self.HISTORY, encoding="utf-8")
+        return path
+
+    def test_a_forgotten_row_is_not_re_imported(self) -> None:
+        importer.run("bash", self.source())
+        self.assertEqual(support.run_cli("forget", "etc/shadow", "--yes").code, 0)
+        # What a restored machine looks like: the importer's own watermark is
+        # progress, not history, so losing it re-reads the whole file.
+        store.save_json(store.config_dir() / "imported.json", {})
+        importer.run("bash", self.source())
+        self.assertNotIn("etc/shadow", " ".join(e.cmd for e in cache.load_entries()))
+
+    def test_the_rest_of_the_history_still_comes_back(self) -> None:
+        """The fixture that stops the assertion above passing on an import that
+        silently did nothing at all."""
+        importer.run("bash", self.source())
+        support.run_cli("forget", "etc/shadow", "--yes")
+        store.save_json(store.config_dir() / "imported.json", {})
+        importer.run("bash", self.source())
+        self.assertIn("git status", [e.cmd for e in cache.load_entries()])
+
+
+class TestTheTwoSpellingsOfTheDigestAgree(support.WoswoarTestCase):
+    def test_bytes_and_text_name_the_same_row(self) -> None:
+        """`surviving` hashes bytes and `apply` hashes text; a divergence would
+        make a row forgettable and un-suppressable at the same time."""
+        line = _line(1_755_600_001, "café ☕ --token=abc")
+        self.assertEqual(forget.digest(line), forget._of(line.encode("utf-8", "surrogateescape")))

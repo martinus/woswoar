@@ -2016,10 +2016,10 @@ class TestTheDirectoryInThePrompt(DirScopeCase):
 
         prompt = search._prompt_for("dir")
         self.assertLessEqual(len(prompt), len("woswoar (dir ) ") + search._PROMPT_LABEL_MAX)
-        # `_ELLIPSIS`, the same one-column character `_clip` uses on the machine
+        # `ELLIPSIS`, the same one-column character `_clip` uses on the machine
         # column -- three dots would spend two more of the columns this constant
         # exists to save.
-        self.assertIn(search._ELLIPSIS, prompt)
+        self.assertIn(search.ELLIPSIS, prompt)
         self.assertIn("eight", prompt, "the end of the path is what it had to keep")
 
     def test_a_path_either_parser_would_read_is_not_shown_at_all(self) -> None:

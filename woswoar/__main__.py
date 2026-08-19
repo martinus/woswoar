@@ -1217,34 +1217,38 @@ FORGET_PREVIEW = 96
 
 
 def _forget_row(found: Match) -> str:
-    """One line of the listing: where it was recorded, when, and what it says."""
+    """One line of the listing: where it was recorded, when, and what it says.
+
+    Both peer-controlled fields go through the same door the picker uses.
+    `search.host_label` for the machine, because `_merge_name` writes whatever
+    decrypted out of a peer's `name.age` and sealing one needs no secret -- so
+    the name is chosen by anyone who can push, and this listing is read on a
+    terminal immediately before somebody answers a delete question about it.
+    `make_inert` for the command, for the same reason one step closer to home.
+    """
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(found.record.ts))
-    who = store.host_name(found.host_id) or found.host_id
-    # `make_inert` for the same reason the picker uses it: a recorded command
-    # can contain escape sequences, and this listing is read on a terminal
-    # immediately before somebody answers a question about it.
     shown = make_inert(found.record.cmd)
     if len(shown) > FORGET_PREVIEW:
-        shown = shown[:FORGET_PREVIEW] + "..."
+        # `search._ELLIPSIS` is the picker's and trims the *tail*; a row about to
+        # be deleted is one the person typed, so the beginning identifies it and
+        # the clip goes the other way. The character is the same on purpose.
+        shown = shown[:FORGET_PREVIEW] + search.ELLIPSIS
     mark = "published" if found.published else "local only"
-    return f"  {who}  {when}  [{mark}]  {shown}"
+    return f"  {search.host_label(found.host_id)}  {when}  [{mark}]  {shown}"
 
 
 def cmd_forget(args: argparse.Namespace) -> int:
     """Remove recorded commands from this machine, and keep them removed."""
     from . import forget, sync
 
-    state = sync.State.load()
-    try:
-        matches = forget.find(
-            args.pattern or "",
-            only_credentials=args.credentials,
-            exported=state.exported,
-        )
-    except ValueError as exc:
-        print(f"woswoar: {exc}", file=sys.stderr)
-        return 2
-
+    # `State` only to answer "has this row left the machine yet", which is the
+    # difference between a row somebody can simply be rid of and one whose
+    # credential has to be rotated. The removal reloads it under the lock.
+    matches = forget.find(
+        args.pattern or "",
+        only_credentials=args.credentials,
+        exported=sync.State.load().exported,
+    )
     if not matches:
         what = "look like credentials" if args.credentials else f"contain {args.pattern!r}"
         print(f"nothing recorded here seems to {what}")
@@ -1254,19 +1258,19 @@ def cmd_forget(args: argparse.Namespace) -> int:
     for match in matches:
         print(_forget_row(match))
 
-    published = sorted({match.day for match in matches if match.published})
-    if published:
+    gone = [match for match in matches if match.published]
+    if gone:
         # Before the prompt rather than after, as `revoke` argues: this is the
         # reason somebody might answer no and go and rotate a key first, so
         # printing it alongside the result would be printing it too late to act
-        # on.
+        # on. One list, so the count and the days provably describe the same rows.
+        days = ", ".join(sorted({store.day_of_log(match.relpath) for match in gone}))
         print(
-            f"\n{sum(1 for m in matches if m.published)} of these have already been published,"
-            f"\non {', '.join(published)}. Published chunks are never rewritten -- history"
-            "\nis append-only and every peer's signature rests on that -- so those rows"
-            "\nstay in the repository and on every machine that has merged them."
-            "\nIf one of them is a credential, rotate it: that is the only thing that"
-            "\nactually takes it out of use."
+            f"\n{len(gone)} of these have already been published, on {days}."
+            "\nPublished chunks are never rewritten -- history is append-only and every"
+            "\npeer's signature rests on that -- so those rows stay in the repository and"
+            "\non every machine that has merged them. If one of them is a credential,"
+            "\nrotate it: that is the only thing that actually takes it out of use."
         )
 
     if not args.yes:
@@ -1274,24 +1278,13 @@ def cmd_forget(args: argparse.Namespace) -> int:
         print(f"\nNothing was changed. Re-run with --yes to remove {it} from this machine.")
         return 0
 
-    # Under the sync lock: a sync running alongside this would either seal the
-    # rows being removed or merge into a file being replaced, and both races end
-    # with the forgotten row still on a machine.
-    with sync.lock():
-        # Re-read inside the lock. The listing above was taken outside it, and a
-        # sync that ran in between moves `state.exported` -- which is the number
-        # the rewrite adjusts.
-        state = sync.State.load()
-        removal = forget.apply(
-            forget.find(
-                args.pattern or "", only_credentials=args.credentials, exported=state.exported
-            ),
-            state.exported,
-        )
-        state.exported.update(removal.exported)
-        state.save()
-
-    print(f"\nremoved {removal.rows} row(s) from {removal.files} day file(s)")
+    # Only what was on screen. `forget_rows` searches again under the lock, so a
+    # row recorded since the listing would otherwise be deleted without ever
+    # having been shown.
+    removed = sync.forget_rows(
+        args.pattern or "", args.credentials, {forget.digest(match.line) for match in matches}
+    )
+    print(f"\nremoved {len(removed)} row(s) from {len({m.relpath for m in removed})} day file(s)")
     print("the parse cache was dropped; the next search rebuilds it")
     return 0
 
