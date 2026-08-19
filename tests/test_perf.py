@@ -21,6 +21,7 @@ from pathlib import Path
 from woswoar import cache, search, store
 from woswoar.entry import Entry, format_line
 
+from . import support
 from .support import MACHINE_ID, WoswoarTestCase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -157,7 +158,7 @@ class TestPerformance(WoswoarTestCase):
         cache.load_entries()  # warm the cache, as any real shell would have
 
         argv = [sys.executable, "-m", "woswoar", "list", "--scope", "global"]
-        env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+        env = support.child_env(PYTHONPATH=str(REPO_ROOT))
         run = subprocess.run(argv, capture_output=True, env=env, check=True, timeout=120)
         lines = run.stdout.count(b"\n")
 

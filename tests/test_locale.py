@@ -29,6 +29,7 @@ from pathlib import Path
 
 from woswoar import store
 
+from . import support
 from .support import MACHINE_ID, WoswoarTestCase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -97,7 +98,7 @@ class TestARoundTripUnderAnAsciiLocale(WoswoarTestCase):
         (store.config_dir() / "machine").write_text(
             f"id={MACHINE_ID}\nname={NON_ASCII_HOST}\n", encoding="utf-8"
         )
-        self.env = {**os.environ, **ASCII_LOCALE, "PYTHONPATH": str(REPO_ROOT)}
+        self.env = support.child_env(**ASCII_LOCALE, PYTHONPATH=str(REPO_ROOT))
 
     def woswoar(self, *argv: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

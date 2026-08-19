@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, ClassVar
 from woswoar import cache, search, store
 from woswoar.entry import MAX_CMD_CHARS, TRUNCATION_MARKER, Entry, escape, unescape
 
+from . import support
 from .credential_shapes import DOCUMENTED_GAPS, INNOCENT_SHAPES, SECRET_SHAPES
 from .support import (
     MACHINE_ID,
@@ -90,15 +91,9 @@ class ShellHookTestCase(WoswoarTestCase):
         """A minimal environment pointing the hook at this test's sandbox."""
         runtime = self.runtime_dir()
         runtime.mkdir(exist_ok=True)
-        env = {
-            "HOME": str(self.root),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "TERM": "dumb",
-            "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
-            "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
-            "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
-            "XDG_RUNTIME_DIR": str(runtime),
-        }
+        # `HOME` is this test's root rather than the sandbox's home: the hook
+        # writes its own rc file and the shell reads it from here.
+        env = support.child_env(HOME=str(self.root), TERM="dumb", XDG_RUNTIME_DIR=str(runtime))
         env.update(extra or {})
         return env
 
@@ -1742,6 +1737,9 @@ class TestThePtyHarness(unittest.TestCase):
         chunks = run_in_pty(
             ["bash", "--norc", "-i"],
             [Typed("", "ps> "), Typed("stty size\n", "41 123")],
+            # Deliberately *not* `support.child_env`: this drives a shell that
+            # has never met woswoar, so handing it a `WOSWOAR_DIR` would change
+            # what the test proves. An opt-out, named here so it reads as one.
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PS1": "ps> ", "TERM": "xterm"},
             size=(41, 123),
         )

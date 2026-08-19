@@ -34,6 +34,27 @@ requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
 
 
+def child_env(**extra: str) -> dict[str, str]:
+    """The sandbox environment, plus whatever this child needs on top.
+
+    Built from `os.environ` rather than from a list of names, and that is only
+    correct since #217: the *parent* environment is now the sandbox itself --
+    `WoswoarTestCase` replaces it wholesale with `store.sandbox_environ` -- so
+    inheriting it hands a child exactly the sandbox and nothing of the
+    developer's machine.
+
+    What the literals cost while they were necessary is #239: none of the six
+    carried `PYTHONWARNINGS`, so in the suites where the shipped CLI actually
+    runs, CI's `error::DeprecationWarning` never applied. `tests/test_install`'s
+    `TestWhatASpawnedChildInherits` is the guard for that.
+
+    A test that is *about* a bare environment should not use this. Two are: both
+    drive a shell that has never met woswoar, and handing it a `WOSWOAR_DIR`
+    would quietly change what they prove.
+    """
+    return {**os.environ, **extra}
+
+
 def git(root: Path, *argv: str) -> str:
     """Run `git` against `root` with a configuration of its own, and return stdout.
 
@@ -66,6 +87,10 @@ def git(root: Path, *argv: str) -> str:
         check=True,
         env={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            # And `TMPDIR` for the same reason `store.SANDBOX_CARRIES` gives:
+            # on macOS that is a per-user directory rather than `/tmp`, and a
+            # real `git` writes scratch files.
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
             "HOME": str(root),
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",

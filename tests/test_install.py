@@ -12,6 +12,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -146,6 +147,39 @@ class TestTheSuiteCannotReachTheMachineItRunsOn(WoswoarTestCase):
         self.assertEqual(os.environ["SHELL"], "/bin/bash")
 
 
+class TestWhatASpawnedChildInherits(WoswoarTestCase):
+    """The other half of the class above: what a test's *child* can see.
+
+    Six fixtures built one as a literal list of six names, so none carried
+    `PYTHONWARNINGS` -- which CI exports as `error::DeprecationWarning` for the
+    whole workflow. In the pty and hook suites, where the shipped CLI actually
+    runs as `python -m woswoar`, a deprecation had therefore never been an
+    error (#239). It failed quiet, which is the only reason it lasted.
+
+    Asserted through the thing itself: a child that emits one must die when the
+    policy says so. A test comparing two dicts would pass just as happily on a
+    helper nobody calls.
+    """
+
+    def test_the_warning_policy_reaches_it(self) -> None:
+        warns = "import warnings; warnings.warn('x', DeprecationWarning)"
+        with mock.patch.dict(os.environ, {"PYTHONWARNINGS": "error::DeprecationWarning"}):
+            died = subprocess.run(
+                [sys.executable, "-c", warns],
+                capture_output=True,
+                env=support.child_env(),
+                check=False,
+            )
+        self.assertNotEqual(died.returncode, 0, died.stderr)
+
+    def test_and_is_not_invented_when_it_is_absent(self) -> None:
+        """Carried, not imposed. Without this, a helper that hardcoded the flag
+        would pass the test above while telling every child the same lie."""
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONWARNINGS", None)
+            self.assertNotIn("PYTHONWARNINGS", support.child_env())
+
+
 class TestInstall(WoswoarTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -203,7 +237,7 @@ class TestInstall(WoswoarTestCase):
             text=True,
             check=True,
             timeout=30,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            env=support.child_env(HOME=str(self.home)),
         ).stdout
         self.assertTrue(Path(resolved).is_file(), f"{resolved} was not written by install")
 
@@ -523,15 +557,7 @@ class TestBothShellsRecordIntoOneHistory(WoswoarTestCase):
             argv,
             input=f"source {self.home / rcfile}\necho {marker}\n",
             text=True,
-            env={
-                "HOME": str(self.home),
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "TERM": "dumb",
-                "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
-                "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
-                "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
-                "WOSWOAR_SYNC_INTERVAL": "0",
-            },
+            env=support.child_env(HOME=str(self.home), TERM="dumb", WOSWOAR_SYNC_INTERVAL="0"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,

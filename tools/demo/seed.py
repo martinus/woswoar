@@ -377,14 +377,16 @@ def _sandbox_env(root: Path, repo: Path) -> dict[str, str]:
     of the sandbox is that it is *this* checkout that answers, not a `pipx`
     install that happens to be on the machine and a release behind.
     """
-    env = dict(os.environ)
+    # Built from `store.sandbox_environ` rather than from `os.environ` plus
+    # overrides, which is what this was and which is the shape `tools/sandbox.py`
+    # rejects in its own docstring: that one overrode four of `store.ENV_KEYS`'
+    # six names, and this one missed `WOSWOAR_SESSION` -- exported by the
+    # installed hook in every interactive shell, so a demo recorded from a real
+    # terminal carried the maintainer's own session id into the sandbox.
+    env = store.sandbox_environ(root, root / "home")
     env.update(
-        HOME=str(root / "home"),
-        PATH=f"{root / 'bin'}:{env.get('PATH', '/usr/bin:/bin')}",
+        PATH=f"{root / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
         PYTHONPATH=str(repo),
-        WOSWOAR_DIR=str(root / "data"),
-        XDG_CONFIG_HOME=str(root / "config"),
-        XDG_CACHE_HOME=str(root / "cache"),
         # The recording is of a person searching, not of a machine syncing: a
         # background `git push` in the middle of a take would be a spinner
         # nobody asked about, and there is no remote here to push to anyway.

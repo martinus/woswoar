@@ -19,6 +19,7 @@ from woswoar import search, store
 from woswoar.__main__ import main
 from woswoar.entry import Entry, format_line
 
+from . import support
 from .support import (
     MACHINE_ID,
     Captured,
@@ -1631,6 +1632,31 @@ class TestThePreviewBinding(unittest.TestCase):
 
 
 @requires_fzf
+def shimmed(root: Path, **extra: str) -> dict[str, str]:
+    """The sandbox environment, with a `woswoar` on PATH that is *this* tree.
+
+    Not optional: `_self_command` prefers whatever `woswoar` it finds, and on a
+    machine with woswoar installed that is a released copy which may predate the
+    flag under test. The picker would then pass or fail on which version happens
+    to be on the developer's PATH.
+
+    Two fixtures here need it and had a copy each; they differed only in `HOME`,
+    which is what the keyword is for.
+    """
+    bin_dir = root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "woswoar"
+    shim.write_text(f'#!/bin/sh\nexec {sys.executable} -m woswoar "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    return support.child_env(
+        PATH=f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        TERM="xterm",
+        SHELL="/bin/sh",
+        PYTHONPATH=str(Path(__file__).resolve().parent.parent),
+        **extra,
+    )
+
+
 class TestTheDirectoryPromptUnderARealFzf(WoswoarTestCase):
     """The label on screen, and still the right scope after it.
 
@@ -1655,22 +1681,7 @@ class TestTheDirectoryPromptUnderARealFzf(WoswoarTestCase):
                 handle.write(format_line(entry) + "\n")
 
     def picker_env(self) -> dict[str, str]:
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        shim = bin_dir / "woswoar"
-        shim.write_text(f'#!/bin/sh\nexec {sys.executable} -m woswoar "$@"\n', encoding="utf-8")
-        shim.chmod(0o755)
-        return {
-            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            "TERM": "xterm",
-            "HOME": str(self.home),
-            "PWD": str(self.home / "src/session-manager"),
-            "SHELL": "/bin/sh",
-            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
-            "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
-            "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
-            "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
-        }
+        return shimmed(self.root, HOME=str(self.home), PWD=str(self.home / "src/session-manager"))
 
     def test_the_prompt_shows_the_directory_and_still_cycles_out_of_dir(self) -> None:
         """Two presses, and the markers are the assertions.
@@ -1736,24 +1747,7 @@ class TestThePreviewUnderARealFzf(WoswoarTestCase):
         predate `--show` entirely. The test would then pass or fail on which
         version happens to be on the developer's PATH.
         """
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        shim = bin_dir / "woswoar"
-        shim.write_text(
-            f'#!/bin/sh\nexec {sys.executable} -m woswoar "$@"\n',
-            encoding="utf-8",
-        )
-        shim.chmod(0o755)
-        return {
-            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            "TERM": "xterm",
-            "HOME": str(self.root),
-            "SHELL": "/bin/sh",
-            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
-            "WOSWOAR_DIR": os.environ["WOSWOAR_DIR"],
-            "XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"],
-            "XDG_CACHE_HOME": os.environ["XDG_CACHE_HOME"],
-        }
+        return shimmed(self.root, HOME=str(self.root))
 
     def drive(self, steps: list[Typed]) -> list[str]:
         return run_in_pty([sys.executable, "-m", "woswoar", "search"], steps, env=self.picker_env())
@@ -1863,6 +1857,9 @@ class TestWhatFzfSubstitutesWhenNoRowIsCurrent(WoswoarTestCase):
                 Typed("\x14", "done"),
                 Typed("\x1b", ""),
             ],
+            # Deliberately bare, as in `test_shell_hook`: a shell that has
+            # never met woswoar is the subject, so `support.child_env` would
+            # hand it the sandbox and quietly change the question.
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TERM": "xterm"},
         )
         self.assertEqual(recorded.read_text(encoding="utf-8"), "[]")
