@@ -24,6 +24,7 @@ entry, errors        the record format, and the exceptions every layer raises
     cache            the parse index
       search         Ctrl-R
     gitrepo          every git fork woswoar makes
+  codec              a chunk compressed, and a bomb refused
   crypto             age and ssh-keygen
   credentials
     importer         bash, zsh, atuin
@@ -32,8 +33,8 @@ entry, errors        the record format, and the exceptions every layer raises
 deps, progress,      leaves: asked things by anyone, knowing nobody
 report
 
-sync      <- gitrepo, manifest, archive, crypto, progress, report, store,
-             entry, errors
+sync      <- gitrepo, manifest, archive, codec, crypto, progress, report,
+             store, entry, errors
 doctor    <- report, search, cache, crypto, deps, store, entry, errors
 prove     <- sync, and everything sync is made of, plus deps and report
 __main__  <- search, cache, importer, install, setup, report, store,
@@ -48,6 +49,7 @@ __main__  <- search, cache, importer, install, setup, report, store,
 | format | `entry`, `errors` | nothing else in the package |
 | platform | `store`, `crypto`, `deps`, `progress`, `report`, `credentials` | the format layer |
 | derived | `cache`, `archive`, `manifest`, `gitrepo` | the two above |
+| leaf | `codec` | nothing -- `zlib` and two bounds |
 | domains | `search`, `sync`, `importer`, `install` | everything below, and **never each other** |
 | composition | `setup`, `doctor`, `prove`, `__main__` | everything |
 
@@ -204,31 +206,29 @@ exists so that nobody has to rediscover it.
 
 **`sync.py` held five separable concerns** — the recipient-file grammar, trust
 and pinning, manifests, the chunk codec, and git plumbing — plus the
-orchestration that drives them and the status queries `doctor` asks. #201 has
-taken two of them out, as `manifest.py` and `gitrepo.py`, and stopped there on
-purpose: `run`, `export`, `merge` and `_Day` stay together for the reason
+orchestration that drives them and the status queries `doctor` asks. #201 took
+two of them out, as `manifest.py` and `gitrepo.py`, and #214 took the third as
+`codec.py`. What is left stays on purpose: `run`, `export`, `merge` and `_Day` stay together for the reason
 "Two costs shape everything" gives above — those operations are ordered and the
 ordering is the correctness argument. Each of the three is one line from being
 broken, and they want to be read in one sequence rather than found in three files.
 
-So the file came down by a tenth and is still well over 3000 lines, not the
-~1500 that [#203](https://github.com/martinus/woswoar/issues/203) asks for. That
-target is not met and is not being quietly dropped. What the two slices bought is
-the other criterion: a behaviour of either layer can now be reached without
-driving `run()`. `tests/test_manifest.py` is the first collection of that, and it
+So the file came down by an eighth and is still over 3000 lines, not the ~1500
+that [#203](https://github.com/martinus/woswoar/issues/203) asks for. That target
+is not met and is not being quietly dropped. What the three slices bought is the
+other criterion: a behaviour of any of them can now be reached without driving
+`run()`. `tests/test_manifest.py` and `tests/test_codec.py` are that, and it
 is not a tidiness exercise — `manifest.signs_and_verifies` is the check behind
 `doctor`'s `signing` line, and while it sat inline in `sync.signing_status`
 nothing in the suite reached it. Replacing the verify call with `return False`
 survived every one of the 966 tests.
 
-Of the three concerns still in there, two really are a redesign of `run` rather
+Of the two concerns still in there, both really are a redesign of `run` rather
 than a move — trust and pinning is a set of functions that each take `State` and
 record an `Outcome` into `Report`, and the recipients grammar has `add_recipient`
-sitting inside the `grant`/`revoke` flow. The third is not: the chunk codec
-(`pack`, `unpack`, `split_for_export` and the two size bounds) imports nothing
-from the package, and no ordering argument touches it. That is a cleaner slice
-than either of the two taken here, and it is
-[#214](https://github.com/martinus/woswoar/issues/214).
+sitting inside the `grant`/`revoke` flow. The one that was not is gone: the chunk
+codec imported nothing from the package and no ordering argument touched it,
+which made it a cleaner slice than either module #201 took.
 
 The visible symptom *was* `sync.Report`: seventeen fields, each a failure from a
 different one of those layers. #199 has collapsed it. The ten fields that were
@@ -331,3 +331,4 @@ outcome collapse in #199 is what turned #201 from a redesign into two moves.
 | 2 | ~~[#199](https://github.com/martinus/woswoar/issues/199) — one shape for outcome reporting~~ — **done**, in three parts: `report.Check`, `report.Notice`, and `sync.Outcome` collapsing `Report`'s seventeen fields to seven. |
 | 3 | ~~[#202](https://github.com/martinus/woswoar/issues/202) — lift the installer and the setup wizard out of `__main__.py`~~ — **done**, as `woswoar/install.py` and `woswoar/setup.py`. |
 | 4 | ~~[#201](https://github.com/martinus/woswoar/issues/201) — split `sync.py`, in slices, after the three above~~ — **done**, as `woswoar/manifest.py` and `woswoar/gitrepo.py`. The orchestration stayed; see above for why, and for the line count that did not reach its target. |
+| 5 | ~~[#214](https://github.com/martinus/woswoar/issues/214) — the chunk codec, the third slice~~ — **done**, as `woswoar/codec.py`. A pure move: `tools/compare.py` reports `identical` over `init status doctor sync grant stats`, scrubbing only freshly generated key material. |
