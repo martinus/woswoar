@@ -32,6 +32,48 @@ MACHINE_ID = "0123456789abcdef"
 #: forgotten in the other.
 requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
+
+
+def git(root: Path, *argv: str) -> str:
+    """Run `git` against `root` with a configuration of its own, and return stdout.
+
+    Hardened here rather than at each fixture, because every clause was paid for
+    once and must not have to be paid for again: a maintainer whose global
+    config signs commits or renames the default branch must not fail a suite for
+    reasons that are not the code under test, and `check=True` turns a machine
+    without git into an error rather than the skip `requires_git` gives.
+
+    `PATH` is carried across rather than hardcoded -- there is no
+    sandbox-relative answer to where the real `git` lives, and a machine with it
+    outside `/usr/bin` (Nix, a Homebrew-first PATH, most containers) would
+    otherwise fail for the same irrelevant reason. Same argument
+    `store.SANDBOX_CARRIES` makes, one layer down.
+    """
+    finished = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            *argv,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(root),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+    )
+    return finished.stdout
+
+
 requires_ssh_keygen = unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen required")
 requires_bash = unittest.skipUnless(shutil.which("bash"), "bash required")
 requires_zsh = unittest.skipUnless(shutil.which("zsh"), "zsh required")

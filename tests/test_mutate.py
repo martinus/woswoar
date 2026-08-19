@@ -29,6 +29,9 @@ from unittest import mock
 from tools import mutate, reached
 from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
 
+from . import support
+from .support import requires_git
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: The module every fixture here mutates. One spelling: three fixtures wrote it
@@ -63,23 +66,39 @@ class MutateTestCase(unittest.TestCase):
         path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
         return path
 
-    def package(self, guarded: bool) -> None:
-        """A module with one behaviour, and a test that may or may not see it."""
-        self.write("mod.py", CLAMP)
-        assertion = (
-            "self.assertEqual(mod.clamp(-5), 0)" if guarded else "self.assertEqual(mod.clamp(5), 5)"
-        )
+    def package(self, guarded: bool, inside: str = "", both: bool = False) -> None:
+        """A module with one behaviour, and a test that may or may not see it.
+
+        `inside` puts it in a package, which is what a *generated* table needs:
+        `mutants.mutable` only generates for paths under `woswoar/` or `tools/`,
+        so a module at the sandbox root is invisible to `--base`.
+
+        `both` asserts the guarded branch *and* the unguarded one, which a
+        generated `branch` table needs -- its two mutants are "the guard always
+        fires" and "it never does", and catching them takes an assertion each.
+        It is a parameter rather than the default because a stronger fixture
+        changes what the rest of this file observes: turned on for everyone,
+        `TestAnUnanswerableRowNeedNotEndTheRun` stops having a surviving row to
+        report, which is most of what that test is for.
+        """
+        self.write(f"{inside}/mod.py" if inside else "mod.py", CLAMP)
+        sees = "self.assertEqual(mod.clamp(-5), 0)" if guarded else ""
+        seen = [
+            line
+            for line in (sees, "self.assertEqual(mod.clamp(5), 5)" if both or not guarded else "")
+            if line
+        ]
         self.write(
-            "test_mod.py",
+            f"{inside}/../tests/test_mod.py" if inside else "test_mod.py",
             f"""
             import unittest
 
-            import mod
+            {f"from {inside} import mod" if inside else "import mod"}
 
 
             class T(unittest.TestCase):
                 def test_it(self) -> None:
-                    {assertion}
+                    {"; ".join(seen)}
             """,
         )
 
@@ -850,8 +869,15 @@ class TestAllDropsTheDiffSizedCap(unittest.TestCase):
         self.assertNotIn("not run", self.listed("--all"))
 
     def test_an_explicit_limit_is_still_honoured(self) -> None:
-        """Reset, not ignored: someone who says `--limit 50` means it."""
-        self.assertIn("--limit 50:", self.listed("--all", "--limit", "50"))
+        """Reset, not ignored: someone who says `--limit 50` means it.
+
+        The count as well as the notice, because a cap that says it dropped
+        rows and then runs a different number of them is the same wrong answer
+        told twice.
+        """
+        listed = self.listed("--all", "--limit", "50")
+        self.assertIn("--limit 50:", listed)
+        self.assertEqual(len([line for line in listed.splitlines() if line.startswith("  ")]), 50)
 
     def test_a_diff_run_keeps_the_default(self) -> None:
         """The default exists for this shape and must not be collateral."""
@@ -1929,6 +1955,113 @@ class TestOneLaneIsNotADeadlock(MutateTestCase):
         self.assertIn("caught", finished.stdout, finished.stderr)
 
 
+def cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """`python -m tools.mutate` against `root`, as someone would type it.
+
+    `PYTHONPATH` is the repository, so the harness under test is this tree's
+    while the code it mutates is the sandbox's -- the same split `_run` makes
+    for the probe, and the reason a fixture may shadow `woswoar` only if it
+    provides the whole package (`tools.sandbox` imports `store`).
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "tools.mutate", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+    )
+
+
+@requires_git
+class TestTheGeneratedEntryPoint(MutateTestCase):
+    """`--base`, `--json`, `--no-confirm` and the exit status (#235).
+
+    Everything in `TestTheScriptEntryPoint` drives a *spec file*, which is the
+    other branch of `main` -- so the branch a maintainer actually types was
+    executed by no test at all. The first full sweep of `tools/` found 24
+    surviving mutants in it, including `--json` never written and the exit
+    status inverted. `--all`'s reset of the diff-sized `--limit` is not here:
+    `TestAllDropsTheDiffSizedCap` already drives it through `main`, and `--all`
+    consults no git at all, so a repository fixture would be scaffolding this
+    class needs and that question does not.
+
+    The fixture is a real git repository, because `_SKIP` keeps `.git` out of a
+    sandbox and a diff needs one. It also holds a *copy* of `woswoar/`: a
+    mutable path has to start with `woswoar/` or `tools/`, and a fixture package
+    that shadows either without providing it breaks the harness's own imports.
+    """
+
+    def repo(self, guarded: bool) -> None:
+        shutil.copytree(
+            REPO_ROOT / "woswoar",
+            self.root / "woswoar",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        self.write("tests/__init__.py", "")
+        self.package(guarded, inside="woswoar", both=True)
+        moved = self.root / "woswoar" / "mod.py"
+        source = moved.read_text(encoding="utf-8")
+        moved.unlink()
+        support.git(self.root, "init", "--quiet", "--template=")
+        support.git(self.root, "add", ".")
+        support.git(self.root, "commit", "--quiet", "-m", "base")
+        # The module lands *after* that commit, and only then: `changed_lines`
+        # treats every untracked mutable file as wholly changed, so a `woswoar/`
+        # left out of it puts the whole package in the diff. It did, on the
+        # first run of this fixture -- 200 rows against `sync.py` for a test
+        # about `mod.py`.
+        moved.write_text(source, encoding="utf-8")
+
+    def test_a_diff_generates_rows_and_a_clean_run_exits_zero(self) -> None:
+        self.repo(guarded=True)
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch")
+        self.assertIn("caught", finished.stdout)
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+
+    def test_a_survivor_makes_the_exit_status_one(self) -> None:
+        """The half a reader believes without checking: a run that found
+        something and said so is not a run that succeeded."""
+        self.repo(guarded=False)
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch")
+        self.assertIn("SURVIVED", finished.stdout)
+        self.assertEqual(finished.returncode, 1, finished.stdout + finished.stderr)
+
+    def test_json_holds_every_row_that_was_printed(self) -> None:
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report))
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        written = json.loads(report.read_text(encoding="utf-8"))
+        self.assertFalse(written["baseline_red"])
+        # As many rows as were printed, and about the file the diff touched.
+        # What each row must *hold* is `TestTheJsonReport`'s question, asked
+        # once there rather than again here.
+        self.assertEqual(
+            len(written["results"]), finished.stdout.count("  caught  "), finished.stdout
+        )
+        self.assertEqual({row["path"] for row in written["results"]}, {"woswoar/mod.py"})
+
+    def test_no_confirm_says_what_it_did_not_do(self) -> None:
+        """A survivor that was never re-run against the whole suite may simply
+        have been run against tests that cannot see it, and that is the
+        expensive error -- it sends someone to rewrite a test that was fine."""
+        self.repo(guarded=False)
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--no-confirm")
+        self.assertIn("were not re-run against the whole suite", finished.stdout)
+        self.assertEqual(finished.returncode, 1)
+
+    def test_the_two_ways_of_asking_for_nothing_are_refused(self) -> None:
+        for args, said in (
+            (("--all", "--base", "HEAD"), "Not both"),
+            ((), "give a spec file"),
+        ):
+            with self.subTest(args=args):
+                finished = cli(self.root, *args)
+                self.assertEqual(finished.returncode, 2, finished.stderr)
+                self.assertIn(said, finished.stderr)
+
+
 class TestTheScriptEntryPoint(MutateTestCase):
     def test_it_runs_a_table_from_a_file(self) -> None:
         self.package(guarded=True)
@@ -1947,14 +2080,7 @@ class TestTheScriptEntryPoint(MutateTestCase):
         self.assertIn("caught", finished.stdout)
 
     def drive(self, name: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, "-m", "tools.mutate", str(self.root / name)],
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
-        )
+        return cli(self.root, str(self.root / name))
 
     def test_a_script_that_calls_verify_itself_is_not_a_failure(self) -> None:
         """#213: it ran the table, printed `caught`, and then exited 1.
