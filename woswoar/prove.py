@@ -32,7 +32,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import archive, crypto, deps, gitrepo, store, sync
+from . import archive, codec, crypto, deps, gitrepo, store, sync
 from .entry import Entry
 from .errors import WoswoarError
 from .report import Check
@@ -184,7 +184,7 @@ def _pushed_plaintext(origin: Path, known: store.Machine, day: str) -> bytes:
     pieces = []
     for name in listing.splitlines():
         blob = _git_bytes("cat-file", "blob", f"{tip}:{name}", cwd=origin)
-        pieces.append(sync.unpack(crypto.decrypt_with_secret(blob, day_secret)))
+        pieces.append(codec.unpack(crypto.decrypt_with_secret(blob, day_secret)))
     return b"".join(pieces)
 
 

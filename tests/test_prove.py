@@ -22,7 +22,7 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
-from woswoar import crypto, prove, store, sync
+from woswoar import codec, crypto, prove, store, sync
 
 from . import support
 from .support import WoswoarTestCase, requires_age, requires_bash, requires_git, requires_ssh_keygen
@@ -141,7 +141,7 @@ class TestAPlantedLeakIsCaught(ProveTestCase):
         with (
             mock.patch.object(crypto, "encrypt_to", lambda data, recipient: data),
             mock.patch.object(crypto, "encrypt_to_recipients", lambda data, recipients: data),
-            mock.patch.object(sync, "pack", lambda data: data),
+            mock.patch.object(codec, "pack", lambda data: data),
         ):
             ran = self.prove()
         self.assertEqual(ran.code, 1, ran.out + ran.err)
@@ -170,7 +170,7 @@ class TestAWrongChunkGoesRed(ProveTestCase):
 
     def test_a_chunk_without_the_canary_fails_sealed(self) -> None:
         with mock.patch.object(
-            sync, "pack", lambda data: zlib.compress(b"1700000000\tprove\t~\t0\t1\tnot it\n")
+            codec, "pack", lambda data: zlib.compress(b"1700000000\tprove\t~\t0\t1\tnot it\n")
         ):
             ran = self.prove()
         self.assertEqual(ran.code, 1, ran.out + ran.err)

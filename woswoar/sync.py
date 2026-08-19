@@ -25,7 +25,7 @@ stayed in one file because the *ordering* between them is the correctness
 argument rather than an implementation detail, and each of the three orderings
 that matter is one line from being broken. The list is in `docs/architecture.md`
 under "The repository is append-only", and each one is also commented where it is
-enforced. Two layers did come out cleanly: `manifest`, the authenticity layer,
+enforced. Three layers did come out cleanly: `manifest`, the authenticity layer,
 and `gitrepo`, every git fork and the only thing here that talks to the network
 -- so nothing in this module spawns a subprocess any more.
 """
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, crypto, gitrepo, manifest, progress, store
+from . import archive, codec, crypto, gitrepo, manifest, progress, store
 from .entry import make_inert
 from .errors import SyncError, WoswoarError
 from .report import Check, Notice
@@ -1346,117 +1346,6 @@ def apply_withdrawals(state: State, report: Report) -> None:
 # ---------------------------------------------------------------------------
 
 
-def pack(data: bytes) -> bytes:
-    """Compress a chunk's lines before they are sealed.
-
-    This is the only moment compression is possible. age does not compress, and
-    ciphertext is incompressible by definition, so once the bytes are sealed
-    neither git's packfile nor anything else can ever shrink them again -- and
-    the repo is append-only, so there is no second chance. Shell history is
-    extremely repetitive, and the measured effect on repo size is in
-    docs/woswoar_design_summary.md.
-
-    Deliberately unconditional. An earlier version tagged each payload raw-or-
-    deflated and stored whichever was smaller, on the theory that a very short
-    chunk would inflate. On real line shapes it does not: a single-line chunk
-    is 42 bytes raw and 35 deflated, so the tag saved a byte exactly once and
-    cost one on every chunk after that.
-    """
-    return zlib.compress(data, 9)
-
-
-#: The most a single chunk may decompress to.
-#:
-#: deflate reaches about 1030:1, so an unbounded `zlib.decompress` turns a
-#: 204 KB commit into 200 MiB of log and 420 MiB of RSS -- measured -- and a
-#: 10 MB one into roughly 10 GB, on a timer that fires every minute and asks
-#: nobody. The cap is what stops one machine deciding how much memory every
-#: other machine spends.
-#:
-#: Sized against what a real chunk holds, measured on generated history:
-#:
-#:     a typical day                        0.03 MiB
-#:     a very heavy day                     0.35 MiB
-#:     an entire bash_history, imported     4.43 MiB
-#:
-#: so 64 MiB is about fifteen times the largest legitimate case anyone has --
-#: importing a whole shell history in one go -- and still two hundred times
-#: smaller than what the same bytes could otherwise expand to. The case it does
-#: refuse is a single chunk holding tens of thousands of *maximum-length*
-#: commands, which is 383 MiB of plaintext; that is legal but has never
-#: happened, and refusing it is reported rather than silent.
-MAX_CHUNK_BYTES = 64 * 1024 * 1024
-
-
-#: Most plaintext this machine will put in one chunk.
-#:
-#: `MAX_CHUNK_BYTES` is what a *reader* refuses. Nothing used to stop a writer
-#: exceeding it: `read_tail` is bounded by "everything since the last export",
-#: not by size, so a machine importing a decade of history in one go could seal
-#: a chunk every peer would then refuse -- silently and permanently, because
-#: `state.exported` has already moved past those bytes and its own copy in
-#: `logs/` looks fine.
-#:
-#: Eight times under the reader's cap rather than just below it, so the two
-#: numbers can move independently and the writer never has to reason about
-#: compression -- this bounds the plaintext, which is exactly what the reader
-#: measures. An entire imported bash_history is 4.43 MiB, so nothing anyone
-#: actually has is split at all; this is the shape of the failure, not its
-#: likelihood, and one-sided invariants are the ones that stay true.
-MAX_EXPORT_BYTES = 8 * 1024 * 1024
-
-
-def split_for_export(data: bytes, limit: int = MAX_EXPORT_BYTES) -> Iterator[bytes]:
-    """``data`` in pieces of at most ``limit`` bytes, split only at line ends.
-
-    A piece has to be whole lines: a chunk is decrypted, decompressed and parsed
-    line by line, so a record cut in half would be dropped by one reader and
-    never seen by any.
-
-    A single line longer than the limit is yielded whole rather than split,
-    which is why the limit is "at most" only for lines that fit. It cannot
-    happen today -- `entry.MAX_CMD_CHARS` bounds a record to about 8 KB against
-    a limit of 8 MiB -- but splitting mid-record to honour a size bound would
-    trade a bound nobody is near for corruption everybody would see.
-    """
-    start = 0
-    while len(data) - start > limit:
-        cut = data.rfind(b"\n", start, start + limit)
-        if cut < 0:
-            # No line end within the budget: take the whole over-long line.
-            cut = data.find(b"\n", start + limit)
-            if cut < 0:
-                break
-        yield data[start : cut + 1]
-        start = cut + 1
-    if start < len(data):
-        yield data[start:]
-
-
-def unpack(blob: bytes, limit: int = MAX_CHUNK_BYTES) -> bytes:
-    """Inverse of :func:`pack`, refusing anything implausibly large.
-
-    Not defensive about *shape* on purpose: zlib rejects anything that is not a
-    deflate stream, so a payload written by some future format fails here rather
-    than being appended to a log as garbage.
-
-    It is defensive about *size*, which is a different question and the one the
-    original version did not ask. `decompressobj` is what allows that: it stops
-    at ``limit`` instead of allocating whatever the stream asks for, so the
-    refusal costs one bounded buffer rather than the allocation being refused.
-    """
-    engine = zlib.decompressobj()
-    out = engine.decompress(blob, limit)
-    if not engine.eof:
-        # `eof` alone, not `eof or unconsumed_tail`: a stream stopped by the
-        # limit leaves both, and a truncated one leaves eof clear with no tail,
-        # so the tail says nothing the first test has not. The two are told
-        # apart for the message only -- to a caller they are one refusal.
-        stopped_early = "is longer than" if engine.unconsumed_tail else "was truncated before"
-        raise zlib.error(f"chunk {stopped_early} the {limit} byte limit")
-    return out
-
-
 def export(known: Machine, state: State, report: Report, now: int) -> bool:
     """Seal each log file's new lines into a fresh chunk, and sign the day's list.
 
@@ -1579,13 +1468,13 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
 
         for relpath, data, new_offset in tails:
             # Split rather than capped: a reader refuses a chunk over
-            # `MAX_CHUNK_BYTES`, and the writer used to be able to exceed that
-            # with no idea it had. See `MAX_EXPORT_BYTES`. A day already holds
+            # `codec.MAX_CHUNK_BYTES`, and the writer used to be able to exceed that
+            # with no idea it had. See `codec.MAX_EXPORT_BYTES`. A day already holds
             # many chunks, so this needs no format change and is invisible to
             # anything whose tail fits -- which is everything anyone has.
             public = day_public_key(known, day)
-            for piece in split_for_export(data, MAX_EXPORT_BYTES):
-                sealed = crypto.encrypt_to(pack(piece), public)
+            for piece in codec.split_for_export(data, codec.MAX_EXPORT_BYTES):
+                sealed = crypto.encrypt_to(codec.pack(piece), public)
                 written = archive.new_chunk(known.id, day, now)
                 store.write_atomic(written, sealed)
                 listed[written.name] = manifest.ManifestEntry(manifest.digest_of(sealed))
@@ -1816,11 +1705,11 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 continue
 
             try:
-                plaintext = unpack(crypto.decrypt_with_secret(blob, secret))
+                plaintext = codec.unpack(crypto.decrypt_with_secret(blob, secret))
             except (crypto.AgeError, zlib.error, OSError):
                 # Same judgement as an unopenable day key above: a chunk we
                 # cannot consume -- damaged, written by a woswoar that packs it
-                # some other way, or expanding past `MAX_CHUNK_BYTES` -- must not
+                # some other way, or expanding past `codec.MAX_CHUNK_BYTES` -- must not
                 # abort the sync. Aborting would block this machine's own export
                 # and every other host's readable chunks, on this run and every
                 # run after it.
@@ -1995,7 +1884,7 @@ class _Day:
 
 
 #: How much merged plaintext to hold before writing it out. Not a correctness
-#: bound -- `MAX_CHUNK_BYTES` is -- just the point at which holding more stops
+#: bound -- `codec.MAX_CHUNK_BYTES` is -- just the point at which holding more stops
 #: buying fewer file opens. One open per day was the old behaviour and is still
 #: what happens for any host with less than this waiting.
 FLUSH_BYTES = 8 * 1024 * 1024
@@ -3012,7 +2901,7 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
     where asking for it is what was meant.
 
     Returns (days compacted, chunks replaced, days left alone because merging
-    them would exceed `MAX_EXPORT_BYTES`).
+    them would exceed `codec.MAX_EXPORT_BYTES`).
     """
     crypto.require()
     crypto.require_signing()
@@ -3074,7 +2963,7 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
                 )
             try:
                 plaintexts = [
-                    unpack(
+                    codec.unpack(
                         crypto.decrypt_with_secret(
                             manifest.open_chunk(c.path, listed[c.name].digest), secret
                         )
@@ -3083,15 +2972,15 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
                 ]
             except (ValueError, zlib.error) as exc:
                 # `zlib.error` as well as `ValueError`, which it is not a
-                # subclass of: `manifest.open_chunk` raises the second and `unpack` the
+                # subclass of: `manifest.open_chunk` raises the second and `codec.unpack` the
                 # first, so catching only one let a chunk that will not
-                # decompress -- damaged, or past `MAX_CHUNK_BYTES` -- escape as
+                # decompress -- damaged, or past `codec.MAX_CHUNK_BYTES` -- escape as
                 # a bare zlib traceback instead of the guided refusal.
                 raise SyncError(f"refusing to compact {day}: {exc}") from exc
 
             # Compaction is the other producer of chunks, so it is bound by the
             # same budget: joining a whole day unbounded would rebuild exactly
-            # the over-cap chunk `MAX_EXPORT_BYTES` exists to prevent, and then
+            # the over-cap chunk `codec.MAX_EXPORT_BYTES` exists to prevent, and then
             # unlink the smaller ones that were fine -- leaving a day no peer
             # can read and no way to re-export it.
             #
@@ -3104,12 +2993,12 @@ def compact(before: str | None = None) -> tuple[int, int, int]:
             # large stays as the small chunks it already is, which is correct
             # if untidy.
             plain = b"".join(plaintexts)
-            if len(plain) > MAX_EXPORT_BYTES:
+            if len(plain) > codec.MAX_EXPORT_BYTES:
                 skipped += 1
                 continue
 
             merged = archive.new_chunk(known.id, day, int(chunks[-1].name.split("-")[0]))
-            sealed = crypto.encrypt_to(pack(plain), crypto.public_of(secret))
+            sealed = crypto.encrypt_to(codec.pack(plain), crypto.public_of(secret))
             store.write_atomic(merged, sealed)
             for chunk in chunks:
                 chunk.path.unlink()

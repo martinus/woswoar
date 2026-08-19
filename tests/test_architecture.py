@@ -47,10 +47,12 @@ REPO = Path(__file__).resolve().parent.parent
 #: this is for; a table that only caught *additions* would silently rot as
 #: modules lost dependencies and stop describing the package it claims to pin.
 #:
-#: The five leaves are leaves on purpose. `errors` holds the exceptions every
+#: The six leaves are leaves on purpose. `errors` holds the exceptions every
 #: layer raises; `deps`, `progress` and `report` are asked things by the layers
-#: above without knowing anything about them -- so each of them stays importable
-#: from anywhere without dragging a domain along. `report` in particular has to
+#: above without knowing anything about them; `codec` is `zlib` and a pair of
+#: bounds, which is why it could leave `sync` when nothing else could -- so each
+#: of them stays importable from anywhere without dragging a domain along.
+#: `report` in particular has to
 #: be free: a check is a value any module might hand back, and a value type that
 #: cost you an import of the CLI would not be used.
 LAYERS: dict[str, set[str]] = {
@@ -59,6 +61,7 @@ LAYERS: dict[str, set[str]] = {
     "deps": set(),
     "progress": set(),
     "report": set(),
+    "codec": set(),
     "credentials": {"errors"},
     "crypto": {"errors"},
     "store": {"entry"},
@@ -84,6 +87,7 @@ LAYERS: dict[str, set[str]] = {
     "manifest": {"archive", "crypto", "entry", "errors", "store"},
     "sync": {
         "archive",
+        "codec",
         "crypto",
         "entry",
         "errors",
@@ -100,9 +104,12 @@ LAYERS: dict[str, set[str]] = {
     #: `gitrepo` for the commit boilerplate it must not mistake for a leaked
     #: username; `manifest` only through `sync`. Both arrived when #201 turned
     #: two of sync's internal layers into modules, which is a name for an edge
-    #: that already existed rather than a new one.
+    #: that already existed rather than a new one. `codec` is the third and the
+    #: only one `prove` calls *directly* -- it unpacks a chunk itself to prove
+    #: the round trip, which is the whole of what it is for.
     "prove": {
         "archive",
+        "codec",
         "crypto",
         "deps",
         "entry",
@@ -228,7 +235,7 @@ MAY_SPAWN_GIT = {"gitrepo", "prove"}
 
 #: Modules whose functions the test suite patches to count what a sync did, and
 #: which therefore have to be reached by attribute rather than by ``from`` import.
-SPY_SEAMS = ("gitrepo", "manifest")
+SPY_SEAMS = ("codec", "gitrepo", "manifest")
 
 
 class TestOneModuleSpawnsGit(unittest.TestCase):

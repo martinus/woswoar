@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import tracemalloc
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
@@ -27,6 +26,7 @@ from unittest import mock
 from woswoar import (
     archive,
     cache,
+    codec,
     crypto,
     errors,
     gitrepo,
@@ -771,41 +771,6 @@ class TestImmutability(SyncTestCase):
         )
 
 
-class TestChunkPayload(unittest.TestCase):
-    """The chunk encoding, without needing age or git."""
-
-    def test_round_trip(self) -> None:
-        for data in (b"", b"x", b"a line\n", b"repeated line\n" * 500, bytes(range(256))):
-            self.assertEqual(sync.unpack(sync.pack(data)), data)
-
-    def test_repetitive_input_shrinks(self) -> None:
-        # Shell history is repetitive by nature, and this is the one moment it
-        # can be compressed: once sealed, ciphertext is incompressible forever.
-        data = b"1700000000\ts1\t~/src\t0\t5\tgit status\n" * 200
-        self.assertLess(len(sync.pack(data)), len(data) // 10)
-
-    def test_a_tiny_chunk_costs_only_a_few_bytes(self) -> None:
-        """Deflate has a floor, and one very short line can land above it.
-
-        This is what `pack` used to avoid by tagging each payload raw-or-
-        deflated and keeping the smaller. It was not worth it: the tag cost a
-        byte on every chunk that *did* compress, which is all but the shortest,
-        and the worst case it bought back is the handful of bytes below --
-        against a sealed chunk that already carries a 200-byte age header.
-        """
-        data = b"1700000000\ts1\t~\t0\t5\tls\n"
-        self.assertLess(len(sync.pack(data)) - len(data), 8)
-
-    def test_a_payload_we_cannot_read_is_refused(self) -> None:
-        # Loudly, rather than decoding into garbage that then gets appended to
-        # a log file and cached. `_merge_host` turns this into an unreadable
-        # chunk rather than letting it abort the sync.
-        truncated = zlib.compress(b"x" * 5000)[:20]
-        for blob in (b"\x7fanything", b"", b"1700000000\ts1\t~\t0\t5\tls\n", truncated):
-            with self.assertRaises(zlib.error):
-                sync.unpack(blob)
-
-
 class TestGrantConfirmation(SyncTestCase):
     """`grant` widens who can read everything, so it says so and asks first."""
 
@@ -1288,7 +1253,7 @@ class TestARevokedMachineCannotPublish(SyncTestCase):
                 pub = archive.day_key_public(alpha.id, day)
                 entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted-under-alpha")
                 sealed = crypto.encrypt_to(
-                    sync.pack((format_line(entry) + "\n").encode("utf-8")),
+                    codec.pack((format_line(entry) + "\n").encode("utf-8")),
                     pub.read_text(encoding="utf-8").strip(),
                 )
                 target = archive.chunk_dir(alpha.id, day) / "9999999999-ffffff.age"
@@ -1364,7 +1329,7 @@ class TestExportNeverSignsWhatItDidNotWrite(SyncTestCase):
             sync.grant()
             entry = Entry(1_700_000_900, alpha.id, "s1", "~", 0, 5, "planted")
             pub = archive.day_key_public(alpha.id, "2023-11-14").read_text(encoding="utf-8").strip()
-            sealed = crypto.encrypt_to(sync.pack((format_line(entry) + "\n").encode("utf-8")), pub)
+            sealed = crypto.encrypt_to(codec.pack((format_line(entry) + "\n").encode("utf-8")), pub)
             (archive.chunk_dir(alpha.id, "2023-11-14") / "9999999999-ffffff.age").write_bytes(
                 sealed
             )
@@ -2427,7 +2392,7 @@ class TestChunkAuthenticity(SyncTestCase):
         """
         pub = (work / "hosts" / host_id / "keys" / f"{day}.pub").read_text(encoding="utf-8").strip()
         entry = Entry(1_700_000_900, host_id, "s1", "~", 0, 5, cmd)
-        payload = sync.pack((format_line(entry) + "\n").encode("utf-8"))
+        payload = codec.pack((format_line(entry) + "\n").encode("utf-8"))
         # Named far in the future so it sorts above whatever the real machine
         # has published; a forgery that lands among chunks already merged
         # proves nothing.
@@ -2895,47 +2860,6 @@ class TestADecompressionBomb(SyncTestCase):
     compromised machine against every other one.
     """
 
-    def test_a_bomb_is_refused_rather_than_expanded(self) -> None:
-        bomb = zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9)
-        self.assertLess(len(bomb), 1024 * 1024, "the fixture should be small to be a bomb")
-        with self.assertRaises(zlib.error):
-            sync.unpack(bomb)
-
-    def test_the_boundary_is_where_it_says_it_is(self) -> None:
-        """Exactly at the cap is legitimate; one byte past it is not.
-
-        An off-by-one here either refuses a chunk a machine legitimately sent or
-        leaves the last doubling unbounded, and neither shows up in a test that
-        only tries a 200 MiB bomb.
-        """
-        limit = sync.MAX_CHUNK_BYTES
-        self.assertEqual(len(sync.unpack(zlib.compress(b"x" * limit, 9))), limit)
-        with self.assertRaises(zlib.error):
-            sync.unpack(zlib.compress(b"x" * (limit + 1), 9))
-
-    def test_the_refusal_costs_a_bounded_allocation(self) -> None:
-        """`decompressobj` stops at the limit; `decompress` allocates first.
-
-        Refusing *after* materialising the payload would leave the memory
-        exhaustion in place and merely decline to write the file, so this
-        measures what `sync.unpack` actually allocates rather than asserting a
-        property of the standard library -- which is what it did first, and
-        which passed perfectly well with the fix reverted.
-        """
-        bomb = zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 4), 9)
-        tracemalloc.start()
-        try:
-            with self.assertRaises(zlib.error):
-                sync.unpack(bomb)
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-        # The bomb expands to four times the cap, so unbounded this peaks at
-        # 256 MiB; bounded it peaks around 128 MiB -- the 64 MiB buffer plus the
-        # doubling zlib does while filling it. Three times the cap sits in the
-        # gap with room on both sides, which a tighter bound did not.
-        self.assertLess(peak, sync.MAX_CHUNK_BYTES * 3)
-
     def test_a_bomb_in_a_real_chunk_is_reported_and_merges_nothing(self) -> None:
         """Through the whole path: it is refused like any other unusable chunk,
         the sync completes, and everything else still merges."""
@@ -2950,7 +2874,7 @@ class TestADecompressionBomb(SyncTestCase):
             # A chunk alpha signs, holding a payload that unpacks far too big.
             day = "2023-11-14"
             pub = archive.day_key_public(alpha.id, day).read_text(encoding="utf-8").strip()
-            sealed = crypto.encrypt_to(zlib.compress(b"\n" * (sync.MAX_CHUNK_BYTES * 2), 9), pub)
+            sealed = crypto.encrypt_to(zlib.compress(b"\n" * (codec.MAX_CHUNK_BYTES * 2), 9), pub)
             path = archive.chunk_dir(alpha.id, day) / "1900000000-ffffff.age"
             path.write_bytes(sealed)
             listed = manifest.read(alpha.id, day, sync.signing_public())
@@ -3686,7 +3610,7 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
         with alpha.active():
             for i in range(200):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
-            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+            with mock.patch.object(codec, "MAX_EXPORT_BYTES", 512):
                 report = sync.run()
 
             self.assertGreater(report.chunks_written, 1, "the tail was not split")
@@ -3694,7 +3618,7 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
 
             secret = sync.open_day_key(store.machine(), alpha.id, "2023-11-14")
             for chunk in archive.iter_chunks(alpha.id):
-                plain = sync.unpack(crypto.decrypt_with_secret(chunk.path.read_bytes(), secret))
+                plain = codec.unpack(crypto.decrypt_with_secret(chunk.path.read_bytes(), secret))
                 self.assertLessEqual(len(plain), 512, f"{chunk.name} is over the budget")
 
     def test_a_peer_gets_every_line(self) -> None:
@@ -3703,7 +3627,7 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
         with alpha.active():
             for i in range(200):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
-            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+            with mock.patch.object(codec, "MAX_EXPORT_BYTES", 512):
                 sync.run()
 
         with beta.active():
@@ -3731,11 +3655,11 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
             for i in range(400):
                 alpha.record("2023-11-14", 1_700_000_000 + i, f"command number {i}")
                 if i % 40 == 39:
-                    with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+                    with mock.patch.object(codec, "MAX_EXPORT_BYTES", 512):
                         sync.run()
 
             before = {c.name for c in archive.iter_chunks(alpha.id)}
-            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+            with mock.patch.object(codec, "MAX_EXPORT_BYTES", 512):
                 days, replaced, skipped = sync.compact(before="2023-12-01")
 
             self.assertEqual((days, replaced), (0, 0), "an over-budget day was merged")
@@ -3775,14 +3699,14 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
                 real(path, data)
 
             with (
-                mock.patch.object(sync, "MAX_EXPORT_BYTES", 512),
+                mock.patch.object(codec, "MAX_EXPORT_BYTES", 512),
                 mock.patch.object(store, "write_atomic", die_after_two),
                 self.assertRaises(OSError),
             ):
                 sync.run()
 
             self.assertEqual(sync.State.load().exported, {}, "a dead run saved a watermark")
-            with mock.patch.object(sync, "MAX_EXPORT_BYTES", 512):
+            with mock.patch.object(codec, "MAX_EXPORT_BYTES", 512):
                 sync.run()
 
         with beta.active():
@@ -3795,34 +3719,6 @@ class TestASingleChunkStaysUnderTheReadersCap(SyncTestCase):
             sync.run()
             self.assertEqual(len(beta.commands()), 200)
             self.assertEqual(len(set(beta.commands())), 200, "a line arrived twice")
-
-
-class TestSplitForExport(unittest.TestCase):
-    """The splitter on its own, where the edges are cheap to state."""
-
-    def test_it_is_lossless_and_line_aligned(self) -> None:
-        data = b"".join(b"line %d\n" % i for i in range(50))
-        for limit in (1, 7, 8, 20, 1000):
-            with self.subTest(limit=limit):
-                pieces = list(sync.split_for_export(data, limit))
-                self.assertEqual(b"".join(pieces), data)
-                for piece in pieces:
-                    self.assertTrue(piece.endswith(b"\n"))
-
-    def test_a_tail_that_fits_is_one_piece(self) -> None:
-        data = b"one\ntwo\n"
-        self.assertEqual(list(sync.split_for_export(data, 1000)), [data])
-
-    def test_a_line_longer_than_the_budget_is_kept_whole(self) -> None:
-        """Splitting a record would drop it from every reader, not just one."""
-        long_line = b"y" * 100 + b"\n"
-        pieces = list(sync.split_for_export(long_line + b"short\n", 10))
-        self.assertEqual(pieces[0], long_line)
-        self.assertEqual(b"".join(pieces), long_line + b"short\n")
-
-    def test_the_budget_is_under_what_a_reader_accepts(self) -> None:
-        """The invariant the whole change exists for, stated once."""
-        self.assertLess(sync.MAX_EXPORT_BYTES, sync.MAX_CHUNK_BYTES)
 
 
 class TestADayThatGainsAChunkAfterCompaction(SyncTestCase):
