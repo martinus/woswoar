@@ -36,6 +36,7 @@ must never become the thing those depend on.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import NamedTuple, TextIO
 
@@ -50,6 +51,38 @@ COLOUR_MARKERS = {
     "fail": "\x1b[31m✘\x1b[0m",
     "info": "\x1b[2m·\x1b[0m",
 }
+
+#: What `visible` discounts. Only the SGR form, because that is all
+#: `COLOUR_MARKERS` holds and a general terminal-escape parser here would be a
+#: guess at input nothing in this package produces.
+_SGR = re.compile("\x1b\\[[0-9;]*m")
+
+
+def visible(text: str) -> int:
+    """How many columns `text` occupies once the terminal has eaten its escapes.
+
+    `len` is ten for a coloured tick that draws one column. That does not matter
+    where a marker starts the line, which is every caller `doctor` has -- it
+    matters to `fleet`, which puts markers in a grid and has to know how wide
+    its columns are before it prints the header.
+    """
+    return len(_SGR.sub("", text))
+
+
+def centred(text: str, width: int) -> str:
+    """`text` centred in `width` columns as a terminal will show it.
+
+    `str.center` and `f"{text:^{width}}"` both count characters, so a table of
+    coloured markers built with either loses its alignment exactly when there is
+    colour to align -- the padding goes to the escape sequences. Wider than
+    `width` is returned unpadded, as the format spec does.
+    """
+    padding = width - visible(text)
+    if padding <= 0:
+        return text
+    left = padding // 2
+    return " " * left + text + " " * (padding - left)
+
 
 #: How wide the label column is. One number, because the continuation lines in
 #: `note` are indented to sit under the detail rather than under the marker.

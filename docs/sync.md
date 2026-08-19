@@ -83,23 +83,35 @@ anything kept inside it. Revoking removes that decision everywhere
 automatically, since taking trust away can only ever cause a refusal.
 
 `woswoar fleet` says how far through that walk you are — rows are the machine
-doing the accepting, columns the machine accepted:
+doing the accepting, columns the machine accepted, and the marks are the ones
+`woswoar doctor` uses, so a tick reads the same way in both:
 
 ```
 $ woswoar fleet
 who accepts whom, as each machine last published it
+rows accept, columns are accepted
 
-        desk    yoga    shed
-desk     .      yes     no
-yoga    yes      .      yes
-shed    yes     yes      .     (unverified)
+      desk  shed  yoga
+desk   ·     ✘     ✔
+shed   ✔     ·     ✔    (unverified)
+yoga   ✔     ✔     ·
+
+  ✔  accepted -- the row's machine merges the column's history
+  ✘  not accepted -- run 'woswoar accept' on the row's machine
+  ·  a machine and itself
+  (unverified)  nobody here has accepted that machine, so the row was checked
+                against nothing -- it is what somebody published, and no more
 ```
 
+The key lists only the symbols that are on screen, so it stays short enough to
+read. Two more can appear: `?` for a machine that has published no row this one
+can open, and `!`, sharper than either, for a machine that says it accepted a
+host under a key you did not pin — the two of you are not talking about the same
+machine. Piped rather than shown on a terminal, the three marks come out as
+`[ok]`, `[FAIL]` and `[--]`, exactly as `doctor`'s do.
+
 Only your own row is checked here; the others are what those machines published
-about themselves, and `?` or `(unverified)` marks one whose signing key this
-machine has not accepted. A `!` is sharper than either: that machine says it
-accepted a host under a key you did not pin, so the two of you are not talking
-about the same machine.
+about themselves.
 
 A cell is what a machine *says*, never what is true — if it were the latter, the
 repository would be making the trust decision that the paragraph above refuses

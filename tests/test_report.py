@@ -206,6 +206,46 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(report.markers(io.StringIO()), report.PLAIN_MARKERS)
 
 
+class TestWidthAsATerminalSeesIt(unittest.TestCase):
+    """`fleet` puts markers in a grid, which is the one place a marker is not
+    the first thing on its line -- and the first thing on a line needs no
+    padding, so nothing measured a marker until there was a table of them.
+
+    A coloured tick is ten characters that draw one column. Every ordinary way
+    of padding counts the ten, so a table laid out with `str.center` or a format
+    spec loses its columns exactly when there is colour to align them by, and is
+    perfectly aligned in the pipe a test captures. That is why these assert on
+    `COLOUR_MARKERS` rather than on a string of the test's own.
+    """
+
+    def test_a_coloured_marker_measures_the_column_it_draws(self) -> None:
+        self.assertEqual(report.visible(report.COLOUR_MARKERS["ok"]), 1)
+        self.assertEqual(report.visible(report.PLAIN_MARKERS["fail"]), len("[FAIL]"))
+
+    def test_text_with_no_escapes_is_its_own_length(self) -> None:
+        self.assertEqual(report.visible("(unverified)"), len("(unverified)"))
+
+    def test_padding_is_counted_in_columns_not_characters(self) -> None:
+        """The bug this exists to prevent, stated as the difference it makes:
+        the format spec pads a coloured marker by nothing at all, because it is
+        already ten characters wide by its own reckoning."""
+        marker = report.COLOUR_MARKERS["ok"]
+        self.assertEqual(report.visible(report.centred(marker, 5)), 5)
+        self.assertEqual(f"{marker:^5}", marker, "sanity: what the format spec does instead")
+
+    def test_the_padding_is_split_with_the_odd_column_on_the_right(self) -> None:
+        """Which side the odd space goes is arbitrary; that it is *decided* is
+        not. A centring that rounded the other way in one branch and this way in
+        another would ripple through a table as a column that moves by one."""
+        self.assertEqual(report.centred("x", 4), " x  ")
+        self.assertEqual(report.centred("x", 5), "  x  ")
+
+    def test_something_wider_than_the_column_is_left_alone(self) -> None:
+        """As the format spec does: a cell that does not fit is better ragged
+        than cut, which is the same call `report.lines` makes for a long label."""
+        self.assertEqual(report.centred("[FAIL]", 2), "[FAIL]")
+
+
 class TestDoctorDecidesWithoutPrinting(WoswoarTestCase):
     """The checks `doctor` owns, asked directly.
 
