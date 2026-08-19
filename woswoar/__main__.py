@@ -1421,8 +1421,8 @@ def build_parser() -> argparse.ArgumentParser:
         how far through that you are.
 
         Rows accept, columns are accepted, and a key under the table says what
-        each symbol in it means. They are doctor's, so a tick reads the same
-        way in both reports.
+        each symbol in it means. The marks are doctor's own, so a tick reads
+        the same way in both reports.
 
         Only this machine's row is authoritative. Every other row is what that
         machine published about itself, and a repository is not where trust
