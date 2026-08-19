@@ -294,11 +294,22 @@ def _signalled(returncode: int) -> str:
     macOS case the cap's own docstring admits to. Naming it is the difference
     between a row that reports nothing and a row that says the machine, not the
     mutation, ended the run.
+
+    It names two causes rather than one because a sweep of this module produced
+    the second: a mutation to `_lane` makes the *nested* harness inside a lane
+    compute the wrong membership and kill the session hosting it, and the row
+    then reported an out-of-memory that had not happened. A message that names
+    the wrong cause costs more than one that names none.
     """
     if returncode >= 0:
         return f"the probe exited {returncode} without writing a report"
     name = signal.Signals(-returncode).name if -returncode in set(signal.Signals) else "?"
-    killed = " -- the host ran out of memory, and this lane was chosen" if name == "SIGKILL" else ""
+    killed = (
+        " -- either the host ran out of memory and this lane was chosen, or a harness "
+        "running inside it killed the session it was in"
+        if name == "SIGKILL"
+        else ""
+    )
     return f"the probe was killed by {name}{killed}"
 
 
