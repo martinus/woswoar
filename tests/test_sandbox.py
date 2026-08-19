@@ -146,10 +146,24 @@ class TestBytecodeStaysOutOfTheTree(unittest.TestCase):
 
     def test_running_under_it_leaves_no_pycache_in_the_tree(self) -> None:
         """The property rather than the variable: drives a real interpreter over a
-        throwaway module and checks where the bytecode landed."""
+        throwaway module and checks where the bytecode landed.
+
+        `PYTHONDONTWRITEBYTECODE` is cleared for the whole of it, and that is the
+        fix for #258 rather than tidiness. `sandbox_env` carries the name out of
+        `os.environ` -- deliberately, so that the real `age`, `git` and `bash` a
+        suite forks cannot leave a `.pyc` behind -- and `tools/mutate` exports it
+        for exactly that reason. Inherited here, the child writes no bytecode at
+        all, the second assertion below fails, and every `mutate` run whose
+        selection reaches this module ends `BASELINE NOT GREEN`, which tells the
+        reader that verdicts about their own change mean nothing. The claim under
+        test is about what `sandbox_env` produces, so it must not change answer
+        with who invoked the suite; cleared before the environment is *built*,
+        not merely before the child runs, because that is when the name is read.
+        """
         import tempfile
 
-        with tempfile.TemporaryDirectory() as area:
+        with tempfile.TemporaryDirectory() as area, mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
             root = Path(area)
             tree, home = root / "tree", root / "home"
             tree.mkdir()
@@ -168,6 +182,51 @@ class TestBytecodeStaysOutOfTheTree(unittest.TestCase):
             self.assertTrue(
                 any((home / "pycache").rglob("*.pyc")), "bytecode did not reach the sandbox"
             )
+
+
+class TestTheBytecodeCheckIsNotDecidedByItsCaller(unittest.TestCase):
+    """#258: the class above must answer the same under `mutate` as under `python`.
+
+    A guard rather than a duplicate. `TestBytecodeStaysOutOfTheTree` asserts
+    where bytecode landed, and the thing that broke was not that claim but its
+    *independence* -- one exported variable in the parent turned it red, and the
+    tool that exported it was `tools/mutate`, whose whole job is to say whether
+    the tests are good. That is a property of the harness rather than of
+    `sandbox_env`, so nothing inside that class can hold it: reverting the
+    `patch.dict` leaves both of its assertions reading exactly as they do now.
+
+    Driven by starting a real interpreter with the variable set, for the reason
+    `CLAUDE.md` rule 3 gives for the shell hook and for sync -- the failure was
+    an interaction between two processes' environments, and a mock of either end
+    would be asserting the thing that was already believed.
+    """
+
+    def test_the_case_passes_with_pythondontwritebytecode_exported(self) -> None:
+        # Inherited and overridden, which is the shape this file's docstring
+        # rejects everywhere else -- and right here, because the child is the
+        # *suite* rather than a sandboxed woswoar. The claim is "an ordinary
+        # invocation that happens to export this stays green", so the ordinary
+        # invocation is what has to be reproduced; the sandbox the child then
+        # builds for itself is the thing under test and is still built from
+        # nothing.
+        exported = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        # `-B` as well, because that is how `mutate` starts its probe: the flag
+        # covers the probe and the variable covers what the suite forks, and it
+        # was the pair that reached this module.
+        ran = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                f"{__name__}.TestBytecodeStaysOutOfTheTree",
+            ],
+            cwd=REPO,
+            env=exported,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
 
 
 class TestSeeding(unittest.TestCase):
