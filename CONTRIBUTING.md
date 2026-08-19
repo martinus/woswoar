@@ -283,7 +283,8 @@ reach for the wrong fix is doing the main thing.
   none.
 
 Nothing is merged without the maintainer saying so, including by the maintainer's
-own agents.
+own agents — said per pull request, or once for a run that works the whole open
+issue list.
 
 ## Re-recording the demo
 
