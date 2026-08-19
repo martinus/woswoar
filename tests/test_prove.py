@@ -62,17 +62,70 @@ class TestACleanInstallProves(ProveTestCase):
             made.append(path)
             return path
 
-        saved = {key: os.environ.get(key) for key in prove._ENV_KEYS}
+        # The whole environment, not the names `prove` happens to know it
+        # changes. It now replaces `os.environ` wholesale, so "restored" is a
+        # claim about every name -- including one a future check exports and
+        # forgets to list, which is precisely the shape of leak the list this
+        # replaced could not see.
+        saved = dict(os.environ)
         with mock.patch.object(tempfile, "mkdtemp", side_effect=watched):
             ran = self.prove()
 
         self.assertEqual(ran.code, 0, ran.out + ran.err)
-        self.assertEqual(saved, {key: os.environ.get(key) for key in prove._ENV_KEYS})
+        self.assertEqual(saved, dict(os.environ))
         self.assertEqual(len(made), 1)
         self.assertFalse(Path(made[0]).exists())
         # This test environment's own store: prove created nothing in it.
         self.assertFalse(store.history_dir().exists())
         self.assertFalse(store.logs_dir().exists())
+
+
+class TestTheProofRunsInAWorldOfItsOwn(ProveTestCase):
+    """`prove` runs from inside a live installation, on a machine belonging to
+    someone who has exported things.
+
+    Restoring the environment afterwards is tested above; this is the other
+    half, and the one a list of names could not give. It used to remove
+    `store.ENV_KEYS` plus `HOME` and leave everything else in place, so a
+    `GIT_CONFIG_GLOBAL` pointing at a config with hooks and filters, or a
+    `ZDOTDIR`, reached a proof whose whole claim is that it ran against nothing
+    but itself.
+    """
+
+    def test_what_the_user_exported_does_not_reach_the_sandbox(self) -> None:
+        exported = {"GIT_CONFIG_GLOBAL": "/somewhere/else/gitconfig", "ZDOTDIR": "/elsewhere"}
+        with mock.patch.dict(os.environ, exported):
+            with prove._sandbox() as root:
+                inside = dict(os.environ)
+            self.assertEqual([name for name in exported if name in inside], [])
+            self.assertEqual(inside["HOME"], str(root / "home"))
+            # And it came back, which is what makes running this from a live
+            # installation safe.
+            self.assertEqual(os.environ["GIT_CONFIG_GLOBAL"], exported["GIT_CONFIG_GLOBAL"])
+
+    def test_the_sandbox_can_still_find_the_tools_it_needs(self) -> None:
+        """A proof that cannot find `age` or `git` is not a proof. Asserted as a
+        value rather than through `shutil.which`, because that is what the
+        failure hid behind -- see `store.SANDBOX_CARRIES`."""
+        outside = os.environ["PATH"]
+        with prove._sandbox():
+            self.assertEqual(os.environ["PATH"], outside)
+
+    def test_a_name_the_sandbox_invents_does_not_outlive_it(self) -> None:
+        """The half that restoring by `update` cannot do.
+
+        Putting the saved values back covers every name that was overwritten and
+        no name that was *added* -- so the mutation `os.environ.update(saved)`
+        without the `clear()` before it survives any fixture whose environment
+        already holds everything the sandbox sets. This one takes `SHELL` away
+        first, which the sandbox then invents.
+        """
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SHELL", None)
+            before = dict(os.environ)
+            with prove._sandbox():
+                self.assertEqual(os.environ["SHELL"], "/bin/bash")
+            self.assertEqual(dict(os.environ), before)
 
 
 class TestAPlantedLeakIsCaught(ProveTestCase):
@@ -180,11 +233,14 @@ class TestTheDocsRecipeStillDecrypts(unittest.TestCase):
             root = Path(tmp)
             (root / "home").mkdir()
             (root / "home" / ".gitconfig").write_text(prove.QUIET_MAINTENANCE, encoding="utf-8")
-            saved = {key: os.environ.get(key) for key in prove._ENV_KEYS}
-            try:
-                # Only HOME is set: the recipe spells paths as `~/...`, so the
-                # fixture must resolve them the way a stock install would.
-                for key in prove._ENV_KEYS:
+            with mock.patch.dict(os.environ):
+                # The store variables go, and `HOME` is moved: the recipe spells
+                # paths as `~/...`, so the fixture must resolve them the way a
+                # stock install would. Names rather than
+                # `store.sandbox_environ`, because this one *wants* the ambient
+                # `WOSWOAR_DIR` gone rather than pointed somewhere else -- the
+                # recipe is being asked to find the store on its own.
+                for key in (*store.ENV_KEYS, "HOME"):
                     os.environ.pop(key, None)
                 os.environ["HOME"] = str(root / "home")
                 origin = root / "origin.git"
@@ -216,9 +272,3 @@ class TestTheDocsRecipeStillDecrypts(unittest.TestCase):
                         break
                 self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
                 self.assertIn("echo docs-recipe-canary", ran.stdout)
-            finally:
-                for key, value in saved.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value

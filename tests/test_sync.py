@@ -47,11 +47,6 @@ from woswoar.sync import _GRANT_REMEDY
 from . import support
 from .support import requires_age, requires_git, requires_ssh_keygen
 
-#: One authoritative list, plus the HOME these tests give each machine of its
-#: own -- `WoswoarTestCase` redirects it once for the whole suite, and here
-#: every simulated machine needs a different one.
-_ENV = (*support.ENV_KEYS, "HOME")
-
 #: `gc --auto` runs after a commit and after a push, and `gc.autoDetach` sends
 #: it to the background -- so it is still repacking while the *next* git command
 #: runs. A real installation wants exactly that. These tests want a repo that
@@ -83,34 +78,20 @@ class Fake:
         self.root = root / name
         self.name = name
         self._id: str | None = None
-        for sub in ("data", "conf", "cache"):
+        for sub in ("data", "config", "cache"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
         # This machine's HOME, so its clone inherits it.
         (self.root / ".gitconfig").write_text(QUIET_MAINTENANCE, encoding="utf-8")
 
-    @property
-    def env(self) -> dict[str, str]:
-        return {
-            "HOME": str(self.root),
-            "WOSWOAR_DIR": str(self.root / "data"),
-            "XDG_CONFIG_HOME": str(self.root / "conf"),
-            "XDG_CACHE_HOME": str(self.root / "cache"),
-        }
-
     @contextmanager
     def active(self) -> Iterator[Fake]:
         """Run a block as if we were sitting at this machine."""
-        saved = {k: os.environ.get(k) for k in _ENV}
-        os.environ.pop("WOSWOAR_SESSION", None)
-        os.environ.update(self.env)
-        try:
+        # Replaced wholesale, which is also what drops the ambient
+        # `WOSWOAR_SESSION`: this used to update a list of names and pop that
+        # one by hand, so anything a future check reads and this list does not
+        # name would cross from one simulated machine to the next.
+        with store.sandboxed(self.root, self.root):
             yield self
-        finally:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
 
     # -- convenience, all assuming `active()` is held ----------------------
 
@@ -304,6 +285,33 @@ class SyncTestCase(unittest.TestCase):
         """Drive the real CLI as ``fake``. Both streams -- see `support.run_cli`."""
         with fake.active():
             return support.run_cli(*argv, tty=tty)
+
+
+class TestASimulatedMachineIsAWholeWorld(SyncTestCase):
+    """`Fake.active` replaces the environment rather than updating names, so
+    every check here is about what that must and must not carry."""
+
+    def test_a_machine_carries_the_path_it_runs_its_git_with(self) -> None:
+        """Every test in this file runs a real `git` and a real `age`, and
+        `active()` builds its environment from `store.sandbox_environ`, which
+        carries `PATH` from the environment it is *called* in. Building it after
+        clearing carried nothing, and stayed invisible on Linux because
+        `shutil.which` falls back to `confstr("CS_PATH")` and finds
+        `/usr/bin/age` there. macOS, where Homebrew is not on that fallback,
+        is what said so -- 87 errors in one shard.
+        """
+        outside = os.environ["PATH"]
+        with self.machine("alpha").active():
+            self.assertEqual(os.environ["PATH"], outside)
+
+    def test_one_machine_does_not_see_another_ones_session(self) -> None:
+        """`WOSWOAR_SESSION` used to be popped by name here; a wholesale replace
+        is what makes that true of every name rather than of the one that was
+        noticed."""
+        with self.machine("alpha").active():
+            os.environ["WOSWOAR_SESSION"] = "alpha-session"
+            with self.machine("beta").active():
+                self.assertNotIn("WOSWOAR_SESSION", os.environ)
 
 
 class TestSingleMachine(SyncTestCase):

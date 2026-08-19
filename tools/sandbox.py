@@ -33,6 +33,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from woswoar import store
+
 #: The identity every sandbox is given, on every side of every comparison.
 #: Seeded rather than generated: `install` prints the id it made, so a fresh one
 #: per run would differ between two trees for a reason that says nothing about
@@ -60,6 +62,14 @@ def sandbox_env(tree: Path, home: Path) -> dict[str, str]:
     answer to where those are.
     """
     return {
+        # `store.SANDBOX_CARRIES` rather than `PATH` alone, and from there
+        # rather than from a list of its own: that constant is where the suite's
+        # sandbox keeps the same knowledge, and two lists of carried names is
+        # the shape this module's docstring is written against. Concretely, it
+        # is what makes CI's `PYTHONWARNINGS=error::DeprecationWarning` reach
+        # the `python` children `bench` and `compare` spawn -- carrying only
+        # `PATH` left that guard downgraded to a warning in here, silently.
+        **{name: os.environ[name] for name in store.SANDBOX_CARRIES if name in os.environ},
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "XDG_DATA_HOME": str(home / "data"),
