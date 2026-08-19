@@ -116,8 +116,16 @@ def _sandbox() -> Iterator[Path]:
         # a `ZDOTDIR`, a `GIT_CONFIG_GLOBAL` or an inherited `SHELL` reached the
         # proof. `store.sandbox_environ` says why a list of names is the wrong
         # shape for that question.
+        # Built *before* the clear, which is load-bearing rather than stylistic:
+        # `sandbox_environ` carries `PATH` over from the environment it is
+        # called in, so building it afterwards carries nothing. That failed only
+        # on macOS -- `shutil.which` falls back to `confstr("CS_PATH")` when
+        # `PATH` is unset, which finds an apt-installed `/usr/bin/age` and does
+        # not find a Homebrew one -- so on Linux it looked like a working
+        # sandbox and every sync test on macOS could not find `age`.
+        built = store.sandbox_environ(root, root / "home")
         os.environ.clear()
-        os.environ.update(store.sandbox_environ(root, root / "home"))
+        os.environ.update(built)
         yield root
     finally:
         os.environ.clear()

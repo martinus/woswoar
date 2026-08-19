@@ -98,8 +98,12 @@ class Fake:
         # one by hand, so anything a future check reads and this list does not
         # name would cross from one simulated machine to the next.
         saved = dict(os.environ)
+        # `self.env` first: it carries `PATH` from the environment it is built
+        # in, so clearing before building leaves the machine with none. See
+        # `prove._sandbox` for why that is invisible on Linux.
+        built = self.env
         os.environ.clear()
-        os.environ.update(self.env)
+        os.environ.update(built)
         try:
             yield self
         finally:
@@ -298,6 +302,33 @@ class SyncTestCase(unittest.TestCase):
         """Drive the real CLI as ``fake``. Both streams -- see `support.run_cli`."""
         with fake.active():
             return support.run_cli(*argv, tty=tty)
+
+
+class TestASimulatedMachineIsAWholeWorld(SyncTestCase):
+    """`Fake.active` replaces the environment rather than updating names, so
+    every check here is about what that must and must not carry."""
+
+    def test_a_machine_carries_the_path_it_runs_its_git_with(self) -> None:
+        """Every test in this file runs a real `git` and a real `age`, and
+        `active()` builds its environment from `store.sandbox_environ`, which
+        carries `PATH` from the environment it is *called* in. Building it after
+        clearing carried nothing, and stayed invisible on Linux because
+        `shutil.which` falls back to `confstr("CS_PATH")` and finds
+        `/usr/bin/age` there. macOS, where Homebrew is not on that fallback,
+        is what said so -- 87 errors in one shard.
+        """
+        outside = os.environ["PATH"]
+        with self.machine("alpha").active():
+            self.assertEqual(os.environ["PATH"], outside)
+
+    def test_one_machine_does_not_see_another_ones_session(self) -> None:
+        """`WOSWOAR_SESSION` used to be popped by name here; a wholesale replace
+        is what makes that true of every name rather than of the one that was
+        noticed."""
+        with self.machine("alpha").active():
+            os.environ["WOSWOAR_SESSION"] = "alpha-session"
+            with self.machine("beta").active():
+                self.assertNotIn("WOSWOAR_SESSION", os.environ)
 
 
 class TestSingleMachine(SyncTestCase):
