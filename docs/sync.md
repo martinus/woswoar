@@ -89,17 +89,22 @@ doing the accepting, columns the machine accepted:
 $ woswoar fleet
 who accepts whom, as each machine last published it
 
-              mar  lap  pi
-martin@desk    .   yes  no
-martin@lapt   yes   .   yes
-pi@shed       yes  yes   .    (unverified)
+        desk    yoga    shed
+desk     .      yes     no
+yoga    yes      .      yes
+shed    yes     yes      .     (unverified)
 ```
 
 Only your own row is checked here; the others are what those machines published
 about themselves, and `?` or `(unverified)` marks one whose signing key this
-machine has not accepted. A cell is what a machine *says*, never what is true —
-if it were the latter, the repository would be making the trust decision that
-the paragraph above refuses to let it make.
+machine has not accepted. A `!` is sharper than either: that machine says it
+accepted a host under a key you did not pin, so the two of you are not talking
+about the same machine.
+
+A cell is what a machine *says*, never what is true — if it were the latter, the
+repository would be making the trust decision that the paragraph above refuses
+to let it make. Rows are also only as fresh as each machine's last push, which
+the report prints beneath them.
 
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared

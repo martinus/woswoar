@@ -187,66 +187,91 @@ def _import(kind: importer.Kind, path: Path | None, *, dry_run: bool, this_host_
 def cmd_fleet(args: argparse.Namespace) -> int:
     """Who has accepted whom, as far as each machine says.
 
-    Rows are the machine doing the accepting, columns the machine accepted. The
-    diagonal is blank -- a machine does not accept itself.
-
-    Only this machine's own row is authoritative; it is read from the local pin
-    and nothing in the repository can change it. Every other row is what that
-    machine published about itself, and is marked `?` unless its signing key has
-    been accepted here, because until then the file's author is "whoever can
-    push". That distinction is the whole design: `accept` is the trust decision
-    and this report must never become the thing someone checks instead.
+    Rows accept, columns are accepted; the diagonal is blank. Only this
+    machine's row is authoritative -- it is the local pin, and nothing in the
+    repository can change it. See `woswoar/fleet.py` for why every other row is
+    a claim rather than a fact, and why that distinction is the design rather
+    than a caveat on it.
     """
     from . import fleet, sync
 
-    now = int(time.time())
     known = store.machine()
     state = sync.State.load()
     names = store.host_names()
-    hosts = sorted(names)
-    if not hosts:
+    if not names:
         print("No machines yet. 'woswoar sync' once this machine has a remote.")
         return 0
 
-    identity = sync.identity_path(known)
-    rows: dict[str, fleet.Accepts | None] = {}
-    for host in hosts:
-        if host == known.id:
-            rows[host] = fleet.Accepts(frozenset(state.signers), now, True)
-        else:
-            rows[host] = fleet.published(host, state.signers.get(host), identity)
+    # A machine that has not run `init` still has an answer for its own row --
+    # the pin is local -- and cannot open anyone else's, which is the `?` this
+    # report already has a column for. Refusing outright would be telling
+    # someone to run `init` to find out who has accepted them.
+    try:
+        identity: Path | None = sync.identity_path(known)
+    except WoswoarError:
+        identity = None
 
-    width = max(len(_short(names, host)) for host in hosts)
+    hosts = sorted(names)
+    rows = {
+        host: fleet.Accepts(dict(state.signers), int(time.time()), True)
+        if host == known.id
+        else (fleet.published(host, state.signers.get(host), identity) if identity else None)
+        for host in hosts
+    }
+
+    # `search.host_labels` rather than a local spelling: it keeps labels
+    # *distinct* -- two machines of one person differ in the host half, not the
+    # user half -- and it runs them through `make_inert`, which matters more
+    # here than anywhere. A name is read straight out of a `.name` file a peer
+    # wrote, and this is the one table whose whole purpose is being read as a
+    # security check.
+    labels = search.host_labels(set(hosts))
+    width = max(len(label) for label in labels.values())
+
     print("who accepts whom, as each machine last published it\n")
-    print(" " * (width + 2) + "  ".join(_short(names, host)[:3].ljust(3) for host in hosts))
+    print(" " * (width + 2) + "  ".join(f"{labels[host]:^{width}}" for host in hosts))
     for host in hosts:
         said = rows[host]
         cells = []
         for other in hosts:
-            if other == host:
-                cells.append(" . ")
-            elif said is None:
-                cells.append(" ? ")
-            else:
-                cells.append(" yes"[-3:] if other in said.hosts else " no ")
-        mark = "" if said is not None and said.verified else "   (unverified)"
-        print(f"{_short(names, host).ljust(width)}  " + "  ".join(cells) + mark)
+            cells.append(f"{_cell(said, other, host, state):^{width}}")
+        mark = "" if said is not None and said.verified else "  (unverified)"
+        print(f"{labels[host]:<{width}}  " + "  ".join(cells) + mark)
 
     print("\nA cell is what that machine says, not what is true: only this")
     print("machine's row is checked against a key pinned here. Run 'woswoar accept'")
     print("on a machine to change its row -- reading it here cannot.")
-    stale = [host for host, said in rows.items() if said is not None and host != known.id]
-    if stale:
-        oldest = min(said.when for host, said in rows.items() if said is not None)
+    whens = [said.when for host, said in rows.items() if said is not None and host != known.id]
+    if whens:
         print(
-            f"Rows are as fresh as each machine's last push; oldest here: {store.day_for(oldest)}."
+            f"Rows are as fresh as each machine's last push; oldest: {store.day_for(min(whens))}."
         )
     return 0
 
 
-def _short(names: dict[str, str], host_id: str) -> str:
-    """A host's friendly name, or the opaque id when none has arrived."""
-    return names.get(host_id) or host_id[:8]
+def _cell(said: object, other: str, host: str, state: object) -> str:
+    """One cell: what `host` says about `other`.
+
+    `!` is the case the fingerprint in each line exists for. A row names the
+    *key* it accepted, so a machine claiming to accept a host under a key this
+    machine did not pin is saying something about a different machine than the
+    reader thinks -- an attacker who can push may move `signer.pub`, and without
+    this the row would read as a vouch for whatever key sits there now.
+    """
+    from . import crypto, fleet, sync
+
+    assert isinstance(state, sync.State)
+    if other == host:
+        return "."
+    if not isinstance(said, fleet.Accepts):
+        return "?"
+    claimed = said.hosts.get(other)
+    if claimed is None:
+        return "no"
+    pinned = state.signers.get(other)
+    if pinned is not None and claimed != crypto.fingerprint(pinned):
+        return "!"
+    return "yes"
 
 
 def cmd_stats(args: argparse.Namespace) -> int:

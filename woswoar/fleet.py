@@ -51,8 +51,12 @@ _SEPARATOR = "\n\n"
 class Accepts(NamedTuple):
     """What one host published about who it accepts, and how much to believe."""
 
-    #: Host ids it says it has accepted.
-    hosts: frozenset[str]
+    #: Host id -> the fingerprint of the key it accepted that host under. The
+    #: fingerprint is half the point: "B accepted A" is only meaningful about a
+    #: *key*, since an attacker who can push can move `hosts/A/signer.pub` and a
+    #: row naming A alone would then read as B vouching for whatever sits there
+    #: now. `__main__._cell` is what compares it with the local pin.
+    hosts: dict[str, str]
     #: When it said so, from the body -- a row is only as fresh as that host's
     #: last push, and a reader who cannot see the date cannot see that.
     when: int
@@ -111,8 +115,10 @@ def parse(blob: str, host_id: str, verify_key: str | None) -> Accepts | None:
         if not crypto.verify(text.encode("utf-8"), signature.encode("utf-8"), verify_key, MAGIC):
             return None
         verified = True
-    hosts = {parts[0] for parts in (line.split() for line in lines[1:]) if len(parts) == 2}
-    return Accepts(frozenset(hosts), when, verified)
+    hosts = {
+        parts[0]: parts[1] for parts in (line.split() for line in lines[1:]) if len(parts) == 2
+    }
+    return Accepts(hosts, when, verified)
 
 
 def published(host_id: str, verify_key: str | None, identity: Path) -> Accepts | None:
