@@ -82,6 +82,25 @@ with push access can write, so what a machine believes cannot be decided by
 anything kept inside it. Revoking removes that decision everywhere
 automatically, since taking trust away can only ever cause a refusal.
 
+`woswoar fleet` says how far through that walk you are — rows are the machine
+doing the accepting, columns the machine accepted:
+
+```
+$ woswoar fleet
+who accepts whom, as each machine last published it
+
+              mar  lap  pi
+martin@desk    .   yes  no
+martin@lapt   yes   .   yes
+pi@shed       yes  yes   .    (unverified)
+```
+
+Only your own row is checked here; the others are what those machines published
+about themselves, and `?` or `(unverified)` marks one whose signing key this
+machine has not accepted. A cell is what a machine *says*, never what is true —
+if it were the latter, the repository would be making the trust decision that
+the paragraph above refuses to let it make.
+
 > [!TIP]
 > `.bashrc` is written with `$HOME` rather than your username, so one shared
 > dotfiles `.bashrc` works on every machine.

@@ -392,6 +392,7 @@ every other check you can run without believing anyone.
 | A machine never signs what it did not write | a chunk planted under a machine's own id stays out of the manifest it signs, and is reported |
 | A changed signing key is never waved through | the peer refuses, keeps the old pin, and says so |
 | A chunk cannot exhaust a peer | a chunk that unpacks past the cap is refused and reported, and the peak allocation is measured to stay bounded rather than the payload being materialised first |
+| The fleet report is advisory, never a trust decision | a row published by a host whose signing key this machine has not accepted is marked unverified, and one that fails to verify against a key it *has* accepted is refused outright |
 
 **A revoked machine stays revoked**
 

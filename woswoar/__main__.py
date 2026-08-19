@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import textwrap
+import time
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -181,6 +182,71 @@ def _import(kind: importer.Kind, path: Path | None, *, dry_run: bool, this_host_
             "Run 'woswoar import atuin' on each machine to give them all the full set."
         )
     return 0
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """Who has accepted whom, as far as each machine says.
+
+    Rows are the machine doing the accepting, columns the machine accepted. The
+    diagonal is blank -- a machine does not accept itself.
+
+    Only this machine's own row is authoritative; it is read from the local pin
+    and nothing in the repository can change it. Every other row is what that
+    machine published about itself, and is marked `?` unless its signing key has
+    been accepted here, because until then the file's author is "whoever can
+    push". That distinction is the whole design: `accept` is the trust decision
+    and this report must never become the thing someone checks instead.
+    """
+    from . import fleet, sync
+
+    now = int(time.time())
+    known = store.machine()
+    state = sync.State.load()
+    names = store.host_names()
+    hosts = sorted(names)
+    if not hosts:
+        print("No machines yet. 'woswoar sync' once this machine has a remote.")
+        return 0
+
+    identity = sync.identity_path(known)
+    rows: dict[str, fleet.Accepts | None] = {}
+    for host in hosts:
+        if host == known.id:
+            rows[host] = fleet.Accepts(frozenset(state.signers), now, True)
+        else:
+            rows[host] = fleet.published(host, state.signers.get(host), identity)
+
+    width = max(len(_short(names, host)) for host in hosts)
+    print("who accepts whom, as each machine last published it\n")
+    print(" " * (width + 2) + "  ".join(_short(names, host)[:3].ljust(3) for host in hosts))
+    for host in hosts:
+        said = rows[host]
+        cells = []
+        for other in hosts:
+            if other == host:
+                cells.append(" . ")
+            elif said is None:
+                cells.append(" ? ")
+            else:
+                cells.append(" yes"[-3:] if other in said.hosts else " no ")
+        mark = "" if said is not None and said.verified else "   (unverified)"
+        print(f"{_short(names, host).ljust(width)}  " + "  ".join(cells) + mark)
+
+    print("\nA cell is what that machine says, not what is true: only this")
+    print("machine's row is checked against a key pinned here. Run 'woswoar accept'")
+    print("on a machine to change its row -- reading it here cannot.")
+    stale = [host for host, said in rows.items() if said is not None and host != known.id]
+    if stale:
+        oldest = min(said.when for host, said in rows.items() if said is not None)
+        print(
+            f"Rows are as fresh as each machine's last push; oldest here: {store.day_for(oldest)}."
+        )
+    return 0
+
+
+def _short(names: dict[str, str], host_id: str) -> str:
+    """A host's friendly name, or the opaque id when none has arrived."""
+    return names.get(host_id) or host_id[:8]
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -1241,6 +1307,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stats.add_argument("--top", type=int, default=10)
     p_stats.set_defaults(func=cmd_stats)
+
+    p_fleet = sub(
+        "fleet",
+        "who has accepted whom",
+        """
+        Accepting is per-machine: enrolling a laptop means running 'woswoar
+        accept' on the laptop and on every machine already syncing. This says
+        how far through that you are.
+
+        Only this machine's row is authoritative. Every other row is what that
+        machine published about itself, and a repository is not where trust
+        lives -- see docs/security.md.
+        """,
+    )
+    p_fleet.set_defaults(func=cmd_fleet)
 
     p_doctor = sub(
         "doctor",

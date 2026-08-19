@@ -196,6 +196,12 @@ def name_seal(machine_id: str) -> Path:
     return repo_host_dir(machine_id) / "name.age"
 
 
+def accepts_seal(machine_id: str) -> Path:
+    """Sealed list of the hosts this machine has accepted, so a fleet report can
+    say who still owes whom an `accept`. Advisory -- see `woswoar/fleet.py`."""
+    return repo_host_dir(machine_id) / "accepts.age"
+
+
 def signer_public(machine_id: str) -> Path:
     """A host's published verify key, and the recipient that owns the host.
 

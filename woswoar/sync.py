@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, codec, crypto, gitrepo, manifest, progress, store
+from . import archive, codec, crypto, fleet, gitrepo, manifest, progress, store
 from .entry import make_inert
 from .errors import SyncError, WoswoarError
 from .report import Check, Notice
@@ -1134,6 +1134,31 @@ def read_signer(host_id: str) -> Signer | None:
     return Signer(lines[0].strip(), lines[1].strip())
 
 
+def publish_accepts(known: Machine, now: int) -> bool:
+    """Publish which hosts this machine has accepted. Returns whether it wrote.
+
+    Guarded by comparing the *plaintext* body, exactly as `publish_signer`
+    compares the verify key, and for the same reason: this runs on a one-minute
+    timer and the file changes about once per `accept`. Comparing ciphertext
+    would rewrite it every minute -- age is randomised, so two seals of one body
+    never match.
+
+    `State.signers` is the authority. It is the local pin, which is the whole
+    point: what a machine accepts must not be readable back out of the repo it
+    syncs with, or the repo would be making the trust decision.
+    """
+    state = State.load()
+    if not state.signers:
+        return False
+    sealed = archive.accepts_seal(known.id)
+    if sealed.is_file():
+        current = fleet.published(known.id, None, identity_path(known))
+        if current is not None and current.hosts == frozenset(state.signers):
+            return False
+    store.write_atomic(sealed, fleet.seal(known.id, state.signers, recipients(), now))
+    return True
+
+
 def publish_signer(known: Machine) -> bool:
     """Make sure this host's published signer file says what is true.
 
@@ -1969,6 +1994,13 @@ def run(push: bool = True, now: int | None = None) -> Report:
         # waits for `grant`. That is a change from the shared-key design, where
         # a machine nobody had granted access to could not tag a chunk either,
         # so its own history piled up locally until someone else acted.
+        # Here rather than in `_write_repo_metadata`, which runs once at
+        # enrolment: what this machine accepts changes with `accept`, long after
+        # it joined, and a file written only at `init` would say "nobody" for
+        # ever. The guard inside makes an idle sync write nothing.
+        if publish_accepts(known, now if now is not None else int(time.time())):
+            marked = True
+
         report.revoked = _this_machine_revoked(known)
         published = False
         exported = False

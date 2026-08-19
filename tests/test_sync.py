@@ -29,6 +29,7 @@ from woswoar import (
     codec,
     crypto,
     errors,
+    fleet,
     gitrepo,
     manifest,
     progress,
@@ -361,6 +362,132 @@ class TestSingleMachine(SyncTestCase):
             # The watermark stops at the last newline, so the half-written record
             # is left for next time rather than sealed into an immutable chunk.
             self.assertEqual(state.exported[relpath], path.stat().st_size - len("1700000002\ts1"))
+
+
+class TestWhoHasAcceptedWhom(SyncTestCase):
+    """#197: a machine you forgot to `accept` on is silent.
+
+    Three machines, not two, and an asymmetric graph -- a two-host fixture
+    cannot tell a matrix from its own transpose, so `A accepts B while B has not
+    accepted A` is the shape that has to be built.
+
+    What is asserted is the published *file*, not the printed table: the file is
+    the protocol between machines, and the table is one reading of it.
+    """
+
+    def published(self, reader: Fake, about: Fake) -> fleet.Accepts | None:
+        with reader.active():
+            state = sync.State.load()
+            return fleet.published(
+                about.id, state.signers.get(about.id), sync.identity_path(store.machine())
+            )
+
+    def test_a_machine_publishes_what_it_has_accepted(self) -> None:
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        said = self.published(beta, alpha)
+        assert said is not None
+        self.assertIn(beta.id, said.hosts)
+        self.assertTrue(said.verified, "beta accepted alpha, so alpha's row is checkable")
+
+    def test_the_graph_is_not_its_own_transpose(self) -> None:
+        """The asymmetry is the point, and it is the one the ceremony creates.
+
+        A machine that clones *after* another enrolled pins it on the spot; the
+        one that was there first has never been told the newcomer exists. So
+        with no `accept` run anywhere, beta's row already holds alpha and
+        alpha's row does not hold beta -- which is precisely the state this
+        report exists to make visible, and a fixture that mirrored one row into
+        the other would show nothing.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.run()
+
+        from_beta = self.published(alpha, beta)
+        assert from_beta is not None
+        self.assertIn(alpha.id, from_beta.hosts, "beta pinned alpha when it cloned")
+
+        from_alpha = self.published(beta, alpha)
+        self.assertTrue(
+            from_alpha is None or beta.id not in from_alpha.hosts,
+            "alpha was there first, so nobody has told it about beta",
+        )
+
+    def test_a_row_from_a_host_this_machine_has_not_accepted_is_unverified(self) -> None:
+        """The distinction the whole design rests on: a file from a host whose
+        key is not pinned here was written by whoever can push, and must not be
+        shown as though it were checked."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            unpinned = fleet.published(alpha.id, None, sync.identity_path(store.machine()))
+        assert unpinned is not None
+        self.assertFalse(unpinned.verified)
+
+    def test_a_forged_row_against_a_pinned_key_is_refused(self) -> None:
+        """Signed under the host's own namespace, so a row that does not verify
+        against the key this machine pinned is not a row at all."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(beta)
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+
+        with beta.active():
+            state = sync.State.load()
+            forged = fleet.parse(
+                "not-a-signature\n\n" + fleet.body(alpha.id, {}, 1),
+                alpha.id,
+                state.signers.get(alpha.id),
+            )
+        self.assertIsNone(forged)
+
+    def test_nothing_is_republished_when_nothing_changed(self) -> None:
+        """It runs on a one-minute timer and changes about once per `accept`.
+        Compared on the plaintext, because age is randomised -- two seals of one
+        body never match, so comparing ciphertext would rewrite it every minute
+        and commit every minute with it."""
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        with alpha.active():
+            sync.run()
+        with beta.active():
+            sync.run()
+        self.accept_everyone(alpha)
+        with alpha.active():
+            sync.run()
+
+        with alpha.active():
+            known = store.machine()
+            self.assertFalse(sync.publish_accepts(known, 2), "unchanged, so nothing to write")
 
 
 class TestTwoMachines(SyncTestCase):
