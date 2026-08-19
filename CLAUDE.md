@@ -30,14 +30,18 @@ change under review.
 If a finding is wrong or its fix would exceed the task's scope, say so
 explicitly in the PR description rather than silently dropping it.
 
-## 2. Never merge without explicit approval
+## 2. Merge only where a rule says you may
 
-Open the PR, report its CI status, and stop. Wait for the maintainer to say to
-merge.
+By default: open the PR, report its CI status, and stop. Wait for the maintainer
+to say to merge.
 
 Approval is per-PR and does not carry over. "Merge it" for one PR is not
 standing authority for the next one, even when the next one is a direct
 follow-up to the same task. Ask again.
+
+The one exception is rule 9's list mode, where "work the issues" is itself the
+approval -- given once, for that run, and spent on green CI. Nothing else grants
+it and it does not outlive the run.
 
 ## 3. Every fix and every new behaviour gets a regression test
 
@@ -192,6 +196,40 @@ The distinction that decides how much care a change needs:
 Nothing in the repo records which version wrote it, so a change to the *repo*
 format has no marker to hang an upgrade on. That is worth fixing before the
 first such change, not during one.
+
+## 9. One line naming an issue is the whole task, and it ends at an open PR
+
+"Do #258" means: branch (7), fix it with the test that fails without it (3),
+prove that with `tools/mutate.py` (3), review in proportion and **apply** what
+that finds (1), preflight, open the pull request, report its CI, stop (2).
+Anything noticed on the way gets one of rule 4's three answers on the spot
+instead of becoming a question. The branch is whatever the harness named, else
+`claude/<issue>-<slug>`.
+
+**Ask only** when proceeding under any assumption would be unsafe or would waste
+the work if the guess went the other way, when it reverses something already
+decided, or when the instruction names something that does not exist. Everything
+else -- which fixture, what to call it, P2 or P3, which of rule 4's answers a
+discovery earns -- is yours: decide it and put the reasoning in the PR body,
+where it can be argued with for the cost of one read. A question asked mid-task
+stops the work and is answered by someone holding less context than the agent
+asking it.
+
+One issue is one PR. A change that acquires a second subject has stopped being
+the issue it was given.
+
+**"Work the issues" is the same loop down the open list**, in label order, one
+PR per issue, each branched from `main`. Do not wait between them: open the PR,
+let CI finish, and **merge it when every check is green** -- that one
+instruction is the approval rule 2 otherwise requires. A red check stops the run
+and is reported rather than retried into submission; so does an issue that needs
+an earlier PR merged first. An issue that turns out to be a non-issue is closed
+with the reason rather than made true.
+
+Green CI is not review, and this is installed software. So the rule 1 pass still
+happens before the PR opens -- it is now the only review the change will get --
+and a change in that table's top row (stored data, a security claim, a cache)
+opens its PR and waits for a person regardless of what CI says.
 
 ## Repository conventions worth matching
 
