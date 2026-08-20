@@ -1229,7 +1229,7 @@ def _forget_row(found: Match) -> str:
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(found.record.ts))
     shown = make_inert(found.record.cmd)
     if len(shown) > FORGET_PREVIEW:
-        # `search._ELLIPSIS` is the picker's and trims the *tail*; a row about to
+        # `search.ELLIPSIS` is the picker's and trims the *tail*; a row about to
         # be deleted is one the person typed, so the beginning identifies it and
         # the clip goes the other way. The character is the same on purpose.
         shown = shown[:FORGET_PREVIEW] + search.ELLIPSIS
