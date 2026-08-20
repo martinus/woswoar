@@ -2186,6 +2186,52 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         self.assertIn("were not re-run against the whole suite", finished.stdout)
         self.assertEqual(finished.returncode, 1)
 
+    def red_for_its_own_reasons(self) -> None:
+        """A failing test the mutation has nothing to do with.
+
+        Untracked and outside `woswoar/`, so it changes no diff -- `mutable`
+        only generates for `woswoar/` and `tools/`, and `changed_lines` treats an
+        untracked *mutable* file as wholly changed. It is invisible to the narrow
+        pass (which runs `test_mod`) and unavoidable to the wide one.
+        """
+        self.write(
+            "tests/test_broken.py",
+            """
+            import unittest
+
+
+            class Broken(unittest.TestCase):
+                def test_something_else_entirely(self) -> None:
+                    self.fail("red for its own reasons")
+            """,
+        )
+
+    def test_a_red_suite_stops_the_confirmation_correcting(self) -> None:
+        """#268 through the command line, which is where it was wired.
+
+        The two mutants that survived this change's own sweep were both at this
+        call site -- `if not args.no_confirm` never taken, and the `not` dropped
+        from `baseline=not args.no_baseline`. Neither is visible to a test that
+        calls `confirm` directly, so the fix could have been wired to the wrong
+        flag, or to nothing, with every unit test still green.
+        """
+        self.repo(guarded=False)
+        self.red_for_its_own_reasons()
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch")
+        self.assertIn("of the confirmation rows only", finished.stdout, finished.stderr)
+        self.assertNotIn("caught by a test the selection had not run", finished.stdout)
+        self.assertEqual(finished.returncode, 1, finished.stdout + finished.stderr)
+
+    def test_no_baseline_reaches_the_confirmation_pass(self) -> None:
+        """The other direction, without which the test above passes on a call
+        site wired to `baseline=args.no_baseline` -- inverted, and asserting the
+        inversion. Same red tree, flag on: the check is skipped, so the run
+        corrects as it did before #268 and says nothing about a baseline."""
+        self.repo(guarded=False)
+        self.red_for_its_own_reasons()
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--no-baseline")
+        self.assertNotIn("of the confirmation rows only", finished.stdout, finished.stderr)
+
     def test_the_two_ways_of_asking_for_nothing_are_refused(self) -> None:
         for args, said in (
             (("--all", "--base", "HEAD"), "Not both"),
