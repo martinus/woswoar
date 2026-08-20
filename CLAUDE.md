@@ -249,7 +249,7 @@ opens its PR and waits for a person regardless of what CI says.
   `python -m unittest discover -s . -t . -p 'test_*.py'` runs the same tests
   serially, and takes about three times as long.
 
-- Four tools in `tools/` exist because the same mistake was made more than
+- Five tools in `tools/` exist because the same mistake was made more than
   once. Each one's module docstring carries the full argument for why it is
   shaped as it is; reach for them rather than writing the loop again.
 
@@ -259,6 +259,7 @@ opens its PR and waits for a person regardless of what CI says.
   | a mutation run left more survivors than you can read | [`tools/reached.py`](tools/reached.py) |
   | a refactor is supposed to change no output | [`tools/compare.py`](tools/compare.py) |
   | a change might have cost time | [`tools/bench.py`](tools/bench.py) |
+  | a long job is running detached and silence is ambiguous | [`tools/watch.py`](tools/watch.py) |
 
   ```sh
   python -m tools.mutate --base main        # generated from the diff
@@ -266,7 +267,15 @@ opens its PR and waits for a person regardless of what CI says.
   python -m tools.reached r.json c.json     # which survivors are missing tests
   python -m tools.compare --base main --show .bashrc install doctor status
   python -m tools.bench --importtime woswoar.__main__ --base main
+  python -m tools.watch $PID --log sweep.log --done r.json --match 'caught|SURVIVED'
   ```
+
+  The last one is not about the code, it is about *reporting on* a job that
+  takes half an hour. Never answer "is it stuck?" with `pgrep -f`: the pattern
+  matches the asking shell's own command line, and it reported a dead sweep
+  alive twice in one session, to somebody who had asked twice. Record the pid at
+  launch and watch that — a death then arrives as a line and an exit status
+  rather than as more silence.
 
   **The generated sweep goes last.** Implement, write the hand table, preflight,
   run `/simplify` *and apply it*, and only then `--base main`. The table is
