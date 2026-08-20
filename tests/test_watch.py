@@ -17,8 +17,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools import watch
 
@@ -54,6 +56,30 @@ class Fixture(unittest.TestCase):
         child.wait()
         return child.pid
 
+    def running(self) -> subprocess.Popen[bytes]:
+        """A process that will still be there in a second unless something kills it."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
+    def command(self, *extra: str) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "tools.watch",
+            *extra,
+            "--log",
+            str(self.log),
+            "--done",
+            str(self.done),
+        ]
+
+    #: The tree, for a subprocess that must import `tools.watch` by module path.
+    @property
+    def repo(self) -> Path:
+        return Path(watch.__file__).resolve().parent.parent
+
 
 class TestWhetherAProcessIsThere(Fixture):
     def test_this_process_is_alive(self) -> None:
@@ -61,6 +87,43 @@ class TestWhetherAProcessIsThere(Fixture):
 
     def test_a_reaped_process_is_not(self) -> None:
         self.assertFalse(watch.alive(self.reaped()))
+
+    def test_asking_does_not_disturb_the_job(self) -> None:
+        """Signal 0 is the *only* number that asks without doing.
+
+        1 is SIGHUP and its default action is to terminate, so a watcher that
+        reached for it would kill the sweep it was hired to report on -- and
+        would then correctly report it dead, which is the worst available
+        outcome. Driven against a real child because the property is the
+        kernel's, not the code's: `wait` timing out is the child surviving.
+        """
+        child = self.running()
+        self.assertTrue(watch.alive(child.pid))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            child.wait(timeout=0.5)
+
+    def test_one_is_a_pid_and_not_a_group(self) -> None:
+        """The guard's boundary, pinned where the kernel will answer anywhere.
+
+        The `PermissionError` test below is skipped as root, which left the
+        guard's `<= 0` free to become `<= 1` -- refusing init -- with the whole
+        suite still green. This asks only that 1 gets through, which is true on
+        every machine.
+        """
+        self.assertEqual(watch.a_pid("1"), 1)
+        watch.alive(1)  # must not raise; what it answers is the next test's business
+
+    def test_a_process_that_is_not_ours_is_alive(self) -> None:
+        """The `PermissionError` branch, forced.
+
+        Mocked, unlike everything else here, because as root there is no process
+        this one may not signal -- the test below skips for exactly that reason
+        and takes the branch's only coverage with it. What this pins is the
+        mapping from that error to an answer, which is where the bug would be;
+        that the kernel raises it at all is the other test's job.
+        """
+        with mock.patch("os.kill", side_effect=PermissionError):
+            self.assertTrue(watch.alive(4242))
 
     def test_pid_one_is_alive_though_it_is_not_ours(self) -> None:
         """`PermissionError` means the process exists and belongs to somebody
@@ -108,28 +171,6 @@ class TestAPidThatIsNotOne(Fixture):
             watch.alive(0)
         self.assertIn("process group", str(raised.exception))
 
-    def test_the_command_line_refuses_it_as_a_usage_error(self) -> None:
-        """Through argparse rather than as a traceback: the whole failure this
-        tool addresses is a reader who has stopped watching closely, and a
-        stack trace twenty seconds in is not where they are looking."""
-        ran = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tools.watch",
-                "0",
-                "--log",
-                str(self.log),
-                "--done",
-                str(self.done),
-            ],
-            cwd=Path(watch.__file__).resolve().parent.parent,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(ran.returncode, 2)
-        self.assertIn("process group", ran.stderr)
-
     def test_an_ordinary_pid_still_gets_through(self) -> None:
         """The guard above passes on a converter that rejects everything."""
         self.assertEqual(watch.a_pid(str(os.getpid())), os.getpid())
@@ -148,6 +189,20 @@ class TestTheJobIsGone(Fixture):
         out, which is exactly what the reader did for an hour."""
         line, _ = self.watching(self.reaped()).step() or ("", -1)
         self.assertIn("gone, not slow", line)
+
+    def test_it_says_how_long_the_job_had_been_running(self) -> None:
+        """Back-dated rather than waited out: an hour of test suite to pin a
+        number is not a trade anyone would take, and the arithmetic is the same.
+
+        Without it every assertion here reads "0m", which is what `// 60`
+        becoming `* 60` also produces at these timescales -- so the minutes
+        figure in the DIED line, the one thing telling a reader how much work
+        was lost, was unguarded.
+        """
+        watching = self.watching(self.reaped())
+        watching.began -= 3600.0
+        line, _ = watching.step() or ("", 0)
+        self.assertIn("after 60m", line)
 
     def test_it_says_how_far_the_job_got(self) -> None:
         self.log.write_text("row\nrow\nrow\n", encoding="utf-8")
@@ -270,46 +325,52 @@ class TestItForksNothing(Fixture):
 
 
 class TestTheCommandLine(Fixture):
+    def ran(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(self.command(*extra), cwd=self.repo, capture_output=True, text=True)
+
     def test_it_exits_zero_when_the_job_finished(self) -> None:
         self.done.write_text("{}", encoding="utf-8")
-        ran = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tools.watch",
-                str(self.reaped()),
-                "--log",
-                str(self.log),
-                "--done",
-                str(self.done),
-            ],
-            cwd=Path(watch.__file__).resolve().parent.parent,
-            capture_output=True,
-            text=True,
-        )
+        ran = self.ran(str(self.reaped()))
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertIn("FINISHED", ran.stdout)
 
     def test_it_exits_one_when_the_job_died(self) -> None:
         """The exit status matters as much as the line: a caller that only reads
         the status still learns the difference."""
-        ran = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tools.watch",
-                str(self.reaped()),
-                "--log",
-                str(self.log),
-                "--done",
-                str(self.done),
-            ],
-            cwd=Path(watch.__file__).resolve().parent.parent,
-            capture_output=True,
-            text=True,
-        )
+        ran = self.ran(str(self.reaped()))
         self.assertEqual(ran.returncode, 1)
         self.assertIn("DIED", ran.stdout)
+
+    def test_it_repeats_nothing_while_nothing_changes(self) -> None:
+        """Twenty polls, one line -- the promise the whole tool rests on.
+
+        Only reachable end to end: `step` returning None is the ordinary quiet
+        poll, and every other test here stops at the first event, so the code
+        that has to *survive* a None had no coverage at all. Run at 50ms so a
+        second of wall clock is twenty of them, and terminated rather than
+        waited for, because a watcher of something still running never exits.
+
+        A traceback would also be one line per poll, so both halves are checked:
+        the count, and that the stream is clean.
+        """
+        watcher = subprocess.Popen(
+            self.command(str(self.running().pid), "--interval", "0.05"),
+            cwd=self.repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.addCleanup(watcher.kill)
+        time.sleep(1.0)
+        watcher.terminate()
+        out = watcher.communicate(timeout=10)[0]
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(out.count("working:"), 1, out)
+
+    def test_a_pid_that_is_a_group_is_a_usage_error(self) -> None:
+        ran = self.ran("0")
+        self.assertEqual(ran.returncode, 2)
+        self.assertIn("process group", ran.stderr)
 
 
 if __name__ == "__main__":
