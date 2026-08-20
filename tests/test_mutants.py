@@ -205,10 +205,23 @@ _QUIET: dict[str, str] = {
     # A variable divisor has no literal to move, and a multiplication is not a
     # division however constant its right side -- the second line is why this
     # is a separate operator from `arith` rather than a case inside it.
-    "divisor": "x = total // count\nx = total * 60\n",
+    #
+    # Then the three the guard rejects one clause at a time, because with only
+    # the two above, *dropping the whole guard* left this fixture quiet and the
+    # mutant survived: `True` is an `int` in Python and would otherwise divide
+    # into `2`, `0` is the division that raises rather than answers, and a float
+    # divisor moved by one is a change of a different order.
+    "divisor": (
+        "x = total // count\nx = total * 60\nw = total // True\ny = total // 0\nz = total // 1.5\n"
+    ),
     # `-0` is `0`, so the row would be an equivalent mutant by construction; and
     # a negated *name* has no literal whose sign there is to flip.
-    "sign": "x = -0\ny = -value\n",
+    #
+    # `-True` and `-"a"` are the two the guard rejects, and they are here for the
+    # same reason as above -- the first is an `int` by inheritance, the second is
+    # not a number at all, and without them the guard could be deleted whole with
+    # this fixture still silent.
+    "sign": 'x = -0\ny = -value\nz = -True\nw = -"a"\n',
     # `return None` is already what the mutation would produce -- and `return
     # True` is left to `return-constant`, which swaps it. `None` is falsy, so
     # asking both would be very nearly the same question at twice the price.
