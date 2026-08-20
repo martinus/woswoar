@@ -841,10 +841,11 @@ def forget_rows(needle: str, only_credentials: bool, shown: set[str]) -> list[fo
     The files are rewritten before the watermarks are saved, and that order is
     load-bearing rather than incidental. A crash in between leaves a watermark
     pointing past a file that is now shorter, so `export` publishes nothing for
-    that day until it grows back -- one line lost, and #262 is about making that
-    unreachable. The other order is worse *for this command specifically*: a
-    watermark saved low with the rows still in `logs/` re-seals and re-publishes
-    them, and the row in question is the one somebody just asked to be rid of.
+    that day until it grows back -- one line lost, and #263 is about making that
+    unreachable by checking the mark lands on a line boundary. The other order
+    is worse *for this command specifically*: a watermark saved low with the
+    rows still in `logs/` re-seals and re-publishes them, and the row in
+    question is the one somebody just asked to be rid of.
     """
     with lock():
         state = State.load()
