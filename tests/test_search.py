@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -1973,6 +1974,60 @@ class TestTheMachineInThePrompt(WoswoarTestCase):
         self.assertIn(f"--scope {search._NEXT['host']})", out)
 
 
+class TestTheAgeOfTheSessionInThePrompt(support.WoswoarTestCase):
+    """`woswoar (session)` said which scope you were in and nothing else (#257).
+
+    The id was correctly ruled out -- nobody recognises `<second>-<pid>` in hex,
+    and "which shell am I in" is not a question anybody has. "How far back does
+    this shell go" is, and nothing else on screen answered it. The start second
+    is already in `WOSWOAR_SESSION`, so the label costs no row read.
+
+    It is inherited and exportable, so every test here is really about the
+    guard: what a hostile or simply stale value does to the Ctrl-R path.
+    """
+
+    def prompt_with(self, session: str) -> str:
+        with mock.patch.dict(os.environ, {"WOSWOAR_SESSION": session}):
+            return search._prompt_for("session")
+
+    def test_it_shows_how_long_the_shell_has_been_open(self) -> None:
+        started = int(time.time()) - 3 * 3600 - 42 * 60
+        self.assertEqual(self.prompt_with(f"{started:x}-1f4"), "woswoar (session 3h42m) ")
+
+    def test_a_shell_opened_moments_ago_still_reads_as_an_age(self) -> None:
+        """The common case for a fresh terminal, and the one a `<hour` unit has
+        to cover -- `relative_time` drops to a single unit below an hour."""
+        self.assertRegex(self.prompt_with(f"{int(time.time()) - 90:x}-1f4"), r"session 1m\)")
+
+    def test_an_unset_variable_says_nothing(self) -> None:
+        """A shell without the hook loaded. Not an error, and not a label."""
+        self.assertEqual(self.prompt_with(""), "woswoar (session) ")
+
+    def test_a_value_that_is_not_a_session_id_says_nothing(self) -> None:
+        """Exported, therefore inherited, therefore anything. Each of these is a
+        different way through `_session_age`, and silence is the answer to all
+        of them -- the scope still works, it just stops describing itself."""
+        for planted in ("nonsense", "zz-1f4", "-1f4", "68a4f1c2", "0-1f4"):
+            with self.subTest(planted=planted):
+                self.assertEqual(self.prompt_with(planted), "woswoar (session) ")
+
+    def test_a_start_in_the_future_does_not_raise_on_the_ctrl_r_path(self) -> None:
+        """A clock that went backwards, or a value from a machine ahead of this
+        one. `relative_time` answers "now" rather than raising, and this pins
+        that the prompt is where that promise is relied on."""
+        ahead = f"{int(time.time()) + 600:x}-1f4"
+        self.assertEqual(self.prompt_with(ahead), "woswoar (session now) ")
+
+    def test_the_label_still_has_to_pass_the_prompt_guard(self) -> None:
+        """Not a hypothetical about today's `relative_time`: the guard is what
+        stops a future unit spelling reaching two parsers unchecked, and the
+        cheapest way to keep it load-bearing is to assert it applies."""
+        self.assertEqual(
+            self.prompt_with(f"{int(time.time()) - 7200:x}-1f4"),
+            f"woswoar (session {search.relative_time(int(time.time()) - 7200)}) ",
+        )
+
+
 class TestTheDirectoryInThePrompt(DirScopeCase):
     """`woswoar (dir)` said which scope you were in and not which directory.
 
@@ -1991,20 +2046,18 @@ class TestTheDirectoryInThePrompt(DirScopeCase):
         self.stand_in(self.home / "src/woswoar")
         self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/woswoar) ")
 
-    def test_global_and_session_gain_nothing(self) -> None:
+    def test_global_gains_nothing(self) -> None:
         """A decision, not an omission.
 
         `global` is every machine, which is what the word says -- a count of
         them describes the history rather than the scope, and moves under
-        someone as they sync. `session` is the shell being typed into, and its
-        id is `<second>-<pid>` in hex, which nobody recognises.
+        someone as they sync. That is also the line `session` had to clear
+        before it could gain a label; see `TestTheAgeOfTheSessionInThePrompt`.
 
         `host` is deliberately absent from this list; it has its own class.
         """
         self.stand_in(self.home)
-        for scope in ("global", "session"):
-            with self.subTest(scope=scope):
-                self.assertEqual(search._prompt_for(scope), f"woswoar ({scope}) ")
+        self.assertEqual(search._prompt_for("global"), "woswoar (global) ")
 
     def test_a_long_path_is_cut_from_the_left(self) -> None:
         """The prompt and the query share a line, and the tail is the part that
