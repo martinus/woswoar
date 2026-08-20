@@ -84,6 +84,12 @@ and the run says so; the narrow pass's own verdicts still stand. `--no-baseline`
 turns that off along with every other untouched-suite check, which is what it is
 for, and what it costs.
 
+Either way the `--json` report says which happened: `widened` is true only when
+every survivor in the file really was re-run against the whole suite. It is
+false after `--no-confirm`, after a suppressed confirmation, and in a
+part-written file from an interrupted sweep — the cases where the paragraph
+above promises something the file cannot deliver.
+
 Fifteen operators, and `--skip-operator NAME` drops one — the escape hatch for
 an equivalent mutant a whole operator keeps producing, where `# pragma: no
 mutate` only suppresses a line. Twelve rewrite an expression (`<` to `<=`, `and`
