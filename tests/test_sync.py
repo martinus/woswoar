@@ -6674,3 +6674,80 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         self.assertRegex(out, r"\[FAIL\] repo format")
         self.assertIn(str(archive.REPO_FORMAT + 1), out)
         self.assertIn("upgrade woswoar", out)
+
+
+class TestAForgottenRowIsNotMergedBack(SyncTestCase):
+    """The half of `forget` that a local delete alone does not buy (#256).
+
+    Removing a row from `logs/` is durable only while `state.merged` remembers
+    that the chunk holding it was already read. That record is progress, not
+    history -- rule 8 says losing it costs a re-merge -- so a re-merge, a
+    restored machine or a fresh clone walks the chunk store and writes every
+    forgotten row straight back. The chunk cannot be edited: history is
+    append-only and every peer's signature rests on it. So the only place a
+    forgotten row can be stopped is on its way back out, every time, which is
+    what the digest file is for.
+
+    Driven end to end for the reason rule 3 gives: the property is an
+    interaction between `forget`, `state.json` and the merge path, and a test of
+    any one of the three would be asserting the part that was already believed.
+    """
+
+    SECRET = "export AWS_SECRET_ACCESS_KEY=wharrgarbl"
+
+    def two_machines(self) -> tuple[Fake, Fake]:
+        """alpha publishes a day holding the secret; beta merges it."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            alpha.record("2023-11-14", 1_700_000_002, self.SECRET)
+            sync.run()
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertIn(self.SECRET, beta.commands())
+        return alpha, beta
+
+    @staticmethod
+    def remerge() -> None:
+        """What a restored `state.json` or a fresh clone looks like from here.
+
+        Only the merge bookkeeping is dropped. Deleting the whole file would
+        also drop `signers`, and beta would then refuse alpha's history as
+        unpinned -- which is a different, louder thing than the silent
+        resurrection this is about.
+        """
+        state = sync.State.load()
+        state.merged.clear()
+        state.merged_at.clear()
+        state.save()
+        sync.run()
+
+    def test_forgetting_removes_it_from_this_machine(self) -> None:
+        """The control. Without this the test below passes on a `forget` that
+        never did anything in the first place."""
+        _, beta = self.two_machines()
+        with beta.active():
+            self.assertEqual(support.run_cli("forget", "AWS_SECRET", "--yes").code, 0)
+            self.assertNotIn(self.SECRET, beta.commands())
+
+    def test_a_re_merge_does_not_bring_it_back(self) -> None:
+        _, beta = self.two_machines()
+        with beta.active():
+            support.run_cli("forget", "AWS_SECRET", "--yes")
+            self.remerge()
+            self.assertNotIn(self.SECRET, beta.commands())
+
+    def test_the_rest_of_the_day_survives_the_re_merge(self) -> None:
+        """The fixture that keeps the assertion above from passing vacuously: a
+        merge that dropped the whole chunk would satisfy it too."""
+        _, beta = self.two_machines()
+        with beta.active():
+            support.run_cli("forget", "AWS_SECRET", "--yes")
+            self.remerge()
+            self.assertIn("git status", beta.commands())

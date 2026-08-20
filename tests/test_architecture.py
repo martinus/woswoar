@@ -79,7 +79,23 @@ LAYERS: dict[str, set[str]] = {
     "install": {"entry", "errors", "report", "store"},
     "cache": {"entry", "store"},
     "search": {"cache", "entry", "store"},
+    #: `forget` is deliberately absent: both import paths reach it inside the
+    #: function that writes, so a keypress -- which imports this module at
+    #: the top, for the parser -- does not pay for it. The edge is real and
+    #: load-bearing: `logs/` has two doors and this is the other one, since a
+    #: row `forget` took out is no longer in `existing_keys` and a re-import
+    #: would write it back verbatim.
     "importer": {"credentials", "entry", "errors", "store"},
+    #: Reached from `sync`, and pointedly not the other way. `forget` knows how
+    #: to take a row out of `logs/` and how to recognise one coming back; when
+    #: that happens is `merge`'s business, and an edge back to `sync` would put
+    #: the suppression list on the wrong side of the module that has to consult
+    #: it on every chunk. `credentials` is deliberately absent: `--credentials`
+    #: is the CLI's selector -- #54's read-only scan arriving as a selector
+    #: rather than as a second verb -- and `find` asks for it itself, so a
+    #: background sync, which reaches this module once a minute to ask what is
+    #: suppressed, does not pay to import the importer's credential rules.
+    "forget": {"entry", "errors", "store"},
     #: `importer` and `sync` are deliberately absent: the wizard asks about them
     #: inside the two functions that need them.
     "setup": {"entry", "errors", "install", "report", "store"},
@@ -98,6 +114,7 @@ LAYERS: dict[str, set[str]] = {
         "fleet",
         "entry",
         "errors",
+        "forget",
         "gitrepo",
         "manifest",
         "progress",
@@ -122,6 +139,7 @@ LAYERS: dict[str, set[str]] = {
         "entry",
         "errors",
         "fleet",
+        "forget",
         "gitrepo",
         "manifest",
         "progress",

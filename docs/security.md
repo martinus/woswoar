@@ -421,6 +421,8 @@ every other check you can run without believing anyone.
 | Compaction does not duplicate history | a peer that already merged a day, and one that merged only part of it, both end up holding each command exactly once |
 | A day whose signed list is gone is refused, not re-signed | deleting a manifest and syncing publishes nothing further for that day, rather than signing a replacement that names only the newest chunk and disowns every earlier one |
 | A day whose sealed key is gone is refused, not written over | deleting one and syncing publishes nothing further for that day and says so, rather than adding chunks no machine could ever read |
+| A forgotten command stays forgotten | two real machines: after `woswoar forget --yes`, dropping the merge bookkeeping and syncing again leaves the row gone and the rest of its day intact |
+| Forgetting a published row does not shorten the next chunk | the sealed-bytes watermark moves down by exactly what was removed below it, so the unsealed tail is still exactly the lines that were never sealed |
 | This machine never writes a chunk its peers would refuse | a tail past the export budget is split into several chunks and a peer merges every line of it; compaction, the other producer, leaves a day alone rather than merging it past the same budget |
 
 **Nothing woswoar reads can run**
@@ -482,7 +484,12 @@ Being straight about the limits is part of the security story:
 >   recorded long before woswoar existed, and additionally recognises well-known
 >   token formats, which is where the risk is concentrated. But **no pattern
 >   catches everything**. [What it does and does not catch](shell-integration.md#commands-that-are-never-recorded)
->   is written down; read it before relying on it.
+>   is written down; read it before relying on it. When one gets through,
+>   `woswoar forget <text>` removes it from this machine — out of `logs/`, out
+>   of Ctrl-R, out of `stats` — and remembers it so a later sync cannot merge it
+>   back. It prints what it would remove and does nothing without `--yes`.
+>   `woswoar forget --credentials` runs the filter over what is already
+>   recorded. What it cannot do is the next bullet.
 >
 >   For a sense of scale rather than a promise: measured against one
 >   maintainer's real atuin history of **55,017 commands**, the rules skipped 32
@@ -496,6 +503,13 @@ Being straight about the limits is part of the security story:
 >   a new one and carries on recording, but every peer refuses its history until
 >   a human there runs `woswoar trust --replace` — deliberately, because a
 >   changed signing key and an impersonation look identical from the outside.
+> - **Forgetting is local; publishing is not.** `woswoar forget` rewrites this
+>   machine's plaintext logs, and that is all it can do. Chunks are never
+>   rewritten — history is append-only and every peer's signature rests on that
+>   — so a row that has already synced stays in the repository and on every
+>   machine that merged it. `forget` says which of the rows it found are in that
+>   position, and names the day. If one of them is a credential, rotate it: that
+>   is the only thing that takes it out of use.
 > - **Revoking cannot take back what was already published.** `woswoar revoke`
 >   stops a machine both reading and publishing from that moment on, but a copy
 >   it already made is a copy it keeps. It also refuses history that machine

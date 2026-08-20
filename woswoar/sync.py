@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import archive, codec, crypto, fleet, gitrepo, manifest, progress, store
+from . import archive, codec, crypto, fleet, forget, gitrepo, manifest, progress, store
 from .entry import make_inert
 from .errors import SyncError, WoswoarError
 from .report import Check, Notice
@@ -820,6 +820,47 @@ def lock() -> Iterator[None]:
         handle.close()
 
 
+def forget_rows(needle: str, only_credentials: bool, shown: set[str]) -> list[forget.Match]:
+    """Remove ``shown`` from this machine's logs, and reseat what that moves.
+
+    Here rather than in `forget` because it is one operation and half of it is
+    `sync`'s: `state.exported` is a byte count into a plaintext log that only
+    `export` knows how to read, and `lock` is what every other command that
+    touches `State` already takes. Split across the two modules it was five
+    ordered steps a second caller would have to rediscover from the CLI, and
+    `forget` would have needed an edge back to this module to hold them.
+
+    ``shown`` is the digests of the rows a person was actually shown. The search
+    is run again in here because the listing was taken outside the lock -- a
+    sync since then may have rewritten a peer's day file and moved every offset
+    -- but only rows that were on screen are removed. Without that intersection,
+    a command recorded between the listing and the ``--yes`` could be deleted
+    having never been displayed, which for this command is the one thing that
+    must not happen.
+
+    The files are rewritten before the watermarks are saved, and that order is
+    load-bearing rather than incidental. A crash in between leaves a watermark
+    pointing past a file that is now shorter, so `export` publishes nothing for
+    that day until it grows back -- one line lost, and #263 is about making that
+    unreachable by checking the mark lands on a line boundary. The other order
+    is worse *for this command specifically*: a watermark saved low with the
+    rows still in `logs/` re-seals and re-publishes them, and the row in
+    question is the one somebody just asked to be rid of.
+    """
+    with lock():
+        state = State.load()
+        matches = [
+            match
+            for match in forget.find(
+                needle, only_credentials=only_credentials, exported=state.exported
+            )
+            if forget.digest(match.line) in shown
+        ]
+        state.exported.update(forget.apply(matches, state.exported))
+        state.save()
+    return matches
+
+
 class Failure(NamedTuple):
     """A recorded sync failure, and when it happened."""
 
@@ -1573,10 +1614,16 @@ def merge(known: Machine, state: State, report: Report) -> None:
     # rather than skipped in the loop: the phase names the machine being read,
     # and `_merge_host` counts that machine's days underneath it.
     others = [host for host in archive.repo_hosts() if host != known.id]
+    # Read once for the whole merge rather than per host or per chunk. A chunk
+    # keeps a forgotten row for ever -- history is append-only, which is the
+    # point -- so the only place to stop it is here, on every sync, for as long
+    # as the chunk exists. Empty on every machine that has never run `forget`,
+    # and `forget.surviving` returns its argument unchanged for that case.
+    suppressed = frozenset(forget.load_digests())
     for host_id in others:
         progress.phase(f"reading history from {name_for(host_id).text}")
         report.hosts_seen.add(host_id)
-        _merge_host(known, host_id, state, report)
+        _merge_host(known, host_id, state, report, suppressed)
         _merge_name(known, host_id)
 
 
@@ -1629,7 +1676,13 @@ def _stamp(state: State, key: str, stamp: int | None, settled: bool) -> None:
         state.merged_at[key] = stamp
 
 
-def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> None:
+def _merge_host(
+    known: Machine,
+    host_id: str,
+    state: State,
+    report: Report,
+    suppressed: frozenset[str],
+) -> None:
     verify_key = _trusted_signer(host_id, state, report)
     if verify_key is None:
         return
@@ -1759,7 +1812,19 @@ def _merge_host(known: Machine, host_id: str, state: State, report: Report) -> N
                 report.record(UNREADABLE, key)
                 continue
 
-            day.add(plaintext, report)
+            # Filtered before the day is assembled, not after, because a
+            # rewrite replaces the file from the chunks alone: anything let
+            # through is what the day *becomes*. `state.merged` stops a chunk
+            # being read twice, so on an ordinary machine this only ever sees
+            # new lines -- but a re-merge, a fresh clone or a compaction rebuild
+            # sends the whole day back through here, which is exactly when a
+            # forgotten row would otherwise return.
+            plaintext = forget.surviving(plaintext, suppressed)
+            if plaintext:
+                day.add(plaintext, report)
+            # Outside the guard on purpose: a chunk whose every line was
+            # forgotten has still been read, and leaving it out of `taken` would
+            # re-read it on every sync for as long as the chunk exists.
             taken.append(name)
 
         # A rewrite *replaces* the day's file, so it must not run on a partial

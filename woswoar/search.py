@@ -160,7 +160,10 @@ _HOST_WIDTH = 20
 #: Cut here rather than at the end. A name is `user@host`, and the *host* is
 #: what tells two of your machines apart -- it is also the part a long username
 #: pushes off the end.
-_ELLIPSIS = "\u2026"
+#: Public because `__main__`'s `forget` listing clips too, in the other
+#: direction. One spelling of the character, two decisions about which half
+#: of a string it replaces.
+ELLIPSIS = "\u2026"
 
 
 def host_label(host_id: str) -> str:
@@ -199,7 +202,7 @@ def host_labels(hosts: set[str]) -> dict[str, str]:
 
 
 def _clip(label: str, width: int = _HOST_WIDTH) -> str:
-    """Trim to ``width``, keeping the end -- see `_ELLIPSIS`.
+    """Trim to ``width``, keeping the end -- see `ELLIPSIS`.
 
     The default is the machine column, which is where this started. The prompt's
     directory label wants the same operation at a different width, and for the
@@ -208,7 +211,7 @@ def _clip(label: str, width: int = _HOST_WIDTH) -> str:
     """
     if len(label) <= width:
         return label
-    return _ELLIPSIS + label[-(width - 1) :]
+    return ELLIPSIS + label[-(width - 1) :]
 
 
 def command_from_line(line: str, host_width: int = 0) -> str:
@@ -413,7 +416,7 @@ def _safe_for_prompt(label: str) -> str:
     Cut from the left, because `.../woswoar/tests` says which directory it is
     and `~/src/very/deep/...` does not -- and because a machine called
     `martinus@DT-24YY` is told apart by its end too, which is the argument
-    `_ELLIPSIS` already makes for the machine column.
+    `ELLIPSIS` already makes for the machine column.
     """
     if not label or any(
         not char.isalnum() and char not in _PROMPT_SAFE_PUNCTUATION for char in label

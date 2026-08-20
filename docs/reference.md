@@ -21,6 +21,7 @@ Every command and every environment variable, in one place. `woswoar --help` and
 | `woswoar grant` | let newly enrolled machines read the older history |
 | `woswoar trust` | accept another machine's published history here |
 | `woswoar compact` | merge old chunks to reduce the working-tree file count |
+| `woswoar forget <text>` | remove recorded commands from this machine (dry run without `--yes`) |
 
 ## Environment
 
