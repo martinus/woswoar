@@ -289,8 +289,11 @@ def _project_root(path: str, home: str) -> str:
     And it returns ``path`` unchanged when it finds nothing, which is not a
     fallback so much as the scope exactly as it stands.
     """
-    if not path:
-        return path
+    # No guard on an empty ``path``: `_here` returns `()` before it gets here, so
+    # a branch for it would be unreachable -- and an unreachable branch is a row
+    # that survives every mutation sweep for ever, which is how a survivor list
+    # stops being read.
+    #
     # `os.path` rather than `pathlib`, matching the rest of this module: these
     # are string operations on a path that is already absolute, and the only
     # syscall in the loop is the one asking the question. `os.path.exists` is
