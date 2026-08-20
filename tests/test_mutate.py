@@ -864,6 +864,44 @@ class TestConfirmingNeedsAGreenSuiteToo(TwoRowsSharingALabel):
             ["survived", "survived"],
         )
 
+    def test_a_clean_report_is_neither_announced_nor_re_run(self) -> None:
+        """No survivor, so nothing to widen -- and nothing to say about it.
+
+        The promise holds vacuously, which is why `widened` is true here; a
+        clean sweep marked "not confirmed" would be the one report this tool
+        exists to produce, carrying a warning about work it correctly skipped.
+        Silence is asserted too, because falling through announces "confirming
+        0 survivor(s) against the whole suite" about a pass that runs nothing.
+        """
+        self.package(guarded=True)
+        report = run(
+            [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+            baseline=False,
+        )
+        self.assertEqual([result.verdict.outcome for result in report.results], ["caught"])
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(said.getvalue(), "")
+        self.assertTrue(confirmed.widened)
+
+    def test_a_survivor_the_whole_suite_cannot_see_either_is_still_widened(self) -> None:
+        """The healthy-repo case, and the one the other tests skip past.
+
+        A real survivor on a green tree: the pass runs, corrects nothing, and
+        must still report that it happened -- otherwise `widened` is false
+        exactly when the news is "your test is genuinely weak", which is when a
+        reader most needs to trust the row.
+
+        Only the second row, because the first is corrected by the wide suite
+        and a non-empty `corrected` takes a different return.
+        """
+        report = run(self.two_rows_with_one_label(), baseline=False, strict=False)
+        genuine = Report(report.results[1:], report.baseline_red)
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(genuine, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual([result.verdict.outcome for result in confirmed.results], ["survived"])
+        self.assertTrue(confirmed.widened)
+
     def test_no_baseline_still_means_no_baseline(self) -> None:
         """The escape hatch keeps working, and the reader gets to see its price.
 
