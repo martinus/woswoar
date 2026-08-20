@@ -72,11 +72,23 @@ class Fixture(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_DFL); time.sleep(30)",
-            ]
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGHUP, signal.SIG_DFL)\n"
+                "sys.stdout.write('x')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(30)\n",
+            ],
+            stdout=subprocess.PIPE,
         )
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
+        assert child.stdout is not None
+        # Blocks until the reset above has actually run. Without this the caller
+        # signals a process that is still importing, the default is not restored
+        # yet, and the inherited SIG_IGN swallows it -- a fixture that proves the
+        # opposite of what it says while staying green. The sweep found it: the
+        # reset alone left the SIGHUP mutant alive.
+        self.assertEqual(child.stdout.read(1), b"x")
         return child
 
     def command(self, *extra: str) -> list[str]:
