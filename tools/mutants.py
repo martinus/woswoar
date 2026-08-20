@@ -499,6 +499,75 @@ def off_by_one(node: ast.AST) -> Iterator[Edit]:
         yield Edit(node, repr(now), f"`{node.value}` becomes `{now}`")
 
 
+def sign(node: ast.AST) -> Iterator[Edit]:
+    """A negative numeric literal, made positive. `-1` -> `1`.
+
+    `off-by-one` cannot reach this. `-1` parses as `UnaryOp(USub, Constant(1))`,
+    so that operator sees the `1` and moves it to `0` or `2`, which the minus
+    then turns into `0` and `-2` -- both still negative-or-zero, and a sentinel
+    chosen for being negative survives all of them. Nothing here touched the
+    minus itself until #274.
+
+    Found by comparing against mutmut on #272: `tools/watch.py` sets
+    `self.last = -1` so that a job already at zero rows still gets its opening
+    line, and `+1` breaks that for a log holding exactly one matching row --
+    silently, which is the failure the sentinel exists to prevent.
+
+    Only negative to positive, never the reverse. Flipping every positive
+    literal would fire on nearly every integer in the codebase, and a negative
+    one is rare enough to be deliberate: a sentinel, a reverse index, an offset
+    backwards. The asymmetry is the precision.
+    """
+    if not isinstance(node, ast.UnaryOp) or not isinstance(node.op, ast.USub):
+        return
+    if not isinstance(node.operand, ast.Constant):
+        return
+    value = node.operand.value
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return
+    # `0` and `-0` are the same number, so the row would be an equivalent mutant
+    # by construction and cost a suite run to say so.
+    if not value:
+        return
+    yield Edit(node, repr(value), f"`-{value}` becomes `{value}`")
+
+
+#: Division and modulo, where an off-by-one on the right operand changes the
+#: *unit* rather than an index -- `// 60` reading a count of seconds as minutes.
+_DIVIDES = (ast.Div, ast.FloorDiv, ast.Mod)
+
+
+def divisor(node: ast.AST) -> Iterator[Edit]:
+    """The right operand of `/`, `//` or `%`, moved by one.
+
+    Deliberately not a widening of `off-by-one`, which caps at `abs(value) > 2`
+    and should keep that cap: moving every integer in the codebase by one would
+    be thousands of rows, nearly all equivalent. The cap is why `// 60` was
+    never a candidate, and the answer is not a bigger cap but a narrower
+    position -- a divisor is a *unit*, and its magnitude says nothing about how
+    interesting it is to be wrong by one.
+
+    From #272: `Watch.minutes()` computes `// 60`, and at the revision compared
+    there nothing could tell `// 61` from it, because every assertion in the
+    file read "0m".
+
+    A divisor of `1` yields no row for the `0` direction: dividing by zero is a
+    `ZeroDivisionError`, which reports `BROKE` rather than an answer and costs a
+    whole suite run to establish nothing.
+    """
+    if not isinstance(node, ast.BinOp) or not isinstance(node.op, _DIVIDES):
+        return
+    if not isinstance(node.right, ast.Constant):
+        return
+    value = node.right.value
+    if isinstance(value, bool) or not isinstance(value, int) or not value:
+        return
+    for now in (value + 1, value - 1):
+        if not now:
+            continue
+        yield Edit(node.right, repr(now), f"`{value}` becomes `{now}`")
+
+
 def return_value(node: ast.AST) -> Iterator[Edit]:
     """`return X` -> `return None`: the function that silently returns nothing.
 
@@ -615,6 +684,8 @@ OPERATORS: tuple[Operator, ...] = (
     Operator("drop-assign", drop_assign),
     Operator("drop-kwarg", drop_kwarg),
     Operator("off-by-one", off_by_one),
+    Operator("sign", sign),
+    Operator("divisor", divisor),
     Operator("return-value", return_value),
     Operator("arith", arith),
     Operator("slice", slice_widened),

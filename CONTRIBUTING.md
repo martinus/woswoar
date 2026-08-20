@@ -90,13 +90,23 @@ false after `--no-confirm`, after a suppressed confirmation, and in a
 part-written file from an interrupted sweep — the cases where the paragraph
 above promises something the file cannot deliver.
 
-Fifteen operators, and `--skip-operator NAME` drops one — the escape hatch for
+Seventeen operators, and `--skip-operator NAME` drops one — the escape hatch for
 an equivalent mutant a whole operator keeps producing, where `# pragma: no
-mutate` only suppresses a line. Twelve rewrite an expression (`<` to `<=`, `and`
-to `or`, `sorted(x)` to `sorted(x, reverse=True)`, `.endswith(...)` to `True`, an
-`if` forced both ways, `+` to `-`, a slice's bounds dropped, a small integer
-moved by one, `return X` to `return None`); two delete a statement, and one
-drops a keyword argument.
+mutate` only suppresses a line. Fourteen rewrite an expression (`<` to `<=`,
+`and` to `or`, `sorted(x)` to `sorted(x, reverse=True)`, `.endswith(...)` to
+`True`, an `if` forced both ways, `+` to `-`, a slice's bounds dropped, a small
+integer moved by one, a *divisor* moved by one, a negative literal made
+positive, `return X` to `return None`); two delete a statement, and one drops a
+keyword argument.
+
+The last two arrived from #274, after #272 measured us against mutmut on a
+revision whose answer was already known. `divisor` is separate from `off-by-one`
+rather than a widening of it: that operator caps at literals of two or less, and
+should — moving every integer in the codebase by one is thousands of rows, nearly
+all equivalent. A divisor is a *unit*, so its magnitude says nothing about how
+interesting it is to be wrong by one. `sign` exists because `-1` parses as a
+minus applied to `1`, so `off-by-one` moves the `1` and never the minus, and a
+sentinel chosen for being negative survives every row it produces.
 
 Deletion is deliberately narrow. `drop-call` removes a call whose value is
 discarded — `path.mkdir()`, `store.flush()` — which is the "the write never
