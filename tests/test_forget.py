@@ -166,6 +166,23 @@ class TestTheSealedPrefixMovesWithTheFile(ForgetTestCase):
         support.run_cli("forget", "make -j8", "--yes")
         self.assertEqual(self.exported(), len(self.lines[0]) + 1)
 
+    def test_a_long_unsealed_row_is_still_not_counted(self) -> None:
+        """The fixture the test above is too short to be.
+
+        `offset + length <= watermark` decides which removed rows move the mark.
+        With rows of ordinary length, writing that as `offset - length` picks out
+        the same set, so the arithmetic reads as tested when it is not. A row
+        longer than everything sealed before it is what separates them: its
+        `offset - length` falls below the watermark while `offset + length` is
+        well past it, and counting it would silently stop that many bytes of real
+        history from ever being published.
+        """
+        self.lines = [_line(1_755_600_001, "cd /tmp"), _line(1_755_600_002, "echo " + "y" * 300)]
+        self.log = self.write_log(support.MACHINE_ID, self.DAY, self.lines)
+        self.mark_exported(1)
+        support.run_cli("forget", "yyy", "--yes")
+        self.assertEqual(self.exported(), len(self.lines[0]) + 1)
+
 
 class TestWhatItSaysAboutWhatItCannotDo(ForgetTestCase):
     def test_a_published_row_is_named_with_its_day(self) -> None:
@@ -419,8 +436,14 @@ class TestTheListingSaysEnoughToAnswerWith(ForgetTestCase):
         """Both halves, because a sentence that always says "them" satisfies the
         first assertion on its own."""
         self.assertIn("to remove it from", support.run_cli("forget", "AWS_SECRET").out)
-        # "a" is in all three fixture commands.
-        self.assertIn("to remove them from", support.run_cli("forget", "a").out)
+        # Exactly two, which is the boundary `len(matches) > 1` sits on: three
+        # cannot tell it from `> 2`.
+        self.write_log(
+            support.MACHINE_ID,
+            self.DAY,
+            [_line(1_755_600_001, "one token"), _line(1_755_600_002, "two token")],
+        )
+        self.assertIn("to remove them from", support.run_cli("forget", "token").out)
 
     def test_a_long_command_is_clipped_and_says_so(self) -> None:
         """`FORGET_PREVIEW` characters and the picker's own ellipsis. Clipped from
@@ -438,6 +461,14 @@ class TestTheListingSaysEnoughToAnswerWith(ForgetTestCase):
         out = support.run_cli("forget", "make -j8").out
         self.assertIn("make -j8", out)
         self.assertNotIn(search.ELLIPSIS, out)
+
+    def test_a_command_that_exactly_fills_the_preview_is_not_clipped(self) -> None:
+        """The boundary `>` sits on. A command one character over is clipped and
+        one exactly at the limit is not, and only a fixture of exactly that
+        length can tell the two comparisons apart."""
+        exact = "x" * main_module.FORGET_PREVIEW
+        self.write_log(support.MACHINE_ID, self.DAY, [_line(1_755_600_001, exact)])
+        self.assertNotIn(search.ELLIPSIS, support.run_cli("forget", "xxx").out)
 
     def test_it_says_what_it_removed(self) -> None:
         out = support.run_cli("forget", "AWS_SECRET", "--yes").out
