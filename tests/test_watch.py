@@ -284,6 +284,22 @@ class TestWhatCountsAsProgress(Fixture):
         line, status = self.watching(os.getpid()).step() or ("", 0)
         self.assertEqual((line, status), ("working: 0 rows after 0m", -1))
 
+    def test_a_log_that_already_has_rows_still_gets_an_opening_line(self) -> None:
+        """The sentinel's *sign*, which its magnitude was standing in for.
+
+        `last` starts negative so the opening poll is always a change. Any
+        non-negative start silently swallows the first line for a log that
+        already holds exactly that many rows -- and attaching a watcher to a job
+        already under way is the ordinary case, not a corner.
+
+        Found by #274's `sign` operator: `-1` becoming `1` survived every test
+        in this file, because none of them started the watcher against a log
+        with anything in it.
+        """
+        self.log.write_text("row\n", encoding="utf-8")
+        line, status = self.watching(os.getpid()).step() or ("", 0)
+        self.assertEqual((line, status), ("working: 1 rows after 0m", -1))
+
     def test_an_unchanged_count_is_not_an_event(self) -> None:
         """One line per twenty seconds for forty minutes is the same as no
         signal, by a different route."""
@@ -302,6 +318,24 @@ class TestWhatCountsAsProgress(Fixture):
         self.log.write_text("caught one\nnoise\ncaught two\n", encoding="utf-8")
         line, _ = self.watching(os.getpid(), match="^caught").step() or ("", 0)
         self.assertIn("2 rows", line)
+
+    def test_a_log_holding_bytes_that_are_not_utf8_is_still_counted(self) -> None:
+        """`errors="replace"` rather than strict decoding, and why it matters.
+
+        The log belongs to the job, not to the watcher, and a job killed
+        mid-write leaves a partial multi-byte sequence at the end of it. Strict
+        decoding raises `UnicodeDecodeError` there -- a `ValueError`, so the
+        `except OSError` above does *not* catch it, and it propagates out of
+        `main` as a traceback. The watcher would die of the thing it was hired
+        to report on, at exactly the moment it was about to report it.
+
+        From #272: mutmut mutates string literals and found this unguarded. We
+        do not generate that mutant and #274 argues we should not, so this test
+        guards a property no sweep of ours will check -- which is the reason to
+        say all of that here rather than leave it to the next reader.
+        """
+        self.log.write_bytes(b"caught one\ncaught \xff\xfe two\n")
+        self.assertEqual(watch.counted(self.log, re.compile("^caught")), 2)
 
     def test_a_log_that_does_not_exist_yet_is_zero_rather_than_an_error(self) -> None:
         """A job that has not opened its log is at zero rows. Treating absence as
