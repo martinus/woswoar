@@ -6751,3 +6751,93 @@ class TestAForgottenRowIsNotMergedBack(SyncTestCase):
             support.run_cli("forget", "AWS_SECRET", "--yes")
             self.remerge()
             self.assertIn("git status", beta.commands())
+
+
+class TestAWatermarkLeftInsideARecord(SyncTestCase):
+    """What `forget` made reachable, and `store.line_start` closes (#263).
+
+    `export` takes the tail from `state.exported`, and every mark `read_tail`
+    ever produced names the start of a line -- so while the logs were strictly
+    append-only, the assumption held by construction and nothing checked it.
+    `forget` can *shorten* a log. Its rewrite and its `state.save` are two
+    steps, and a crash between them leaves the mark pointing into the middle of
+    a record that is now in a different place.
+
+    What follows is silent and cannot be repaired afterwards: the next chunk for
+    that day begins with a fragment, no peer can parse it, and the command it
+    came from reaches no other machine. The repository is append-only, so the
+    bad chunk stays.
+
+    The crash is simulated by putting the watermark back after the rewrite,
+    which is exactly the state that interruption leaves -- and is the only way
+    to reach it deterministically.
+    """
+
+    #: Short, so that removing it leaves the stale mark *inside* the command
+    #: recorded afterwards rather than past the end of the file -- past the end
+    #: is the other half of the same bug and shows up as a day that silently
+    #: stops publishing, which `test_the_day_does_not_stall` covers.
+    GONE = "ls"
+    #: Longer than `GONE`, for the same reason.
+    AFTER = "echo " + "z" * 200
+
+    def alpha_with_a_stale_watermark(self) -> Fake:
+        """alpha, having forgotten a row and crashed before saving progress."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            alpha.record("2023-11-14", 1_700_000_002, self.GONE)
+            alpha.record("2023-11-14", 1_700_000_003, "make -j8")
+            sync.run()
+            before = dict(sync.State.load().exported)
+
+            self.assertEqual(support.run_cli("forget", self.GONE, "--yes").code, 0)
+
+            # The rewrite landed; the save did not.
+            state = sync.State.load()
+            state.exported.update(before)
+            state.save()
+
+            alpha.record("2023-11-14", 1_700_000_004, self.AFTER)
+            sync.run()
+        return alpha
+
+    def beta_seeing(self, alpha: Fake) -> set[str]:
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            return beta.commands()
+
+    def test_the_command_recorded_afterwards_reaches_the_peer(self) -> None:
+        self.assertIn(self.AFTER, self.beta_seeing(self.alpha_with_a_stale_watermark()))
+
+    def test_no_half_record_is_published(self) -> None:
+        """The sharper form of the same claim, and the one that would still fail
+        if a fragment happened to parse: every command a peer merges is one this
+        machine actually recorded, not a suffix of one."""
+        recorded = {"git status", self.GONE, "make -j8", self.AFTER}
+        self.assertTrue(self.beta_seeing(self.alpha_with_a_stale_watermark()) <= recorded)
+
+    def test_an_ordinary_sync_still_publishes_each_line_once(self) -> None:
+        """The fixture that keeps the two above from passing on a guard that
+        re-publishes the whole day every time: a mark that is already on a
+        boundary must be left exactly where it is."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            alpha.record("2023-11-14", 1_700_000_001, "git status")
+            sync.run()
+            alpha.record("2023-11-14", 1_700_000_002, "make -j8")
+            sync.run()
+
+        beta = self.machine("beta")
+        with beta.active():
+            sync.run()
+        with alpha.active():
+            sync.grant()
+        with beta.active():
+            sync.run()
+            self.assertEqual(sorted(e.cmd for e in beta.entries()), ["git status", "make -j8"])

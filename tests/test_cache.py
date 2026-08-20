@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from woswoar import cache, store
+from woswoar import cache, entry, store
 from woswoar.entry import Entry, format_line
 
 from .support import MACHINE_ID, WoswoarTestCase, make_entry
@@ -420,6 +420,55 @@ class TestReadTailReturnsWholeLinesOnly(unittest.TestCase):
     def test_a_missing_file_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as box:
             self.assertEqual(store.read_tail(Path(box) / "absent", 0), (b"", 0))
+
+
+class TestAWatermarkIsSnappedBackToItsLine(unittest.TestCase):
+    """`store.line_start`, the guard `read_tail` used to get for free (#263).
+
+    Every watermark `read_tail` produces names the start of a line, so while the
+    logs were strictly append-only nothing could hand `export` an offset that
+    did not. `forget` can shorten a log, and a crash between its rewrite and its
+    `state.save` leaves the mark inside a record -- after which `export` seals a
+    fragment no peer can parse, in a repository where it cannot be fixed.
+
+    Driven against real files, as the class above is: the whole function is file
+    offsets, and a fixture that mocked the read would be asserting the belief.
+    """
+
+    def start(self, body: bytes, offset: int) -> int:
+        with tempfile.TemporaryDirectory() as box:
+            path = Path(box) / "log"
+            path.write_bytes(body)
+            return store.line_start(path, offset)
+
+    def test_a_mark_already_on_a_boundary_is_left_alone(self) -> None:
+        """The overwhelmingly common case, and the one that must cost nothing:
+        every mark `read_tail` ever returned is of this shape."""
+        self.assertEqual(self.start(b"one\ntwo\n", 4), 4)
+
+    def test_a_mark_inside_a_record_moves_back_to_where_it_began(self) -> None:
+        self.assertEqual(self.start(b"one\ntwo\n", 6), 4)
+
+    def test_the_start_of_the_file_is_a_boundary(self) -> None:
+        self.assertEqual(self.start(b"one\ntwo\n", 0), 0)
+
+    def test_a_file_with_no_newline_before_the_mark_starts_over(self) -> None:
+        """Not a log this wrote. Re-publishing the day is duplicate rows on a
+        peer; sealing from the middle of one is a record no peer can read."""
+        self.assertEqual(self.start(b"no newlines here", 5), 0)
+
+    def test_a_missing_file_leaves_the_mark_where_it_was(self) -> None:
+        """`export`'s own `OSError` guard is what handles the file being gone;
+        this must not answer 0 and re-publish a day that is not there."""
+        with tempfile.TemporaryDirectory() as box:
+            self.assertEqual(store.line_start(Path(box) / "absent", 40), 40)
+
+    def test_it_looks_further_back_than_the_longest_record(self) -> None:
+        """The window has to clear `entry.MAX_CMD_CHARS` and its escaping, or a
+        legitimate long command would be read as "not a log this wrote" and
+        re-publish the whole day."""
+        line = b"x" * (entry.MAX_CMD_CHARS * 2)
+        self.assertEqual(self.start(b"first\n" + line + b"\n", 6 + len(line) // 2), 6)
 
 
 if __name__ == "__main__":

@@ -1480,6 +1480,10 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         if size <= exported:
             continue
 
+        # The watermark has to name the start of a line, and until `forget`
+        # existed nothing could shorten a log, so nothing had to check. See
+        # `store.line_start` for why the guard is on the reading side (#263).
+        exported = store.line_start(log.path, exported)
         data, new_offset = store.read_tail(log.path, exported)
         if data:
             fresh.setdefault(store.day_of_log(log.relpath), []).append(
