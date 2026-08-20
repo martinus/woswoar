@@ -326,7 +326,19 @@ class TestItForksNothing(Fixture):
 
 class TestTheCommandLine(Fixture):
     def ran(self, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(self.command(*extra), cwd=self.repo, capture_output=True, text=True)
+        """Every invocation here is one that must *return*, so a hang is a
+        failure and not something to sit through.
+
+        The bound is not politeness. `main` is a `while True`, and the mutations
+        that stop it ever leaving -- dropping the `if` that returns on an event,
+        say -- turn a test without one into a test that never finishes. A
+        mutation run of this file spent ten minutes on its last ten rows for
+        exactly that reason, with the tool's own per-mutant timeout the only
+        thing left to catch them.
+        """
+        return subprocess.run(
+            self.command(*extra), cwd=self.repo, capture_output=True, text=True, timeout=30
+        )
 
     def test_it_exits_zero_when_the_job_finished(self) -> None:
         self.done.write_text("{}", encoding="utf-8")
