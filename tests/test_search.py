@@ -2364,3 +2364,240 @@ class TestAnEmptyDirScopeSaysWhereItLooked(DirScopeCase):
         for scope in ("global", "host", "session"):
             with self.subTest(scope=scope):
                 self.assertEqual(run_cli("list", "--scope", scope, tty=True).err, "")
+
+
+class TestAProjectThatIsSeveralDirectories(DirScopeCase):
+    """`dir` is a path prefix, so a project in more than one directory had no
+    scope at all (#255).
+
+    The common case is `git worktree`: a bare repo with sibling checkouts under
+    one umbrella is one project by every meaning that matters, and standing in
+    any one of them Ctrl-O showed that worktree only. A `.woswoar-dir` at the
+    umbrella makes the umbrella the root, for every worktree below it, present
+    and future, with nothing to enumerate.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = self.home / "src/api"
+        self.first = self.project / "main"
+        self.second = self.project / "feature"
+        for where in (self.first, self.second):
+            where.mkdir(parents=True)
+        self.record("~/src/api/main", "make test")
+        self.record("~/src/api/feature", "make bench")
+        self.record("~/src/other", "unrelated")
+
+    def mark(self, where: Path, text: str = "") -> None:
+        (where / search.PROJECT_MARKER).write_text(text, encoding="utf-8")
+
+    def test_without_a_marker_the_scope_is_the_directory_it_always_was(self) -> None:
+        """The fallback is not a new case; it is the scope as it stands."""
+        self.stand_in(self.first)
+        self.assertEqual(self.commands(), ["make test"])
+
+    def test_a_marker_above_covers_every_directory_below_it(self) -> None:
+        self.mark(self.project)
+        self.stand_in(self.first)
+        self.assertEqual(self.commands(), ["make bench", "make test"])
+
+    def test_it_still_stops_at_the_project_rather_than_taking_everything(self) -> None:
+        """The fixture that keeps the test above from passing on a scope that
+        quietly widened to the whole history."""
+        self.mark(self.project)
+        self.stand_in(self.first)
+        self.assertNotIn("unrelated", self.commands())
+
+    def test_the_prompt_shows_the_root_rather_than_where_you_stand(self) -> None:
+        """The widening is visible rather than silent, which is what makes the
+        cost of it -- no way to scope to just this subdirectory -- something a
+        person can see they have opted into."""
+        self.mark(self.project)
+        self.stand_in(self.first)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+    def test_a_sibling_whose_name_merely_starts_the_same_is_not_swept_in(self) -> None:
+        """The root goes through `_under`, not a bare `startswith`.
+
+        `~/src/api` must not match `~/src/apifoo`, and the umbrella layout this
+        issue is about makes adjacent names of exactly that shape ordinary
+        rather than contrived.
+        """
+        (self.home / "src/apifoo").mkdir(parents=True)
+        self.record("~/src/apifoo", "next door")
+        self.mark(self.project)
+        self.stand_in(self.first)
+        self.assertNotIn("next door", self.commands())
+
+    def test_the_nearest_marker_wins(self) -> None:
+        """Two markers is a project inside a project, and the answer is the one
+        you are standing in."""
+        self.mark(self.home / "src")
+        self.mark(self.project)
+        self.stand_in(self.first)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+
+class TestWhereTheMarkerWalkStops(DirScopeCase):
+    """Above `$HOME` are `/home` and `/`, where a marker would make the scope
+    meaningless -- and on a shared machine could be planted by another account."""
+
+    def test_a_marker_above_home_is_not_used(self) -> None:
+        deep = self.home / "src/api"
+        deep.mkdir(parents=True)
+        (self.home.parent / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.addCleanup((self.home.parent / search.PROJECT_MARKER).unlink)
+        self.stand_in(deep)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+    def test_a_marker_at_home_is_legal_and_degenerate(self) -> None:
+        """Not special-cased. `$HOME` is where the walk stops, not a place a
+        marker is refused, and one there means "all of my history under home"."""
+        deep = self.home / "src/api"
+        deep.mkdir(parents=True)
+        (self.home / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.stand_in(deep)
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~) ")
+
+
+class TestTheMarkersContentsAreNeverRead(DirScopeCase):
+    """Presence only, and it is a security property rather than a simplification.
+
+    A file found by walking up from `cwd` whose contents configure the tool is
+    the direnv problem: `cd` into somebody else's repository and their file
+    decides how yours behaves. `docs/security.md` says so under *Nothing woswoar
+    reads can run*, and this is the test behind that claim.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = self.home / "src/api"
+        (self.project / "app").mkdir(parents=True)
+        self.record("~/src/api/app", "make test")
+
+    def test_a_marker_full_of_instructions_still_only_marks(self) -> None:
+        (self.project / search.PROJECT_MARKER).write_text(
+            "scope = global\nroot = /etc\nname=somebody-elses-project\n$(touch /tmp/pwned)\n",
+            encoding="utf-8",
+        )
+        self.stand_in(self.project / "app")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+        self.assertEqual(self.commands(), ["make test"])
+
+    def test_an_empty_marker_and_a_full_one_behave_alike(self) -> None:
+        """The fixture that makes the assertion above mean something: if the
+        contents changed anything at all, these two would differ."""
+        (self.project / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.stand_in(self.project / "app")
+        empty = search._prompt_for("dir"), self.commands()
+        (self.project / search.PROJECT_MARKER).write_text("root = /etc\n", encoding="utf-8")
+        self.assertEqual((search._prompt_for("dir"), self.commands()), empty)
+
+
+class TestTheWalkFollowsTheLogicalPath(DirScopeCase):
+    """`$PWD` and `os.getcwd()` are different answers after a `cd` through a
+    symlink, and `_here` already documents at length why the hook's `$PWD` is
+    the one that matters. The walk has to agree: a root found by resolving the
+    path does not prefix-match the rows recorded under the link.
+    """
+
+    def test_the_root_is_spelled_the_way_the_rows_are(self) -> None:
+        real = self.home / "real/api"
+        (real / "app").mkdir(parents=True)
+        (real / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        (self.home / "link").symlink_to(real)
+        # Recorded the way the hook would, standing in the linked spelling.
+        self.record("~/link/app", "make test")
+
+        self.stand_in(self.home / "link/app")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/link) ")
+        self.assertEqual(self.commands(), ["make test"])
+
+
+class TestTheMarkerIsAskedAboutItselfNotItsTarget(DirScopeCase):
+    """`lexists`, not `exists`, and the difference is a hang on the Ctrl-R path.
+
+    `exists` resolves the marker, so a `.woswoar-dir` that is a *symlink* --
+    in a repository somebody else wrote -- points the `stat` wherever they
+    chose. A dead NFS or FUSE mount, or an autofs path that mounting is
+    attempted for, blocks every keypress. `docs/searching.md` promises that
+    `cd`-ing into somebody else's marked repository can at worst widen your
+    Ctrl-O, and this is what makes that true.
+
+    A dangling symlink standing in for the unreachable target: `exists` says
+    False for it, `lexists` says True, and no other fixture separates them.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = self.home / "src/api"
+        (self.project / "app").mkdir(parents=True)
+        self.record("~/src/api/app", "make test")
+        self.stand_in(self.project / "app")
+
+    def test_a_symlinked_marker_pointing_nowhere_still_marks(self) -> None:
+        (self.project / search.PROJECT_MARKER).symlink_to(self.home / "no/such/mount")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+    def test_an_ordinary_marker_still_marks(self) -> None:
+        """The fixture that keeps the assertion above from passing on a walk
+        that stopped looking at the file altogether."""
+        (self.project / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+
+class TestTheWalkOutsideHome(DirScopeCase):
+    """`$HOME` bounds the walk only for paths under `$HOME`, and that is stated
+    rather than guarded -- a project in `/opt/work` is an ordinary thing, and
+    refusing to look above a path outside home would remove the feature for it.
+
+    What is refused is `/` itself, because `_under` reads that root as every row
+    on every machine: a marker there would turn `dir` into `global` while the
+    prompt still said `dir`.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = self.root / "opt/work/api"
+        (self.outside / "main").mkdir(parents=True)
+
+    def test_a_marker_above_a_path_outside_home_is_still_found(self) -> None:
+        # On `_here` rather than the prompt: a sandbox path outside `$HOME` has
+        # no `~` to shorten it and runs past `_PROMPT_LABEL_MAX`, so the prompt
+        # would be asserting the clip rather than the root.
+        (self.outside / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.stand_in(self.outside / "main")
+        self.assertEqual(search._here(), (str(self.outside),))
+
+    def test_without_a_marker_it_is_the_directory_it_always_was(self) -> None:
+        self.stand_in(self.outside / "main")
+        self.assertEqual(search._here(), (str(self.outside / "main"),))
+
+    def test_a_marker_at_the_filesystem_root_is_refused(self) -> None:
+        """The one place a wider scope stops being merely wider.
+
+        `_under` reads a root of `/` as every row on every machine, so a marker
+        there turns `dir` into `global` while the prompt still says `dir`.
+
+        The marker is faked rather than planted, and this is the one test here
+        that mocks: writing `/.woswoar-dir` needs root, so a fixture that did it
+        would pass on this container and fail in CI -- and asserting on a real
+        `/` with no marker passes whether or not the guard exists, which is the
+        decoration this repository's rule 3 is about. Only the *answer to one
+        `lexists`* is replaced; the walk, the boundary and the return are the
+        real ones.
+        """
+        deep = self.outside / "main"
+        self.stand_in(deep)
+        at_root = os.path.join(os.sep, search.PROJECT_MARKER)
+        with mock.patch("os.path.lexists", lambda where: where == at_root):
+            self.assertEqual(search._project_root(str(deep), ""), str(deep))
+
+    def test_the_same_fake_one_level_down_is_honoured(self) -> None:
+        """The fixture that stops the assertion above passing on a walk that had
+        simply stopped finding markers at all."""
+        deep = self.outside / "main"
+        self.stand_in(deep)
+        wanted = os.path.join(str(self.outside), search.PROJECT_MARKER)
+        with mock.patch("os.path.lexists", lambda where: where == wanted):
+            self.assertEqual(search._project_root(str(deep), ""), str(self.outside))
