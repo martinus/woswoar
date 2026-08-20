@@ -234,6 +234,99 @@ def _same_directory(path: str) -> bool:
         return False
 
 
+#: Put a file of this name at the top of a project and Ctrl-O covers all of it.
+#:
+#: **Presence only. The contents are never read**, and that is a security
+#: decision rather than a simplification. A file found by walking up from `cwd`
+#: whose contents configure the tool is the direnv problem: `cd` into somebody
+#: else's repository and their file decides how yours behaves. Presence-only
+#: caps the worst case at a wider Ctrl-O than expected, which is not a threat --
+#: and it means the file may hold a sentence explaining itself to whoever finds
+#: it. `docs/security.md` states this under *Nothing woswoar reads can run*, and
+#: `tests/test_search.py` asserts it, because the next request will be to put
+#: settings in it.
+PROJECT_MARKER = ".woswoar-dir"
+
+
+def _project_root(path: str, home: str) -> str:
+    """The nearest directory at or above ``path`` holding `PROJECT_MARKER`, else ``path``.
+
+    What this buys is the case `dir` could not express: a project that lives in
+    more than one directory. A bare repository with sibling `git worktree`
+    checkouts under one umbrella is one project by every meaning that matters,
+    and without a marker its history is split into as many `dir` scopes as there
+    are worktrees.
+
+    The cost is real and is not a free widening: with a marker above you there
+    is no longer a way to scope to just the subdirectory you are standing in.
+    That is judged rare against the case it buys, and it is visible rather than
+    silent -- the prompt shows the root, so a marked tree reads `~/src/api`
+    where an unmarked one reads `~/src/api/app/routes`.
+
+    Four things decide the walk.
+
+    It stops at ``home``, where above are `/home` and `/` and a marker would
+    make the scope meaningless. One *at* `$HOME` is legal and degenerate, and is
+    not worth special-casing. **That stop only fires for a path under `$HOME`**,
+    which is the honest statement of it: standing in `/opt/work/api/main` the
+    walk runs to `/`, because a project outside home is an ordinary thing and
+    refusing to look would remove the feature for it. What that leaves is a
+    marker in a world-writable ancestor -- `/tmp`, `/var/tmp`, `/dev/shm` --
+    widening your Ctrl-O over your *own* history. A nuisance rather than a
+    disclosure: nothing is shown to whoever planted it, and nothing leaves the
+    machine. It is written down here rather than guarded because every guard for
+    it is a policy (ownership? mode? a list of paths?) that would be wrong on
+    somebody's machine.
+
+    ``/`` is refused outright, and that is the one place a wider scope stops
+    being merely wider: `_under` reads a root of `/` as *every row on every
+    machine*, so a marker there would silently turn `dir` into `global` while
+    the prompt still said `dir`. Only root can create it, so it is a foot-gun
+    rather than an attack, and one line settles it.
+
+    It walks the **logical** path it is given, never `Path.resolve()`. `_here`
+    documents at length why `$PWD` and `os.getcwd()` are different answers after
+    a `cd` through a symlink: the hook records `$PWD`, so a root resolved
+    through the link would not prefix-match the rows recorded under it.
+
+    And it returns ``path`` unchanged when it finds nothing, which is not a
+    fallback so much as the scope exactly as it stands.
+    """
+    # No guard on an empty ``path``: `_here` returns `()` before it gets here, so
+    # a branch for it would be unreachable -- and an unreachable branch is a row
+    # that survives every mutation sweep for ever, which is how a survivor list
+    # stops being read.
+    #
+    # `os.path` rather than `pathlib`, matching the rest of this module: these
+    # are string operations on a path that is already absolute, and the only
+    # syscall in the loop is the one asking the question. `os.path.exists` is
+    # False for an unreadable directory rather than raising, which is the right
+    # answer on a keypress -- a directory this process cannot stat cannot hold
+    # the answer either.
+    candidate = path
+    while True:
+        # `lexists`, not `exists`, and the difference is the whole of what
+        # "presence only" is worth. `exists` *resolves* the marker, so a
+        # `.woswoar-dir` that is a symlink -- in a repository somebody else
+        # wrote -- points this `stat` wherever they chose: a hung NFS mount, a
+        # dead FUSE mount, an autofs path like `/net/their-host/x` that mounting
+        # is attempted for. Every Ctrl-R would block there. `lexists` asks about
+        # the marker itself, which is the fact this wants, and it also makes a
+        # dangling symlink a marker rather than silently not one.
+        if os.path.lexists(os.path.join(candidate, PROJECT_MARKER)) and candidate != os.sep:
+            return candidate
+        if home and candidate == home:
+            break
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            # `dirname("/")` is `"/"`, which is how the walk ends for a path
+            # outside `$HOME`, or on a machine with no `$HOME` set, rather than
+            # looping.
+            break
+        candidate = parent
+    return path
+
+
 def _here() -> tuple[str, ...]:
     """The current directory, in every form a recorded ``cwd`` might take.
 
@@ -272,6 +365,7 @@ def _here() -> tuple[str, ...]:
         return ()
 
     home = os.environ.get("HOME", "")
+    path = _project_root(path, home)
     tilde = make_inert(home_relative(path, home))
     absolute = make_inert(path)
     # Standing anywhere outside home makes the two spellings the same string,
@@ -341,15 +435,36 @@ def _prompt_suffix(scope: Scope) -> str:
     fact about the history rather than about the scope, and it would change
     under someone as they sync.
 
-    `session` is this shell -- the one being typed into. Its id is
-    `<start second>-<pid>` in hex, which nobody recognises, and "which shell am
-    I in" is not a question the person holding the keyboard has.
-
     `host` is the one that needed it. Below two machines the machine column is
     not drawn at all (`host_width_for`), so in that scope nothing on screen says
     *which* machine -- and being ssh'd somewhere is exactly when you press
     Ctrl-H.
+
+    `session` shows the shell's **age**, and the reason it is allowed where a
+    global count is not is the sentence above: a count changes under someone as
+    they sync, while a session's start second is fixed for the life of the
+    shell. What that paragraph ruled out was the *id*, correctly -- nobody
+    recognises `68a4f1c2-3b19`, and "which shell am I in" is not a question
+    anybody has. "How far back does this shell go" is one, and nothing else on
+    screen answers it: a session is a handful of commands when you count
+    sessions and an order of magnitude more when you count the commands you are
+    actually typing among, which is the case Ctrl-S is pressed in.
+
+    The age is free. Both hooks build the id as `<start second>-<pid>` in hex,
+    so the shell's first second is already in the environment and this needs no
+    row read and no extra pass -- which the session's most-used *directory*
+    would, on the picker's open path, for all four scopes at once. That half of
+    #257 is deliberately not here.
+
+    It is a snapshot, not a clock. `interactive` bakes all four labels into the
+    fzf `--bind` when the picker opens, so cycling repaints without re-entering
+    Python and the age does not tick while the picker is up. At
+    `relative_time`'s granularity that is invisible for any shell old enough to
+    be interesting, but it is a property of the mechanism rather than an
+    oversight.
     """
+    if scope == "session":
+        return _safe_for_prompt(_session_age())
     if scope == "dir":
         # `_here()` rather than `_here_label()`, which answers "this directory"
         # when there is none -- a sentence, in a slot the rest of this reads as
@@ -359,6 +474,35 @@ def _prompt_suffix(scope: Scope) -> str:
     if scope == "host":
         return _safe_for_prompt(_this_machine_label())
     return ""
+
+
+def _session_age() -> str:
+    """How long this shell has been open, or "" if that cannot be known.
+
+    `WOSWOAR_SESSION` is `<start second>-<pid>`, both hex, written by the two
+    hooks -- so the parse is `int(head, 16)` and the guard is the whole of the
+    rest of this function. The variable is exported, which means it is
+    inherited, which means anything at all can be in it: a value from a shell
+    that is not this one, a hand-set string, an empty string from a shell
+    without the hook. `_here` already applies this discipline to `$PWD` --
+    believed only when it passes an independent check -- and the same shape
+    belongs here.
+
+    `relative_time` answers "now" rather than raising for a start in the
+    future, so a clock that went backwards is a harmless label rather than a
+    traceback on the Ctrl-R path. What is left is the parse, and a bad one is
+    silence: the scope still works, it just says nothing extra about itself.
+    """
+    head, sep, _ = os.environ.get("WOSWOAR_SESSION", "").partition("-")
+    if not sep:
+        return ""
+    try:
+        started = int(head, 16)
+    except ValueError:
+        return ""
+    # A start before the epoch is not a shell, it is a variable somebody set.
+    # `relative_time` would happily render it as decades, which reads as a fact.
+    return relative_time(started) if started > 0 else ""
 
 
 def _this_machine_label() -> str:

@@ -431,6 +431,7 @@ every other check you can run without believing anyone.
 |---|---|
 | The cache cannot execute | a pickle that would run code on load is written to the cache path; it is refused and a witness file never appears |
 | A recalled command is one command | control characters never survive from the picker into the shell buffer |
+| A `.woswoar-dir` marker cannot configure anything | a marker holding settings, a different root and a shell substitution behaves exactly like an empty one; only its presence is read, and a marker that is a symlink is never followed |
 | Nothing woswoar prints can drive your terminal | no C0 byte reaches the terminal raw from `list`, `search`, `stats`, `import` or the picker's preview pane -- a peer's command, directory and session are made inert on the way into the cache, a peer's machine name where it is read |
 | Shell and Python escaping agree | a command containing a literal tab and newline must round-trip byte-for-byte |
 
