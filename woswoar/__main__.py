@@ -1273,7 +1273,10 @@ def build_parser() -> argparse.ArgumentParser:
         leaving the picker.
 
         The directory scope spans machines on purpose: ~/src/woswoar on either
-        of your boxes is the same project.
+        of your boxes is the same project. Put an empty .woswoar-dir file at
+        the top of a project whose directories are several -- git worktrees,
+        say -- and Ctrl-O covers all of them from anywhere inside. Only the
+        file's presence is used; nothing in it is ever read.
 
         Ctrl-/ shows the rest of what was recorded for the highlighted command
         -- its directory, session, exit code and duration.
