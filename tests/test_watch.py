@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -57,8 +58,23 @@ class Fixture(unittest.TestCase):
         return child.pid
 
     def running(self) -> subprocess.Popen[bytes]:
-        """A process that will still be there in a second unless something kills it."""
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        """A process that will still be there in a second unless something kills it.
+
+        SIGHUP is reset to its default explicitly, and that line is the whole
+        test below. A disposition of SIG_IGN is inherited across fork *and*
+        exec, so a suite launched under `nohup` -- which is how a detached
+        mutation run gets started, and how this one was -- hands every child an
+        ignored SIGHUP. Without the reset the sweep reported "watching cannot
+        kill the job" as unproven on the machine that most needed to know it,
+        and would have proven it on CI by luck.
+        """
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_DFL); time.sleep(30)",
+            ]
+        )
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         return child
@@ -365,6 +381,7 @@ class TestTheCommandLine(Fixture):
         A traceback would also be one line per poll, so both halves are checked:
         the count, and that the stream is clean.
         """
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
         watcher = subprocess.Popen(
             self.command(str(self.running().pid), "--interval", "0.05"),
             cwd=self.repo,
@@ -374,10 +391,27 @@ class TestTheCommandLine(Fixture):
         )
         self.addCleanup(watcher.kill)
         time.sleep(1.0)
+        # Before the terminate, because "it exited on its own" and "it was still
+        # watching" are the two answers here and terminating erases the
+        # difference. Returning on a `working` line is a watcher that stops at
+        # the first sign of life, which is worse than not running it.
+        self.assertIsNone(watcher.poll(), "the watcher returned instead of carrying on")
         watcher.terminate()
         out = watcher.communicate(timeout=10)[0]
         self.assertNotIn("Traceback", out)
         self.assertEqual(out.count("working:"), 1, out)
+        # The sleep, measured rather than read. Dropping it changes no output at
+        # all -- same lines, same order -- and turns the tool into a spin on a
+        # machine that is already busy with the job it is watching, which is the
+        # one promise its docstring makes that nothing else here checks.
+        #
+        # `RUSAGE_CHILDREN` counts children that have been waited for, and
+        # `communicate` waited for this one; the sleeping process from
+        # `running()` is not reaped until cleanup. A loaded machine can only
+        # give the watcher *less* CPU than this, so the threshold has no false
+        # failure in it.
+        burned = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime - before
+        self.assertLess(burned, 0.5, f"a second of watching cost {burned:.2f}s of CPU")
 
     def test_a_pid_that_is_a_group_is_a_usage_error(self) -> None:
         ran = self.ran("0")
