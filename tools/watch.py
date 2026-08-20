@@ -172,7 +172,9 @@ class Watch:
         #: latter; it was not there.
         self.moved = self.began
         #: The stall this last spoke about, which is what makes the next report a
-        #: doubling rather than a repeat. Zero means nothing said yet.
+        #: doubling rather than a repeat. Zero means nothing said yet -- and, as
+        #: with `moved`, the opening poll overwrites it before `stalling` can
+        #: read it, so this value is the declaration rather than the behaviour.
         self.told = 0.0
 
     def minutes(self) -> int:

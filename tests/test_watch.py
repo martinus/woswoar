@@ -368,6 +368,25 @@ class TestAJobCanStopWithoutEnding(Fixture):
         self.assertIn("working", line)
         self.assertIsNone(watching.step())
 
+    def test_a_recovered_job_stalls_again_on_its_own_terms(self) -> None:
+        """Progress resets what was *said*, not only when work last moved.
+
+        The doubling is measured from the last report, so a job that stalled for
+        ten minutes and then recovered would need twenty minutes of silence
+        before anyone heard about its next stall -- the interval getting longer
+        exactly because the job had already been in trouble once.
+
+        The sibling above pins the clock; this pins the counter. Both are reset
+        in the same line, and the sweep found that only one of them was tested.
+        """
+        watching = self.stuck_for(600.0)
+        watching.step()
+        self.log.write_text("row\n", encoding="utf-8")
+        watching.step()
+        watching.moved -= 120.0
+        line, _ = watching.step() or ("", 0)
+        self.assertIn("STALLED", line)
+
     def test_zero_turns_it_off(self) -> None:
         """For a job whose work genuinely arrives in one lump at the end, where
         every poll before it is a true stall and none of them is news."""
