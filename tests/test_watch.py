@@ -38,8 +38,23 @@ class Fixture(unittest.TestCase):
         self.log = self.root / "run.log"
         self.done = self.root / "report.json"
 
-    def watching(self, pid: int, match: str = ".") -> watch.Watch:
-        return watch.Watch(pid, self.log, self.done, re.compile(match))
+    def watching(self, pid: int, match: str = ".", stale: float = watch.STALE) -> watch.Watch:
+        return watch.Watch(pid, self.log, self.done, re.compile(match), stale)
+
+    def stuck_for(self, seconds: float, stale: float = 60.0) -> watch.Watch:
+        """A live watch whose count has not moved for ``seconds``.
+
+        Back-dated rather than waited out, as the elapsed-time tests here are:
+        the arithmetic is the same and the suite does not spend five minutes
+        proving a five-minute threshold. The first `step` is taken first, so the
+        clock this rewinds is the one a real run would be looking at -- rewinding
+        a freshly built `Watch` would test a state no job reaches, since the
+        opening poll always counts as movement.
+        """
+        watching = self.watching(os.getpid(), stale=stale)
+        watching.step()
+        watching.moved -= seconds
+        return watching
 
     def reaped(self) -> int:
         """A pid that has certainly exited *and been waited for*.
@@ -294,6 +309,90 @@ class TestWhatCountsAsProgress(Fixture):
         self.assertEqual(watch.counted(self.root / "not-yet", ANY), 0)
 
 
+class TestAJobCanStopWithoutEnding(Fixture):
+    """The third ending, and the one the first two versions of this tool missed.
+
+    `DIED` and `FINISHED` were events; being alive and wedged was silence -- the
+    same silence a job that is merely slow produces. So the reader was back to
+    guessing from the other side, which is the failure this whole tool is about.
+    It happened here: a mutation sweep went quiet at 58 of 68 rows and was called
+    dead, and it was still running.
+    """
+
+    def test_a_long_enough_silence_is_reported(self) -> None:
+        line, status = self.stuck_for(120.0).step() or ("", 0)
+        self.assertIn("STALLED", line)
+        self.assertEqual(status, -1)
+
+    def test_it_says_the_process_is_still_there(self) -> None:
+        """The half that separates this from `DIED`, and the half no amount of
+        waiting gives the reader. "Nothing is happening" and "nothing is
+        happening and the job is gone" call for different actions."""
+        line, _ = self.stuck_for(120.0).step() or ("", 0)
+        self.assertIn("alive and not working", line)
+
+    def test_it_says_how_long_and_how_far(self) -> None:
+        line, _ = self.stuck_for(120.0).step() or ("", 0)
+        self.assertIn("120s", line)
+        self.assertIn("0 rows", line)
+
+    def test_a_short_silence_is_not(self) -> None:
+        """The threshold is the whole value of the line. One that fires on an
+        ordinary gap trains the reader to skip it, and the next real one goes
+        with it."""
+        self.assertIsNone(self.stuck_for(30.0).step())
+
+    def test_it_does_not_repeat_itself_every_poll(self) -> None:
+        """A stall line every twenty seconds is the per-poll noise this tool was
+        built to avoid, arriving through the feature meant to fix it."""
+        watching = self.stuck_for(120.0)
+        self.assertIsNotNone(watching.step())
+        self.assertIsNone(watching.step())
+
+    def test_it_speaks_again_when_the_stall_doubles(self) -> None:
+        """One line at minute two is undatable by a reader arriving at minute
+        forty. A stall twice as long as the last report is new information."""
+        watching = self.stuck_for(120.0)
+        watching.step()
+        watching.moved -= 130.0
+        line, _ = watching.step() or ("", 0)
+        self.assertIn("250s", line)
+
+    def test_progress_starts_the_clock_again(self) -> None:
+        """Otherwise a job that recovers stays branded stalled for as long as it
+        runs, which is a lie that gets louder the longer it works."""
+        watching = self.stuck_for(120.0)
+        watching.step()
+        self.log.write_text("row\n", encoding="utf-8")
+        line, _ = watching.step() or ("", 0)
+        self.assertIn("working", line)
+        self.assertIsNone(watching.step())
+
+    def test_zero_turns_it_off(self) -> None:
+        """For a job whose work genuinely arrives in one lump at the end, where
+        every poll before it is a true stall and none of them is news."""
+        self.assertIsNone(self.stuck_for(9999.0, stale=0.0).step())
+
+    def test_a_finish_outranks_a_stall(self) -> None:
+        """`done` is checked first, and a stalled job that has since written its
+        report is a finished one. Reporting the stall would send the reader to
+        look at a run that is over."""
+        watching = self.stuck_for(9999.0)
+        self.done.write_text("{}", encoding="utf-8")
+        line, status = watching.step() or ("", -1)
+        self.assertIn("FINISHED", line)
+        self.assertEqual(status, 0)
+
+    def test_a_death_outranks_a_stall(self) -> None:
+        """Both are true of a dead job -- it has certainly stopped progressing --
+        and only one of them tells the reader to stop waiting."""
+        watching = self.watching(self.reaped(), stale=60.0)
+        watching.moved -= 9999.0
+        line, status = watching.step() or ("", 0)
+        self.assertIn("DIED", line)
+        self.assertEqual(status, 1)
+
+
 class TestItForksNothing(Fixture):
     """The property that keeps the original bug from coming back.
 
@@ -424,6 +523,33 @@ class TestTheCommandLine(Fixture):
         # failure in it.
         burned = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime - before
         self.assertLess(burned, 0.5, f"a second of watching cost {burned:.2f}s of CPU")
+
+    def test_the_stall_threshold_reaches_the_watch(self) -> None:
+        """End to end, because a flag wired to nothing is invisible to every
+        test that builds a `Watch` itself -- which is how both survivors of this
+        tool's first sweep got in.
+
+        Also the only place the doubling is driven by a real clock. A tenth of a
+        second against twenty polls: on a per-poll report that is nineteen stall
+        lines, on a doubling one it is a handful, and on a flag that never
+        arrived it is none. The three are far enough apart that a loaded machine
+        cannot turn one into another.
+        """
+        watcher = subprocess.Popen(
+            self.command(str(self.running().pid), "--interval", "0.05", "--stale", "0.1"),
+            cwd=self.repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.addCleanup(watcher.kill)
+        time.sleep(1.0)
+        watcher.terminate()
+        out = watcher.communicate(timeout=10)[0]
+        self.assertNotIn("Traceback", out)
+        said = out.count("STALLED")
+        self.assertGreaterEqual(said, 1, out)
+        self.assertLess(said, 10, out)
 
     def test_a_pid_that_is_a_group_is_a_usage_error(self) -> None:
         ran = self.ran("0")
