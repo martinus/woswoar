@@ -480,6 +480,30 @@ class TestAWatermarkIsSnappedBackToItsLine(unittest.TestCase):
         self.assertGreater(mark, store._LINE_WINDOW, "the fixture must exceed the window")
         self.assertEqual(self.start(body, mark), wanted)
 
+    def test_a_newline_exactly_at_the_window_edge_is_a_real_cut(self) -> None:
+        """`rfind` returning 0 is a position, not "not found" -- the same trap
+        `read_tail` above documents, one function over.
+
+        It needs the newline to land exactly on the first byte of the window,
+        which is `offset - _LINE_WINDOW`. Nothing else in this class can reach
+        that alignment, so `cut >= 0` reads as tested against `> 0` without it.
+        """
+        start = 10
+        offset = start + store._LINE_WINDOW
+        body = b"x" * start + b"\n" + b"y" * (offset - start)
+        self.assertEqual(self.start(body, offset), start + 1)
+
+    def test_no_newline_in_a_window_that_does_not_reach_the_file_start(self) -> None:
+        """The other half of the same comparison. With `cut` of -1 and a `start`
+        of 0 -- every small fixture -- `start + cut + 1` is 0, which is what the
+        `else` says anyway; only a window that begins part way into the file
+        tells `cut >= 0` from `cut >= -1`, and getting that wrong seals from the
+        middle of a record instead of starting the day over."""
+        body = b"first\n" + b"z" * 200_000
+        offset = 150_000
+        self.assertGreater(offset - store._LINE_WINDOW, 0, "the window must not reach byte 0")
+        self.assertEqual(self.start(body, offset), 0)
+
     def test_it_looks_further_back_than_the_longest_record(self) -> None:
         """The window has to clear `entry.MAX_CMD_CHARS` and its escaping, or a
         legitimate long command would be read as "not a log this wrote" and
