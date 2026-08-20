@@ -480,6 +480,19 @@ class TestAWatermarkIsSnappedBackToItsLine(unittest.TestCase):
         self.assertGreater(mark, store._LINE_WINDOW, "the fixture must exceed the window")
         self.assertEqual(self.start(body, mark), wanted)
 
+    def test_the_byte_it_checks_is_the_one_before_the_mark(self) -> None:
+        """The fast path reads *at* `offset - 1`, not at the start of the file.
+
+        Without the seek it reads byte 0, and in a log -- which never begins
+        with a newline -- that simply falls through to the scan and reaches the
+        same answer, so nothing notices. A body that *does* begin with one
+        separates them: here the mark is mid-record and the correct answer is
+        line 1, while reading byte 0 says "already on a boundary" and leaves it
+        where it was. `TestReadTailBoundaries` above keeps a leading-newline
+        fixture for the same reason, one function along.
+        """
+        self.assertEqual(self.start(b"\nabc", 3), 1)
+
     def test_a_newline_exactly_at_the_window_edge_is_a_real_cut(self) -> None:
         """`rfind` returning 0 is a position, not "not found" -- the same trap
         `read_tail` above documents, one function over.

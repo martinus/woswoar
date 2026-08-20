@@ -456,11 +456,27 @@ def line_start(path: Path, offset: int) -> int:
     and the direction to be wrong in. `read_tail` is deliberately left alone --
     `cache` reaches it with its own offsets, and changing what it consumes would
     change what the parse cache sees.
+
+    Costed for the case that always happens rather than the one it exists for:
+    a single byte answers "already on a boundary", and only a mark that is not
+    pays for the window. `export` calls this once per grown log file on a
+    one-minute timer, so the scan has to be the exception.
     """
     if offset <= 0:
         return 0
     try:
         with path.open("rb") as handle:
+            # One byte first, and this is the whole of the cost on an ordinary
+            # sync. `export` reaches this for every log file that grew, on a
+            # timer that fires once a minute, and the answer is *already on a
+            # boundary* in every run but the one after an interrupted `forget` --
+            # so paying up to 64 KiB of read to discover that would be 64 KiB a
+            # minute per active day file for nothing. The byte before a
+            # watermark is the newline that ended the last sealed record, or
+            # this is one of the rare marks worth scanning for.
+            handle.seek(offset - 1)
+            if handle.read(1) == b"\n":
+                return offset
             start = max(0, offset - _LINE_WINDOW)
             handle.seek(start)
             window = handle.read(offset - start)
@@ -468,8 +484,6 @@ def line_start(path: Path, offset: int) -> int:
         # As `read_tail` treats one: a file that cannot be opened has nothing to
         # say about where its lines begin, and the caller's own `OSError` guard
         # is what handles the file being gone.
-        return offset
-    if window.endswith(b"\n"):
         return offset
     cut = window.rfind(b"\n")
     # No newline anywhere in the window: not a log this wrote, so start over.
