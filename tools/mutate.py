@@ -1068,7 +1068,14 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
 WHOLE_SUITE = ""
 
 
-def confirm(report: Report, workers: int | None, timeout: float, memory: int) -> Report:
+def confirm(
+    report: Report,
+    workers: int | None,
+    timeout: float,
+    memory: int,
+    *,
+    baseline: bool = True,
+) -> Report:
     """Re-run every survivor against the whole suite, and correct the ones caught.
 
     This is what makes per-file test selection a *speed* decision rather than a
@@ -1080,6 +1087,25 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
     Only survivors, because they are the minority and the only ones whose answer
     can be wrong in that direction -- a `caught` row was caught by a real test,
     and no wider suite makes that less true.
+
+    **With a baseline, like every other pass, and this is the whole of #268.**
+    A correction here is the claim "a test the selection had not run noticed
+    this", and on a suite that is already failing the claim is free: `failfast`
+    stops at the first red test, whatever it was about. Both real survivors of
+    one sweep came back credited to a shell-hook test that had never heard of
+    the file under mutation. That is the false `caught` this module exists to
+    make impossible, arriving in the one pass that had no baseline.
+
+    The cost is one whole-suite run, not one per survivor: `run` shards its
+    baseline by `Mutation.tests`, and every row here carries `WHOLE_SUITE`, so
+    the set is a single shard queued alongside the survivors in the same lanes.
+
+    ``baseline`` is `--no-baseline` arriving here, and it has to arrive: that
+    flag means "skip the untouched-suite check", and a check it cannot turn off
+    would make it *worse* than useless on the tree it exists for -- a knowingly
+    red one -- by silently suppressing every correction instead of skipping a
+    check. Turned off, this is the pre-#268 behaviour, false `caught` included,
+    which is what the flag has always been an opt-in to.
     """
     # Positions, not labels. Two generated rows share a label whenever they touch
     # the same line with the same operator -- `generate` dedupes on `(span, new)`,
@@ -1101,7 +1127,7 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
     widened = [result.mutation._replace(tests=WHOLE_SUITE) for _, result in survivors]
     again = run(
         widened,
-        baseline=False,
+        baseline=baseline,
         workers=workers,
         strict=False,
         # As the narrow pass does, and for the same reason: the first test that
@@ -1112,6 +1138,21 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
         memory=memory,
         summarise=False,
     )
+
+    if again.baseline_red:
+        # Suppressed, not voided, and the wording has to carry that. `run` has
+        # just printed "nothing above means anything", which is true of the
+        # confirmation rows and false of the sweep -- the narrow pass had its
+        # own green baseline and its verdicts are worth exactly what they were.
+        # Left to stand alone, that line reads as voiding the whole run, which
+        # is the difference between "fix your suite and ask again" and "throw
+        # away the answers you have already paid for".
+        print(
+            "-- of the confirmation rows only. No survivor was corrected: on a "
+            "red suite, being noticed says nothing about the mutation. Every "
+            "verdict from the narrow pass stands as reported."
+        )
+        return report
 
     # Only `caught` corrects a survivor. A confirmation that broke or timed out
     # answered nothing, and folding it in would print "caught by a test the
@@ -1441,7 +1482,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         report = sweep(table, args) if args.all or args.batch else _run_generated(table, args)
         if not args.no_confirm:
-            report = confirm(report, args.workers, args.timeout, args.memory)
+            report = confirm(
+                report,
+                args.workers,
+                args.timeout,
+                args.memory,
+                baseline=not args.no_baseline,
+            )
         else:
             print("\n--no-confirm: survivors below were not re-run against the whole suite,")
             print("so one may simply have been run against tests that cannot see it.")

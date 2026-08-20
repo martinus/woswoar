@@ -624,13 +624,14 @@ class TestASpanThatNoLongerHoldsItsText(MutateTestCase):
         self.assertEqual((self.root / "mod.py").read_text(encoding="utf-8"), before)
 
 
-class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
-    """The pass that makes narrow test selection a speed decision, not a wrong one.
+class TwoRowsSharingALabel(MutateTestCase):
+    """The fixture both confirmation suites below need, held in one place.
 
-    A row run against too few tests survives for the wrong reason, and that error
-    points the expensive way: it sends the author to rewrite a test that was
-    never weak. So every survivor is re-run against everything before it is
-    printed.
+    No tests of its own. It is a class rather than a function because it wants
+    `write`, and the two suites derive from it rather than copying it because a
+    fixture this fiddly -- two rows that must *both* survive the narrow pass,
+    one of which the wider suite catches -- drifts the moment there are two of
+    it, and a drifted copy is how a confirmation test stops confirming anything.
     """
 
     def two_rows_with_one_label(self) -> list[Mutation]:
@@ -684,6 +685,16 @@ class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
             Mutation(shared, "mod.py", "2", "9", "test_narrow", span=(at_two, at_two + 1)),
         ]
 
+
+class TestConfirmingSurvivorsAgainstTheWholeSuite(TwoRowsSharingALabel):
+    """The pass that makes narrow test selection a speed decision, not a wrong one.
+
+    A row run against too few tests survives for the wrong reason, and that error
+    points the expensive way: it sends the author to rewrite a test that was
+    never weak. So every survivor is re-run against everything before it is
+    printed.
+    """
+
     def test_a_shared_label_does_not_spread_one_rows_answer_to_another(self) -> None:
         """Keying the corrections by label wrote the caught row's verdict onto the
         other, so a genuine survivor was reported as `caught` -- naming a test
@@ -704,6 +715,130 @@ class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
             "one row's confirmation was written onto the other",
         )
         self.assertFalse(confirmed.clean)
+
+
+class TestConfirmingNeedsAGreenSuiteToo(TwoRowsSharingALabel):
+    """#268: the one pass that had no baseline, and what it cost.
+
+    `confirm` re-runs each survivor against everything with `failfast`, so the
+    first red test settles the row. On a suite that is already failing for its
+    own reasons that test is always reached, and every survivor comes back
+    "caught by a test the selection had not run" -- naming a test that has never
+    heard of the file under mutation. A false clean sweep, in the report a pull
+    request quotes as evidence.
+
+    Found for real: two genuine survivors of a `tools/watch.py` sweep were both
+    credited to a shell-hook test, on a container where three tests are red for
+    environmental reasons.
+    """
+
+    def with_an_unrelated_failure(self) -> Report:
+        """The narrow pass over two survivors, in a tree whose wider suite is red.
+
+        Built on `two_rows_with_one_label`'s fixture because it already has what
+        this needs and is hard to get: two rows that *survive* the narrow pass,
+        so there is something for `confirm` to widen, one of which the wide
+        suite legitimately catches and one of which it does not.
+
+        The failure is deliberately about nothing -- it does not import `mod`,
+        let alone call it -- because the point is that being red is enough. A
+        broken test that touched the mutated module would leave the reader
+        unable to tell a false correction from a true one.
+        """
+        rows = self.two_rows_with_one_label()
+        self.write(
+            "test_broken.py",
+            """
+            import unittest
+
+
+            class Broken(unittest.TestCase):
+                def test_something_else_entirely(self) -> None:
+                    self.fail("red for its own reasons")
+            """,
+        )
+        report = run(rows, baseline=False, strict=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results],
+            ["survived", "survived"],
+            "precondition: both rows must survive, or nothing is widened",
+        )
+        return report
+
+    def test_a_red_suite_corrects_nothing(self) -> None:
+        """Both rows stand as the narrow pass reported them.
+
+        Including the first, which the wide suite really does catch. Suppressing
+        a correction that happens to be true is the price of not publishing the
+        one that is false: with the suite red there is no way to tell them apart
+        from in here, and a report that is right by luck is the thing this
+        module refuses to produce.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["survived", "survived"],
+            "a red suite was allowed to correct a survivor",
+        )
+
+    def test_it_says_the_suite_is_why(self) -> None:
+        """A silently unwidened survivor is a different bug report.
+
+        The reader is deciding whether to go and strengthen a test. "This row
+        survived" and "this row survived and nothing could widen it" send them
+        to different places, and only one of them is true here.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        spoken = said.getvalue()
+        self.assertIn("BASELINE NOT GREEN", spoken)
+        # Not "stand as reported": the unanswerable-row line further down says
+        # that too, so a mutation removing this one would have been caught by
+        # the wrong print. `run`'s own "nothing above means anything" needs the
+        # scoping this line gives it, and that is what is asserted.
+        self.assertIn("of the confirmation rows only", spoken)
+        self.assertIn("No survivor was corrected", spoken)
+        self.assertNotIn("caught by a test the selection had not run", spoken)
+
+    def test_no_baseline_still_means_no_baseline(self) -> None:
+        """The escape hatch keeps working, and the reader gets to see its price.
+
+        `--no-baseline` exists for a tree the author knows is red and wants
+        mutation answers about anyway. If the check it turns off ran here
+        regardless, the flag would silently stop correcting anything on exactly
+        the tree it was reached for -- a worse failure than the one #268 fixed,
+        because at least that one printed a reason.
+
+        So with it off this is the old behaviour, false correction and all: the
+        second row is a real survivor and the broken test "catches" it.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY, baseline=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught", "caught"],
+            "--no-baseline no longer reaches the confirmation pass",
+        )
+
+    def test_a_green_suite_still_corrects(self) -> None:
+        """The other half, without which everything above passes on a `confirm`
+        that has stopped correcting anything at all.
+
+        Same fixture minus the broken test: the first row is caught by the wide
+        suite, the second is a real survivor and stays one.
+        """
+        rows = self.two_rows_with_one_label()
+        report = run(rows, baseline=False, strict=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught", "survived"],
+        )
 
 
 class TestASubTestIsARealAnswer(MutateTestCase):
