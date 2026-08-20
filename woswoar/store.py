@@ -422,6 +422,74 @@ def read_tail(path: Path, offset: int) -> tuple[bytes, int]:
     return data[: cut + 1], offset + cut + 1
 
 
+#: How far back `line_start` looks for the newline before a watermark.
+#:
+#: A record is bounded by `entry.MAX_CMD_CHARS` -- 8,000 characters -- plus five
+#: short fields, plus escaping that can at worst double the length, so 64 KiB is
+#: several times the longest line this format can hold. A window with no newline
+#: in it is therefore not a log this code wrote, and starting the day over is
+#: the safe answer for that: duplicate rows on a peer, which `parse_line` and the
+#: day's own dedup absorb, rather than a record sealed in half.
+_LINE_WINDOW = 64 << 10
+
+
+def line_start(path: Path, offset: int) -> int:
+    """``offset`` moved back to the beginning of its line, if it is not at one.
+
+    `read_tail` cuts at a newline, so every watermark it produced names the start
+    of a line -- and while the logs were strictly append-only, that was the only
+    way a watermark could be produced. `forget` broke the assumption by being
+    able to *shorten* a log: a crash between its rewrite and its `state.save`
+    leaves `state.exported` pointing into the middle of a record, and `export`
+    would then seal from there. The first line of that chunk is a fragment, no
+    peer can parse it, and the command it came from is lost to every machine but
+    this one -- silently, and in an append-only repository where it cannot be
+    fixed afterwards.
+
+    So the reader checks rather than every writer remembering. That is the whole
+    argument for putting it here (#263): `forget` cannot repair a transaction it
+    died in the middle of, and the next thing to shorten a log would have to
+    rediscover the same rule.
+
+    Rewinding *re-publishes* the part of that record already sealed, which is
+    duplicate rows on a peer rather than a half-record: recoverable, visible,
+    and the direction to be wrong in. `read_tail` is deliberately left alone --
+    `cache` reaches it with its own offsets, and changing what it consumes would
+    change what the parse cache sees.
+
+    Costed for the case that always happens rather than the one it exists for:
+    a single byte answers "already on a boundary", and only a mark that is not
+    pays for the window. `export` calls this once per grown log file on a
+    one-minute timer, so the scan has to be the exception.
+    """
+    if offset <= 0:
+        return 0
+    try:
+        with path.open("rb") as handle:
+            # One byte first, and this is the whole of the cost on an ordinary
+            # sync. `export` reaches this for every log file that grew, on a
+            # timer that fires once a minute, and the answer is *already on a
+            # boundary* in every run but the one after an interrupted `forget` --
+            # so paying up to 64 KiB of read to discover that would be 64 KiB a
+            # minute per active day file for nothing. The byte before a
+            # watermark is the newline that ended the last sealed record, or
+            # this is one of the rare marks worth scanning for.
+            handle.seek(offset - 1)
+            if handle.read(1) == b"\n":
+                return offset
+            start = max(0, offset - _LINE_WINDOW)
+            handle.seek(start)
+            window = handle.read(offset - start)
+    except OSError:
+        # As `read_tail` treats one: a file that cannot be opened has nothing to
+        # say about where its lines begin, and the caller's own `OSError` guard
+        # is what handles the file being gone.
+        return offset
+    cut = window.rfind(b"\n")
+    # No newline anywhere in the window: not a log this wrote, so start over.
+    return start + cut + 1 if cut >= 0 else 0
+
+
 def load_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
     """Read a small JSON state file, tolerating absence and corruption.
 

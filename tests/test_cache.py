@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from woswoar import cache, store
+from woswoar import cache, entry, store
 from woswoar.entry import Entry, format_line
 
 from .support import MACHINE_ID, WoswoarTestCase, make_entry
@@ -420,6 +420,109 @@ class TestReadTailReturnsWholeLinesOnly(unittest.TestCase):
     def test_a_missing_file_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as box:
             self.assertEqual(store.read_tail(Path(box) / "absent", 0), (b"", 0))
+
+
+class TestAWatermarkIsSnappedBackToItsLine(unittest.TestCase):
+    """`store.line_start`, the guard `read_tail` used to get for free (#263).
+
+    Every watermark `read_tail` produces names the start of a line, so while the
+    logs were strictly append-only nothing could hand `export` an offset that
+    did not. `forget` can shorten a log, and a crash between its rewrite and its
+    `state.save` leaves the mark inside a record -- after which `export` seals a
+    fragment no peer can parse, in a repository where it cannot be fixed.
+
+    Driven against real files, as the class above is: the whole function is file
+    offsets, and a fixture that mocked the read would be asserting the belief.
+    """
+
+    def start(self, body: bytes, offset: int) -> int:
+        with tempfile.TemporaryDirectory() as box:
+            path = Path(box) / "log"
+            path.write_bytes(body)
+            return store.line_start(path, offset)
+
+    def test_a_mark_already_on_a_boundary_is_left_alone(self) -> None:
+        """The overwhelmingly common case, and the one that must cost nothing:
+        every mark `read_tail` ever returned is of this shape."""
+        self.assertEqual(self.start(b"one\ntwo\n", 4), 4)
+
+    def test_a_mark_inside_a_record_moves_back_to_where_it_began(self) -> None:
+        self.assertEqual(self.start(b"one\ntwo\n", 6), 4)
+
+    def test_the_start_of_the_file_is_a_boundary(self) -> None:
+        self.assertEqual(self.start(b"one\ntwo\n", 0), 0)
+
+    def test_a_file_with_no_newline_before_the_mark_starts_over(self) -> None:
+        """Not a log this wrote. Re-publishing the day is duplicate rows on a
+        peer; sealing from the middle of one is a record no peer can read."""
+        self.assertEqual(self.start(b"no newlines here", 5), 0)
+
+    def test_a_missing_file_leaves_the_mark_where_it_was(self) -> None:
+        """`export`'s own `OSError` guard is what handles the file being gone;
+        this must not answer 0 and re-publish a day that is not there."""
+        with tempfile.TemporaryDirectory() as box:
+            self.assertEqual(store.line_start(Path(box) / "absent", 40), 40)
+
+    def test_a_mark_far_past_the_window_still_finds_its_line(self) -> None:
+        """The fixture every other one here is too small to be.
+
+        `start` is `max(0, offset - _LINE_WINDOW)`, and in a file smaller than
+        the window that is always 0 -- which makes the seek and the read length
+        indistinguishable from having no window at all. Only a mark more than
+        64 KiB into a file separates them: without the seek the window is the
+        *beginning* of the file, and its last newline is nowhere near the mark.
+        """
+        head = b"first\n"
+        filler = b"".join(b"line %d\n" % n for n in range(20_000))
+        body = head + filler
+        mark = len(body) - 4  # inside the last record
+        wanted = body.rfind(b"\n", 0, mark) + 1
+        self.assertGreater(mark, store._LINE_WINDOW, "the fixture must exceed the window")
+        self.assertEqual(self.start(body, mark), wanted)
+
+    def test_the_byte_it_checks_is_the_one_before_the_mark(self) -> None:
+        """The fast path reads *at* `offset - 1`, not at the start of the file.
+
+        Without the seek it reads byte 0, and in a log -- which never begins
+        with a newline -- that simply falls through to the scan and reaches the
+        same answer, so nothing notices. A body that *does* begin with one
+        separates them: here the mark is mid-record and the correct answer is
+        line 1, while reading byte 0 says "already on a boundary" and leaves it
+        where it was. `TestReadTailBoundaries` above keeps a leading-newline
+        fixture for the same reason, one function along.
+        """
+        self.assertEqual(self.start(b"\nabc", 3), 1)
+
+    def test_a_newline_exactly_at_the_window_edge_is_a_real_cut(self) -> None:
+        """`rfind` returning 0 is a position, not "not found" -- the same trap
+        `read_tail` above documents, one function over.
+
+        It needs the newline to land exactly on the first byte of the window,
+        which is `offset - _LINE_WINDOW`. Nothing else in this class can reach
+        that alignment, so `cut >= 0` reads as tested against `> 0` without it.
+        """
+        start = 10
+        offset = start + store._LINE_WINDOW
+        body = b"x" * start + b"\n" + b"y" * (offset - start)
+        self.assertEqual(self.start(body, offset), start + 1)
+
+    def test_no_newline_in_a_window_that_does_not_reach_the_file_start(self) -> None:
+        """The other half of the same comparison. With `cut` of -1 and a `start`
+        of 0 -- every small fixture -- `start + cut + 1` is 0, which is what the
+        `else` says anyway; only a window that begins part way into the file
+        tells `cut >= 0` from `cut >= -1`, and getting that wrong seals from the
+        middle of a record instead of starting the day over."""
+        body = b"first\n" + b"z" * 200_000
+        offset = 150_000
+        self.assertGreater(offset - store._LINE_WINDOW, 0, "the window must not reach byte 0")
+        self.assertEqual(self.start(body, offset), 0)
+
+    def test_it_looks_further_back_than_the_longest_record(self) -> None:
+        """The window has to clear `entry.MAX_CMD_CHARS` and its escaping, or a
+        legitimate long command would be read as "not a log this wrote" and
+        re-publish the whole day."""
+        line = b"x" * (entry.MAX_CMD_CHARS * 2)
+        self.assertEqual(self.start(b"first\n" + line + b"\n", 6 + len(line) // 2), 6)
 
 
 if __name__ == "__main__":
