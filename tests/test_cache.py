@@ -463,6 +463,23 @@ class TestAWatermarkIsSnappedBackToItsLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as box:
             self.assertEqual(store.line_start(Path(box) / "absent", 40), 40)
 
+    def test_a_mark_far_past_the_window_still_finds_its_line(self) -> None:
+        """The fixture every other one here is too small to be.
+
+        `start` is `max(0, offset - _LINE_WINDOW)`, and in a file smaller than
+        the window that is always 0 -- which makes the seek and the read length
+        indistinguishable from having no window at all. Only a mark more than
+        64 KiB into a file separates them: without the seek the window is the
+        *beginning* of the file, and its last newline is nowhere near the mark.
+        """
+        head = b"first\n"
+        filler = b"".join(b"line %d\n" % n for n in range(20_000))
+        body = head + filler
+        mark = len(body) - 4  # inside the last record
+        wanted = body.rfind(b"\n", 0, mark) + 1
+        self.assertGreater(mark, store._LINE_WINDOW, "the fixture must exceed the window")
+        self.assertEqual(self.start(body, mark), wanted)
+
     def test_it_looks_further_back_than_the_longest_record(self) -> None:
         """The window has to clear `entry.MAX_CMD_CHARS` and its escaping, or a
         legitimate long command would be read as "not a log this wrote" and
