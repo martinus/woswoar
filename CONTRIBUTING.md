@@ -76,6 +76,20 @@ the file, and **every survivor is then re-run against the whole suite** before i
 is reported, so a narrow selection can cost time but cannot produce a false
 `SURVIVED`. On the change that became #216 that pass corrected nine of eleven.
 
+That pass takes its own baseline, and needs it: correcting a survivor is the
+claim *a test the selection had not run noticed this*, and on a suite that is
+already failing the claim is free — the re-run stops at the first red test,
+whatever it was about. So if the whole suite is not green, nothing is corrected
+and the run says so; the narrow pass's own verdicts still stand. `--no-baseline`
+turns that off along with every other untouched-suite check, which is what it is
+for, and what it costs.
+
+Either way the `--json` report says which happened: `widened` is true only when
+every survivor in the file really was re-run against the whole suite. It is
+false after `--no-confirm`, after a suppressed confirmation, and in a
+part-written file from an interrupted sweep — the cases where the paragraph
+above promises something the file cannot deliver.
+
 Fifteen operators, and `--skip-operator NAME` drops one — the escape hatch for
 an equivalent mutant a whole operator keeps producing, where `# pragma: no
 mutate` only suppresses a line. Twelve rewrite an expression (`<` to `<=`, `and`

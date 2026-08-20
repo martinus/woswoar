@@ -221,6 +221,20 @@ class Report(NamedTuple):
     #: Nothing in `results` means anything when this is set: a suite that already
     #: fails catches every mutation, including the ones no test can see.
     baseline_red: bool = False
+    #: Whether every survivor here was re-run against the whole suite, which is
+    #: what `CONTRIBUTING.md` promises about a survivor before it is reported.
+    #:
+    #: False by default and set only by `confirm`, rather than true by default
+    #: and cleared where the promise fails. The ways to *not* widen keep being
+    #: added -- `--no-confirm`, a red confirmation baseline, a crash mid-sweep --
+    #: and each one that forgot to clear the flag would claim a guarantee it had
+    #: not met. There is exactly one way to earn it, so that is what sets it.
+    #:
+    #: It is on the report at all because the failure is durable: `_persist`
+    #: writes these rows, `tools/reached.py` reads them back and explains each
+    #: survivor, and until #269 the only record that the promise had not been
+    #: kept was a line of prose in a terminal nobody scrolls back to.
+    widened: bool = False
 
     @property
     def clean(self) -> bool:
@@ -920,6 +934,7 @@ def run(
     timeout: float = TIMEOUT,
     memory: int = MEMORY,
     summarise: bool = True,
+    scope: str = "nothing above",
 ) -> Report:
     """Apply each mutation in its own copy of the tree; report what each answered.
 
@@ -932,6 +947,14 @@ def run(
     everything. Its targets are sharded and queued alongside the mutations rather
     than run as one serial pass, because a single pass over the union of every
     target was measured at two thirds of the wall clock.
+
+    ``scope`` names what a red baseline voids, because this function does not
+    always own the whole of "above". A nested pass -- `confirm`, or one batch of
+    a `sweep` -- prints its rows inside a larger run whose earlier verdicts are
+    still good, and "nothing above means anything" reads there as voiding those
+    too. The alternative was a second `print` in the caller correcting this one,
+    which is two sites that must stay adjacent, in order, and in agreement about
+    wording, with nothing enforcing any of the three.
 
     ``strict`` decides what an unanswerable row does. For a hand-written table it
     should stop the run: a row that breaks collection is a mistake in the table,
@@ -1016,7 +1039,7 @@ def run(
                 # happened.
                 print(
                     f"  BASELINE NOT GREEN ({baseline_verdict.outcome}) -- the suite does not "
-                    f"pass untouched, so nothing above means anything: {baseline_verdict.detail}"
+                    f"pass untouched, so {scope} means anything: {baseline_verdict.detail}"
                 )
                 red = True
                 break
@@ -1068,7 +1091,14 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
 WHOLE_SUITE = ""
 
 
-def confirm(report: Report, workers: int | None, timeout: float, memory: int) -> Report:
+def confirm(
+    report: Report,
+    workers: int | None,
+    timeout: float,
+    memory: int,
+    *,
+    baseline: bool = True,
+) -> Report:
     """Re-run every survivor against the whole suite, and correct the ones caught.
 
     This is what makes per-file test selection a *speed* decision rather than a
@@ -1080,6 +1110,25 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
     Only survivors, because they are the minority and the only ones whose answer
     can be wrong in that direction -- a `caught` row was caught by a real test,
     and no wider suite makes that less true.
+
+    **With a baseline, like every other pass, and this is the whole of #268.**
+    A correction here is the claim "a test the selection had not run noticed
+    this", and on a suite that is already failing the claim is free: `failfast`
+    stops at the first red test, whatever it was about. Both real survivors of
+    one sweep came back credited to a shell-hook test that had never heard of
+    the file under mutation. That is the false `caught` this module exists to
+    make impossible, arriving in the one pass that had no baseline.
+
+    The cost is one whole-suite run, not one per survivor: `run` shards its
+    baseline by `Mutation.tests`, and every row here carries `WHOLE_SUITE`, so
+    the set is a single shard queued alongside the survivors in the same lanes.
+
+    ``baseline`` is `--no-baseline` arriving here, and it has to arrive: that
+    flag means "skip the untouched-suite check", and a check it cannot turn off
+    would make it *worse* than useless on the tree it exists for -- a knowingly
+    red one -- by silently suppressing every correction instead of skipping a
+    check. Turned off, this is the pre-#268 behaviour, false `caught` included,
+    which is what the flag has always been an opt-in to.
     """
     # Positions, not labels. Two generated rows share a label whenever they touch
     # the same line with the same operator -- `generate` dedupes on `(span, new)`,
@@ -1089,19 +1138,33 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
     # had never seen it. On this branch's own diff, 23 labels are duplicated.
     #
     # `run` appends in table order, and with `strict=False` there is no early
-    # exit, so `again.results` is positionally aligned with `widened`.
+    # exit, so `again.results` is positionally aligned with `rerun`.
+    if report.baseline_red:
+        # The narrow pass already found the tree red, and its shard is a module
+        # *inside* the whole suite, so this pass would come back red too -- after
+        # paying one whole-suite run per survivor plus a baseline to learn it.
+        # `clean` is already False and nothing here could change that.
+        #
+        # It also drops a "confirming N survivor(s)..." line about a pass that
+        # was never going to correct one.
+        return report
     survivors = [
         (where, result)
         for where, result in enumerate(report.results)
         if result.verdict.outcome == "survived"
     ]
     if not survivors:
-        return report
+        # Vacuously widened: there was no survivor to re-run, so the promise
+        # holds. Leaving it false here would mark every clean sweep as
+        # unconfirmed, which is the one report this tool exists to produce.
+        return report._replace(widened=True)
     print(f"\nconfirming {len(survivors)} survivor(s) against the whole suite...")
-    widened = [result.mutation._replace(tests=WHOLE_SUITE) for _, result in survivors]
+    # `rerun` rather than `widened`: `Report.widened` is a different thing three
+    # lines down, and one word for two meanings in one function is a re-read.
+    rerun = [result.mutation._replace(tests=WHOLE_SUITE) for _, result in survivors]
     again = run(
-        widened,
-        baseline=False,
+        rerun,
+        baseline=baseline,
         workers=workers,
         strict=False,
         # As the narrow pass does, and for the same reason: the first test that
@@ -1111,7 +1174,19 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
         timeout=timeout,
         memory=memory,
         summarise=False,
+        # These rows are not the run's answer -- the narrow pass's are, and they
+        # are still good. See `run`'s ``scope``.
+        scope="nothing among the confirmation rows",
     )
+
+    if again.baseline_red:
+        # Suppressed, not voided: the narrow pass had its own green baseline and
+        # its verdicts are worth exactly what they were. Only this line's own
+        # decision is printed here -- `run` has already scoped its warning to the
+        # confirmation rows, which is why that scoping is a parameter there
+        # rather than a correcting sentence here.
+        print("No survivor was corrected; the narrow pass's verdicts stand as reported.")
+        return report
 
     # Only `caught` corrects a survivor. A confirmation that broke or timed out
     # answered nothing, and folding it in would print "caught by a test the
@@ -1127,7 +1202,7 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
     if unsure:
         print(f"{unsure} confirmation(s) could not be answered; those rows stand as reported.")
     if not corrected:
-        return report
+        return report._replace(widened=True)
     print(f"{len(corrected)} of them were caught by a test the selection had not run.")
     return Report(
         [
@@ -1135,6 +1210,7 @@ def confirm(report: Report, workers: int | None, timeout: float, memory: int) ->
             for where, result in enumerate(report.results)
         ],
         report.baseline_red,
+        True,
     )
 
 
@@ -1246,7 +1322,10 @@ def _persist(report: Report, where: Path) -> None:
             }
         )
     where.write_text(
-        json.dumps({"baseline_red": report.baseline_red, "results": rows}, indent=1),
+        json.dumps(
+            {"baseline_red": report.baseline_red, "widened": report.widened, "results": rows},
+            indent=1,
+        ),
         encoding="utf-8",
     )
     print(f"\nwrote {len(rows)} row(s) to {where}")
@@ -1441,8 +1520,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         report = sweep(table, args) if args.all or args.batch else _run_generated(table, args)
         if not args.no_confirm:
-            report = confirm(report, args.workers, args.timeout, args.memory)
+            report = confirm(
+                report,
+                args.workers,
+                args.timeout,
+                args.memory,
+                baseline=not args.no_baseline,
+            )
         else:
+            # Nothing to clear: `widened` is false until `confirm` earns it, so
+            # this branch reaches `_persist` saying so without a line here.
             print("\n--no-confirm: survivors below were not re-run against the whole suite,")
             print("so one may simply have been run against tests that cannot see it.")
         _summarise(report.results)

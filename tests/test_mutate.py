@@ -66,6 +66,35 @@ class MutateTestCase(unittest.TestCase):
         path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
         return path
 
+    def red_for_its_own_reasons(self, at: str) -> None:
+        """A failing test the mutation has nothing to do with.
+
+        Deliberately about nothing -- it does not import the mutated module, let
+        alone call it -- because what the callers need is that *being red is
+        enough*. One that touched the module under mutation would leave a reader
+        unable to tell a false correction from a true one.
+
+        The path is the caller's, and under a git fixture it matters: it must be
+        untracked and outside `woswoar/`, or `changed_lines` treats it as wholly
+        changed and puts it in the diff.
+
+        Here rather than in the two suites that want it, for the reason `CLAMP`
+        gives above: written out separately, two copies stay self-consistent
+        while drifting into being red for different reasons, and both suites go
+        on looking green.
+        """
+        self.write(
+            at,
+            """
+            import unittest
+
+
+            class Broken(unittest.TestCase):
+                def test_something_else_entirely(self) -> None:
+                    self.fail("red for its own reasons")
+            """,
+        )
+
     def package(self, guarded: bool, inside: str = "", both: bool = False) -> None:
         """A module with one behaviour, and a test that may or may not see it.
 
@@ -624,13 +653,14 @@ class TestASpanThatNoLongerHoldsItsText(MutateTestCase):
         self.assertEqual((self.root / "mod.py").read_text(encoding="utf-8"), before)
 
 
-class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
-    """The pass that makes narrow test selection a speed decision, not a wrong one.
+class TwoRowsSharingALabel(MutateTestCase):
+    """The fixture both confirmation suites below need, held in one place.
 
-    A row run against too few tests survives for the wrong reason, and that error
-    points the expensive way: it sends the author to rewrite a test that was
-    never weak. So every survivor is re-run against everything before it is
-    printed.
+    No tests of its own. It is a class rather than a function because it wants
+    `write`, and the two suites derive from it rather than copying it because a
+    fixture this fiddly -- two rows that must *both* survive the narrow pass,
+    one of which the wider suite catches -- drifts the moment there are two of
+    it, and a drifted copy is how a confirmation test stops confirming anything.
     """
 
     def two_rows_with_one_label(self) -> list[Mutation]:
@@ -684,6 +714,16 @@ class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
             Mutation(shared, "mod.py", "2", "9", "test_narrow", span=(at_two, at_two + 1)),
         ]
 
+
+class TestConfirmingSurvivorsAgainstTheWholeSuite(TwoRowsSharingALabel):
+    """The pass that makes narrow test selection a speed decision, not a wrong one.
+
+    A row run against too few tests survives for the wrong reason, and that error
+    points the expensive way: it sends the author to rewrite a test that was
+    never weak. So every survivor is re-run against everything before it is
+    printed.
+    """
+
     def test_a_shared_label_does_not_spread_one_rows_answer_to_another(self) -> None:
         """Keying the corrections by label wrote the caught row's verdict onto the
         other, so a genuine survivor was reported as `caught` -- naming a test
@@ -704,6 +744,184 @@ class TestConfirmingSurvivorsAgainstTheWholeSuite(MutateTestCase):
             "one row's confirmation was written onto the other",
         )
         self.assertFalse(confirmed.clean)
+
+
+class TestConfirmingNeedsAGreenSuiteToo(TwoRowsSharingALabel):
+    """#268: the one pass that had no baseline, and what it cost.
+
+    `confirm` re-runs each survivor against everything with `failfast`, so the
+    first red test settles the row. On a suite that is already failing for its
+    own reasons that test is always reached, and every survivor comes back
+    "caught by a test the selection had not run" -- naming a test that has never
+    heard of the file under mutation. A false clean sweep, in the report a pull
+    request quotes as evidence.
+
+    Found for real: two genuine survivors of a `tools/watch.py` sweep were both
+    credited to a shell-hook test, on a container where three tests are red for
+    environmental reasons.
+
+    The other half -- that a *green* suite still corrects, without which all of
+    this passes on a `confirm` that has stopped correcting anything at all -- is
+    `TestConfirmingSurvivorsAgainstTheWholeSuite`'s own test, on this same
+    fixture, one class up. It is not repeated here: it asserts strictly more,
+    and a second copy is another whole-suite run for an answer already in the
+    same file and the same run.
+    """
+
+    def with_an_unrelated_failure(self) -> Report:
+        """The narrow pass over two survivors, in a tree whose wider suite is red.
+
+        Built on `two_rows_with_one_label`'s fixture because it already has what
+        this needs and is hard to get: two rows that *survive* the narrow pass,
+        so there is something for `confirm` to widen, one of which the wide
+        suite legitimately catches and one of which it does not.
+
+        The failure is deliberately about nothing -- it does not import `mod`,
+        let alone call it -- because the point is that being red is enough. A
+        broken test that touched the mutated module would leave the reader
+        unable to tell a false correction from a true one.
+        """
+        rows = self.two_rows_with_one_label()
+        self.red_for_its_own_reasons("test_broken.py")
+        report = run(rows, baseline=False, strict=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results],
+            ["survived", "survived"],
+            "precondition: both rows must survive, or nothing is widened",
+        )
+        return report
+
+    def test_a_red_suite_corrects_nothing(self) -> None:
+        """Both rows stand as the narrow pass reported them.
+
+        Including the first, which the wide suite really does catch. Suppressing
+        a correction that happens to be true is the price of not publishing the
+        one that is false: with the suite red there is no way to tell them apart
+        from in here, and a report that is right by luck is the thing this
+        module refuses to produce.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["survived", "survived"],
+            "a red suite was allowed to correct a survivor",
+        )
+
+    def test_it_says_the_suite_is_why(self) -> None:
+        """A silently unwidened survivor is a different bug report.
+
+        The reader is deciding whether to go and strengthen a test. "This row
+        survived" and "this row survived and nothing could widen it" send them
+        to different places, and only one of them is true here.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        spoken = said.getvalue()
+        self.assertIn("BASELINE NOT GREEN", spoken)
+        # The two halves, each from the function that owns it. `run` must scope
+        # its warning -- unscoped it reads as voiding the narrow pass too --
+        # and `confirm` must say what it decided. Not "stand as reported" on its
+        # own: the unanswerable-row line further down says that too, so a
+        # mutation removing this print would have been caught by the wrong one.
+        self.assertIn("nothing among the confirmation rows", spoken)
+        self.assertIn("No survivor was corrected", spoken)
+        self.assertNotIn("caught by a test the selection had not run", spoken)
+
+    def test_the_report_says_the_survivors_were_never_widened(self) -> None:
+        """The stdout line is gone the moment the terminal scrolls; the flag is
+        what `--json` writes and `tools/reached.py` will read.
+
+        `widened` is false until `confirm` earns it, so this asserts the earning
+        did not happen -- and the sibling below asserts it does on a green tree,
+        without which a flag hard-coded to false would pass here.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertFalse(confirmed.widened)
+
+    def test_a_completed_pass_says_so(self) -> None:
+        report = run(self.two_rows_with_one_label(), baseline=False, strict=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertTrue(confirmed.widened)
+
+    def test_an_already_red_report_runs_nothing(self) -> None:
+        """The narrow pass's shard is a module inside the whole suite, so a red
+        one guarantees a red confirmation -- after paying a whole-suite run per
+        survivor to find out. Nothing should run, and the pass should not
+        announce itself either."""
+        report = self.with_an_unrelated_failure()._replace(baseline_red=True)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(said.getvalue(), "")
+        self.assertFalse(confirmed.widened)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["survived", "survived"],
+        )
+
+    def test_a_clean_report_is_neither_announced_nor_re_run(self) -> None:
+        """No survivor, so nothing to widen -- and nothing to say about it.
+
+        The promise holds vacuously, which is why `widened` is true here; a
+        clean sweep marked "not confirmed" would be the one report this tool
+        exists to produce, carrying a warning about work it correctly skipped.
+        Silence is asserted too, because falling through announces "confirming
+        0 survivor(s) against the whole suite" about a pass that runs nothing.
+        """
+        self.package(guarded=True)
+        report = run(
+            [Mutation("the clamp is gone", "mod.py", "if value < 0:", "if False:", "test_mod")],
+            baseline=False,
+        )
+        self.assertEqual([result.verdict.outcome for result in report.results], ["caught"])
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual(said.getvalue(), "")
+        self.assertTrue(confirmed.widened)
+
+    def test_a_survivor_the_whole_suite_cannot_see_either_is_still_widened(self) -> None:
+        """The healthy-repo case, and the one the other tests skip past.
+
+        A real survivor on a green tree: the pass runs, corrects nothing, and
+        must still report that it happened -- otherwise `widened` is false
+        exactly when the news is "your test is genuinely weak", which is when a
+        reader most needs to trust the row.
+
+        Only the second row, because the first is corrected by the wide suite
+        and a non-empty `corrected` takes a different return.
+        """
+        report = run(self.two_rows_with_one_label(), baseline=False, strict=False)
+        genuine = Report(report.results[1:], report.baseline_red)
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(genuine, workers=None, timeout=60.0, memory=MEMORY)
+        self.assertEqual([result.verdict.outcome for result in confirmed.results], ["survived"])
+        self.assertTrue(confirmed.widened)
+
+    def test_no_baseline_still_means_no_baseline(self) -> None:
+        """The escape hatch keeps working, and the reader gets to see its price.
+
+        `--no-baseline` exists for a tree the author knows is red and wants
+        mutation answers about anyway. If the check it turns off ran here
+        regardless, the flag would silently stop correcting anything on exactly
+        the tree it was reached for -- a worse failure than the one #268 fixed,
+        because at least that one printed a reason.
+
+        So with it off this is the old behaviour, false correction and all: the
+        second row is a real survivor and the broken test "catches" it.
+        """
+        report = self.with_an_unrelated_failure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirmed = confirm(report, workers=None, timeout=60.0, memory=MEMORY, baseline=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught", "caught"],
+            "--no-baseline no longer reaches the confirmation pass",
+        )
 
 
 class TestASubTestIsARealAnswer(MutateTestCase):
@@ -2034,6 +2252,9 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
         written = json.loads(report.read_text(encoding="utf-8"))
         self.assertFalse(written["baseline_red"])
+        # The claim the file makes about itself, and the only place it survives
+        # the terminal: every survivor here was re-run against the whole suite.
+        self.assertTrue(written["widened"])
         # As many rows as were printed, and about the file the diff touched.
         # What each row must *hold* is `TestTheJsonReport`'s question, asked
         # once there rather than again here.
@@ -2050,6 +2271,32 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--no-confirm")
         self.assertIn("were not re-run against the whole suite", finished.stdout)
         self.assertEqual(finished.returncode, 1)
+
+    def test_a_red_suite_stops_the_confirmation_correcting(self) -> None:
+        """#268 through the command line, which is where it was wired.
+
+        The two mutants that survived this change's own sweep were both at this
+        call site -- `if not args.no_confirm` never taken, and the `not` dropped
+        from `baseline=not args.no_baseline`. Neither is visible to a test that
+        calls `confirm` directly, so the fix could have been wired to the wrong
+        flag, or to nothing, with every unit test still green.
+        """
+        self.repo(guarded=False)
+        self.red_for_its_own_reasons("tests/test_broken.py")
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch")
+        self.assertIn("No survivor was corrected", finished.stdout, finished.stderr)
+        self.assertNotIn("caught by a test the selection had not run", finished.stdout)
+        self.assertEqual(finished.returncode, 1, finished.stdout + finished.stderr)
+
+    def test_no_baseline_reaches_the_confirmation_pass(self) -> None:
+        """The other direction, without which the test above passes on a call
+        site wired to `baseline=args.no_baseline` -- inverted, and asserting the
+        inversion. Same red tree, flag on: the check is skipped, so the run
+        corrects as it did before #268 and says nothing about a baseline."""
+        self.repo(guarded=False)
+        self.red_for_its_own_reasons("tests/test_broken.py")
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--no-baseline")
+        self.assertNotIn("No survivor was corrected", finished.stdout, finished.stderr)
 
     def test_the_two_ways_of_asking_for_nothing_are_refused(self) -> None:
         for args, said in (
