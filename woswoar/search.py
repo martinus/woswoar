@@ -260,12 +260,26 @@ def _project_root(path: str, home: str) -> str:
     silent -- the prompt shows the root, so a marked tree reads `~/src/api`
     where an unmarked one reads `~/src/api/app/routes`.
 
-    Three things decide the walk.
+    Four things decide the walk.
 
-    It stops at ``home``. Above it are `/home` and `/`, where a marker would
-    make the scope meaningless -- and where one could be planted by another
-    account on a shared machine. One *at* `$HOME` is legal and degenerate, and
-    is not worth special-casing.
+    It stops at ``home``, where above are `/home` and `/` and a marker would
+    make the scope meaningless. One *at* `$HOME` is legal and degenerate, and is
+    not worth special-casing. **That stop only fires for a path under `$HOME`**,
+    which is the honest statement of it: standing in `/opt/work/api/main` the
+    walk runs to `/`, because a project outside home is an ordinary thing and
+    refusing to look would remove the feature for it. What that leaves is a
+    marker in a world-writable ancestor -- `/tmp`, `/var/tmp`, `/dev/shm` --
+    widening your Ctrl-O over your *own* history. A nuisance rather than a
+    disclosure: nothing is shown to whoever planted it, and nothing leaves the
+    machine. It is written down here rather than guarded because every guard for
+    it is a policy (ownership? mode? a list of paths?) that would be wrong on
+    somebody's machine.
+
+    ``/`` is refused outright, and that is the one place a wider scope stops
+    being merely wider: `_under` reads a root of `/` as *every row on every
+    machine*, so a marker there would silently turn `dir` into `global` while
+    the prompt still said `dir`. Only root can create it, so it is a foot-gun
+    rather than an attack, and one line settles it.
 
     It walks the **logical** path it is given, never `Path.resolve()`. `_here`
     documents at length why `$PWD` and `os.getcwd()` are different answers after
@@ -285,14 +299,23 @@ def _project_root(path: str, home: str) -> str:
     # the answer either.
     candidate = path
     while True:
-        if os.path.exists(os.path.join(candidate, PROJECT_MARKER)):
+        # `lexists`, not `exists`, and the difference is the whole of what
+        # "presence only" is worth. `exists` *resolves* the marker, so a
+        # `.woswoar-dir` that is a symlink -- in a repository somebody else
+        # wrote -- points this `stat` wherever they chose: a hung NFS mount, a
+        # dead FUSE mount, an autofs path like `/net/their-host/x` that mounting
+        # is attempted for. Every Ctrl-R would block there. `lexists` asks about
+        # the marker itself, which is the fact this wants, and it also makes a
+        # dangling symlink a marker rather than silently not one.
+        if os.path.lexists(os.path.join(candidate, PROJECT_MARKER)) and candidate != os.sep:
             return candidate
         if home and candidate == home:
             break
         parent = os.path.dirname(candidate)
         if parent == candidate:
-            # `dirname("/")` is `"/"`, which is how the walk ends on a machine
-            # with no `$HOME` set rather than looping.
+            # `dirname("/")` is `"/"`, which is how the walk ends for a path
+            # outside `$HOME`, or on a machine with no `$HOME` set, rather than
+            # looping.
             break
         candidate = parent
     return path

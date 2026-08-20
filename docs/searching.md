@@ -40,10 +40,15 @@ unmarked one reads `woswoar (dir ~/src/api/app/routes)`. The trade is visible in
 that line: with a marker above you there is no longer a way to scope to just the
 subdirectory you are standing in.
 
-Only the file's *presence* counts. Nothing inside it is ever read, so it is safe
-to `cd` into somebody else's repository that has one — the worst it can do is
-make your <kbd>Ctrl</kbd>+<kbd>O</kbd> wider than you expected — and you can
-write a sentence in it explaining itself to whoever finds it.
+Only the file's *presence* counts — and only its own, since a marker that is a
+symlink is not followed. Nothing inside it is ever read, so it is safe to `cd`
+into somebody else's repository that has one: the worst it can do is make your
+<kbd>Ctrl</kbd>+<kbd>O</kbd> wider than you expected. You can write a sentence
+in it explaining itself to whoever finds it.
+
+The search for it stops at your home directory. Below a path outside home —
+`/opt/work/api`, say — it runs to the filesystem root instead, so that a project
+living outside home works the same way; a marker at `/` itself is ignored.
 
 **A short machine name is also an ordinary word.** If yours is `box`, typing it
 finds `sandbox` and `~/dropbox` too — so anchor it: **`^box`** matches only the

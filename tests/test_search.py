@@ -2459,3 +2459,92 @@ class TestTheWalkFollowsTheLogicalPath(DirScopeCase):
         self.stand_in(self.home / "link/app")
         self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/link) ")
         self.assertEqual(self.commands(), ["make test"])
+
+
+class TestTheMarkerIsAskedAboutItselfNotItsTarget(DirScopeCase):
+    """`lexists`, not `exists`, and the difference is a hang on the Ctrl-R path.
+
+    `exists` resolves the marker, so a `.woswoar-dir` that is a *symlink* --
+    in a repository somebody else wrote -- points the `stat` wherever they
+    chose. A dead NFS or FUSE mount, or an autofs path that mounting is
+    attempted for, blocks every keypress. `docs/searching.md` promises that
+    `cd`-ing into somebody else's marked repository can at worst widen your
+    Ctrl-O, and this is what makes that true.
+
+    A dangling symlink standing in for the unreachable target: `exists` says
+    False for it, `lexists` says True, and no other fixture separates them.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = self.home / "src/api"
+        (self.project / "app").mkdir(parents=True)
+        self.record("~/src/api/app", "make test")
+        self.stand_in(self.project / "app")
+
+    def test_a_symlinked_marker_pointing_nowhere_still_marks(self) -> None:
+        (self.project / search.PROJECT_MARKER).symlink_to(self.home / "no/such/mount")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+    def test_an_ordinary_marker_still_marks(self) -> None:
+        """The fixture that keeps the assertion above from passing on a walk
+        that stopped looking at the file altogether."""
+        (self.project / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.assertEqual(search._prompt_for("dir"), "woswoar (dir ~/src/api) ")
+
+
+class TestTheWalkOutsideHome(DirScopeCase):
+    """`$HOME` bounds the walk only for paths under `$HOME`, and that is stated
+    rather than guarded -- a project in `/opt/work` is an ordinary thing, and
+    refusing to look above a path outside home would remove the feature for it.
+
+    What is refused is `/` itself, because `_under` reads that root as every row
+    on every machine: a marker there would turn `dir` into `global` while the
+    prompt still said `dir`.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = self.root / "opt/work/api"
+        (self.outside / "main").mkdir(parents=True)
+
+    def test_a_marker_above_a_path_outside_home_is_still_found(self) -> None:
+        # On `_here` rather than the prompt: a sandbox path outside `$HOME` has
+        # no `~` to shorten it and runs past `_PROMPT_LABEL_MAX`, so the prompt
+        # would be asserting the clip rather than the root.
+        (self.outside / search.PROJECT_MARKER).write_text("", encoding="utf-8")
+        self.stand_in(self.outside / "main")
+        self.assertEqual(search._here(), (str(self.outside),))
+
+    def test_without_a_marker_it_is_the_directory_it_always_was(self) -> None:
+        self.stand_in(self.outside / "main")
+        self.assertEqual(search._here(), (str(self.outside / "main"),))
+
+    def test_a_marker_at_the_filesystem_root_is_refused(self) -> None:
+        """The one place a wider scope stops being merely wider.
+
+        `_under` reads a root of `/` as every row on every machine, so a marker
+        there turns `dir` into `global` while the prompt still says `dir`.
+
+        The marker is faked rather than planted, and this is the one test here
+        that mocks: writing `/.woswoar-dir` needs root, so a fixture that did it
+        would pass on this container and fail in CI -- and asserting on a real
+        `/` with no marker passes whether or not the guard exists, which is the
+        decoration this repository's rule 3 is about. Only the *answer to one
+        `lexists`* is replaced; the walk, the boundary and the return are the
+        real ones.
+        """
+        deep = self.outside / "main"
+        self.stand_in(deep)
+        at_root = os.path.join(os.sep, search.PROJECT_MARKER)
+        with mock.patch("os.path.lexists", lambda where: where == at_root):
+            self.assertEqual(search._project_root(str(deep), ""), str(deep))
+
+    def test_the_same_fake_one_level_down_is_honoured(self) -> None:
+        """The fixture that stops the assertion above passing on a walk that had
+        simply stopped finding markers at all."""
+        deep = self.outside / "main"
+        self.stand_in(deep)
+        wanted = os.path.join(str(self.outside), search.PROJECT_MARKER)
+        with mock.patch("os.path.lexists", lambda where: where == wanted):
+            self.assertEqual(search._project_root(str(deep), ""), str(self.outside))
