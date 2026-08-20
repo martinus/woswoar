@@ -24,6 +24,23 @@ of finished work changes, one line when it ends, nothing in between. Emitting
 per poll instead would be a line every twenty seconds for forty minutes, which
 is the same as no signal at all by a different route.
 
+**A job can also stop without ending, and that was the gap the first two
+versions left.** Death and completion are events here; *stalling* was not, so a
+sweep that was alive and wedged printed one line and then nothing -- which is
+exactly what a sweep that is alive and slow prints. The reader is back to
+guessing, from the other side of the same silence. Measured on this repository:
+a nine-minute mutation run emitted a row every thirty seconds or so, and the run
+that hung went quiet for ten minutes and more. So a stall long enough to be
+abnormal is now its own line, and it says the job is still alive -- which is the
+half that distinguishes it from `DIED`, and the half a reader cannot get by
+waiting.
+
+Reported on a doubling interval rather than every poll or once. Every poll is
+the noise this tool exists to avoid; once is a line at minute five that a reader
+arriving at minute forty cannot date. Doubling gives four lines in forty minutes,
+each of which is real news -- a stall twice as long as the last report is worth
+saying, one ten per cent longer is not.
+
 **It watches rather than wraps.** The obvious shape is to run the job itself and
 report as it goes, and that is wrong here: these jobs are already started
 detached, precisely so that a foreground call timing out does not take them
@@ -50,6 +67,17 @@ from pathlib import Path
 #: minutes apart, and the point of the tool is to be cheap enough to leave
 #: running beside a job that is already using the machine.
 INTERVAL = 20.0
+
+#: Seconds without new work before a job is called stalled. Five minutes is a
+#: judgement, and it is this one: the longest gap between rows in a healthy
+#: mutation sweep here was about a minute, and the wedged one was silent for ten
+#: and counting. Anything in between is arbitrary, so the value is generous --
+#: a threshold that cries wolf is worse than none, because the next real one is
+#: read as noise too.
+#:
+#: No job's own rhythm is knowable from here, which is why this is a flag. Zero
+#: turns it off, for a job whose work genuinely arrives in one lump at the end.
+STALE = 300.0
 
 
 def alive(pid: int) -> bool:
@@ -117,16 +145,37 @@ class Watch:
     without a clock or a subprocess. `main` is the part that sleeps.
     """
 
-    def __init__(self, pid: int, log: Path, done: Path, pattern: re.Pattern[str]) -> None:
+    def __init__(
+        self,
+        pid: int,
+        log: Path,
+        done: Path,
+        pattern: re.Pattern[str],
+        stale: float = STALE,
+    ) -> None:
         self.pid = pid
         self.log = log
         self.done = done
         self.pattern = pattern
+        self.stale = stale
         self.began = time.monotonic()
         #: -1 rather than 0, so a job that is already at zero rows still gets its
         #: first "working" line. Starting at 0 would make the opening silence
         #: indistinguishable from a job that never starts.
         self.last = -1
+        #: When the count last moved. `began` rather than 0, because nothing has
+        #: moved yet and "since we started watching" is what that means. In
+        #: practice the first `step` overwrites it before anything reads it --
+        #: `last` starts at -1, so the opening poll is always a change -- which
+        #: is why a job stuck at zero rows stalls a `stale` after the watcher
+        #: starts rather than after the job did. The watcher cannot know the
+        #: latter; it was not there.
+        self.moved = self.began
+        #: The stall this last spoke about, which is what makes the next report a
+        #: doubling rather than a repeat. Zero means nothing said yet -- and, as
+        #: with `moved`, the opening poll overwrites it before `stalling` can
+        #: read it, so this value is the declaration rather than the behaviour.
+        self.told = 0.0
 
     def minutes(self) -> int:
         return int((time.monotonic() - self.began) // 60)
@@ -152,8 +201,36 @@ class Watch:
             )
         if rows != self.last:
             self.last = rows
+            self.moved = time.monotonic()
+            self.told = 0.0
             return f"working: {rows} rows after {self.minutes()}m", -1
-        return None
+        return self.stalling(rows)
+
+    def stalling(self, rows: int) -> tuple[str, int] | None:
+        """The line for a job that is alive and getting nothing done.
+
+        Status -1, like `working`: a stall is not a verdict. The job may still
+        finish, and quite often does -- what the reader gains is the chance to
+        go and look rather than to keep waiting on a guess.
+
+        In seconds, where the rest of this speaks in minutes, and deliberately:
+        this is the one figure a reader compares against `--stale`, which is a
+        number of seconds they typed. Rendering it in a different unit from the
+        flag that controls it is how a threshold gets read as not working.
+        """
+        if not self.stale:
+            return None
+        idle = time.monotonic() - self.moved
+        # `told * 2` is the doubling. Below `stale` nothing is said at all, and
+        # `told` is 0 until the first report, so that term cannot suppress it.
+        if idle < self.stale or idle < self.told * 2:
+            return None
+        self.told = idle
+        return (
+            f"STALLED: no new rows for {int(idle)}s at {rows} rows, "
+            f"{self.minutes()}m in -- the process is alive and not working",
+            -1,
+        )
 
 
 def a_pid(text: str) -> int:
@@ -190,9 +267,15 @@ def main(argv: list[str] | None = None) -> int:
         "--match", default=".", help="count lines of --log matching this regex (default: all)"
     )
     parser.add_argument("--interval", type=float, default=INTERVAL, help="seconds between polls")
+    parser.add_argument(
+        "--stale",
+        type=float,
+        default=STALE,
+        help="say so when --log has not grown for this long; 0 to never (default: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
-    watch = Watch(args.pid, args.log, args.done, re.compile(args.match))
+    watch = Watch(args.pid, args.log, args.done, re.compile(args.match), args.stale)
     while True:
         event = watch.step()
         if event is not None:

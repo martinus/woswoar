@@ -275,7 +275,9 @@ opens its PR and waits for a person regardless of what CI says.
   matches the asking shell's own command line, and it reported a dead sweep
   alive twice in one session, to somebody who had asked twice. Record the pid at
   launch and watch that — a death then arrives as a line and an exit status
-  rather than as more silence.
+  rather than as more silence, and so does a *stall*, which is the case that
+  actually bit: a run alive and wedged looks exactly like one that is slow, and
+  waiting longer is what both of them look like.
 
   **The generated sweep goes last.** Implement, write the hand table, preflight,
   run `/simplify` *and apply it*, and only then `--base main`. The table is
