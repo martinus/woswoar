@@ -5456,6 +5456,51 @@ class TestSyncDoesNotForkGitMoreThanItNeedsTo(SyncTestCase):
             self.assertIn("commit -q", calls)
             self.assertIn("push --quiet", calls)
 
+    def test_a_new_identity_moves_the_owner_line(self) -> None:
+        """#283. `signer.pub` has two lines and only the first was compared.
+
+        The second names the age recipient that owns this host, and it is why
+        the file exists at all: revocation names a *recipient* while chunks live
+        under a *host id*, and nothing else joins the two.
+
+        `woswoar init --new-identity` -- the remedy the program prints after a
+        revoke -- changes the identity and nothing else. The host id and the
+        signing key both stay, so the verify key still matched, `publish_signer`
+        returned False, and the owner line went on naming the tombstoned
+        recipient for the life of the machine: unpinned on every peer's sync for
+        ever, and never offered for trust again.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            before = sync.read_signer(alpha.id)
+            assert before is not None
+
+            # The identity alone, exactly as `--new-identity` does it. The
+            # signing key is deliberately left in place: with it changed the old
+            # guard rewrites anyway and the test proves nothing.
+            identity = sync.identity_path(store.machine())
+            # The `.pub` sibling goes too: `recipient_for` prefers it, so a
+            # stale one would report the old recipient for the new identity and
+            # the test would pass against an unfixed guard.
+            crypto.public_half(identity).unlink(missing_ok=True)
+            identity.write_text(crypto.generate_identity().secret, encoding="utf-8")
+
+            self.assertTrue(sync.publish_signer(store.machine()), "nothing was rewritten")
+            after = sync.read_signer(alpha.id)
+            assert after is not None
+            self.assertEqual(after.verify_key, before.verify_key, "the signing key did not move")
+            self.assertNotEqual(after.owner, before.owner, "the owner line is still the old one")
+
+    def test_an_unchanged_identity_rewrites_nothing(self) -> None:
+        """The other direction, and without it the fix could be "always
+        rewrite" -- which passes the test above and puts a write plus a commit
+        on a timer that fires every minute."""
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+            self.assertFalse(sync.publish_signer(store.machine()))
+
     def test_a_republished_signer_is_committed_even_with_nothing_to_export(self) -> None:
         """The other writer on this path, and the one with no chunk beside it.
 

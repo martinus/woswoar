@@ -1273,13 +1273,38 @@ def publish_signer(known: Machine) -> bool:
     """Make sure this host's published signer file says what is true.
 
     Guarded, and the guard is not only tidiness: working out the owning
-    recipient means reading an identity, which for a dedicated age key is an
+    recipient means reading an identity, which for a dedicated age key can be an
     `age-keygen` subprocess. This runs on a one-minute timer, and the file
     changes about once in a machine's life. Returns whether it wrote.
+
+    **Both lines are compared, not just the key (#283).** The file's second line
+    names the age recipient that owns this host, and `archive.signer_public`'s
+    docstring says that line is why the file exists: revocation names a
+    *recipient* while chunks live under a *host id*, and nothing else joins the
+    two.
+
+    `woswoar init --new-identity` changes the identity and nothing else -- the
+    host id comes from `config/machine` and the signing key from
+    `config/signing_key`, and neither moves. So the verify key still matched,
+    this returned `False`, and the owner line went on naming the tombstoned
+    recipient for the life of the machine. That is the remedy the program itself
+    prints after a revoke, and following it left the machine unpinned on every
+    peer's sync for ever and never offered for trust again.
+
+    The owner is read *after* the key comparison rather than before it, and the
+    `and` chain is what keeps that true: a machine whose key has changed is being
+    rewritten anyway, so the read costs nothing there, and one that has not is
+    the only case where this is on the idle path.
     """
     verify_key = signing_public()
     current = read_signer(known.id)
-    if current is not None and current.verify_key == verify_key:
+    if (
+        current is not None
+        and current.verify_key == verify_key
+        # Last, and `and` short-circuits: reached only once the cheap
+        # comparisons have failed to settle it. See the docstring.
+        and current.owner == _own_recipient(known)
+    ):
         return False
     store.write_atomic(
         archive.signer_public(known.id),
