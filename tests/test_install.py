@@ -234,6 +234,36 @@ class TestInstall(WoswoarTestCase):
         self.assertIn('source "$HOME/.local/share/woswoar/woswoar.bash"', text)
         self.assertNotIn(str(self.home), text)
 
+    def test_a_backslash_in_the_path_survives_a_reinstall(self) -> None:
+        """#292. The second argument to `re.sub` is a replacement *template*,
+        and the block being substituted holds a path the user controls.
+
+        Two installs, because one never reaches `sub` -- the first appends the
+        block through the other branch, so this worked once and then broke. A
+        fixture with a single install cannot tell the two implementations apart,
+        which is why the existing reinstall test above did not catch it.
+
+        `\\i` is `bad escape` and raises; the quieter half is `\\1`, which
+        substitutes a group from the pattern and writes a `source` line pointing
+        somewhere else while reporting success.
+        """
+        weird = self.home / "back\\slash"
+        os.environ["WOSWOAR_DIR"] = str(weird)
+        first = self.install()
+        self.assertIn("woswoar.bash", first)
+
+        text = self.install()
+        self.assertIn("woswoar.bash", text)
+        self.assertEqual(text.count("# >>> woswoar >>>"), 1, "the block was duplicated")
+
+    def test_a_group_reference_in_the_path_is_not_expanded(self) -> None:
+        """The silent half on its own. `\\1` does not raise -- it substitutes,
+        so the rc file still looks plausible and the hook simply never loads."""
+        os.environ["WOSWOAR_DIR"] = str(self.home / "g\\1roup")
+        self.install()
+        text = self.install()
+        self.assertIn("g\\1roup", text, "the group reference was expanded away")
+
     def test_reinstalling_rewrites_an_older_absolute_block(self) -> None:
         """The upgrade path. Both of the reporting machines have one of these."""
         os.environ["WOSWOAR_DIR"] = str(self.home / ".local/share/woswoar")
