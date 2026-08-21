@@ -1545,6 +1545,7 @@ class TestTheScratchFileIsPrivate(ShellHookTestCase):
         self.run_shell("echo still-recording\n", env_extra=env)
         self.assertIn("echo still-recording", self.commands())
 
+    @support.requires_unprivileged
     def test_an_unwritable_runtime_dir_falls_back_instead_of_giving_up(self) -> None:
         """XDG_RUNTIME_DIR is inherited, not verified.
 
