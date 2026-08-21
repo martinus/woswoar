@@ -1188,6 +1188,75 @@ class TestResumingASweep(unittest.TestCase):
             report = mutate.sweep([], args)
         self.assertFalse(report.clean, "a recorded survivor still counts against the run")
 
+    def batch_args(self, where: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            json=where,
+            no_baseline=True,
+            workers=1,
+            timeout=30.0,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+        )
+
+    def swept(self, table: list[Mutation], answer: Report) -> tuple[str, mock.Mock]:
+        """One sweep with `run` stubbed, returning what was printed and the stub.
+
+        Stubbed for the reason the resume test gives: `sweep`'s job is the
+        bookkeeping around `run`, and running a real mutation would test `run`,
+        which has its own tests.
+        """
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        args = self.batch_args(Path(box) / "out.json")
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as said,
+            mock.patch.object(mutate, "run", return_value=answer) as ran,
+        ):
+            mutate.sweep(table, args)
+        return said.getvalue(), ran
+
+    def test_each_batch_scopes_its_warning_to_its_own_file(self) -> None:
+        """#271. A sweep runs `run` once per file, and eleven batches' worth of
+        verdicts can be scrolled above the twelfth -- so an unscoped "nothing
+        above means anything" is false about all of them.
+
+        Asserted on the argument rather than the printed line, because the line
+        is `run`'s and is stubbed out here; that `run` honours `scope` is
+        `TestConfirmingNeedsAGreenSuiteToo`'s subject.
+        """
+        table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
+        _, ran = self.swept(table, Report([Result(table[0], Verdict("caught"))]))
+        self.assertEqual(ran.call_args.kwargs["scope"], "nothing above about a.py")
+
+    def test_a_whole_table_keeps_the_unscoped_wording(self) -> None:
+        """`main`'s single-table path really does own everything above it, so
+        the default must not drift to the per-file phrasing."""
+        rows = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "run", return_value=Report([])) as ran,
+        ):
+            mutate._run_generated(rows, self.batch_args(Path("unused.json")))
+        self.assertEqual(ran.call_args.kwargs["scope"], "nothing above")
+
+    def test_rows_from_a_red_batch_are_counted_at_the_end(self) -> None:
+        """The number nothing printed. A reader was told "nothing above means
+        anything" once per red file and never told how much of the run that
+        came to -- so a `caught` row could be lifted out of a void batch and
+        believed. That happened."""
+        table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
+        answer = Report([Result(table[0], Verdict("caught"))], baseline_red=True)
+        said, _ = self.swept(table, answer)
+        self.assertIn("1 of 1 row(s) came from a batch whose baseline was red", said)
+
+    def test_a_green_sweep_says_nothing_about_it(self) -> None:
+        """Without this the count could be printed unconditionally, saying
+        `0 of N` on every clean run."""
+        table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
+        said, _ = self.swept(table, Report([Result(table[0], Verdict("caught"))]))
+        self.assertNotIn("came from a batch whose baseline was red", said)
+
     def test_a_missing_file_is_not_an_error(self) -> None:
         """The first run of a sweep has nothing to resume from."""
         with tempfile.TemporaryDirectory() as box:
