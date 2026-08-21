@@ -1248,7 +1248,13 @@ class TestResumingASweep(unittest.TestCase):
         table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
         answer = Report([Result(table[0], Verdict("caught"))], baseline_red=True)
         said, _ = self.swept(table, answer)
-        self.assertIn("1 of 1 row(s) came from a batch whose baseline was red", said)
+        # The line, then `startswith`, rather than `assertIn` on the whole of
+        # stdout. "-1 of 1 row(s)..." *contains* "1 of 1 row(s)...", so the
+        # obvious assertion passes on a counter that subtracts -- which is
+        # exactly the mutant that survived the first version of this test.
+        counted = next(line for line in said.splitlines() if "came from a batch" in line)
+        self.assertTrue(counted.startswith("1 of 1 row(s)"), counted)
+        self.assertIn("so they have no verdict", counted)
 
     def test_a_green_sweep_says_nothing_about_it(self) -> None:
         """Without this the count could be printed unconditionally, saying
