@@ -106,6 +106,7 @@ ignore_missing_imports = true
 # earns them, and the list is what mypy will take.
 module = [
     "tests.test_cache_properties",
+    "tests.test_credential_properties",
     "tests.test_export_properties",
     "tests.test_forget_properties",
     "tests.test_import_properties",
