@@ -169,6 +169,13 @@ silently unmatches them. `coverage` is not a dependency and is not imported —
 the map, because a caught mutation proves its line ran and in-process coverage
 cannot see the lines this suite reaches by running a real `bash`.
 
+It reads the two fields above before any of that. A report with `baseline_red`
+is refused outright — there is nothing in it to partition — and one without
+`widened` is partitioned under a printed caveat, because its survivors may be a
+narrow selection rather than a weak fixture. The asymmetry is the point: a red
+baseline makes every row meaningless, an unwidened one only makes the survivors
+provisional, and `--no-confirm` has to stay usable with this tool.
+
 Running out of memory is reported `BROKE`, never `caught`. It arrives as a
 `MemoryError` inside whichever test was running, which by protocol looks exactly
 like that test noticing — and crediting a test with a guard it does not have is

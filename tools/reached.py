@@ -66,6 +66,30 @@ class Row(NamedTuple):
         return self.outcome in ("caught", "survived")
 
 
+def voided(report: dict[str, Any]) -> bool:
+    """Whether the run that produced ``report`` answered anything at all.
+
+    A suite that is already failing catches whatever it is shown, so on a red
+    baseline every `caught` is unattributable and every `survived` is whatever
+    happened to be left. There is no partition to draw from that, and drawing
+    one anyway is how a reader is sent to strengthen a test that was never weak.
+    """
+    return bool(report.get("baseline_red"))
+
+
+def confirmed(report: dict[str, Any]) -> bool:
+    """Whether every survivor in ``report`` was re-run against the whole suite.
+
+    Absent means **no**, and the default is the whole point. A report written
+    before `Report.widened` existed records nothing either way, and "nothing
+    knows whether these were widened" is exactly what the caveat says -- so the
+    caveat is *true* of those files. Defaulting to yes would make an old file's
+    silence indistinguishable from a claim, which is the class of error this
+    module exists to remove rather than add.
+    """
+    return bool(report.get("widened", False))
+
+
 def rows_from(results: dict[str, Any]) -> list[Row]:
     """The rows of a `--json` report, ignoring anything without a position."""
     out = []
@@ -175,12 +199,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        rows = rows_from(json.loads(args.results.read_text(encoding="utf-8")))
+        report = json.loads(args.results.read_text(encoding="utf-8"))
+        rows = rows_from(report)
         raw = executed_lines(json.loads(args.coverage.read_text(encoding="utf-8")))
     except (OSError, ValueError) as exc:
         raise SystemExit(f"cannot read the inputs: {exc}") from None
+    # Before the empty check, because "this report is void" is the more useful
+    # of the two things a caller can be told about a file with nothing in it.
+    if voided(report):
+        raise SystemExit(
+            f"{args.results} was produced against a suite that was not green, so no row "
+            f"in it is attributable: a failing test catches whatever it is shown. There "
+            f"is nothing here to partition. Fix the suite and sweep again."
+        )
     if not rows:
         raise SystemExit(f"{args.results} holds no positioned rows to classify.")
+
+    if not confirmed(report):
+        # A note rather than a refusal, and the asymmetry with `voided` above is
+        # deliberate. A red baseline makes every row meaningless; an unwidened
+        # one makes the survivors *provisional* -- the narrow pass's verdicts are
+        # sound and only the widening is missing. Refusing here would make
+        # `--no-confirm` unusable with this tool, and `--no-confirm` exists
+        # precisely so a long sweep can skip the expensive pass.
+        print(
+            "NOTE: this report's survivors were not re-run against the whole suite, so "
+            "some\nmay be a narrow test selection rather than a weak fixture. Confirm on "
+            "a green\ntree before rewriting a test on this evidence.\n"
+        )
 
     fixed = repair(raw, rows)
     corrected = sum(len(fixed[p] - raw.get(p, set())) for p in fixed)
