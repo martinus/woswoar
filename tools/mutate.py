@@ -1348,7 +1348,9 @@ def _persist(report: Report, where: Path) -> None:
     print(f"\nwrote {len(rows)} row(s) to {where}")
 
 
-def _run_generated(rows: Sequence[Mutation], args: argparse.Namespace) -> Report:
+def _run_generated(
+    rows: Sequence[Mutation], args: argparse.Namespace, scope: str = "nothing above"
+) -> Report:
     """One batch of generated rows. Both the whole table and `sweep` use this.
 
     `strict=False`: a generated row that breaks collection is not a mistake
@@ -1360,6 +1362,13 @@ def _run_generated(rows: Sequence[Mutation], args: argparse.Namespace) -> Report
     without it each one runs the rest of its target after the answer is known.
     An average, not a bound -- `unittest` runs classes alphabetically, so a
     mutant caught only by the last of them still pays for nearly all.
+
+    ``scope`` is passed through to `run`, and defaults to the whole-table
+    wording because that is what `main`'s single-table path is. `sweep` calls
+    this once per *file* and must say so: eleven batches' worth of verdicts can
+    be scrolled above the twelfth, and telling the reader that all of it means
+    nothing is both false and the reason a real sweep's numbers were misread --
+    see #271.
     """
     return run(
         rows,
@@ -1370,6 +1379,7 @@ def _run_generated(rows: Sequence[Mutation], args: argparse.Namespace) -> Report
         failfast=True,
         timeout=args.timeout,
         memory=args.memory,
+        scope=scope,
     )
 
 
@@ -1438,6 +1448,13 @@ def sweep(table: Sequence[Mutation], args: argparse.Namespace) -> Report:
         by_file.setdefault(row.path, []).append(row)
 
     red = False
+    #: Rows from a batch whose baseline was red. They are kept -- dropping them
+    #: would make a resumed sweep re-run work it has already paid for -- but
+    #: they have no verdict, and until #271 nothing said how many there were.
+    #: The per-batch line said "nothing above means anything" about one file of
+    #: twelve, and the summary said nothing at all, so a reader could take a
+    #: `caught` row out of a void batch and believe it. One did.
+    unanswered = 0
     order = sorted(by_file, key=lambda path: len(by_file[path]))
     for at, path in enumerate(order, start=1):
         if path in done:
@@ -1445,11 +1462,18 @@ def sweep(table: Sequence[Mutation], args: argparse.Namespace) -> Report:
             continue
         rows = by_file[path]
         print(f"\n[{at}/{len(order)}] {path}: {len(rows)} mutant(s)")
-        batch = _run_generated(rows, args)
+        batch = _run_generated(rows, args, scope=f"nothing above about {path}")
         red |= batch.baseline_red
+        if batch.baseline_red:
+            unanswered += len(batch.results)
         collected.extend(batch.results)
         if args.json:
             _persist(Report(collected, red), args.json)
+    if unanswered:
+        print(
+            f"\n{unanswered} of {len(collected)} row(s) came from a batch whose baseline "
+            f"was red, so they have no verdict -- the rest stand."
+        )
     return Report(collected, red)
 
 
