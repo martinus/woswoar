@@ -199,8 +199,14 @@ class TestTheUsersOwnPattern(unittest.TestCase):
         # No NUL and no surrogates: `os.environ` refuses both with an
         # exception from the patch itself, which reads as the property failing
         # when it is the fixture that cannot be built.
+        #
+        # `codec="utf-8"` rather than excluding the surrogate category by name:
+        # a lone surrogate is precisely what utf-8 cannot encode, so this says
+        # the same thing in the terms the constraint actually has -- and the
+        # category spelling is a tuple of `str` where the signature wants a
+        # collection of literals, which mypy rejects on CI's hypothesis.
         st.text(
-            alphabet=st.characters(blacklist_categories=("Cs",), blacklist_characters="\x00"),
+            alphabet=st.characters(codec="utf-8", exclude_characters="\x00"),
             min_size=1,
             max_size=30,
         )
