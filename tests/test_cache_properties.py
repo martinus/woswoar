@@ -42,12 +42,6 @@ FILES = st.lists(
 
 SEPARATORS = ("\x00", "\x01", "\x02")
 
-#: One ordinary entry, for the pin below. Fixed rather than generated: it needs
-#: a timestamp whose digits can be found in the dump by `bytes.index`.
-_SAMPLE = Entry(
-    ts=1700000000, host="h", session="s", cwd="/tmp", exit_code=0, duration_ms=5, cmd="echo hi"
-)
-
 
 def built(files: dict[str, tuple[str, list[Entry]]]) -> cache.Cache:
     """A `Cache` holding exactly ``files``, as `refresh` would leave it."""
@@ -164,46 +158,6 @@ class TestDamageBecomesARebuild(unittest.TestCase):
             except self.CAUGHT:
                 continue
             self.whole(loaded)
-
-
-class TestTheKnownGap(unittest.TestCase):
-    """#314, held open so that closing it is noticed.
-
-    `loads` leaves the numeric entry fields as strings and says a bad one
-    "surfaces as a rebuild rather than a traceback, which is what every other
-    kind of damage to this file already does". It does not: `loads` accepts the
-    cache, and the `int()` happens later in `entries()`, outside `load`'s
-    `try`. Fix #314 and this test fails, and whoever fixed it deletes the class.
-    """
-
-    def test_one_byte_of_ordinary_corruption_reaches_it(self) -> None:
-        """The route that matters, and the reason #314 is P2 rather than P3.
-
-        A cache row is a ten-digit timestamp, a session, a cwd, two more
-        numbers and the command -- so a large share of the file's bytes *are*
-        digits in a numeric field, and changing one is the most ordinary thing
-        corruption does. Fuzzing a real dump at one to three byte positions,
-        294 of 4000 trials were accepted by `loads` and then raised in
-        `entries()`. This is one of them, made deterministic.
-        """
-        original = built({"a/1.log": ("h", [_SAMPLE])})
-        blob = cache.dumps(original)
-        stamp = str(_SAMPLE.ts).encode("utf-8")
-        at = blob.index(stamp)
-        damaged = blob[: at + 3] + b"?" + blob[at + 4 :]
-
-        back = cache.loads(damaged)
-        with self.assertRaises(ValueError, msg="#314 looks fixed -- delete this class"):
-            back.entries()
-
-    def test_loads_accepts_a_field_that_is_not_a_number(self) -> None:
-        broken = cache.Cache()
-        broken.meta["a/1.log"] = cache.FileMeta(size=1, mtime_ns=1, offset=1, head=b"", host="h")
-        broken.files["a/1.log"] = ["not-a-number", "s", "/tmp", "0", "5", "echo hi"]
-        back = cache.loads(cache.dumps(broken))
-        self.assertEqual(back.files["a/1.log"][0], "not-a-number")
-        with self.assertRaises(ValueError, msg="#314 looks fixed -- delete this class"):
-            back.entries()
 
 
 if __name__ == "__main__":

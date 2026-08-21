@@ -174,6 +174,80 @@ class TestCache(WoswoarTestCase):
         self.assertEqual(leftovers, [])
 
 
+class TestADamagedNumberRebuilds(WoswoarTestCase):
+    """#314: `loads` accepts a cache whose numbers are not numbers.
+
+    It does so on purpose -- converting them costs 25 ms of the 39 ms it takes
+    to read a real history's cache -- so the damage surfaces later, in
+    `entries`, outside the `try` in `load` that answers every other kind. The
+    answer for this kind is the same one: throw the cache away and re-parse.
+    """
+
+    def damage_a_timestamp(self, ts: int) -> None:
+        """Change one byte inside a stored timestamp, leaving the separators.
+
+        Not a hand-built `Cache`: this is the shape ordinary corruption takes,
+        because most of a cache row's bytes *are* digits in a numeric field.
+        Fuzzing a real dump at one to three byte positions put 294 of 4000
+        trials in exactly this state.
+        """
+        path = store.cache_file()
+        blob = path.read_bytes()
+        at = blob.index(str(ts).encode("utf-8"))
+        # The *second* digit, so the damage stays inside the number whatever
+        # its length. Writing past the last digit lands on the field separator
+        # instead, which breaks the record structure -- a different failure,
+        # caught by `loads` and already rebuilt by `load`, so a test damaging
+        # that byte passes with or without the fix under test.
+        path.write_bytes(blob[: at + 1] + b"?" + blob[at + 2 :])
+
+    def test_the_entries_come_back_rather_than_a_traceback(self) -> None:
+        self.write_log(MACHINE_ID, "2026-07-29", [line(100, "git status"), line(200, "ls")])
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["git status", "ls"])
+
+        self.damage_a_timestamp(100)
+        # Reads the damaged file, notices in `entries`, re-parses from `logs/`.
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["git status", "ls"])
+
+    def test_the_damaged_file_is_replaced_and_not_merely_bypassed(self) -> None:
+        """Otherwise every later run pays the rebuild again -- and Ctrl-R,
+        which converts nothing and so never notices, would go on displaying the
+        damaged timestamp for as long as that day's log stayed unchanged."""
+        self.write_log(MACHINE_ID, "2026-07-29", [line(100, "git status")])
+        cache.load_entries()
+        self.damage_a_timestamp(100)
+        cache.load_entries()
+
+        restored = cache.loads(store.cache_file().read_bytes())
+        self.assertEqual([e.ts for e in restored.entries()], [100])
+
+    def test_a_cache_that_is_merely_stale_is_still_updated_in_place(self) -> None:
+        """Guard the guard, and it has to be observable rather than merely
+        true. If `load_entries` rebuilt on *every* call the two tests above
+        would still pass -- a rebuilt cache holds the same entries -- so this
+        needs something only the incremental path does.
+
+        That thing is the deferred write. An ordinary load persists nothing
+        until `_SAVE_THRESHOLD` entries have accumulated, while the rebuild
+        saves unconditionally. So after a one-line append the returned entries
+        are current and the file on disk is deliberately still behind, and a
+        rebuild-every-time makes them agree.
+        """
+        path = self.write_log(MACHINE_ID, "2026-07-29", [line(100, "first")])
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["first"])
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line(200, "second") + "\n")
+
+        self.assertEqual([e.cmd for e in cache.load_entries()], ["first", "second"])
+        on_disk = cache.loads(store.cache_file().read_bytes())
+        self.assertEqual(
+            [e.cmd for e in on_disk.entries()],
+            ["first"],
+            "the cache was rewritten for one entry, so this was a rebuild",
+        )
+
+
 class TestNoFormatWeReadCanExecute(unittest.TestCase):
     """docs/security.md claims this of the whole codebase, so assert it there.
 
