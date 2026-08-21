@@ -334,6 +334,71 @@ class TestImportRun(ImportTestCase):
         self.assertEqual(cache.load_entries()[0].cmd, "awk -F'\t' '{print $1}'")
 
 
+class TestFindingTheWatermarkAgain(unittest.TestCase):
+    """`_anchored` as a unit. #294 goes through `run` for the behaviour that
+    matters, and `run` reaches two of these branches -- the sweep reported
+    twelve survivors in here, which is what an under-tested unit looks like from
+    the outside.
+    """
+
+    @staticmethod
+    def rows(*commands: str) -> list[importer.Parsed]:
+        return [importer.Parsed(ts=100 + n, cmd=c, duration_ms=-1) for n, c in enumerate(commands)]
+
+    def test_no_mark_leaves_the_count_alone(self) -> None:
+        """A source imported before the anchor existed. Trusted once, and the
+        mark is written on the way out -- the protection starts next run."""
+        self.assertEqual(importer._anchored(2, None, self.rows("a", "b", "c")), 2)
+
+    def test_an_empty_mark_leaves_the_count_alone(self) -> None:
+        """What an import of an empty source writes. It anchors nothing, and
+        must not be searched for -- every record's command would fail to match
+        and the scan would walk the whole history to conclude nothing."""
+        self.assertEqual(importer._anchored(2, "", self.rows("a", "b", "c")), 2)
+
+    def test_a_mark_still_in_place_leaves_the_count_alone(self) -> None:
+        """The ordinary case, and the one that must not pay for a scan: the
+        file only grew, so the record below the mark is where it was."""
+        self.assertEqual(importer._anchored(2, "b", self.rows("a", "b", "c")), 2)
+
+    def test_a_trimmed_front_moves_the_count_down(self) -> None:
+        """Two records dropped from the front, so what was at index 1 is now at
+        index 0 and the count must follow it."""
+        self.assertEqual(importer._anchored(3, "c", self.rows("c", "d", "e")), 1)
+
+    def test_a_mark_that_is_gone_leaves_the_count_alone(self) -> None:
+        """Replaced rather than trimmed. There is no position to re-anchor to,
+        so this is the pre-#294 answer -- and the safe one, since resetting
+        would re-import an untimed history in full."""
+        self.assertEqual(importer._anchored(2, "b", self.rows("x", "y", "z")), 2)
+
+    def test_a_count_past_the_end_still_searches(self) -> None:
+        """The shrink case `run`'s own guard also catches, reached here when the
+        file lost records without gaining any. The scan is clamped to the list
+        rather than indexing past it."""
+        self.assertEqual(importer._anchored(9, "a", self.rows("a", "b")), 1)
+
+    def test_a_count_of_zero_searches_nothing(self) -> None:
+        """Nothing was imported, so there is no anchor to find and no work to
+        do -- and `parsed[already - 1]` would be `parsed[-1]`, the *last*
+        record, which is the wrong end of the file entirely."""
+        self.assertEqual(importer._anchored(0, "a", self.rows("a", "b")), 0)
+
+    def test_a_count_that_is_not_a_number_starts_from_nothing(self) -> None:
+        """The state file is hand-editable and #291 is about exactly that."""
+        self.assertEqual(importer._anchored("two", "b", self.rows("a", "b")), 0)
+
+    def test_a_mark_that_is_not_a_string_is_ignored(self) -> None:
+        self.assertEqual(importer._anchored(2, 17, self.rows("a", "b", "c")), 2)
+
+    def test_the_last_of_two_equal_commands_wins(self) -> None:
+        """A repeated command is ordinary in a shell history, so the scan runs
+        backwards from the old position: the nearest match below it is the one
+        a trim would have produced, and anchoring to the earlier copy would
+        re-import everything between them."""
+        self.assertEqual(importer._anchored(4, "ls", self.rows("ls", "cd", "ls", "vi")), 3)
+
+
 class TestAMalformedImportStateDoesNotStopTheImport(unittest.TestCase):
     """#291's other half. `_load_state` had the same bare `int(v)`, and it runs
     on the way into every `woswoar import`."""
