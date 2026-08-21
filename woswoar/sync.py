@@ -669,6 +669,21 @@ class State:
 
     #: log relpath -> plaintext bytes already sealed into a chunk.
     exported: dict[str, int] = field(default_factory=dict)
+    #: log relpath -> the file's `st_mtime_ns` when that watermark was taken.
+    #:
+    #: A watermark is a byte count and means nothing once the file it counts
+    #: into has been *rewritten* rather than appended to. Only `forget` rewrites
+    #: a log, and it saves the corrected watermarks itself -- but a crash
+    #: between its rewrite and that save leaves a mark describing a file that no
+    #: longer exists in that shape, and `export` then skips real history for
+    #: good (#310). Comparing what the file says now against what it said when
+    #: the mark was taken is what makes that recoverable, and the stat it needs
+    #: is one `export` already does.
+    #:
+    #: Absent for a log means "not known", which is what every installation
+    #: written before this field looks like: the mark is trusted and the stamp
+    #: recorded, so an upgrade re-exports nothing.
+    stamped: dict[str, int] = field(default_factory=dict)
     #: "<host>/<day>" -> the chunk filenames of that day already merged into
     #: logs/. Pruned to the day's *signed manifest* once every name in it has
     #: been merged, so this shrinks when a peer compacts -- it is a record of
@@ -749,6 +764,7 @@ class State:
         digest = raw.get("published_digest", "")
         signers = raw.get("signers", {})
         merged_at = raw.get("merged_at", {})
+        stamped = raw.get("stamped", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
         state = cls(
@@ -762,6 +778,15 @@ class State:
             # Same direction as `merged`'s comment below, for the same reason:
             # repeating work beats dropping history. #285 over #291.
             exported={str(k): int(v) for k, v in exported.items() if isinstance(v, int)},
+            # Per value like `exported` above. Dropping one stamp costs a
+            # single log its rewrite detection until the next export records a
+            # fresh one -- the same "repeat work rather than drop history"
+            # direction, and cheaper here, since a missing stamp means trust.
+            stamped=(
+                {str(k): int(v) for k, v in stamped.items() if isinstance(v, int)}
+                if isinstance(stamped, dict)
+                else {}
+            ),
             # Guarded per value, not just on `merged` being a dict. A value
             # that is a bare *string* rather than a list is iterable, so without
             # this every day's record turns into its own characters, every chunk
@@ -807,6 +832,7 @@ class State:
         """
         return {
             "exported": dict(self.exported),
+            "stamped": dict(self.stamped),
             "merged": {key: sorted(names) for key, names in self.merged.items()},
             "granted": list(self.granted),
             "granted_complete": self.granted_complete,
@@ -1532,6 +1558,11 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
     # that turned a no-op sync from 0.04 s into nearly 3 s and grew with the
     # archive forever.
     fresh: dict[str, list[tuple[str, bytes, int]]] = {}
+    #: relpath -> the `st_mtime_ns` the file had when its tail was taken. Kept
+    #: beside the tail rather than re-stat'ed at save time, so an append landing
+    #: during the read cannot be mistaken for the state the mark was taken
+    #: against. See the rewrite check above for what it is compared with.
+    stamp_of: dict[str, int] = {}
     # Only this machine's own logs: other hosts' arrived decrypted and are never
     # re-exported. Asked for by host rather than listed and then filtered, which
     # at three machines walked two thirds of a tree to throw it away.
@@ -1548,12 +1579,61 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
         # every idle sync -- goes from 5.50 ms to 1.85 ms at three years of
         # three machines, and stops growing with how many machines there are.
         try:
-            size = log.path.stat().st_size
+            stat = log.path.stat()
         except OSError:
             # As `read_tail` treats one: a file that went away between being
             # listed and being looked at has no tail to export.
             continue
+        size = stat.st_size
+
+        # A watermark counts bytes into a particular file, and `forget` is the
+        # one thing that rewrites a log rather than appending to it. It saves
+        # the corrected watermarks itself; a crash between its rewrite and that
+        # save leaves this mark describing a shape the file no longer has, and
+        # the lines written *after* the crash are then skipped for good -- the
+        # mark advances past them and no later sync looks again (#310).
+        #
+        # Two signals, both free, because this is the `stat` the fast path was
+        # already making:
+        #
+        # - shorter than the mark: nothing but a rewrite can do that.
+        # - exactly as long as the mark, but modified since the mark was taken:
+        #   a rewrite that happened to land on the same length. `forget` can do
+        #   that -- remove a line and let the day grow back -- and size alone
+        #   is blind to it, which is why the stamp exists.
+        #
+        # What neither sees is a rewrite the file has since grown *past*, since
+        # an append moves the modification time exactly as a rewrite does and
+        # the mark is then no longer above the end. Catching that needs the
+        # content below the mark hashed, which is a read of the whole prefix on
+        # a path tuned to one stat -- so the honest position is that this closes
+        # the window a sync can still see and narrows #310 rather than removing
+        # it. The sync timer is what bounds the rest: the run that follows the
+        # crash sees the short file, unless the machine out-types a one-minute
+        # timer first.
+        #
+        # Reset to zero rather than to the new size. The correct mark is the old
+        # one minus however much was removed *below* it, which is not knowable
+        # from here, and any guess too high skips exactly the history this is
+        # trying to save. Zero re-seals the day: duplicate rows on a peer, which
+        # dedup absorbs -- "recoverable, visible, and the direction to be wrong
+        # in", as `store.line_start` puts it. One log, not the map, which is
+        # #285's granularity and #291's mistake.
+        #
+        # Safe *here* and not one step earlier, which is the whole reason it
+        # lives in `export`: by the time a rewrite is visible the rows are gone
+        # from `logs/`, so re-sealing the day cannot re-publish them.
+        # `forget_rows` explains why saving a low watermark before the rewrite
+        # is worse, and it is right.
+        stamped = state.stamped.get(log.relpath)
+        if size < exported or (size == exported and stamped not in (None, stat.st_mtime_ns)):
+            exported = 0
+            state.exported[log.relpath] = 0
+
         if size <= exported:
+            # Stamped even on the idle path, so the first sync after this field
+            # arrives gives every log a stamp and re-exports nothing.
+            state.stamped[log.relpath] = stat.st_mtime_ns
             continue
 
         # The watermark has to name the start of a line, and until `forget`
@@ -1565,6 +1645,7 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             fresh.setdefault(store.day_of_log(log.relpath), []).append(
                 (log.relpath, data, new_offset)
             )
+            stamp_of[log.relpath] = stat.st_mtime_ns
 
     # Whether anything reached the repo. What lets `run` skip the `git add` that
     # would otherwise stat the whole working tree to find that out.
@@ -1652,6 +1733,11 @@ def export(known: Machine, state: State, report: Report, now: int) -> bool:
             # that dies part way through persists no watermark at all. What it
             # does leave is chunks in no manifest, which is issue #66.
             state.exported[relpath] = new_offset
+            # Beside the watermark it describes, and from the same stat that
+            # decided this file had grown -- a fresh stat here could pick up an
+            # append that happened during the read, and then the next sync
+            # would believe the mark had been taken against it.
+            state.stamped[relpath] = stamp_of.get(relpath, 0)
 
         manifest.write(known, day, listed)
         wrote = True

@@ -5388,6 +5388,112 @@ class TestWalkingAPeersChunks(SyncTestCase):
         self.assertEqual(used, [], "merge built Chunk objects for an idle sync")
 
 
+class TestAWatermarkThatOutlivedItsFile(SyncTestCase):
+    """#310: a `forget` that rewrote a log and died before saving.
+
+    `forget_rows` rewrites the files first and saves the corrected watermarks
+    second, and says why: the other order leaves a low watermark with the rows
+    still in `logs/`, which re-publishes the very rows somebody asked to be rid
+    of. The cost of that choice is this window -- a mark describing a shape the
+    file no longer has -- and until now the lines written after it were skipped
+    for good, because the mark then advances past them and no later sync looks
+    again.
+    """
+
+    DAY = "2023-11-14"
+
+    def crashed_forget(self, machine: Fake, drop: str) -> None:
+        """Rewrite a log without the rows naming ``drop``, saving no watermark.
+
+        Exactly what `forget.apply` leaves behind when the process dies before
+        `forget_rows` reaches `state.save()`. The rewrite is whole lines, which
+        is all `apply` ever writes.
+        """
+        path = store.log_file(machine.id, self.DAY)
+        kept = [
+            line for line in path.read_text(encoding="utf-8").splitlines(True) if drop not in line
+        ]
+        path.write_text("".join(kept), encoding="utf-8")
+
+    def peer_sees(self, alpha: Fake, beta: Fake) -> set[str]:
+        """What `beta` holds after fetching and merging `alpha`'s day.
+
+        Twice, with `settle` between: the first run is what puts alpha's chunk
+        directory in beta's checkout at all, and `settle` ages it past the racy
+        window that would otherwise make the day unstampable.
+        """
+        with beta.active():
+            sync.run()
+        self.settle(beta, alpha, self.DAY)
+        with beta.active():
+            sync.run()
+            return beta.commands()
+
+    def test_a_sync_that_saw_the_short_file_does_not_lose_what_came_next(self) -> None:
+        """The short-file signal, isolated -- and it took two attempts.
+
+        The first version of this test replaced the forgotten command with a
+        *longer* one and asserted the replacement arrived. It passed with the
+        fix removed, because the loss needs the stale watermark to land exactly
+        on a record boundary of the rewritten file: anywhere else, `line_start`
+        rewinds into the middle of a record and republishes the whole of it. A
+        replacement of the same length is what puts a boundary there.
+
+        So: a sync runs while the file is short -- which is what the one-minute
+        timer does after a crash -- and only then are two commands typed, the
+        first of them the same length as the one `forget` removed. Without the
+        reset the mark now names the boundary between them and the first is
+        skipped for good.
+        """
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        self.accept_everyone(beta)
+        with alpha.active():
+            alpha.record(self.DAY, 1_700_000_001, "before one")
+            alpha.record(self.DAY, 1_700_000_002, "the secret")
+            sync.run()
+
+            self.crashed_forget(alpha, "the secret")
+            sync.run()
+
+            alpha.record(self.DAY, 1_700_000_003, "the sekret")
+            alpha.record(self.DAY, 1_700_000_004, "and later")
+            sync.run()
+
+        self.assertIn("the sekret", self.peer_sees(alpha, beta))
+
+    def test_a_rewrite_that_kept_the_length_is_caught_too(self) -> None:
+        """The case a size comparison cannot see, and the reason the watermark
+        carries a modification time.
+
+        The replacement command is the same length as the one removed, so the
+        day grows back to exactly the length the watermark records and there is
+        nothing short about the file when the next sync looks at it. Built by
+        construction rather than by padding: a fixture that has to be measured
+        into shape is one that silently stops testing this case the day a field
+        width changes.
+        """
+        alpha, beta = self.machine("alpha"), self.machine("beta")
+        self.accept_everyone(beta)
+        with alpha.active():
+            alpha.record(self.DAY, 1_700_000_001, "before one")
+            alpha.record(self.DAY, 1_700_000_002, "the secret")
+            sync.run()
+            was = store.log_file(alpha.id, self.DAY).stat().st_size
+
+            self.crashed_forget(alpha, "the secret")
+            # Same width of timestamp and same length of command, so the record
+            # is byte-for-byte as long as the one that went.
+            alpha.record(self.DAY, 1_700_000_003, "the sekret")
+            self.assertEqual(
+                store.log_file(alpha.id, self.DAY).stat().st_size,
+                was,
+                "fixture no longer reproduces an equal-length rewrite",
+            )
+            sync.run()
+
+        self.assertIn("the sekret", self.peer_sees(alpha, beta))
+
+
 class TestExportDoesNotReadWhatCannotHaveChanged(SyncTestCase):
     """Issue #80: the early exit is the shape of every idle sync.
 
