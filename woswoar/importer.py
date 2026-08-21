@@ -108,7 +108,7 @@ def parse_bash(text: str, mtime: int) -> list[Parsed]:
     ]
 
 
-def _zsh_records(text: str, mtime: int) -> list[Parsed]:
+def parse_zsh(text: str, mtime: int) -> list[Parsed]:
     """Parse ``.zsh_history``, **in the order the records appear in the file**.
 
     Extended history looks like ``: <start>:<elapsed>;<command>``. A command
@@ -126,6 +126,12 @@ def _zsh_records(text: str, mtime: int) -> list[Parsed]:
     rather than two. Untimed records were collected and appended after the timed
     ones, so a newly timed record pushed every untimed one down a slot -- enough
     on its own to drop a command even without the sort.
+
+    It sorted, too, and returned that. Nothing wanted it: `run` was the only
+    caller in shipped code. A public parser handing back timestamp order is the
+    footgun that made #289 -- the next caller reaches for the obvious name and
+    inherits the ordering the watermark cannot survive -- so both parsers now
+    return file order, and a caller that wants time order sorts and says so.
     """
     records: list[str] = []
     current: list[str] = []
@@ -169,11 +175,6 @@ def _zsh_records(text: str, mtime: int) -> list[Parsed]:
             )
         )
     return rows
-
-
-def parse_zsh(text: str, mtime: int) -> list[Parsed]:
-    """`_zsh_records`, in timestamp order. What every caller but `run` wants."""
-    return sorted(_zsh_records(text, mtime), key=lambda row: row.ts)
 
 
 # ---------------------------------------------------------------------------
@@ -493,10 +494,9 @@ def run(
 
     mtime = int(source.stat().st_mtime)
     text = _read(source)
-    # `_zsh_records` rather than `parse_zsh`: the watermark below counts
-    # positions, so it has to count them in a list that only grows at the end.
-    # `parse_bash` is already in file order and never sorts. See #289.
-    parsed = parse_bash(text, mtime) if kind == "bash" else _zsh_records(text, mtime)
+    # Both parsers return file order and neither sorts, which is not a
+    # coincidence but the contract the watermark below rests on. See #289.
+    parsed = parse_bash(text, mtime) if kind == "bash" else parse_zsh(text, mtime)
 
     state = _load_state()
     key = str(source)

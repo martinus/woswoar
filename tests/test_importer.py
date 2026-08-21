@@ -42,6 +42,24 @@ class TestParseBash(unittest.TestCase):
     def test_blank_lines_ignored(self) -> None:
         self.assertEqual(len(importer.parse_bash("a\n\n\nb\n", MTIME)), 2)
 
+    def test_the_record_list_only_grows_at_the_end(self) -> None:
+        """The same requirement `parse_zsh` now carries, mirrored here.
+
+        `parse_bash` has always been file-ordered and assigns synthetic stamps
+        in place, so it never had #289's defect -- but until now that was prose
+        in a comment while zsh had an executable version of it. A future "sort
+        both for consistency" would reintroduce the bug on this path, silently,
+        and this is what stops it.
+        """
+        # Real epochs: `#100` is not a plausible timestamp and `parse_bash`
+        # reads it as a command, which made the first version of this fixture
+        # assert about seven untimed lines rather than the property.
+        before = "#1753000000\nalpha\nbare\n#1753000200\ngamma\n"
+        first = importer.parse_bash(before, MTIME)
+        grown = importer.parse_bash(before + "#1753000100\ndelta\n", MTIME)
+        self.assertEqual([r.cmd for r in grown[: len(first)]], [r.cmd for r in first])
+        self.assertEqual([r.cmd for r in grown[len(first) :]], ["delta"])
+
     def test_bash_records_no_timing_so_the_duration_is_unknown(self) -> None:
         """The sentinel's *sign*, which is the whole of what it claims.
 
@@ -97,27 +115,28 @@ class TestParseZsh(unittest.TestCase):
     def test_the_record_list_only_grows_at_the_end(self) -> None:
         """The property `run`'s watermark rests on, asserted directly.
 
-        `parse_zsh` sorts and is what every other caller wants; `_zsh_records`
-        is the file-order list, and appending to the history must leave every
-        earlier position exactly where it was.
+        Appending to the history must leave every earlier position exactly where
+        it was -- that is what makes a count of records a usable mark, and both
+        parsers now owe it.
         """
         before = ": 100:0;alpha\nbare\n: 200:0;gamma\n"
-        first = importer._zsh_records(before, 9999)
-        grown = importer._zsh_records(before + ": 150:0;delta\n", 9999)
+        first = importer.parse_zsh(before, MTIME)
+        grown = importer.parse_zsh(before + ": 150:0;delta\n", MTIME)
         self.assertEqual([r.cmd for r in grown[: len(first)]], [r.cmd for r in first])
         self.assertEqual([r.cmd for r in grown[len(first) :]], ["delta"])
 
-    def test_sorting_is_unchanged_by_the_file_order_split(self) -> None:
-        """`parse_zsh`'s own contract, which #289 must not have moved: untimed
-        records carry a synthetic stamp at or after the file's mtime, so they
-        still land last however the list was built."""
-        rows = importer.parse_zsh(": 200:0;gamma\nbare\n: 100:0;alpha\n", 9999)
-        self.assertEqual([r.cmd for r in rows], ["alpha", "gamma", "bare"])
+    def test_it_does_not_sort(self) -> None:
+        """File order, not timestamp order, and this is the executable form of
+        that requirement.
 
-    def test_output_is_sorted_by_time(self) -> None:
-        text = ": 1753000100:0;later\n: 1753000000:0;earlier\n"
-        parsed = importer.parse_zsh(text, MTIME)
-        self.assertEqual([p.cmd for p in parsed], ["earlier", "later"])
+        `parse_zsh` used to sort and return that, which is what #289 was: `run`
+        sliced a positional count into a re-sorted list. Nothing outside tests
+        ever wanted the sorted view, so the sort is gone rather than hidden
+        behind a second name -- a public parser handing back timestamp order is
+        the footgun, whatever it is called.
+        """
+        rows = importer.parse_zsh(": 200:0;gamma\n: 100:0;alpha\n", MTIME)
+        self.assertEqual([r.cmd for r in rows], ["gamma", "alpha"])
 
 
 class ImportTestCase(WoswoarTestCase):
