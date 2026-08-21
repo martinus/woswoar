@@ -247,12 +247,60 @@ def a_pid(text: str) -> int:
     return pid
 
 
+#: How long `--pidfile` waits for the job to write one before giving up. Ten
+#: seconds because the file is written before the first row of work, so the only
+#: thing being waited on is an interpreter starting -- and a watcher that hung
+#: here for ever would be the silence this tool exists to break.
+PIDFILE_WAIT = 10.0
+
+
+def _await_pid(where: Path, interval: float) -> int:
+    """The pid in ``where``, once the job has written it.
+
+    Waited for rather than required up front, because the watcher is usually
+    started in the same breath as the job and may win the race. Polled at
+    `--interval` or a tenth of a second, whichever is shorter: this is the one
+    place a poll is cheap and the wait is measured in a startup rather than in
+    minutes.
+
+    A file that never appears, or holds something that is not a pid, is an
+    error and not a wait: the job it names is not running, and a watcher that
+    settled into watching nothing would be reporting the thing it was built to
+    refuse.
+    """
+    step = min(interval, 0.1)
+    deadline = time.monotonic() + PIDFILE_WAIT
+    while True:
+        try:
+            return a_pid(where.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"no usable pid in {where} after {PIDFILE_WAIT:g}s: {exc}"
+                ) from None
+        time.sleep(step)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tools.watch",
         description="Report a long job's progress, and say plainly when it dies.",
     )
-    parser.add_argument("pid", type=a_pid, help="the job's process id, recorded when it started")
+    where = parser.add_mutually_exclusive_group(required=True)
+    where.add_argument(
+        "pid", type=a_pid, nargs="?", help="the job's process id, recorded when it started"
+    )
+    where.add_argument(
+        "--pidfile",
+        type=Path,
+        # The job writes its own, which is the only party that cannot get it
+        # wrong. `... & echo $! > sweep.pid` looks equivalent and is not: it
+        # produced no file at all in one shell, and the pid was recovered from
+        # the process table fifteen times running -- by pattern, which is the
+        # `pgrep -f` hole this tool exists to close, back in the step that feeds
+        # it. `tools.mutate --json r.json` writes `r.json.pid`.
+        help="read the pid from this file instead, waiting briefly for it to appear",
+    )
     parser.add_argument("--log", type=Path, required=True, help="the file it appends progress to")
     parser.add_argument(
         "--done",
@@ -280,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    watch = Watch(args.pid, args.log, args.done, re.compile(args.match), args.stale)
+    pid = args.pid if args.pid is not None else _await_pid(args.pidfile, args.interval)
+    watch = Watch(pid, args.log, args.done, re.compile(args.match), args.stale)
     while True:
         event = watch.step()
         if event is not None:
