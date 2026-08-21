@@ -110,6 +110,7 @@ module = [
     "tests.test_export_properties",
     "tests.test_forget_properties",
     "tests.test_import_properties",
+    "tests.test_merge_properties",
     "tests.test_record_properties",
 ]
 disallow_untyped_decorators = false
