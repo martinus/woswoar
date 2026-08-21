@@ -953,6 +953,52 @@ class TestAMalformedStateFileDoesNotStopTheTool(unittest.TestCase):
         self.assertEqual(self.loaded({"exported": {"a": "7"}}).exported, {})
 
 
+class TestInitDoesNotPinItself(SyncTestCase):
+    """#287. Trust on first use is the one moment a machine accepts others
+    without a human comparing anything, and `init` prints the keys so there is
+    something to compare against afterwards.
+
+    It was printing its own among them. On a solo repo -- the README's install
+    path -- that list was *entirely* this machine's own key, under a sentence
+    telling the reader to check it against the machines themselves. A list that
+    contains rows which are not decisions is one people learn to skim, which is
+    the same argument `grant` makes for only prompting about additions.
+    """
+
+    def test_a_solo_init_pins_nobody(self) -> None:
+        alpha = self.machine("alpha", enrol=False)
+        with alpha.active():
+            known, _identity, pinned = sync.initialise(remote=str(self.origin), new_identity=True)
+            self.assertEqual(pinned, [], "it reported accepting somebody on an empty repo")
+            # And the pin itself *stays*. `state.signers` answers "whose
+            # manifests can I verify", which legitimately includes this machine:
+            # `unlisted_chunks` skips a host it has not pinned, so dropping the
+            # self-entry stops `doctor` noticing this machine's own crash debris
+            # -- #66's whole subject. The two facts were conflated, and only the
+            # reported one was wrong.
+            self.assertIn(known.id, sync.State.load().signers)
+
+    def test_a_peer_is_still_pinned(self) -> None:
+        """The fixture the issue asks for, and the reason: with no peer in the
+        repo, "nobody was pinned" and "it skipped itself" are the same
+        observation -- exactly the too-weak fixture rule 3 warns about.
+
+        Here alpha is already publishing, so beta's init has a real decision to
+        make. It must pin alpha and only alpha.
+        """
+        alpha = self.machine("alpha")
+        with alpha.active():
+            sync.run()
+
+        beta = self.machine("beta", enrol=False)
+        with beta.active():
+            known, _identity, pinned = sync.initialise(remote=str(self.origin), new_identity=True)
+            signers = sync.State.load().signers
+            self.assertEqual(pinned, [signers[alpha.id]], "beta reported the wrong set")
+            self.assertIn(alpha.id, signers)
+            self.assertIn(known.id, signers, "beta must still verify its own manifests")
+
+
 class TestTwoMachines(SyncTestCase):
     def test_history_reaches_the_other_machine(self) -> None:
         alpha = self.machine("alpha")
