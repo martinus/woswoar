@@ -56,15 +56,39 @@ def is_repo() -> bool:
 
 
 def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
+    """One git fork, with a timeout that is an error rather than a traceback.
+
+    `crypto._run` and `_run_signer` both convert `TimeoutExpired`; this seam did
+    not, and it is the one that talks to the **network** -- so a hang here is
+    ordinary rather than exotic. A remote that accepts the connection and then
+    stalls (a sleeping NAS, a dead ssh host, an https remote behind a captive
+    portal) gives `git fetch` no reason to exit, and after `GIT_TIMEOUT` the
+    unattended sync ended in a stack trace nobody reads. `WoswoarError`'s
+    docstring is explicit that this is the contract: sync runs from a timer,
+    "where nobody ever reads one". See #286.
+
+    **Raised regardless of `check`, which is why it is on the `try` and not
+    inside the `if`.** `check=False` means "a non-zero exit is an answer" --
+    `read_repo`, `remote_summary` and `resolve` all rely on that -- and a
+    timeout is an answer in none of them: `resolve` would hand back empty
+    strings and `fetch_and_rebase` would read that as "no upstream" and skip
+    the rebase without a word.
+
+    `OSError` is deliberately left alone: git missing from `PATH` is a different
+    failure with a different remedy, and `deps` already owns that message.
+    """
     repo = cwd or store.history_dir()
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=GIT_TIMEOUT,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SyncError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT}s") from exc
     if check and result.returncode != 0:
         raise SyncError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
     return result.stdout.strip()

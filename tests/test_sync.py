@@ -1017,6 +1017,72 @@ class TestInitDoesNotPinItself(SyncTestCase):
             self.assertIn(known.id, signers, "beta must still verify its own manifests")
 
 
+class TestAHungGitIsAMessageNotATraceback(unittest.TestCase):
+    """#286. `gitrepo.git` is the seam that talks to the network, so a hang is
+    ordinary here rather than exotic -- and it was the one seam of the three
+    that let `TimeoutExpired` through.
+
+    `WoswoarError`'s docstring names the contract: sync runs unattended from a
+    timer, "where nobody ever reads one". A remote that accepts and then stalls
+    ended the run in a stack trace, and `cmd_sync` recorded the class name
+    `TimeoutExpired` into `sync-failure.json` as the reason -- which is then what
+    every later bare `woswoar` showed the user.
+
+    Mocked at `subprocess.run`, because the seam is the whole of it: producing a
+    real 300-second hang would be a test that takes five minutes to assert one
+    conversion.
+    """
+
+    def hung(self, **kwargs: object) -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired("git", gitrepo.GIT_TIMEOUT)
+
+    def test_a_timeout_becomes_a_sync_error(self) -> None:
+        with (
+            mock.patch("subprocess.run", side_effect=self.hung()),
+            self.assertRaises(errors.SyncError) as raised,
+        ):
+            gitrepo.git("fetch", "origin")
+        self.assertIn("timed out", str(raised.exception))
+
+    def test_the_message_names_the_command_and_the_limit(self) -> None:
+        """A sentence a person can act on. "TimeoutExpired" alone is the class
+        name, which is what `sync-failure.json` was recording."""
+        with (
+            mock.patch("subprocess.run", side_effect=self.hung()),
+            self.assertRaises(errors.SyncError) as raised,
+        ):
+            gitrepo.git("fetch", "origin")
+        said = str(raised.exception)
+        self.assertIn("fetch origin", said)
+        self.assertIn(str(gitrepo.GIT_TIMEOUT), said)
+
+    def test_check_false_does_not_swallow_it(self) -> None:
+        """The constraint, and the reason the guard is on the `try` rather than
+        inside the `if`.
+
+        `check=False` means "a non-zero exit is an answer" -- `read_repo`,
+        `remote_summary` and `resolve` rely on it. A timeout is an answer in
+        none of them: `resolve` would hand back empty strings and
+        `fetch_and_rebase` would read that as "no upstream" and skip the rebase
+        without a word.
+        """
+        with (
+            mock.patch("subprocess.run", side_effect=self.hung()),
+            self.assertRaises(errors.SyncError),
+        ):
+            gitrepo.git("rev-parse", "HEAD", check=False)
+
+    def test_a_missing_git_is_left_alone(self) -> None:
+        """Deliberately not widened. git absent from `PATH` is a different
+        failure with a different remedy, and `deps` owns that message -- so it
+        must still arrive as an `OSError` rather than as a sync problem."""
+        with (
+            mock.patch("subprocess.run", side_effect=FileNotFoundError("git")),
+            self.assertRaises(FileNotFoundError),
+        ):
+            gitrepo.git("status")
+
+
 class TestTwoMachines(SyncTestCase):
     def test_history_reaches_the_other_machine(self) -> None:
         alpha = self.machine("alpha")
