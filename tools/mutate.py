@@ -1287,6 +1287,23 @@ def _bytes(said: str) -> int:
     return value
 
 
+def _marker(where: Path) -> Path:
+    """The file whose only meaning is that the run is over.
+
+    ``--json`` cannot carry that meaning. Under `--batch` and `--all`, `_persist`
+    writes after every file, so the report exists long before the run ends and
+    the confirmation pass has not started -- `tools/watch.py --done` read its
+    arrival as a finish and announced one **nine minutes** early, exiting 0 while
+    the sweep still had eleven files to go. That is this repository's own
+    watchdog being told the wrong thing by this module, which is #275.
+
+    A sibling name rather than a suffix swap: `Path("r.json").with_suffix(...)`
+    has to reason about which suffix it is replacing, and `r.json.done` beside
+    `r.json` is what a reader sorting a directory expects to see.
+    """
+    return where.parent / (where.name + ".done")
+
+
 def _persist(report: Report, where: Path) -> None:
     """The run's answers, as `tools/reached.py` reads them.
 
@@ -1542,6 +1559,14 @@ def main(argv: list[str] | None = None) -> int:
             for row in table:
                 print(f"  {row.operator:16} {row.label}")
             return 0
+        if args.json:
+            # Cleared before the first row, not merely written after the last.
+            # A resumed sweep points `--json` at a part-written report, and a
+            # marker left by the run that was interrupted would tell a watcher
+            # that *this* one had finished before it began. After the `--list`
+            # return on purpose: listing a table is not a run, and must not
+            # retract a marker an earlier complete run earned.
+            _marker(args.json).unlink(missing_ok=True)
         report = sweep(table, args) if args.all or args.batch else _run_generated(table, args)
         if not args.no_confirm:
             report = confirm(
@@ -1559,6 +1584,9 @@ def main(argv: list[str] | None = None) -> int:
         _summarise(report.results)
         if args.json:
             _persist(report, args.json)
+            # Last, and after `confirm`: the marker means the whole run is over,
+            # including the pass that can still change a verdict.
+            _marker(args.json).touch()
         return 0 if report.clean else 1
 
     already = len(_RUNS)
