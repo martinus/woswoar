@@ -969,12 +969,14 @@ class TestInitDoesNotPinItself(SyncTestCase):
         alpha = self.machine("alpha", enrol=False)
         with alpha.active():
             known, _identity, pinned = sync.initialise(remote=str(self.origin), new_identity=True)
-            self.assertEqual(pinned, [], "it pinned something on an empty repo")
-            # `state.signers`, not just `pinned`: the first is what is rendered
-            # and the second is what is believed and then published in
-            # `accepts.age`. A fix that only trimmed the display would pass an
-            # assertion on `pinned` alone while leaving the self-pin on the wire.
-            self.assertNotIn(known.id, sync.State.load().signers)
+            self.assertEqual(pinned, [], "it reported accepting somebody on an empty repo")
+            # And the pin itself *stays*. `state.signers` answers "whose
+            # manifests can I verify", which legitimately includes this machine:
+            # `unlisted_chunks` skips a host it has not pinned, so dropping the
+            # self-entry stops `doctor` noticing this machine's own crash debris
+            # -- #66's whole subject. The two facts were conflated, and only the
+            # reported one was wrong.
+            self.assertIn(known.id, sync.State.load().signers)
 
     def test_a_peer_is_still_pinned(self) -> None:
         """The fixture the issue asks for, and the reason: with no peer in the
@@ -992,9 +994,9 @@ class TestInitDoesNotPinItself(SyncTestCase):
         with beta.active():
             known, _identity, pinned = sync.initialise(remote=str(self.origin), new_identity=True)
             signers = sync.State.load().signers
-            self.assertEqual(len(pinned), 1, "alpha was not pinned")
+            self.assertEqual(pinned, [signers[alpha.id]], "beta reported the wrong set")
             self.assertIn(alpha.id, signers)
-            self.assertNotIn(known.id, signers, "beta pinned itself as well")
+            self.assertIn(known.id, signers, "beta must still verify its own manifests")
 
 
 class TestTwoMachines(SyncTestCase):
