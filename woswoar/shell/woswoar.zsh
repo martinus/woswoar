@@ -111,7 +111,7 @@ export WOSWOAR_SESSION
 # reasoning lives; `tests/test_credentials.py`'s `TestParityWithTheHook` holds
 # *every* hook against `credentials._SHARED`, so a rule can never be added to
 # one shell alone -- nor to both shells and not to the importer.
-: "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:]]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|://(hooks\.slack\.com|discord(app)?\.com/api/webhooks)/[^[:space:]]|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
+: "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:];|&()<>]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|://(hooks\.slack\.com|discord(app)?\.com/api/webhooks)/[^[:space:]]|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
 
 # Appended, not merged into the default above, so that adding one rule of your
 # own does not pin you to today's default forever.
