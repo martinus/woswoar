@@ -2360,6 +2360,21 @@ def initialise(
     state = State.load()
     pinned: list[str] = []
     for host_id in archive.repo_hosts():
+        # Not ourselves. `_write_repo_metadata` ran a few lines up and called
+        # `publish_signer`, so this machine's own `signer.pub` is already there
+        # and it was pinning itself -- then printing its own key under "check
+        # these against the machines themselves", which on a solo repo is the
+        # whole of that list and cannot be checked against anything (#287).
+        #
+        # The skip is here rather than in the printing, and that matters:
+        # `pinned` is what `_init` renders but `state.signers` is what is
+        # believed, and `publish_accepts` puts it in `accepts.age`. Trimming the
+        # display alone would leave the self-pin in `state.json` and on the wire
+        # while the screen said otherwise -- a report that no longer describes
+        # the state. `merge`, `_trust_candidates` and `trust_status` all skip
+        # this id already.
+        if host_id == known.id:
+            continue
         signer = read_signer(host_id)
         if signer is not None and host_id not in state.signers:
             state.signers[host_id] = signer.verify_key
