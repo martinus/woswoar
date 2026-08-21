@@ -31,6 +31,10 @@ def results(*rows: tuple[str, int, str]) -> dict[str, Any]:
     """A `--json` report holding `(path, line, outcome)` rows."""
     return {
         "baseline_red": False,
+        # A trustworthy report by default, so the partition tests below are
+        # about the partition. The two fields' own behaviour is
+        # `TestAReportThatCannotBeBelieved`'s subject, and it overrides them.
+        "widened": True,
         "results": [
             {
                 "label": f"{path}:{line} in f() -- something",
@@ -139,6 +143,39 @@ class TestReadingTheInputs(unittest.TestCase):
         self.assertEqual(reached.executed_lines({"files": {"a.py": {}}}), {"a.py": set()})
 
 
+class TestAReportThatCannotBeBelieved(unittest.TestCase):
+    """#270: this module explains survivors, and some reports have none to explain.
+
+    Both fields are about attribution, and they fail differently: a red baseline
+    makes every row meaningless, an unwidened one makes the survivors
+    provisional. Treating them the same would either refuse a `--no-confirm`
+    report that is perfectly usable with a caveat, or partition a void one.
+    """
+
+    def test_a_red_baseline_is_void(self) -> None:
+        self.assertTrue(reached.voided({"baseline_red": True}))
+
+    def test_a_green_one_is_not(self) -> None:
+        self.assertFalse(reached.voided({"baseline_red": False}))
+
+    def test_a_report_that_says_nothing_about_its_baseline_is_read_as_green(self) -> None:
+        """The opposite default from `confirmed`, and for the opposite reason:
+        every report since the flag existed writes it, so absence here means a
+        hand-built or ancient file rather than a claim being withheld -- and
+        refusing to read those would be a regression for no gain."""
+        self.assertFalse(reached.voided({}))
+
+    def test_a_report_that_says_nothing_about_widening_is_read_as_unwidened(self) -> None:
+        """A file written before `Report.widened` existed knows nothing either
+        way, which is precisely what the caveat says -- so the caveat is true of
+        it. Defaulting the other way would make old silence read as a claim."""
+        self.assertFalse(reached.confirmed({}))
+
+    def test_an_explicit_claim_is_believed(self) -> None:
+        self.assertTrue(reached.confirmed({"widened": True}))
+        self.assertFalse(reached.confirmed({"widened": False}))
+
+
 class TestTheCommandLine(unittest.TestCase):
     """Driven as a subprocess, because the exit status and the printed
     partition are what a person actually uses."""
@@ -188,6 +225,34 @@ class TestTheCommandLine(unittest.TestCase):
         self.assertEqual(got["SURVIVED"], 2, done.stdout)
         self.assertEqual(got["on a line NO test executes  (missing test)"], 1, done.stdout)
         self.assertEqual(got["on a line tests DO execute  (weak/equiv)"], 1, done.stdout)
+
+    def test_a_void_report_is_refused_rather_than_partitioned(self) -> None:
+        """Non-zero and nothing printed to stdout: a caller reading only the
+        status must not be told the run succeeded, and one reading stdout must
+        not find a partition drawn from rows that mean nothing."""
+        report = results(("a/b.py", 10, "survived"))
+        report["baseline_red"] = True
+        done = self.run_it(report, coverage(a__b=[]))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("not green", done.stderr)
+        self.assertNotIn("missing test", done.stdout)
+
+    def test_an_unwidened_report_is_explained_with_a_caveat(self) -> None:
+        """Still partitioned -- `--no-confirm` exists so a long sweep can skip
+        the expensive pass, and refusing here would make the two unusable
+        together -- but the reader is told before they act on it."""
+        report = results(("a/b.py", 10, "survived"))
+        report["widened"] = False
+        done = self.run_it(report, coverage(a__b=[]))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("not re-run against the whole suite", done.stdout)
+        self.assertEqual(self.counts(done.stdout)["SURVIVED"], 1, done.stdout)
+
+    def test_a_widened_report_gets_no_caveat(self) -> None:
+        """Without this the note could be printed unconditionally and every test
+        above would still pass."""
+        done = self.run_it(results(("a/b.py", 10, "survived")), coverage(a__b=[]))
+        self.assertNotIn("not re-run against the whole suite", done.stdout)
 
     def test_rows_that_asked_nothing_are_counted_apart(self) -> None:
         """`broke` and `timeout` are neither caught nor survived, and folding
