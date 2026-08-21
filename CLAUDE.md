@@ -112,6 +112,16 @@ Each issue you do file should carry enough for someone to act on it cold:
 If a finding turns out to be a non-issue on closer inspection, say so in the
 task summary instead of filing it.
 
+**Search before you file, by `file:line` rather than by title.** A listing can
+come back empty when it is not: in one session `list_issues` reported nothing
+open while six issues existed, so two were filed again under new numbers. That
+alone would be tidy-up. What it cost was more: one duplicate was worked from its
+*own* text, and the original had already named the better fix — so a wrong
+implementation was shipped and merged before the pair were noticed, and a second
+PR was needed to take it back out. A duplicate issue is cheap. A duplicate issue
+worked in ignorance of the one it duplicates is a fix argued from half the
+evidence.
+
 ## 5. Give every issue a priority label
 
 Label each issue you file with exactly one of these. They sort lexically, so
@@ -217,6 +227,23 @@ asking it.
 
 One issue is one PR. A change that acquires a second subject has stopped being
 the issue it was given.
+
+**An issue's suggested fix is a hypothesis. Check its premise before you write
+it.** The issue was written by someone who had the bug in front of them and not
+the code you are about to change, and twice in one session the prescribed fix
+was wrong in a way its own reproduction could not show:
+
+- one said a pin was "inert as far as I can find", and removing it stopped
+  `doctor` seeing this machine's own crash debris -- another function skips
+  hosts it has not pinned, which the issue had not read;
+- one offered two spellings of a ref, and the simpler one passed locally and
+  failed CI, because the fixture's branch name comes from `init.defaultBranch`
+  and the two machines disagreed.
+
+Both were caught by tests, which is the system working. The point is that they
+were caught *after* the fix was written to order. Read what the issue asserts,
+confirm it, and when the fix diverges say so in the PR body with the reason --
+the divergence is usually the most useful paragraph in it.
 
 **"Work the issues" is the same loop down the open list**, in label order, one
 PR per issue, each branched from `main`. Do not wait between them: open the PR,
