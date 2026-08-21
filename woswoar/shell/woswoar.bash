@@ -181,7 +181,7 @@ export WOSWOAR_SESSION
 # the pattern's *length*, not how much of it can match. Measured here: 30us for
 # the four-keyword pattern this replaces, 54us for this one, against a 288us ->
 # 324us record path. Weigh anything added against that.
-: "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:]]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|://(hooks\.slack\.com|discord(app)?\.com/api/webhooks)/[^[:space:]]|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
+: "${WOSWOAR_IGNORE=(TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=|--([a-z]+-)*((passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)([=[:space:];|&()<>]|\$)|--from-literal=|://[^/[:space:]]+:[^/@[:space:]]+@|://(hooks\.slack\.com|discord(app)?\.com/api/webhooks)/[^[:space:]]|[Aa]uthorization:[[:space:]]*[A-Za-z]|(sshpass|htpasswd|openssl passwd)[[:space:]]|curl[^|;&]*[[:space:]]-u[[:space:]]|mysql[a-z]*[^|;&]*[[:space:]]-p[^-[:space:]]|docker login[^|;&]*[[:space:]]-p|ssh-keygen[^|;&]*[[:space:]]-N[[:space:]]}"
 
 # The webhook alternative above measured +7.4us per command, 58.3us to 65.7us
 # for the test itself against a record path of ~306us. Paid because the URL *is*

@@ -44,9 +44,27 @@ _SHARED = (
     # after `_`, or MONKEY=, KEYS= and PASSAGE= would all be dropped.
     r"(?:TOKEN|SECRET|PASSW|CREDENTIAL|APIKEY|_KEY|_PASS|_AUTH)[A-Za-z0-9_]*=",
     # A long option that names one. The trailing boundary is what keeps
-    # `--auth-mode` (a real azure flag, not a secret) out of it.
+    # `--auth-mode` (a real azure flag, not a secret) out of it, and the
+    # character doing that work is the `-`: admitting one costs exactly that
+    # command. A letter is a different matter and admitting one would change
+    # almost nothing, because `[a-z-]*` above has already absorbed the letters
+    # before the boundary is consulted -- `--tokenizer` matches today. It stays
+    # out anyway, since the three branches with no `[a-z-]*` of their own
+    # (`api-?key`, `access-?key`, `auth`) are the ones it would loosen.
+    #
+    # It admits the characters that *end a word* in a shell, and #312 is why:
+    # with `[=\s]|$` alone the rule matched `--with-token` only when the flag
+    # ended the line, so `gh auth login --with-token; echo done` went
+    # unrecognised while the same command alone was dropped.
+    #
+    # Word terminators only. `"`, `'` and `\` are excluded deliberately even
+    # though they too can follow the flag: they *continue* the word rather than
+    # end it, so `--password'x'` is the single word `--passwordx` -- an
+    # attached value, which is not a spelling long options accept. Admitting
+    # them would also cost the hook's parity test two more shell-unescaping
+    # rules, since this pattern lives inside a double-quoted default assignment.
     r"--(?:[a-z]+-)*(?:(?:passw|token|secret|credential)[a-z-]*|api-?key|access-?key|auth)"
-    r"(?:[=\s]|$)",
+    r"(?:[=\s;|&()<>]|$)",
     r"--from-literal=",
     # Credentials inside a URL. Two shapes: a `user:pass@` prefix, and a token
     # that *is* a path component -- a webhook URL, where holding the address is
