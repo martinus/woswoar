@@ -360,8 +360,31 @@ def readable_by_others() -> list[Path]:
 
     Named for the check it performs -- the mask is group *and* other, which
     ``world_readable`` would have misdescribed for anyone adding a caller.
+
+    A path that vanishes between the walk and the stat is skipped, and that is
+    the true answer rather than a convenience: a file that no longer exists
+    cannot be read by anybody. `write_atomic` makes this routine rather than
+    rare -- it creates a temp file and `os.replace`s it, and sync runs on a timer
+    once a minute, so `doctor` racing it used to exit with a traceback instead of
+    a report (#293).
+
+    **Only `FileNotFoundError`, not `OSError`.** This is a security check, so
+    "could not look" and "safe" are different answers and collapsing them is the
+    failure the function exists to prevent. `harden`'s blanket suppress two
+    definitions up is right for what it does -- best-effort tightening, where
+    failing to chmod one file costs nothing it claimed -- and would be wrong
+    here. Anything that is not a missing file still propagates, loudly, because
+    a check that cannot see is not a check that passed.
     """
-    return [p for p, _ in _private_paths() if p.stat().st_mode & OTHER_BITS]
+    found = []
+    for path, _ in _private_paths():
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            continue
+        if mode & OTHER_BITS:
+            found.append(path)
+    return found
 
 
 def write_atomic(path: Path, data: bytes) -> None:
