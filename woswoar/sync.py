@@ -33,6 +33,7 @@ and `gitrepo`, every git fork and the only thing here that talks to the network
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import time
 import zlib
 from collections import Counter
@@ -706,7 +707,24 @@ class State:
     #: Progress rather than history: losing it costs one extra publish. See
     #: `publish_accepts` for why the comparison lives here rather than in the
     #: file.
+    #:
+    #: No longer what decides whether to republish -- `published_digest` is --
+    #: but still written, so a machine that downgrades reads a field in the
+    #: shape it expects rather than a digest it would take for a host id.
     published_accepts: list[str] = field(default_factory=list)
+    #: A digest of the id -> fingerprint mapping this machine last published.
+    #:
+    #: The ids alone were the comparison until #290, and they cannot see a key
+    #: *rotation*: `woswoar trust --replace` leaves the host set untouched and
+    #: changes what every entry points at. The seal carries the mapping, so the
+    #: check has to as well, or `accepts.age` keeps a fingerprint that no longer
+    #: matches and every peer's `fleet` marks this machine `!` for ever.
+    #:
+    #: Empty on an installation that predates the field, which republishes once
+    #: on the next sync and costs one seal. That is the upgrade path, and it is
+    #: the safe direction: reading a missing digest as "already published" would
+    #: preserve exactly the bug.
+    published_digest: str = ""
     #: "<host>/<day>" -> the day directory's mtime when every chunk its signed
     #: manifest listed had been merged. A day whose stamp still matches has gained nothing since, so
     #: it needs no listing at all -- and listing is what a peer's whole archive
@@ -728,6 +746,7 @@ class State:
         granted = raw.get("granted", [])
         granted_complete = raw.get("granted_complete", False)
         published = raw.get("published_accepts", [])
+        digest = raw.get("published_digest", "")
         signers = raw.get("signers", {})
         merged_at = raw.get("merged_at", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
@@ -755,6 +774,9 @@ class State:
             published_accepts=sorted(str(host) for host in published)
             if isinstance(published, list)
             else [],
+            # Anything that is not a string is not a digest this wrote, and the
+            # empty default republishes once rather than trusting it.
+            published_digest=digest if isinstance(digest, str) else "",
             signers={str(k): str(v) for k, v in signers.items()}
             if isinstance(signers, dict)
             else {},
@@ -780,6 +802,7 @@ class State:
             "granted": list(self.granted),
             "granted_complete": self.granted_complete,
             "published_accepts": list(self.published_accepts),
+            "published_digest": self.published_digest,
             "signers": dict(self.signers),
             "merged_at": dict(self.merged_at),
         }
@@ -1185,6 +1208,24 @@ def read_signer(host_id: str) -> Signer | None:
     return Signer(lines[0].strip(), lines[1].strip())
 
 
+def accepts_digest(signers: dict[str, str]) -> str:
+    """One comparable string for the id -> fingerprint mapping that gets sealed.
+
+    A digest rather than the mapping itself, because this is written into
+    `state.json` on every sync and a fleet of any size would put the whole table
+    there twice -- once as the pin, once as a record of having published it.
+
+    Tab-separated, and the separator matters. `hashlib` sees a byte sequence, so
+    two different mappings must not flatten into one string: without a delimiter
+    `{"ab": "c"}` and `{"a": "bc"}` are both `abc`. Host ids and age fingerprints
+    contain neither tabs nor newlines, so this pair cannot be forged from the
+    other side either -- which is the same argument `forget.digest` makes for
+    hashing a command apart from its timestamp.
+    """
+    rendered = "\n".join(f"{host}\t{signers[host]}" for host in sorted(signers))
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
 def publish_accepts(known: Machine, state: State, now: int) -> bool:
     """Publish which hosts this machine has accepted. Says whether it wrote.
 
@@ -1201,7 +1242,7 @@ def publish_accepts(known: Machine, state: State, now: int) -> bool:
     """
     if not state.signers:
         return False
-    if state.published_accepts == sorted(state.signers):
+    if state.published_digest == accepts_digest(state.signers):
         return False
     # Through `signing_public`, which mints the key if it is missing, exactly as
     # `publish_signer` does. Signing directly would turn "this machine lost its
@@ -1215,6 +1256,7 @@ def publish_accepts(known: Machine, state: State, now: int) -> bool:
     # then wrote its older copy over the top -- so every sync republished,
     # committed and pushed, which three of this file's own invariants noticed.
     state.published_accepts = sorted(state.signers)
+    state.published_digest = accepts_digest(state.signers)
     return True
 
 
