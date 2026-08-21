@@ -94,6 +94,26 @@ class TestParseZsh(unittest.TestCase):
         for row in parsed:
             self.assertLess(row.duration_ms, 0, row)
 
+    def test_the_record_list_only_grows_at_the_end(self) -> None:
+        """The property `run`'s watermark rests on, asserted directly.
+
+        `parse_zsh` sorts and is what every other caller wants; `_zsh_records`
+        is the file-order list, and appending to the history must leave every
+        earlier position exactly where it was.
+        """
+        before = ": 100:0;alpha\nbare\n: 200:0;gamma\n"
+        first = importer._zsh_records(before, 9999)
+        grown = importer._zsh_records(before + ": 150:0;delta\n", 9999)
+        self.assertEqual([r.cmd for r in grown[: len(first)]], [r.cmd for r in first])
+        self.assertEqual([r.cmd for r in grown[len(first) :]], ["delta"])
+
+    def test_sorting_is_unchanged_by_the_file_order_split(self) -> None:
+        """`parse_zsh`'s own contract, which #289 must not have moved: untimed
+        records carry a synthetic stamp at or after the file's mtime, so they
+        still land last however the list was built."""
+        rows = importer.parse_zsh(": 200:0;gamma\nbare\n: 100:0;alpha\n", 9999)
+        self.assertEqual([r.cmd for r in rows], ["alpha", "gamma", "bare"])
+
     def test_output_is_sorted_by_time(self) -> None:
         text = ": 1753000100:0;later\n: 1753000000:0;earlier\n"
         parsed = importer.parse_zsh(text, MTIME)
@@ -143,6 +163,38 @@ class TestImportRun(ImportTestCase):
         self.assertEqual(len(codes), 1)
         for code in codes:
             self.assertLess(code, 0, codes)
+
+    def test_a_zsh_record_with_an_earlier_timestamp_is_still_imported(self) -> None:
+        """#289. The watermark counts records, so the list it counts into must
+        only ever grow at the end -- and timestamp order does not.
+
+        A shell writes its history when it exits, so two zsh sessions closed in
+        the other order interleave. The appended command sorted below the
+        watermark and was skipped on this run and on every run afterwards, with
+        a successful import reported each time.
+        """
+        source = self._source("hist", ": 100:0;alpha\n: 200:0;gamma\n")
+        importer.run("zsh", source)
+        self._rewrite(source, ": 100:0;alpha\n: 200:0;gamma\n: 150:0;delta\n")
+        result = importer.run("zsh", source)
+        self.assertEqual(result.imported, 1)
+        self.assertIn("delta", self._commands())
+
+    def test_an_untimed_neighbour_does_not_push_a_new_record_under_the_mark(self) -> None:
+        """The second way the order moved, and the one a timestamp fixture
+        misses entirely.
+
+        Untimed records used to be collected and appended *after* the timed
+        ones, so a newly timed record pushed every untimed one down a slot --
+        enough to drop a command with no out-of-order timestamp anywhere. Here
+        `delta`'s stamp is the highest of the three real ones, so a test that
+        only varied timestamps would pass against the old code.
+        """
+        source = self._source("hist", ": 100:0;alpha\nbare\n: 200:0;gamma\n")
+        importer.run("zsh", source)
+        self._rewrite(source, ": 100:0;alpha\nbare\n: 200:0;gamma\n: 300:0;delta\n")
+        importer.run("zsh", source)
+        self.assertIn("delta", self._commands())
 
     def test_rerun_imports_nothing_new(self) -> None:
         source = self._source("hist", "#1753000000\ngit status\n")

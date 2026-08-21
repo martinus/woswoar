@@ -108,12 +108,24 @@ def parse_bash(text: str, mtime: int) -> list[Parsed]:
     ]
 
 
-def parse_zsh(text: str, mtime: int) -> list[Parsed]:
-    """Parse ``.zsh_history``.
+def _zsh_records(text: str, mtime: int) -> list[Parsed]:
+    """Parse ``.zsh_history``, **in the order the records appear in the file**.
 
     Extended history looks like ``: <start>:<elapsed>;<command>``. A command
     continues onto the next line when the current one ends in a backslash.
     Plain (non-extended) history has no header and is handled like untimed bash.
+
+    File order is not a detail here, it is the whole of #289. `run` remembers how
+    far it got as a **count of records**, and slices that count off the front on
+    the next import -- so the order this returns has to be one that only ever
+    *grows at the end*. Timestamp order is not: a shell writes its history when
+    it exits, so two shells closed in the other order interleave, and a record
+    that sorts below the watermark is skipped on that run and on every run after.
+
+    The previous shape had a second way to reorder, which is why this is one loop
+    rather than two. Untimed records were collected and appended after the timed
+    ones, so a newly timed record pushed every untimed one down a slot -- enough
+    on its own to drop a command even without the sort.
     """
     records: list[str] = []
     current: list[str] = []
@@ -132,33 +144,36 @@ def parse_zsh(text: str, mtime: int) -> list[Parsed]:
     if current:
         records.append("\n".join(current))
 
-    parsed: list[Parsed] = []
-    untimed: list[str] = []
+    kept = [record for record in records if record.strip()]
+    # Counted in a pass of its own because `_synthetic` is told up front how
+    # many stamps to mint. The generator is then consumed in encounter order,
+    # so every untimed record gets the same stamp it did before #289 -- what
+    # changed is where it sits in the list, not what it holds.
+    synthetic = _synthetic(mtime, sum(1 for r in kept if _ZSH_HEADER.match(r) is None))
 
-    for record in records:
-        if not record.strip():
-            continue
+    rows: list[Parsed] = []
+    for record in kept:
         match = _ZSH_HEADER.match(record)
         if match is None:
-            untimed.append(record)
+            rows.append(Parsed(ts=next(synthetic), cmd=record, duration_ms=-1))
             continue
         elapsed = int(match.group(2))
         # Continuation backslashes are zsh's line-wrapping, not part of the
         # command.
         cmd = match.group(3).replace("\\\n", "\n")
-        parsed.append(
+        rows.append(
             Parsed(
                 ts=int(match.group(1)),
                 cmd=cmd,
                 duration_ms=elapsed * 1000 if elapsed > 0 else -1,
             )
         )
+    return rows
 
-    synthetic = _synthetic(mtime, len(untimed))
-    parsed.extend(Parsed(ts=next(synthetic), cmd=cmd, duration_ms=-1) for cmd in untimed)
 
-    parsed.sort(key=lambda p: p.ts)
-    return parsed
+def parse_zsh(text: str, mtime: int) -> list[Parsed]:
+    """`_zsh_records`, in timestamp order. What every caller but `run` wants."""
+    return sorted(_zsh_records(text, mtime), key=lambda row: row.ts)
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +493,10 @@ def run(
 
     mtime = int(source.stat().st_mtime)
     text = _read(source)
-    parsed = parse_bash(text, mtime) if kind == "bash" else parse_zsh(text, mtime)
+    # `_zsh_records` rather than `parse_zsh`: the watermark below counts
+    # positions, so it has to count them in a list that only grows at the end.
+    # `parse_bash` is already in file order and never sorts. See #289.
+    parsed = parse_bash(text, mtime) if kind == "bash" else _zsh_records(text, mtime)
 
     state = _load_state()
     key = str(source)
