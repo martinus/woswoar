@@ -638,6 +638,53 @@ class TestTheCommandLine(Fixture):
         ran = self.ran("--pidfile", str(pidfile))
         self.assertEqual(ran.returncode, 0, ran.stderr)
 
+    def test_a_long_poll_interval_does_not_stall_the_wait(self) -> None:
+        """The poll step is the *shorter* of `--interval` and a tenth of a
+        second, and this is why.
+
+        `--interval` is tuned for the work being watched -- twenty seconds, so a
+        sweep is not polled to death. Reusing it here would check for the pidfile
+        every twenty seconds against a ten-second deadline, so a job that wrote
+        its pid promptly would be declared missing. The two waits measure
+        different things and only one of them is minutes long.
+
+        Timed, not just completed: with the longer step this still finishes, it
+        just takes twenty seconds to do it.
+        """
+        self.done.write_text("{}", encoding="utf-8")
+        pidfile = self.root / "slow.pid"
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                f"import time,pathlib\ntime.sleep(0.3)\n"
+                f"pathlib.Path({str(pidfile)!r}).write_text('{os.getpid()}')\n",
+            ]
+        )
+        self.addCleanup(writer.wait)
+        self.addCleanup(writer.kill)
+        began = time.monotonic()
+        ran = self.ran("--pidfile", str(pidfile), "--interval", "20")
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertLess(time.monotonic() - began, 5.0, "it waited a whole poll interval")
+
+    def test_waiting_for_a_pidfile_is_not_a_spin(self) -> None:
+        """Ten seconds of busy loop is ten seconds of a core, on a machine about
+        to be busy with the job being waited for. Measured rather than read,
+        the same way the main loop's sleep is."""
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
+        ran = subprocess.run(
+            self.command("--pidfile", str(self.root / "never"), "--interval", "0.05"),
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "PYTHONPATH": str(self.repo)},
+        )
+        self.assertEqual(ran.returncode, 1)
+        burned = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime - before
+        self.assertLess(burned, 2.0, f"waiting cost {burned:.2f}s of CPU")
+
     def test_a_pidfile_that_never_arrives_is_an_error_not_a_wait(self) -> None:
         """A watcher that settled into watching nothing would be reporting the
         silence it was built to break. Bounded, and it says which file."""
