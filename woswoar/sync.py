@@ -751,25 +751,17 @@ class State:
         merged_at = raw.get("merged_at", {})
         if not isinstance(exported, dict) or not isinstance(merged, dict):
             return cls()
-        try:
-            watermarks = {str(k): int(v) for k, v in exported.items()}
-        except (TypeError, ValueError):
-            # The same answer as a malformed *shape* on the line above, for the
-            # same class of corruption. `int(v)` on a `null` raises `TypeError`,
-            # and `load` runs on the way into every command -- so before #291 a
-            # single bad value in a file that was otherwise valid JSON made
-            # every command traceback until somebody deleted it by hand.
-            #
-            # A whole reset rather than dropping the one bad entry, which is the
-            # tempting alternative and says less: a watermark that quietly
-            # becomes 0 re-exports that log anyway, and nothing tells the reader
-            # a value was discarded. Rule 8 prices this deliberately -- losing
-            # `state.json` "costs a re-merge and a re-export, never a command" --
-            # so the expensive-but-whole answer is the one the file is allowed
-            # to cost.
-            return cls()
         state = cls(
-            exported=watermarks,
+            # Per value, matching `merged_at` below rather than the whole-file
+            # reset this first carried. Both keep `load` from raising, and the
+            # difference is what they cost: dropping one watermark re-exports
+            # one log, where discarding the map re-exports *every* log -- and
+            # what a re-export costs is duplicate rows in the archive, so the
+            # reset multiplies exactly the thing that made it look careful.
+            #
+            # Same direction as `merged`'s comment below, for the same reason:
+            # repeating work beats dropping history. #285 over #291.
+            exported={str(k): int(v) for k, v in exported.items() if isinstance(v, int)},
             # Guarded per value, not just on `merged` being a dict. A value
             # that is a bare *string* rather than a list is iterable, so without
             # this every day's record turns into its own characters, every chunk
