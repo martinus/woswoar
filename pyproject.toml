@@ -104,9 +104,16 @@ ignore_missing_imports = true
 # `tests.test_*_properties` is rejected outright. Every `_properties` module
 # belongs here and needs the same pair -- the suffix is the convention that
 # earns them, and the list is what mypy will take.
-module = ["tests.test_import_properties", "tests.test_record_properties"]
+module = [
+    "tests.test_export_properties",
+    "tests.test_forget_properties",
+    "tests.test_import_properties",
+    "tests.test_record_properties",
+]
 disallow_untyped_decorators = false
 # And `RuleBasedStateMachine` reads as `Any` once its module is unresolved
 # above, so subclassing it trips `disallow_subclassing_any`. Same exemption,
-# same reason, same one file.
+# same reason -- and it applies to the whole list rather than to one file,
+# because only some of these define a machine and mypy takes the pair either
+# way.
 disallow_subclassing_any = false
