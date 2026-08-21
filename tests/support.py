@@ -32,6 +32,13 @@ MACHINE_ID = "0123456789abcdef"
 #: forgotten in the other.
 requires_age = unittest.skipUnless(crypto.available(), "age required")
 requires_git = unittest.skipUnless(shutil.which("git"), "git required")
+#: Skipped as root, where a mode a test sets does not bind and the code under it
+#: never takes the branch being asserted. Defined here beside the other capability
+#: checks rather than inline, for the reason this module exists: a check written
+#: at one call site is the one nobody finds when a second test needs it. See #288.
+requires_unprivileged = unittest.skipIf(
+    os.geteuid() == 0, "root ignores the permission bits these tests set"
+)
 
 
 #: A value for every name a sandbox has to carry, planted in the ambient

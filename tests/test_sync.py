@@ -6669,7 +6669,13 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
         )
         self.assertIn(
             archive.FORMAT,
-            self.git_in_repo(alpha, "ls-tree", "--name-only", "origin/HEAD").split(),
+            # `origin/main` rather than the symbolic ref. `git clone` writes
+            # that one only from a *non-empty* remote, and these fixtures start
+            # from an empty bare repo the first machine `init`s against -- so
+            # clone never creates it, and only git 2.45+ populates it on fetch.
+            # Both spellings say "what the remote has"; this one says it on
+            # every git. See #288.
+            self.git_in_repo(alpha, "ls-tree", "--name-only", "origin/main").split(),
             "the marker never reached the remote, so no other machine sees it",
         )
 
@@ -6763,7 +6769,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
             # here would be one machine learning about the other, which is the
             # thing this test needs not to have happened yet.
             gitrepo.git("fetch", "--quiet", "origin")
-            gitrepo.git("reset", "--hard", "--quiet", "origin/HEAD")
+            gitrepo.git("reset", "--hard", "--quiet", "origin/main")
             self.assertFalse(archive.format_file().is_file(), "the fixture still has the marker")
 
             # Committed locally and deliberately not pushed, so alpha's marker
@@ -6799,7 +6805,7 @@ class TestTheRepoSaysWhichShapeItIs(SyncTestCase):
 
         with alpha.active():
             gitrepo.git("fetch", "--quiet", "origin")
-            gitrepo.git("reset", "--hard", "--quiet", "origin/HEAD")
+            gitrepo.git("reset", "--hard", "--quiet", "origin/main")
             self.assertEqual(
                 archive.recipients_file().read_text(encoding="utf-8"),
                 before,
