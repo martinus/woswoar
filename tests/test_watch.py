@@ -604,6 +604,64 @@ class TestTheCommandLine(Fixture):
         self.assertGreaterEqual(said, 1, out)
         self.assertLess(said, 10, out)
 
+    def test_it_reads_the_pid_the_job_wrote(self) -> None:
+        """The step that feeds this tool, which never worked by hand.
+
+        `... & echo $! > sweep.pid` looks equivalent to the job writing it and
+        is not -- in one session it produced no file, and the pid was recovered
+        from the process table fifteen runs running, by a *pattern*, which is
+        exactly the `pgrep -f` hole this tool exists to close.
+        """
+        self.done.write_text("{}", encoding="utf-8")
+        pidfile = self.root / "sweep.pid"
+        pidfile.write_text(f"{self.reaped()}\n", encoding="utf-8")
+        ran = self.ran("--pidfile", str(pidfile))
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("FINISHED", ran.stdout)
+
+    def test_it_waits_for_a_pidfile_that_is_not_there_yet(self) -> None:
+        """The watcher is started in the same breath as the job and can win the
+        race. Waiting is the difference between that being fine and being a
+        usage error the caller has to sleep around."""
+        self.done.write_text("{}", encoding="utf-8")
+        pidfile = self.root / "late.pid"
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                f"import time,pathlib\ntime.sleep(0.4)\n"
+                f"pathlib.Path({str(pidfile)!r}).write_text('{os.getpid()}')\n",
+            ]
+        )
+        self.addCleanup(writer.wait)
+        self.addCleanup(writer.kill)
+        ran = self.ran("--pidfile", str(pidfile))
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+
+    def test_a_pidfile_that_never_arrives_is_an_error_not_a_wait(self) -> None:
+        """A watcher that settled into watching nothing would be reporting the
+        silence it was built to break. Bounded, and it says which file."""
+        ran = subprocess.run(
+            self.command("--pidfile", str(self.root / "never"), "--interval", "0.05"),
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "PYTHONPATH": str(self.repo)},
+        )
+        self.assertEqual(ran.returncode, 1)
+        self.assertIn("no usable pid", ran.stderr)
+
+    def test_a_pid_and_a_pidfile_together_are_refused(self) -> None:
+        """Two answers to one question, and no way to tell which the caller
+        meant. argparse says so before anything runs."""
+        ran = self.ran("123", "--pidfile", str(self.root / "p"))
+        self.assertEqual(ran.returncode, 2)
+
+    def test_neither_a_pid_nor_a_pidfile_is_refused(self) -> None:
+        ran = self.ran()
+        self.assertEqual(ran.returncode, 2)
+
     def test_a_pid_that_is_a_group_is_a_usage_error(self) -> None:
         ran = self.ran("0")
         self.assertEqual(ran.returncode, 2)

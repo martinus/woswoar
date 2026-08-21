@@ -1304,6 +1304,23 @@ def _marker(where: Path) -> Path:
     return where.parent / (where.name + ".done")
 
 
+def _pidfile(where: Path) -> Path:
+    """Where a run records its own process id, beside its report.
+
+    Written because the caller could not reliably record it. A sweep is started
+    detached -- that is the whole reason `tools/watch.py` exists -- and the
+    obvious `python -m tools.mutate ... & echo $! > sweep.pid` does not survive
+    every shell: in one session it produced no file at all, and the pid had to
+    be recovered from the process table on fifteen consecutive runs, with a
+    pattern filter carefully written not to match the filtering command. That is
+    the `pgrep -f` hole `watch.py` was built to close, reappearing in the step
+    that feeds it.
+
+    The run knows its own pid and cannot get it wrong, so it writes it.
+    """
+    return where.parent / (where.name + ".pid")
+
+
 def _persist(report: Report, where: Path) -> None:
     """The run's answers, as `tools/reached.py` reads them.
 
@@ -1560,6 +1577,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {row.operator:16} {row.label}")
             return 0
         if args.json:
+            # Before the first row, so a watcher started alongside this one has
+            # something to read straight away. Its own pid, not a caller's guess.
+            _pidfile(args.json).write_text(f"{os.getpid()}\n", encoding="utf-8")
             # Cleared before the first row, not merely written after the last.
             # A resumed sweep points `--json` at a part-written report, and a
             # marker left by the run that was interrupted would tell a watcher
@@ -1587,6 +1607,9 @@ def main(argv: list[str] | None = None) -> int:
             # Last, and after `confirm`: the marker means the whole run is over,
             # including the pass that can still change a verdict.
             _marker(args.json).touch()
+            # The pid names a process that no longer exists, and a stale one is
+            # exactly the false-liveness `watch.py` refuses to answer with.
+            _pidfile(args.json).unlink(missing_ok=True)
         return 0 if report.clean else 1
 
     already = len(_RUNS)

@@ -2338,6 +2338,36 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         )
         self.assertEqual({row["path"] for row in written["results"]}, {"woswoar/mod.py"})
 
+    def test_a_finished_run_takes_its_pidfile_away(self) -> None:
+        """The run writes its own pid because the caller could not.
+
+        Removed at the end, because by then it names a process that is gone --
+        and a stale pid read as live is the exact false answer `tools/watch.py`
+        exists to refuse.
+        """
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report))
+        self.assertFalse(mutate._pidfile(report).exists())
+
+    def test_the_pid_is_there_while_the_run_is_going(self) -> None:
+        """Observed from inside, because it is gone by the time `main` returns
+        -- which is the same reason the stale-marker test looks from in here."""
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        seen: list[str] = []
+
+        def watching(rows: Sequence[Mutation], args: Any, **kw: Any) -> Report:
+            seen.append(mutate._pidfile(report).read_text(encoding="utf-8").strip())
+            return Report([])
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "_run_generated", watching),
+        ):
+            mutate.main(["--base", "HEAD", "--operator", "branch", "--json", str(report)])
+        self.assertEqual(seen, [str(os.getpid())], "the run did not name itself")
+
     def test_a_finished_run_leaves_a_marker(self) -> None:
         """#275. `--json` says a batch landed; this says the run is over.
 
@@ -2444,6 +2474,9 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
 
 
 class TestTheCompletionMarker(unittest.TestCase):
+    def test_the_pidfile_sits_beside_the_report_too(self) -> None:
+        self.assertEqual(mutate._pidfile(Path("/tmp/r.json")), Path("/tmp/r.json.pid"))
+
     def test_it_sits_beside_the_report(self) -> None:
         """A sibling name rather than a suffix swap, so a reader sorting a
         directory finds the two together and `.json` keeps its meaning."""
