@@ -810,6 +810,95 @@ class TestWhoHasAcceptedWhom(SyncTestCase):
             )
 
 
+class TestRepublishingAfterAKeyRotation(unittest.TestCase):
+    """#290, at the level the bug lives: what the republish check compares.
+
+    Driven against `accepts_digest` and a hand-built `State` rather than through
+    a real two-machine sync, because the defect is entirely in the comparison --
+    the seal already carried the right thing. A full sync fixture would exercise
+    age, git and a second machine to assert a string equality, and would take
+    minutes to say what these say in milliseconds.
+    """
+
+    def test_a_rotated_key_changes_the_digest(self) -> None:
+        """The whole bug. `trust --replace` leaves the host set untouched and
+        changes what every entry points at, so a check over the *ids* cannot
+        see it -- and `accepts.age` keeps a fingerprint no peer can match."""
+        before = sync.accepts_digest({"alpha": "AAA", "beta": "BBB"})
+        after = sync.accepts_digest({"alpha": "AAA", "beta": "ROTATED"})
+        self.assertNotEqual(before, after)
+
+    def test_the_same_mapping_is_the_same_digest(self) -> None:
+        """The other half: without it the digest could be random and every sync
+        would republish, which is the cost the id check was avoiding."""
+        first = sync.accepts_digest({"alpha": "AAA", "beta": "BBB"})
+        again = sync.accepts_digest({"beta": "BBB", "alpha": "AAA"})
+        self.assertEqual(first, again, "insertion order is not part of the pin")
+
+    def test_two_mappings_cannot_flatten_into_one(self) -> None:
+        """The separator earning its place: without a delimiter between the id
+        and the fingerprint, `{"ab": "c"}` and `{"a": "bc"}` render identically
+        and a rotation could be made invisible by choosing names."""
+        self.assertNotEqual(sync.accepts_digest({"ab": "c"}), sync.accepts_digest({"a": "bc"}))
+
+    def wired(self, state: sync.State) -> bool:
+        """`publish_accepts` with only its side effects held back.
+
+        The digest tests above pass against a call site still comparing ids --
+        they exercise `accepts_digest`, not the decision that uses it. This is
+        the wiring, and it is the half #276 taught: both survivors of that
+        change were at a call site no unit test reached.
+
+        Mocked rather than driven through a two-machine sync because everything
+        held back here is *writing* -- minting a key, sealing, and one
+        `write_atomic` -- and none of it decides anything. The question is
+        whether the guard above them fires.
+        """
+        known = store.Machine(id="alpha", name="alpha")
+        with (
+            mock.patch.object(sync, "signing_public"),
+            mock.patch.object(sync, "recipients", return_value=[]),
+            mock.patch.object(fleet, "seal", return_value=b""),
+            mock.patch.object(archive, "accepts_seal", return_value=Path("/dev/null")),
+            mock.patch.object(store, "write_atomic"),
+        ):
+            return sync.publish_accepts(known, state, 2)
+
+    def test_publish_accepts_writes_again_after_a_rotation(self) -> None:
+        """End to end through the guard: same hosts, new fingerprint, and the
+        file has to be rewritten. Reverting the comparison to the id list makes
+        this the only test in the class that fails."""
+        state = sync.State(signers={"alpha": "AAA"})
+        self.assertTrue(self.wired(state), "never published, so it must write")
+        self.assertFalse(self.wired(state), "unchanged, so nothing to write")
+
+        state.signers = {"alpha": "ROTATED"}
+        self.assertTrue(self.wired(state), "the key rotated and the seal is stale")
+
+    def test_a_state_from_before_the_field_republishes_once(self) -> None:
+        """The upgrade path, per rule 8. An installation carrying only the old
+        id list has no digest, and the empty default must read as *not
+        published* -- treating it as published preserves exactly the bug."""
+        state = sync.State(published_accepts=["alpha", "beta"])
+        self.assertEqual(state.published_digest, "")
+        self.assertNotEqual(state.published_digest, sync.accepts_digest({"alpha": "AAA"}))
+
+    def test_the_digest_survives_a_round_trip(self) -> None:
+        """`published_digest` is only worth anything if it is still there on the
+        next run; a field that is written and not read republishes for ever."""
+        raw = {"published_accepts": ["alpha"], "published_digest": "deadbeef"}
+        with mock.patch.object(store, "load_json", return_value=raw):
+            self.assertEqual(sync.State.load().published_digest, "deadbeef")
+
+    def test_a_digest_that_is_not_a_string_is_discarded(self) -> None:
+        """`State.load` degrades an unreadable value to a safe default rather
+        than raising -- the pattern CLAUDE.md rule 8 names, and the one #291 is
+        about `exported` missing."""
+        raw = {"published_accepts": [], "published_digest": 17}
+        with mock.patch.object(store, "load_json", return_value=raw):
+            self.assertEqual(sync.State.load().published_digest, "")
+
+
 class TestAMalformedStateFileDoesNotStopTheTool(unittest.TestCase):
     """#291. `State.load` runs on the way into every command, so anything it
     raises is not a bad sync -- it is a machine with no working `woswoar` until
