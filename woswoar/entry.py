@@ -213,7 +213,20 @@ def format_line(entry: Entry) -> str:
     return "\t".join(
         (
             str(entry.ts),
-            entry.session,
+            # Escaped like its neighbours, which it was not until a property
+            # test asked. `session` is the only string field that reached the
+            # line raw, so a value holding a tab or a newline wrote a record
+            # that read back as two -- one malformed and dropped, the other a
+            # command nobody ran, in `logs/`, which is the primary copy.
+            #
+            # Not reachable today: the shell hook overwrites `WOSWOAR_SESSION`
+            # with `%x-%x` at every startup, and the importer's is the literal
+            # "import". Both are identity under `escape`, so every record ever
+            # written is byte-identical before and after this change and there
+            # is nothing to migrate. What it closes is the asymmetry -- the
+            # next field fed from somewhere less controlled inherits the
+            # guarantee rather than the gap.
+            escape(entry.session),
             escape(entry.cwd),
             str(entry.exit_code),
             str(entry.duration_ms),
@@ -272,7 +285,7 @@ def parse_line(line: str, host: str, inert: bool = False) -> Entry | None:
     return Entry(
         ts=ts,
         host=host,
-        session=clean(session),
+        session=clean(unescape(session)),
         cwd=clean(unescape(cwd)),
         exit_code=exit_code,
         duration_ms=duration_ms,
