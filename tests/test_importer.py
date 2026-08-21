@@ -42,6 +42,24 @@ class TestParseBash(unittest.TestCase):
     def test_blank_lines_ignored(self) -> None:
         self.assertEqual(len(importer.parse_bash("a\n\n\nb\n", MTIME)), 2)
 
+    def test_bash_records_no_timing_so_the_duration_is_unknown(self) -> None:
+        """The sentinel's *sign*, which is the whole of what it claims.
+
+        `.bash_history` carries no durations at all, so every imported row says
+        "not recorded". Flip the sign and each one claims it took a millisecond
+        -- a number, written into `logs/`, which rule 8 calls the primary copy
+        and which an import is the one operation that fills from outside.
+
+        `< 0` rather than `== -1`: the claim is "this means unknown", and an
+        assertion on the exact number would fail on a deliberate change to `-2`
+        that meant the same thing. Found by #276's `sign` operator, which no
+        test in this file could see.
+        """
+        parsed = importer.parse_bash("#1753000000\ngit status\nbare\n", MTIME)
+        self.assertEqual(len(parsed), 2)
+        for row in parsed:
+            self.assertLess(row.duration_ms, 0, row)
+
     def test_a_comment_is_not_mistaken_for_a_timestamp(self) -> None:
         parsed = importer.parse_bash("#!/bin/sh\n#not-a-number\n", MTIME)
         self.assertEqual([p.cmd for p in parsed], ["#!/bin/sh", "#not-a-number"])
@@ -65,6 +83,16 @@ class TestParseZsh(unittest.TestCase):
     def test_plain_history_without_headers(self) -> None:
         parsed = importer.parse_zsh("git status\nls -la\n", MTIME)
         self.assertEqual([p.cmd for p in parsed], ["git status", "ls -la"])
+
+    def test_a_plain_history_line_has_an_unknown_duration(self) -> None:
+        """The *untimed* branch, which is a separate literal from the one
+        `test_extended_format` pins. That test covers `: ts:0;cmd` -- a header
+        whose elapsed field is zero -- and a zsh history with no headers at all
+        takes the other path and was unguarded."""
+        parsed = importer.parse_zsh("git status\nls -la\n", MTIME)
+        self.assertEqual(len(parsed), 2)
+        for row in parsed:
+            self.assertLess(row.duration_ms, 0, row)
 
     def test_output_is_sorted_by_time(self) -> None:
         text = ": 1753000100:0;later\n: 1753000000:0;earlier\n"
@@ -97,6 +125,24 @@ class TestImportRun(ImportTestCase):
         result = importer.run("bash", source)
         self.assertEqual(result.imported, 2)
         self.assertEqual(self._commands(), {"git status", "ls"})
+
+    def test_an_imported_command_has_an_unknown_exit_code(self) -> None:
+        """The third sentinel, and the one whose flip is worst.
+
+        A shell history records what was *run*, never how it ended, so an
+        imported row cannot know. `1` is not a missing value: it is the code for
+        a command that failed, so every line a user ever imported would read as
+        having failed -- in the history they search, from the primary copy.
+
+        Asserted on what reaches the store rather than on `Parsed`, because
+        `run` builds the `Entry` itself and this literal is nowhere near the two
+        the parsers carry.
+        """
+        importer.run("bash", self._source("hist", "#1753000000\ngit status\n"))
+        codes = [entry.exit_code for entry in cache.load_entries()]
+        self.assertEqual(len(codes), 1)
+        for code in codes:
+            self.assertLess(code, 0, codes)
 
     def test_rerun_imports_nothing_new(self) -> None:
         source = self._source("hist", "#1753000000\ngit status\n")
