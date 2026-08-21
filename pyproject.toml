@@ -105,6 +105,7 @@ ignore_missing_imports = true
 # belongs here and needs the same pair -- the suffix is the convention that
 # earns them, and the list is what mypy will take.
 module = [
+    "tests.test_cache_properties",
     "tests.test_credential_properties",
     "tests.test_export_properties",
     "tests.test_forget_properties",
