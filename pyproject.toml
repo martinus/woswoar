@@ -100,7 +100,11 @@ ignore_missing_imports = true
 # alternative is a `type: ignore` on each one, which is the same exemption
 # written five times where a reader will stop seeing it.
 [[tool.mypy.overrides]]
-module = "tests.test_import_properties"
+# Listed rather than matched: mypy only accepts `*` as a whole component, so
+# `tests.test_*_properties` is rejected outright. Every `_properties` module
+# belongs here and needs the same pair -- the suffix is the convention that
+# earns them, and the list is what mypy will take.
+module = ["tests.test_import_properties", "tests.test_record_properties"]
 disallow_untyped_decorators = false
 # And `RuleBasedStateMachine` reads as `Any` once its module is unresolved
 # above, so subclassing it trips `disallow_subclassing_any`. Same exemption,
