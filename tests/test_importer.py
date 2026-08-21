@@ -250,12 +250,64 @@ class TestImportRun(ImportTestCase):
         source = self._source("hist", "#1753000000\na\n#1753000100\nb\n")
         importer.run("bash", source)
 
-        # Log rotation: the count is now meaningless, so the (ts, cmd) guard has
-        # to carry it.
+        # Log rotation. Since #294 the anchor resolves this before the
+        # `(ts, cmd)` guard has to: the last imported command is found at its new
+        # position and the count is corrected to it, so `b` is not re-examined
+        # and `skipped` is 0 rather than 1. The outcome is what it always was --
+        # nothing imported, nothing duplicated -- and the guard below still
+        # covers the case the anchor cannot find.
         self._rewrite(source, "#1753000100\nb\n")
         result = importer.run("bash", source)
         self.assertEqual(result.imported, 0)
-        self.assertEqual(result.skipped, 1)
+        self.assertEqual(len(cache.load_entries()), 2)
+
+    def test_a_savehist_trim_plus_a_larger_append_loses_nothing(self) -> None:
+        """#294. The file grew overall, so the shrink guard never fired.
+
+        zsh rewrites `.zsh_history` wholesale when trimming to `SAVEHIST`, and
+        again under `HIST_EXPIRE_DUPS_FIRST`, dropping records from the *front*.
+        `run`'s only staleness guard is `already > len(parsed)`, which fires when
+        the file gets shorter -- so a trim of two plus an append of three leaves
+        it longer, nothing fires, and the slice begins two records too late.
+
+        The lost commands are not merely re-read later: they are below the mark
+        on this run and on every run after, and each import reports success.
+
+        The append is deliberately larger than the trim. A fixture where the
+        file shrinks passes against the old code, because that is the one case
+        the existing guard already handled.
+        """
+        source = self._source("hist", ": 100:0;one\n: 200:0;two\n: 300:0;three\n")
+        importer.run("zsh", source)
+        self.assertEqual(self._commands(), {"one", "two", "three"})
+
+        # Trimmed to the last one, then three more arrive: 4 records where there
+        # were 3, so `already > len(parsed)` is false and the count stands.
+        self._rewrite(
+            source,
+            ": 300:0;three\n: 400:0;four\n: 500:0;five\n: 600:0;six\n",
+        )
+        importer.run("zsh", source)
+        self.assertEqual(
+            self._commands(),
+            {"one", "two", "three", "four", "five", "six"},
+            "records below the stale mark were skipped",
+        )
+
+    def test_a_wholly_replaced_source_still_falls_to_the_dedup_guard(self) -> None:
+        """The path the anchor cannot rescue, kept covered.
+
+        When the last imported command is nowhere in the new file, there is no
+        position to re-anchor to. The count then behaves as it always did, and
+        `(ts, cmd)` is what stops a duplicate -- which is why that guard stays.
+        """
+        source = self._source("hist", "#1753000000\na\n#1753000100\nb\n")
+        importer.run("bash", source)
+
+        self._rewrite(source, "#1753000000\na\n")
+        result = importer.run("bash", source)
+        self.assertEqual(result.imported, 0)
+        self.assertEqual(result.skipped, 1, "the anchor missed, so dedup carried it")
         self.assertEqual(len(cache.load_entries()), 2)
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -282,11 +334,76 @@ class TestImportRun(ImportTestCase):
         self.assertEqual(cache.load_entries()[0].cmd, "awk -F'\t' '{print $1}'")
 
 
+class TestFindingTheWatermarkAgain(unittest.TestCase):
+    """`_anchored` as a unit. #294 goes through `run` for the behaviour that
+    matters, and `run` reaches two of these branches -- the sweep reported
+    twelve survivors in here, which is what an under-tested unit looks like from
+    the outside.
+    """
+
+    @staticmethod
+    def rows(*commands: str) -> list[importer.Parsed]:
+        return [importer.Parsed(ts=100 + n, cmd=c, duration_ms=-1) for n, c in enumerate(commands)]
+
+    def test_no_mark_leaves_the_count_alone(self) -> None:
+        """A source imported before the anchor existed. Trusted once, and the
+        mark is written on the way out -- the protection starts next run."""
+        self.assertEqual(importer._anchored(2, None, self.rows("a", "b", "c")), 2)
+
+    def test_an_empty_mark_leaves_the_count_alone(self) -> None:
+        """What an import of an empty source writes. It anchors nothing, and
+        must not be searched for -- every record's command would fail to match
+        and the scan would walk the whole history to conclude nothing."""
+        self.assertEqual(importer._anchored(2, "", self.rows("a", "b", "c")), 2)
+
+    def test_a_mark_still_in_place_leaves_the_count_alone(self) -> None:
+        """The ordinary case, and the one that must not pay for a scan: the
+        file only grew, so the record below the mark is where it was."""
+        self.assertEqual(importer._anchored(2, "b", self.rows("a", "b", "c")), 2)
+
+    def test_a_trimmed_front_moves_the_count_down(self) -> None:
+        """Two records dropped from the front, so what was at index 1 is now at
+        index 0 and the count must follow it."""
+        self.assertEqual(importer._anchored(3, "c", self.rows("c", "d", "e")), 1)
+
+    def test_a_mark_that_is_gone_leaves_the_count_alone(self) -> None:
+        """Replaced rather than trimmed. There is no position to re-anchor to,
+        so this is the pre-#294 answer -- and the safe one, since resetting
+        would re-import an untimed history in full."""
+        self.assertEqual(importer._anchored(2, "b", self.rows("x", "y", "z")), 2)
+
+    def test_a_count_past_the_end_still_searches(self) -> None:
+        """The shrink case `run`'s own guard also catches, reached here when the
+        file lost records without gaining any. The scan is clamped to the list
+        rather than indexing past it."""
+        self.assertEqual(importer._anchored(9, "a", self.rows("a", "b")), 1)
+
+    def test_a_count_of_zero_searches_nothing(self) -> None:
+        """Nothing was imported, so there is no anchor to find and no work to
+        do -- and `parsed[already - 1]` would be `parsed[-1]`, the *last*
+        record, which is the wrong end of the file entirely."""
+        self.assertEqual(importer._anchored(0, "a", self.rows("a", "b")), 0)
+
+    def test_a_count_that_is_not_a_number_starts_from_nothing(self) -> None:
+        """The state file is hand-editable and #291 is about exactly that."""
+        self.assertEqual(importer._anchored("two", "b", self.rows("a", "b")), 0)
+
+    def test_a_mark_that_is_not_a_string_is_ignored(self) -> None:
+        self.assertEqual(importer._anchored(2, 17, self.rows("a", "b", "c")), 2)
+
+    def test_the_last_of_two_equal_commands_wins(self) -> None:
+        """A repeated command is ordinary in a shell history, so the scan runs
+        backwards from the old position: the nearest match below it is the one
+        a trim would have produced, and anchoring to the earlier copy would
+        re-import everything between them."""
+        self.assertEqual(importer._anchored(4, "ls", self.rows("ls", "cd", "ls", "vi")), 3)
+
+
 class TestAMalformedImportStateDoesNotStopTheImport(unittest.TestCase):
     """#291's other half. `_load_state` had the same bare `int(v)`, and it runs
     on the way into every `woswoar import`."""
 
-    def loaded(self, raw: object) -> dict[str, int]:
+    def loaded(self, raw: object) -> dict[str, int | str]:
         with mock.patch.object(store, "load_json", return_value=raw):
             return importer._load_state()
 

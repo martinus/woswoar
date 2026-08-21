@@ -930,16 +930,27 @@ class TestAMalformedStateFileDoesNotStopTheTool(unittest.TestCase):
         state = self.loaded({"exported": {"host/day": 42}})
         self.assertEqual(state.exported, {"host/day": 42})
 
-    def test_one_bad_value_discards_the_whole_map_rather_than_that_entry(self) -> None:
-        """The decision, pinned so it cannot drift by accident.
+    def test_one_bad_value_costs_that_entry_and_no_other(self) -> None:
+        """The decision, corrected. #291 discarded the whole map and argued that
+        was the careful answer; #285 pointed out it is the opposite.
 
-        Keeping the good entries reads as the gentler option and says less: the
-        bad host's watermark silently becomes 0, that log re-exports anyway, and
-        nothing tells anyone a value was dropped. A whole reset is the same
-        answer this function already gives for a malformed *shape*.
+        What a dropped watermark costs is a re-export, and what a re-export
+        costs is duplicate rows in the archive. Dropping one entry duplicates
+        one log. Discarding the map duplicates *every* log -- so the reset
+        multiplied precisely the thing that made it look safe.
+
+        `merged_at`, two lines below in the same expression, has always filtered
+        per value. This is that, and `merged`'s comment gives the reason:
+        repeating work beats dropping history.
         """
         state = self.loaded({"exported": {"good": 1, "bad": None}})
-        self.assertEqual(state.exported, {})
+        self.assertEqual(state.exported, {"good": 1})
+
+    def test_a_watermark_that_is_a_bare_string_of_digits_is_still_dropped(self) -> None:
+        """`isinstance(v, int)` rather than `int(v)` in a `try`, matching
+        `merged_at`. `"7"` converts and is still not what this file writes, so
+        taking it would be trusting a shape nothing here produces."""
+        self.assertEqual(self.loaded({"exported": {"a": "7"}}).exported, {})
 
 
 class TestTwoMachines(SyncTestCase):
