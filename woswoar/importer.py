@@ -338,11 +338,67 @@ def _dedup_key(ts: int, cmd: str) -> tuple[int, str]:
     return (ts, truncate(cmd))
 
 
+def _mark_key(source: str) -> str:
+    """Where a source's anchor lives, beside its count.
+
+    A second key rather than a richer value, so the file stays a flat
+    `str -> str | int` map: `_load_state` degrades a value it cannot read to
+    nothing (#291), and a nested shape would have to degrade per level.
+    """
+    return f"{source}\x00mark"
+
+
+def _anchored(counted: object, mark: object, parsed: list[Parsed]) -> int:
+    """``already``, corrected if the source was rewritten under us.
+
+    The count is a position, and a position is only meaningful while the records
+    below it stay put. #289 made the *parse* order stable; this is about the
+    *file*, which zsh rewrites wholesale when trimming to ``SAVEHIST`` -- and
+    again under ``HIST_EXPIRE_DUPS_FIRST`` -- dropping records from the front.
+
+    `run`'s only staleness guard fires when the file gets *shorter*. A trim of k
+    plus an append of more than k leaves it longer, so nothing fired and the
+    slice began k records too late. Those k commands were skipped on that run and
+    on every run after, with a successful import reported each time.
+
+    **Re-anchored rather than reset**, and the difference matters. Resetting to 0
+    looks safer and is not: an untimed history's timestamps are synthesised from
+    the file's length, so they shift when it grows, and the `(ts, cmd)` guard
+    cannot match what is already stored. Re-reading such a source appends every
+    line again. That is why the count exists at all -- see
+    `test_untimed_rerun_does_not_duplicate` -- so the fix has to *find* the old
+    position, not abandon it.
+
+    Two honest limits. A source imported before the anchor existed has none, and
+    is trusted once: the mark is written on the way out, so the protection starts
+    from the next run. And a trim that happens to leave the same command text at
+    the same index is invisible here -- the anchor is the command, because that
+    is the only part of a record that survives a re-synthesis of its timestamp.
+    """
+    # Both come out of a `str | int` map, so neither is trusted to be what it
+    # should be: the file is hand-editable and #291 is about exactly that.
+    already = counted if isinstance(counted, int) else 0
+    if not isinstance(mark, str) or not mark:
+        return already
+    if 0 < already <= len(parsed) and parsed[already - 1].cmd == mark:
+        return already
+    # Backwards: the anchor is near the end of what was imported, and a trim only
+    # ever moves it *down*. Scanning from the old position outwards finds it in a
+    # few steps for the ordinary case instead of walking the whole history.
+    for at in range(min(already, len(parsed)) - 1, -1, -1):
+        if parsed[at].cmd == mark:
+            return at + 1
+    # Not found at all: the source was replaced rather than trimmed. Keeping the
+    # count is the same answer as before this function existed, and the safe one
+    # -- see the untimed argument above.
+    return already
+
+
 def _state_path() -> Path:
     return store.config_dir() / "imported.json"
 
 
-def _load_state() -> dict[str, int]:
+def _load_state() -> dict[str, int | str]:
     """The per-source watermarks, or nothing if the file cannot be read as them.
 
     Degrading rather than raising, as `sync.State.load` does and for the reason
@@ -353,12 +409,15 @@ def _load_state() -> dict[str, int]:
     and none is duplicated. See #291.
     """
     try:
-        return {k: int(v) for k, v in store.load_json(_state_path()).items()}
+        return {
+            k: (v if isinstance(v, str) else int(v))
+            for k, v in store.load_json(_state_path()).items()
+        }
     except (TypeError, ValueError, AttributeError):
         return {}
 
 
-def _save_state(state: dict[str, int]) -> None:
+def _save_state(state: dict[str, int | str]) -> None:
     # Atomic: a half-written watermark file would make the next import either
     # duplicate everything or skip entries silently.
     store.save_json(_state_path(), state)
@@ -512,7 +571,7 @@ def run(
 
     state = _load_state()
     key = str(source)
-    already = state.get(key, 0)
+    already = _anchored(state.get(key, 0), state.get(_mark_key(key)), parsed)
     if already > len(parsed):
         # Source was rotated or truncated; the count means nothing now.
         already = 0
@@ -575,6 +634,9 @@ def run(
     if not dry_run:
         store.append_entries(machine_id, entries)
         state[key] = len(parsed)
+        # The command at the far end of what was imported, so the next run can
+        # tell whether the count still points where it did. See `_anchored`.
+        state[_mark_key(key)] = parsed[-1].cmd if parsed else ""
         _save_state(state)
 
     return Result(
