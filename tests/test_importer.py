@@ -250,12 +250,64 @@ class TestImportRun(ImportTestCase):
         source = self._source("hist", "#1753000000\na\n#1753000100\nb\n")
         importer.run("bash", source)
 
-        # Log rotation: the count is now meaningless, so the (ts, cmd) guard has
-        # to carry it.
+        # Log rotation. Since #294 the anchor resolves this before the
+        # `(ts, cmd)` guard has to: the last imported command is found at its new
+        # position and the count is corrected to it, so `b` is not re-examined
+        # and `skipped` is 0 rather than 1. The outcome is what it always was --
+        # nothing imported, nothing duplicated -- and the guard below still
+        # covers the case the anchor cannot find.
         self._rewrite(source, "#1753000100\nb\n")
         result = importer.run("bash", source)
         self.assertEqual(result.imported, 0)
-        self.assertEqual(result.skipped, 1)
+        self.assertEqual(len(cache.load_entries()), 2)
+
+    def test_a_savehist_trim_plus_a_larger_append_loses_nothing(self) -> None:
+        """#294. The file grew overall, so the shrink guard never fired.
+
+        zsh rewrites `.zsh_history` wholesale when trimming to `SAVEHIST`, and
+        again under `HIST_EXPIRE_DUPS_FIRST`, dropping records from the *front*.
+        `run`'s only staleness guard is `already > len(parsed)`, which fires when
+        the file gets shorter -- so a trim of two plus an append of three leaves
+        it longer, nothing fires, and the slice begins two records too late.
+
+        The lost commands are not merely re-read later: they are below the mark
+        on this run and on every run after, and each import reports success.
+
+        The append is deliberately larger than the trim. A fixture where the
+        file shrinks passes against the old code, because that is the one case
+        the existing guard already handled.
+        """
+        source = self._source("hist", ": 100:0;one\n: 200:0;two\n: 300:0;three\n")
+        importer.run("zsh", source)
+        self.assertEqual(self._commands(), {"one", "two", "three"})
+
+        # Trimmed to the last one, then three more arrive: 4 records where there
+        # were 3, so `already > len(parsed)` is false and the count stands.
+        self._rewrite(
+            source,
+            ": 300:0;three\n: 400:0;four\n: 500:0;five\n: 600:0;six\n",
+        )
+        importer.run("zsh", source)
+        self.assertEqual(
+            self._commands(),
+            {"one", "two", "three", "four", "five", "six"},
+            "records below the stale mark were skipped",
+        )
+
+    def test_a_wholly_replaced_source_still_falls_to_the_dedup_guard(self) -> None:
+        """The path the anchor cannot rescue, kept covered.
+
+        When the last imported command is nowhere in the new file, there is no
+        position to re-anchor to. The count then behaves as it always did, and
+        `(ts, cmd)` is what stops a duplicate -- which is why that guard stays.
+        """
+        source = self._source("hist", "#1753000000\na\n#1753000100\nb\n")
+        importer.run("bash", source)
+
+        self._rewrite(source, "#1753000000\na\n")
+        result = importer.run("bash", source)
+        self.assertEqual(result.imported, 0)
+        self.assertEqual(result.skipped, 1, "the anchor missed, so dedup carried it")
         self.assertEqual(len(cache.load_entries()), 2)
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -286,7 +338,7 @@ class TestAMalformedImportStateDoesNotStopTheImport(unittest.TestCase):
     """#291's other half. `_load_state` had the same bare `int(v)`, and it runs
     on the way into every `woswoar import`."""
 
-    def loaded(self, raw: object) -> dict[str, int]:
+    def loaded(self, raw: object) -> dict[str, int | str]:
         with mock.patch.object(store, "load_json", return_value=raw):
             return importer._load_state()
 
