@@ -386,9 +386,14 @@ def loads(blob: bytes) -> Cache:
     not -- which is Ctrl-R, the reason this file exists.
 
     The numeric fields are left as strings too. They are validated on the way
-    *out*, by whichever accessor converts them; a field that is not a number
-    therefore surfaces as a rebuild rather than a traceback, which is what every
-    other kind of damage to this file already does.
+    *out*, by whichever accessor converts them -- so a field that is not a
+    number is not caught here, and the rebuild that answers it lives in
+    `load_entries` rather than in `load`. This docstring claimed the rebuild
+    outright for a while and there was none: the `int()` happens after
+    `load_columns` has returned, so `stats` and `doctor` ended in a traceback
+    (#314). `stamps_and_commands` still converts nothing, so Ctrl-R displays
+    such a field rather than crashing on it, and keeps doing so until some
+    command that wants whole entries triggers the rebuild.
     """
     chunks = blob.decode("utf-8").split(_FILE)
     if chunks[0] != _MAGIC:
@@ -499,4 +504,28 @@ def load_columns() -> Cache:
 
 def load_entries() -> list[Entry]:
     """Load, incrementally update, persist, and build every `Entry`."""
-    return load_columns().entries()
+    loaded = load_columns()
+    try:
+        return loaded.entries()
+    except ValueError:
+        # Where a damaged numeric field finally surfaces. `loads` leaves those
+        # as strings on purpose -- converting them costs 25 ms of the 39 ms it
+        # takes to read a real history's cache -- so `entries` is the first
+        # thing to look, and that is outside the `try` in `load` which turns
+        # every other kind of damage into a rebuild. Without this the answer
+        # was a traceback out of `stats` and `doctor` (#314).
+        #
+        # Rebuilt rather than repaired, for the reason `dumps` already gives
+        # about skipping a bad row: a warm cache and a cold one must not show
+        # different history.
+        #
+        # Built here rather than by unlinking and calling `load_columns` again:
+        # `save` replaces the file atomically, so the damaged one is gone
+        # either way, and this cannot loop. `refresh` fills these fields
+        # through `parse_line`, which has no way to produce a non-numeric
+        # timestamp, so a second failure would be a real defect and deserves
+        # the traceback this one no longer gets.
+        rebuilt = Cache()
+        refresh(rebuilt)
+        save(rebuilt)
+        return rebuilt.entries()
