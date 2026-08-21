@@ -35,22 +35,7 @@ from woswoar import credentials
 settings.register_profile("woswoar-credentials", max_examples=400, deadline=None)
 settings.load_profile("woswoar-credentials")
 
-#: The one shape whose match does not survive a metacharacter, and the reason
-#: is #312: the option rule's boundary is ``(?:[=\s]|$)``, so a *bare* flag
-#: ending a word before ``;`` or ``|`` falls out of the rule.
-#:
-#: Pinned rather than quietly excluded, and pinned as a live assertion below
-#: rather than as a comment. `tests/credential_shapes.py` already argues why:
-#: an unbacked claim in a security document is worse than a known gap, because
-#: a later change falsifies it with CI green and nobody looks. The same holds
-#: for a property with an unexplained hole in it.
-ESCAPES_A_TRAILING_METACHARACTER = "gh auth login --with-token"
-
-#: Everything the embedding properties are allowed to assert about. When #312
-#: is fixed this list becomes `SECRET_SHAPES` again and the pin below goes red.
-EMBEDDABLE = [s for s in SECRET_SHAPES if s != ESCAPES_A_TRAILING_METACHARACTER]
-
-SECRET = st.sampled_from(EMBEDDABLE)
+SECRET = st.sampled_from(SECRET_SHAPES)
 INNOCENT = st.sampled_from(INNOCENT_SHAPES)
 
 #: What can stand before a command on one shell line. Every one of these ends in
@@ -119,34 +104,29 @@ class TestASecretStaysRecognised(unittest.TestCase):
         self.assertTrue(credentials.looks_like_credential(f"{innocent}; {secret}"))
         self.assertTrue(credentials.looks_like_credential(f"{secret}; {innocent}"))
 
+    @given(SECRET, st.sampled_from([";", "|tee log", "&", "(", ")", "<f", ">out", "&&x"]))
+    def test_a_bare_flag_before_a_shell_metacharacter_is_still_caught(
+        self, secret: str, tail: str
+    ) -> None:
+        """#312. The rule's boundary once admitted only `=`, whitespace or end
+        of string, so a bare credential flag was recognised when it ended the
+        line and not when a `;` followed it -- and a one-liner is one history
+        entry.
+
+        Written as its own property rather than left to the embedding one
+        above, because that one separates its contexts with a space: a space
+        satisfies the old boundary too, so it could never have found this.
+        """
+        self.assertTrue(
+            credentials.looks_like_credential(secret + tail),
+            f"a metacharacter hid a known shape: {secret + tail!r}",
+        )
+
     @given(SECRET, st.text(alphabet=" \t", max_size=4))
     def test_leading_whitespace_does_not_hide_it(self, secret: str, pad: str) -> None:
         """`HIST_IGNORE_SPACE` means a space-prefixed command is a shape users
         type on purpose, so the filter meets it often."""
         self.assertTrue(credentials.looks_like_credential(pad + secret))
-
-
-class TestTheKnownGap(unittest.TestCase):
-    """#312, held open so that closing it is noticed.
-
-    This asserts the bug, which is the only way a pin is worth having: fix the
-    boundary and this test fails, and whoever fixed it deletes this class and
-    puts the shape back in `EMBEDDABLE`. A comment saying "known gap" would
-    still be sitting here in a year.
-    """
-
-    def test_the_shape_is_dropped_when_it_ends_the_line(self) -> None:
-        """Guard the guard. If this ever stops being a recognised shape, the
-        pin below would pass for the wrong reason -- the rule not matching it
-        at all rather than the boundary being narrow."""
-        self.assertTrue(credentials.looks_like_credential(ESCAPES_A_TRAILING_METACHARACTER))
-
-    @given(st.sampled_from([";", "|tee log", "&", ")", '"', "'", ">out", "&&x", "\\"]))
-    def test_and_is_not_when_a_metacharacter_follows(self, tail: str) -> None:
-        self.assertFalse(
-            credentials.looks_like_credential(ESCAPES_A_TRAILING_METACHARACTER + tail),
-            "#312 looks fixed -- delete this class and restore the shape to EMBEDDABLE",
-        )
 
 
 class TestAnOrdinaryCommandStaysOrdinary(unittest.TestCase):
