@@ -899,6 +899,49 @@ class TestRepublishingAfterAKeyRotation(unittest.TestCase):
             self.assertEqual(sync.State.load().published_digest, "")
 
 
+class TestAMalformedStateFileDoesNotStopTheTool(unittest.TestCase):
+    """#291. `State.load` runs on the way into every command, so anything it
+    raises is not a bad sync -- it is a machine with no working `woswoar` until
+    somebody finds the file and deletes it.
+
+    Rule 8 is explicit that `state.json` is progress rather than history and
+    that losing it "costs a re-merge and a re-export, never a command". A value
+    that cannot be read has to cost the same, and no more.
+    """
+
+    def loaded(self, raw: dict[str, object]) -> sync.State:
+        with mock.patch.object(store, "load_json", return_value=raw):
+            return sync.State.load()
+
+    def test_a_null_watermark_does_not_raise(self) -> None:
+        """`int(None)` is a `TypeError`, and every field beside `exported` was
+        already guarded per value -- the comment explaining that pattern sits
+        directly below the line that was missing it."""
+        self.assertEqual(self.loaded({"exported": {"host/day": None}}).exported, {})
+
+    def test_a_watermark_that_is_not_a_number_does_not_raise(self) -> None:
+        """`ValueError` rather than `TypeError`, which is why the guard catches
+        both: a hand-edited file is far likelier to hold a word than a null."""
+        self.assertEqual(self.loaded({"exported": {"host/day": "soon"}}).exported, {})
+
+    def test_a_good_file_is_still_read(self) -> None:
+        """Without this the guard could swallow everything and every test above
+        would still pass -- on a `load` that had quietly stopped working."""
+        state = self.loaded({"exported": {"host/day": 42}})
+        self.assertEqual(state.exported, {"host/day": 42})
+
+    def test_one_bad_value_discards_the_whole_map_rather_than_that_entry(self) -> None:
+        """The decision, pinned so it cannot drift by accident.
+
+        Keeping the good entries reads as the gentler option and says less: the
+        bad host's watermark silently becomes 0, that log re-exports anyway, and
+        nothing tells anyone a value was dropped. A whole reset is the same
+        answer this function already gives for a malformed *shape*.
+        """
+        state = self.loaded({"exported": {"good": 1, "bad": None}})
+        self.assertEqual(state.exported, {})
+
+
 class TestTwoMachines(SyncTestCase):
     def test_history_reaches_the_other_machine(self) -> None:
         alpha = self.machine("alpha")

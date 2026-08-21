@@ -343,7 +343,19 @@ def _state_path() -> Path:
 
 
 def _load_state() -> dict[str, int]:
-    return {k: int(v) for k, v in store.load_json(_state_path()).items()}
+    """The per-source watermarks, or nothing if the file cannot be read as them.
+
+    Degrading rather than raising, as `sync.State.load` does and for the reason
+    rule 8 gives: this runs on the way into every import, so one unconvertible
+    value in an otherwise valid JSON file would make `woswoar import` traceback
+    until somebody deleted the file. Starting from nothing costs a re-read of
+    each source, and `(ts, cmd)` deduplication absorbs it -- no command is lost
+    and none is duplicated. See #291.
+    """
+    try:
+        return {k: int(v) for k, v in store.load_json(_state_path()).items()}
+    except (TypeError, ValueError, AttributeError):
+        return {}
 
 
 def _save_state(state: dict[str, int]) -> None:
