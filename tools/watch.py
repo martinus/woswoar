@@ -258,10 +258,15 @@ def main(argv: list[str] | None = None) -> int:
         "--done",
         type=Path,
         required=True,
-        # A report left by an earlier run reads as an instant finish, because
-        # this asks whether the file is there and not who wrote it. Cheaper to
-        # say so than to date-stamp it and be wrong about clock skew.
-        help="the file it writes when it finishes; remove a previous run's first",
+        # A file left by an earlier run reads as an instant finish, because this
+        # asks whether it is there and not who wrote it. Cheaper to say so than
+        # to date-stamp it and be wrong about clock skew -- and `tools.mutate`
+        # now clears its own marker before it starts, for that reason.
+        #
+        # It must be a file that means *finished*. A report written
+        # incrementally does not: pointed at one, this announced a finish nine
+        # minutes early. `tools.mutate --json r.json` writes `r.json.done` last.
+        help="the file it writes when it finishes; not one it appends to as it goes",
     )
     parser.add_argument(
         "--match", default=".", help="count lines of --log matching this regex (default: all)"
