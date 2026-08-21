@@ -115,6 +115,11 @@ jobs:
       # parallel runner can. No --no-skips here: strace is not installed in this
       # job, so the fork-scaling tests legitimately skip. The `hook` job is
       # where they are made fatal.
+      # `[test]` rather than `[dev]`: this job runs the suite and nothing else,
+      # and the property tests are the only part of it with a dependency. The
+      # `--only` jobs do not need it -- their filter runs before discovery
+      # imports the module.
+      - run: pip install -e .[test]
       - run: python -m tools.run_tests
       # The ranking tests are the one part of the suite whose subject is fzf's
       # behaviour rather than woswoar's, so they cannot be asserted against a
@@ -394,6 +399,11 @@ jobs:
       # 174 s to 96 s of CPU, on a runner with three cores to absorb it.
       # Nothing is lost; every exclusion here reappears under a strictly
       # stronger flag, `test_sync`'s on another machine.
+      # `[test]` rather than `[dev]`: this job runs the suite and nothing else,
+      # and the property tests are the only part of it with a dependency. The
+      # `--only` jobs do not need it -- their filter runs before discovery
+      # imports the module.
+      - run: pip install -e .[test]
       - run: |
           python -m tools.run_tests \
             --exclude tests.test_shell_hook_zsh \
