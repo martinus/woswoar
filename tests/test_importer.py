@@ -8,8 +8,9 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
-from woswoar import cache, importer
+from woswoar import cache, importer, store
 from woswoar.__main__ import main
 
 from .support import WoswoarTestCase
@@ -279,6 +280,28 @@ class TestImportRun(ImportTestCase):
         source = self._source("hist", "#1753000000\nawk -F'\t' '{print $1}'\n")
         importer.run("bash", source)
         self.assertEqual(cache.load_entries()[0].cmd, "awk -F'\t' '{print $1}'")
+
+
+class TestAMalformedImportStateDoesNotStopTheImport(unittest.TestCase):
+    """#291's other half. `_load_state` had the same bare `int(v)`, and it runs
+    on the way into every `woswoar import`."""
+
+    def loaded(self, raw: object) -> dict[str, int]:
+        with mock.patch.object(store, "load_json", return_value=raw):
+            return importer._load_state()
+
+    def test_a_null_watermark_starts_from_nothing(self) -> None:
+        self.assertEqual(self.loaded({"/some/hist": None}), {})
+
+    def test_a_good_file_is_still_read(self) -> None:
+        """The half that keeps the guard honest: swallowing everything would
+        pass the test above and re-import the world on every run."""
+        self.assertEqual(self.loaded({"/some/hist": 7}), {"/some/hist": 7})
+
+    def test_a_file_that_is_not_a_mapping_starts_from_nothing(self) -> None:
+        """`.items()` on a list is an `AttributeError`, which is a third
+        exception type and the reason the guard names it."""
+        self.assertEqual(self.loaded([1, 2, 3]), {})
 
 
 class TestImportDropsCredentials(ImportTestCase):
