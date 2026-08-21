@@ -555,6 +555,40 @@ class TestAFinderVisitDoesNotDisturbTheLogs(WoswoarTestCase):
         self.assertEqual(store.readable_by_others(), [])
         self.assertNotIn("[FAIL] private", support.run_cli("doctor").out)
 
+    def test_a_file_that_vanishes_mid_walk_is_skipped(self) -> None:
+        """#293. `_private_paths` walks, then this stats, and `write_atomic`
+        makes the gap between them routine: it creates a temp file and
+        `os.replace`s it, and sync runs on a timer once a minute.
+
+        `doctor` racing that used to exit with a `FileNotFoundError` traceback
+        instead of a report -- a crash in the command you run *to check your
+        setup is sound*, which reads as "my install is broken" rather than "try
+        again".
+
+        The vanished path is injected rather than raced for: a real race would
+        be a flaky test that passes for the wrong reason most of the time.
+        """
+        ghost = store.host_dir(MACHINE_ID) / "gone-between-the-walk-and-the-stat.tsv"
+        real = list(store._private_paths())
+        with mock.patch.object(store, "_private_paths", return_value=[*real, (ghost, False)]):
+            self.assertEqual(store.readable_by_others(), [])
+
+    def test_a_path_it_cannot_stat_at_all_is_not_called_safe(self) -> None:
+        """The half that keeps the guard narrow.
+
+        Widening it to `OSError` is the reflex, and it is wrong here: this
+        answers "can another account read my history?", so "could not look" and
+        "safe" are different answers. `harden`'s blanket suppress is right for
+        best-effort tightening and would be a silent pass here.
+        """
+        real = list(store._private_paths())
+        with (
+            mock.patch.object(store, "_private_paths", return_value=real[:1]),
+            mock.patch.object(Path, "stat", side_effect=PermissionError("no")),
+            self.assertRaises(PermissionError),
+        ):
+            store.readable_by_others()
+
     def test_a_real_log_left_loose_is_still_reported(self) -> None:
         """Otherwise the test above passes against a `doctor` that stopped
         looking at `logs/` at all."""
