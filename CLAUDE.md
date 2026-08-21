@@ -267,7 +267,7 @@ opens its PR and waits for a person regardless of what CI says.
   python -m tools.reached r.json c.json     # which survivors are missing tests
   python -m tools.compare --base main --show .bashrc install doctor status
   python -m tools.bench --importtime woswoar.__main__ --base main
-  python -m tools.watch $PID --log sweep.log --done r.json --match 'caught|SURVIVED'
+  python -m tools.watch $PID --log sweep.log --done r.json.done --match 'caught|SURVIVED'
   ```
 
   The last one is not about the code, it is about *reporting on* a job that
@@ -278,6 +278,12 @@ opens its PR and waits for a person regardless of what CI says.
   rather than as more silence, and so does a *stall*, which is the case that
   actually bit: a run alive and wedged looks exactly like one that is slow, and
   waiting longer is what both of them look like.
+
+  Point `--done` at `<json>.done`, never at the `--json` report itself. Under
+  `--batch` and `--all` the report is written after every file, so it exists
+  long before the run ends — a watcher pointed at it announced a finish nine
+  minutes early, with eleven files still to sweep. The `.done` file is written
+  last, after the confirmation pass, and means only that.
 
   **The generated sweep goes last.** Implement, write the hand table, preflight,
   run `/simplify` *and apply it*, and only then `--base main`. The table is

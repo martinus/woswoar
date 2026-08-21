@@ -2263,6 +2263,65 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         )
         self.assertEqual({row["path"] for row in written["results"]}, {"woswoar/mod.py"})
 
+    def test_a_finished_run_leaves_a_marker(self) -> None:
+        """#275. `--json` says a batch landed; this says the run is over.
+
+        `tools/watch.py --done` needs a file whose only meaning is "finished",
+        because under `--batch` the report is written after every file and a
+        watcher pointed at it announced a finish nine minutes early.
+        """
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report))
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assertTrue(mutate._marker(report).exists(), finished.stdout)
+
+    def test_the_marker_is_written_even_when_the_news_is_bad(self) -> None:
+        """It means *over*, not *clean*. A watcher that kept waiting on a run
+        that found survivors would be the same silence, from a third side."""
+        self.repo(guarded=False)
+        report = self.root / "rows.json"
+        finished = cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report))
+        self.assertEqual(finished.returncode, 1)
+        self.assertTrue(mutate._marker(report).exists())
+
+    def test_listing_a_table_does_not_retract_an_earlier_marker(self) -> None:
+        """`--list` runs nothing, so it has no finish to report and no earlier
+        one to withdraw. The clear sits after that return for this reason."""
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        mutate._marker(report).write_text("", encoding="utf-8")
+        cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report), "--list")
+        self.assertTrue(mutate._marker(report).exists())
+
+    def test_a_stale_marker_is_gone_while_the_run_is_still_going(self) -> None:
+        """The half that makes the marker worth anything.
+
+        A resumed sweep points `--json` at a part-written report from the run
+        that was interrupted -- and at the marker that run never removed. Written
+        only at the end, a watcher would read the *previous* run's marker and
+        call this one finished before it started.
+
+        Observed from inside the run rather than after it, because by the time
+        `main` returns the marker is back and the two cases look identical.
+        """
+        self.repo(guarded=True)
+        report = self.root / "rows.json"
+        mutate._marker(report).write_text("", encoding="utf-8")
+        seen: list[bool] = []
+
+        def watching(rows: Sequence[Mutation], args: Any, **kw: Any) -> Report:
+            seen.append(mutate._marker(report).exists())
+            return Report([])
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "_run_generated", watching),
+        ):
+            mutate.main(["--base", "HEAD", "--operator", "branch", "--json", str(report)])
+        self.assertEqual(seen, [False], "the previous run's marker outlived its report")
+        self.assertTrue(mutate._marker(report).exists(), "and the new one was never written")
+
     def test_no_confirm_says_what_it_did_not_do(self) -> None:
         """A survivor that was never re-run against the whole suite may simply
         have been run against tests that cannot see it, and that is the
@@ -2307,6 +2366,16 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
                 finished = cli(self.root, *args)
                 self.assertEqual(finished.returncode, 2, finished.stderr)
                 self.assertIn(said, finished.stderr)
+
+
+class TestTheCompletionMarker(unittest.TestCase):
+    def test_it_sits_beside_the_report(self) -> None:
+        """A sibling name rather than a suffix swap, so a reader sorting a
+        directory finds the two together and `.json` keeps its meaning."""
+        self.assertEqual(mutate._marker(Path("/tmp/r.json")), Path("/tmp/r.json.done"))
+
+    def test_a_report_without_a_suffix_still_gets_one(self) -> None:
+        self.assertEqual(mutate._marker(Path("/tmp/rows")), Path("/tmp/rows.done"))
 
 
 class TestTheScriptEntryPoint(MutateTestCase):
