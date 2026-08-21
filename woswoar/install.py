@@ -195,7 +195,21 @@ def write_block(rcfile: Path, target: Path) -> str:
     block = f'{BEGIN}\nsource "{portable_hook_path(target)}"\n{_END}\n'
     existing = rcfile.read_text(encoding="utf-8") if rcfile.is_file() else ""
     if _BLOCK.search(existing):
-        updated = _BLOCK.sub(block, existing)
+        # A *function* replacement, because the second argument to `sub` is a
+        # template and `block` holds a filesystem path the user controls through
+        # `WOSWOAR_DIR` or `XDG_DATA_HOME`. A backslash in it is read as an
+        # escape: `\i` raises `re.error` and `\1` substitutes a group from the
+        # pattern, writing a `source` line that points somewhere else and
+        # reporting success. Only the *second* install reaches this, since the
+        # first appends through the branch below -- so it worked once and then
+        # broke, or worked once and then lied.
+        #
+        # A lambda rather than `block.replace("\\", "\\\\")`: escaping is
+        # correct and is one refactor away from being lost, while a callable
+        # cannot be template-parsed at all. `re.escape` is the reflex and is the
+        # wrong tool -- it escapes for a *pattern*, and would put literal
+        # backslashes into the rc file.
+        updated = _BLOCK.sub(lambda _: block, existing)
         action = "updated"
     else:
         separator = "" if not existing or existing.endswith("\n") else "\n"
