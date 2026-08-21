@@ -388,10 +388,22 @@ def _anchored(counted: object, mark: object, parsed: list[Parsed]) -> int:
     for at in range(min(already, len(parsed)) - 1, -1, -1):
         if parsed[at].cmd == mark:
             return at + 1
-    # Not found at all: the source was replaced rather than trimmed. Keeping the
-    # count is the same answer as before this function existed, and the safe one
-    # -- see the untimed argument above.
-    return already
+    # Not found at all: the file was rewritten past the point this mark named.
+    # Start over, and let the `(ts, cmd)` guard absorb the re-read.
+    #
+    # #300 kept the count here and called it the safe answer. It is not, and a
+    # property test found the four steps that show it: import one command,
+    # append a second, trim the first away, import again -- the anchor is gone,
+    # the count still says one, and the second command is below it for ever.
+    # "Same as before this function existed" was true and beside the point: this
+    # function exists because that answer loses records.
+    #
+    # The untimed argument that reasoned the other way is real but smaller.
+    # Re-reading a header-less history can duplicate rows, because its stamps
+    # are synthesised from the file's length and shift as it grows. Rule 8 ranks
+    # these: `logs/` is the primary copy, losing a command is unrecoverable, and
+    # a duplicate row is ugly and can be forgotten. Losing is worse.
+    return 0
 
 
 def _state_path() -> Path:

@@ -366,11 +366,21 @@ class TestFindingTheWatermarkAgain(unittest.TestCase):
         index 0 and the count must follow it."""
         self.assertEqual(importer._anchored(3, "c", self.rows("c", "d", "e")), 1)
 
-    def test_a_mark_that_is_gone_leaves_the_count_alone(self) -> None:
-        """Replaced rather than trimmed. There is no position to re-anchor to,
-        so this is the pre-#294 answer -- and the safe one, since resetting
-        would re-import an untimed history in full."""
-        self.assertEqual(importer._anchored(2, "b", self.rows("x", "y", "z")), 2)
+    def test_a_mark_that_is_gone_starts_over(self) -> None:
+        """The file was rewritten past the point the mark named, so the count
+        is a position into something that no longer exists.
+
+        #300 kept the count here and this test pinned that. Both were wrong, and
+        a property test found the four steps that show it: import one command,
+        append a second, trim the first away, import again -- the anchor is gone,
+        the count still says one, and the second command sits below it for ever.
+
+        Starting over re-reads, and `(ts, cmd)` absorbs it. That can duplicate
+        rows in a header-less history, whose stamps shift with the file's
+        length -- and rule 8 ranks the two: losing a command from `logs/` is
+        unrecoverable, a duplicate row can be forgotten.
+        """
+        self.assertEqual(importer._anchored(2, "b", self.rows("x", "y", "z")), 0)
 
     def test_a_count_past_the_end_still_searches(self) -> None:
         """The shrink case `run`'s own guard also catches, reached here when the
