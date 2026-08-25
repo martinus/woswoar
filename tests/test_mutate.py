@@ -1305,6 +1305,40 @@ class TestResumingASweep(unittest.TestCase):
             self.assertEqual(mutate._recorded(where), [])
 
 
+def pin_the_machine(case: unittest.TestCase) -> None:
+    """Make the budget arithmetic below depend only on what each test patches.
+
+    Two ambient facts otherwise decide it, and both are legitimate settings
+    rather than accidents:
+
+    - **who owns the machine.** On a CI runner `dedicated()` answers "this
+      run", and every `// 2` below is then asserting a rule that did not apply.
+    - **`WOSWOAR_MUTATE_TOTAL`.** `_budget` reads it *before* `_visible_memory`,
+      so an operator who exported it -- or a sweep launched with it, which is
+      exactly what the variable is for -- makes these tests read the ambient
+      number instead of the one they patched in.
+
+    The second was measured the expensive way: a 394-mutant sweep launched with
+    `WOSWOAR_MUTATE_TOTAL` set went red on its baseline at
+    `test_a_small_machine_still_gets_a_lane` (`AssertionError: 14 != 1`), which
+    voided all 329 rows it had answered. The variable reaches every probe
+    through the environment `_run` hands down, so the tests guarding the budget
+    code were exactly the tests a legitimate use of that code broke.
+
+    `TestWhoOwnsTheMachine` owns both of these questions and clears the whole
+    environment itself, so it does not use this.
+    """
+    pinned = mock.patch.object(mutate, "dedicated", lambda: "")
+    pinned.start()
+    case.addCleanup(pinned.stop)
+    # `clear=False` with the one name removed: the probe needs the rest of the
+    # environment (PATH, HOME, PYTHONPATH) to run at all.
+    without = mock.patch.dict(os.environ, {}, clear=False)
+    without.start()
+    case.addCleanup(without.stop)
+    os.environ.pop(mutate._TOTAL, None)
+
+
 class TestHowManyLanesFitInMemory(unittest.TestCase):
     """The bound that stops the per-row cap from being multiplied by the lanes.
 
@@ -1315,14 +1349,7 @@ class TestHowManyLanesFitInMemory(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        # `_budget` now asks who owns the machine, and on a CI runner the
-        # honest answer is "this run" -- which would make every `// 2` below
-        # assert the wrong rule. These tests are about the shared-machine
-        # arithmetic, so ownership is pinned to "shared";
-        # `TestWhoOwnsTheMachine` owns the other answer.
-        pinned = mock.patch.object(mutate, "dedicated", lambda: "")
-        pinned.start()
-        self.addCleanup(pinned.stop)
+        pin_the_machine(self)
 
     def test_a_small_machine_still_gets_a_lane(self) -> None:
         """`max(1, ...)` is load-bearing: `ThreadPoolExecutor(max_workers=0)`
@@ -1384,11 +1411,7 @@ class TestTheShareOneLaneGets(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        # Pinned to the shared-machine rule for the reason
-        # `TestHowManyLanesFitInMemory.setUp` gives.
-        pinned = mock.patch.object(mutate, "dedicated", lambda: "")
-        pinned.start()
-        self.addCleanup(pinned.stop)
+        pin_the_machine(self)
 
     def share(self, visible: int, wanted: int = 16, memory: int = MEMORY) -> mutate.Share:
         with mock.patch.object(mutate, "_visible_memory", return_value=visible):
