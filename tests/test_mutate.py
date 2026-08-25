@@ -3367,6 +3367,178 @@ class TestTheBaselineShards(unittest.TestCase):
         self.assertEqual([mutate.WHOLE_SUITE, "tests.test_sync"], mutate._shards(rows))
 
 
+class TestWhatLandsWhileTheRunIsStillGoing(unittest.TestCase):
+    """`landed` is how `sweep` writes answers out as they arrive, and the one
+    thing it must never hand over is a row from a red-baseline run.
+
+    Driven with a real `run` rather than a stub, which is the gap the sweep
+    found: every other test of this fires `sweep` with `mutate.run` replaced,
+    so the callback itself -- the whole mechanism -- never executed. A resume
+    trusts what reached `--json`, so "nothing void was handed over" is the
+    claim, and a stub cannot make it.
+    """
+
+    def landings(self, table: list[Mutation], red: bool) -> list[str]:
+        """Labels handed to `landed`, from a real run of `table`.
+
+        The baseline is made red by failing the *shard*, not by breaking the
+        tree: `_borrow` is what runs a baseline shard, and a `Verdict` from it
+        that is not `survived` is exactly what a red untouched suite looks
+        like one layer up. That keeps the fixture to one seam and leaves the
+        code under test -- `run`'s collection order and its `not red` guard --
+        real.
+        """
+        seen: list[str] = []
+        real = mutate._borrow
+
+        def borrow(*args: Any, **kwargs: Any) -> mutate.Verdict:
+            if not red:
+                return real(*args, **kwargs)
+            return mutate.Verdict("caught", "tests.test_entry.T.test_x", why="a traceback")
+
+        with (
+            mock.patch.object(mutate, "_borrow", borrow),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            mutate.run(
+                table,
+                baseline=True,
+                workers=2,
+                summarise=False,
+                landed=lambda result: seen.append(result.mutation.label),
+            )
+        return seen
+
+    def test_every_row_is_handed_over_as_it_lands(self) -> None:
+        table = [CLAMP_GUARD, CAP_NUDGE]
+        self.assertEqual([row.label for row in table], self.landings(table, red=False))
+
+    def test_a_red_baseline_hands_over_nothing(self) -> None:
+        """The headline of this branch. `_recorded` drops the red flag on read
+        and `sweep` skips a recorded file by name, so a void row that reaches
+        `--json` comes back on the next run as a final answer."""
+        self.assertEqual([], self.landings([CLAMP_GUARD, CAP_NUDGE], red=True))
+
+
+class TestASweepWritesEachFileOutAsItFinishes(unittest.TestCase):
+    """`sweep`'s bookkeeping around a real run: count a file down, say so, and
+    persist what is complete.
+
+    Real again rather than stubbed, for the reason its neighbour gives. Both
+    rows here name the same file, so one "complete" line is the whole of it.
+    """
+
+    def swept(self, args_extra: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        report = Path(box) / "out.json"
+        args = argparse.Namespace(
+            json=report,
+            no_baseline=True,
+            workers=2,
+            timeout=mutate.TIMEOUT,
+            each_test=mutate.EACH_TEST,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+            **(args_extra or {}),
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            mutate.sweep([CLAMP_GUARD, CAP_NUDGE], args)
+        return said.getvalue(), json.loads(report.read_text(encoding="utf-8"))
+
+    def test_the_file_is_counted_down_and_its_rows_recorded(self) -> None:
+        said, written = self.swept()
+        self.assertIn(f"-- {CLAMP_GUARD.path} complete", said)
+        self.assertEqual(
+            sorted(row["label"] for row in written["results"]),
+            sorted([CLAMP_GUARD.label, CAP_NUDGE.label]),
+        )
+
+    def test_a_finished_file_is_on_disk_before_the_run_ends(self) -> None:
+        """The whole point of writing per file: a crash costs one file, not the
+        afternoon. Both assertions above are satisfied by `sweep`'s *final*
+        write, so neither can see the incremental one -- measured, by a spec
+        table: deleting `finished`'s `_persist` survived them both.
+
+        So this looks while the run is still going. The second file's row is
+        held until the first file's rows have been observed on disk; if the
+        report is only written at the end, the wait times out and the run
+        deadlocks rather than passing quietly -- which is why the bound is
+        short and its expiry is the failure.
+        """
+        import threading
+
+        held, seen = threading.Event(), threading.Event()
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        report = Path(box) / "out.json"
+        # Two files, so one can finish while the other is still in flight.
+        # `_attempt` is replaced rather than the tree mutated: what is under
+        # test is when `sweep` *writes*, not what a mutation does.
+        slow = Mutation(
+            "a second file",
+            "woswoar/codec.py",
+            "MAX_EXPORT_BYTES = 8 * 1024 * 1024",
+            "MAX_EXPORT_BYTES = 9 * 1024 * 1024",
+            "tests.test_codec",
+        )
+
+        # The two bounds must not be equal, and that is the whole of the
+        # fixture. The watcher gives up after LOOKING, then releases the held
+        # row; the row's own wait is far longer, so the release only ever comes
+        # from the watcher. Written with both at 30s the two raced -- `sweep`'s
+        # *final* write landed while the watcher was still polling, so deleting
+        # the incremental one passed anyway. Measured: that spelling reported
+        # SURVIVED against the narrow selection and `caught` only under the
+        # whole suite, which is the shape of a fixture that decides by timing.
+        LOOKING, RELEASED = 10.0, 60.0
+
+        def attempt(mutation: Mutation, *args: Any, **kwargs: Any) -> mutate.Verdict:
+            if mutation.path == slow.path:
+                held.wait(timeout=RELEASED)
+            return mutate.Verdict("caught", "tests.test_entry.T.test_x")
+
+        def watch() -> None:
+            deadline = time.monotonic() + LOOKING
+            while time.monotonic() < deadline:
+                if report.is_file() and json.loads(report.read_text(encoding="utf-8"))["results"]:
+                    seen.set()
+                    break
+                time.sleep(0.05)
+            held.set()
+
+        args = argparse.Namespace(
+            json=report,
+            no_baseline=True,
+            workers=2,
+            timeout=mutate.TIMEOUT,
+            each_test=mutate.EACH_TEST,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+        )
+        looking = threading.Thread(target=watch)
+        looking.start()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "_attempt", attempt),
+        ):
+            mutate.sweep([CAP_NUDGE._replace(path=CLAMP_GUARD.path), slow], args)
+        looking.join()
+        self.assertTrue(seen.is_set(), "nothing was written until the whole run had finished")
+
+    def test_the_answers_are_the_real_ones(self) -> None:
+        """The pair was measured before it was trusted: the clamp guard is
+        caught by `tests.test_entry`, the one-character cap nudge is not. A
+        sweep that recorded rows without running them would pass the test above
+        and fail this one."""
+        _, written = self.swept()
+        by_label = {row["label"]: row["outcome"] for row in written["results"]}
+        self.assertEqual("caught", by_label[CLAMP_GUARD.label])
+        self.assertEqual("survived", by_label[CAP_NUDGE.label])
+
+
 class TestWhoOwnsTheMachine(unittest.TestCase):
     """`_budget` halves a shared machine and does not halve a dedicated one.
 
