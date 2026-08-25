@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -55,6 +54,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from tools.cpus import usable_cpus
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -335,8 +336,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Twice the CPUs, because the work is subprocess wait rather than CPU:
     # measured on four cores, jobs=8 beats jobs=4 by ~9%, and jobs=16 regresses.
-    cpus = getattr(os, "process_cpu_count", os.cpu_count)  # process_cpu_count is 3.13+
-    jobs = args.jobs or (cpus() or 2) * 2
+    # `tools/cpus.py` says why the count is not `os.cpu_count()`, and why the
+    # doubling stays here rather than moving in with it.
+    jobs = args.jobs or usable_cpus() * 2
     # More batches than workers, so a batch that runs long is overlapped by the
     # others rather than deciding the wall clock on its own.
     batches = pack(classes, jobs * 2)

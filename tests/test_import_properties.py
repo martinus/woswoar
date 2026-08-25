@@ -23,6 +23,7 @@ from hypothesis import HealthCheck, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
+from tests import profiles
 from woswoar import cache, importer, store
 
 
@@ -103,8 +104,8 @@ class ImportKeepsEverything(RuleBasedStateMachine):
 
 
 ImportKeepsEverything.TestCase.settings = settings(
-    max_examples=250,
-    stateful_step_count=15,
+    max_examples=profiles.IMPORT_MACHINE[0],
+    stateful_step_count=profiles.IMPORT_MACHINE[1],
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )

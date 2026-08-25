@@ -17,14 +17,13 @@ from __future__ import annotations
 
 import unittest
 
-from hypothesis import given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
+from tests import profiles  # noqa: F401  -- registers and loads the profile
 from tests.test_record_properties import ENTRIES
 from woswoar import cache
 from woswoar.entry import Entry
-
-settings.load_profile("woswoar")  # registered beside `ENTRIES`, which this imports.
 
 #: A log's path inside `logs/`, in the shape `store` produces. Not generated
 #: text: a separator in a *relpath* corrupts the header rather than a row, which

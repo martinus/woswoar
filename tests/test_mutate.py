@@ -27,6 +27,7 @@ from typing import Any
 from unittest import mock
 
 from tools import mutate, reached
+from tools import verdict as verdict_module
 from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
 
 from . import support
@@ -1151,6 +1152,7 @@ class TestResumingASweep(unittest.TestCase):
             no_baseline=True,
             workers=1,
             timeout=30.0,
+            each_test=mutate.EACH_TEST,
             memory=mutate.MEMORY,
             all=True,
             batch=True,
@@ -1180,6 +1182,7 @@ class TestResumingASweep(unittest.TestCase):
             no_baseline=True,
             workers=1,
             timeout=30.0,
+            each_test=mutate.EACH_TEST,
             memory=mutate.MEMORY,
             all=True,
             batch=True,
@@ -1194,6 +1197,7 @@ class TestResumingASweep(unittest.TestCase):
             no_baseline=True,
             workers=1,
             timeout=30.0,
+            each_test=mutate.EACH_TEST,
             memory=mutate.MEMORY,
             all=True,
             batch=True,
@@ -1216,52 +1220,62 @@ class TestResumingASweep(unittest.TestCase):
             mutate.sweep(table, args)
         return said.getvalue(), ran
 
-    def test_each_batch_scopes_its_warning_to_its_own_file(self) -> None:
-        """#271. A sweep runs `run` once per file, and eleven batches' worth of
-        verdicts can be scrolled above the twelfth -- so an unscoped "nothing
-        above means anything" is false about all of them.
+    def test_one_pool_means_one_run_for_the_whole_table(self) -> None:
+        """The per-file batches are gone -- tupferl#7's measurement, ported with
+        the design: a pool per file serialised its hung rows, ~600s of a 913s
+        run with the machine two thirds empty. What replaced them is one `run`
+        over every remaining row, so `scope` is gone too: there is one baseline
+        again and #271's per-batch wording has nothing left to mislead about."""
+        table = [
+            Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod"),
+            Mutation("b.py:1 -- two", "b.py", "c", "d", "test_mod"),
+        ]
+        answer = Report([Result(r, Verdict("caught")) for r in table])
+        _, ran = self.swept(table, answer)
+        self.assertEqual(1, ran.call_count, "the sweep still runs a pool per file")
+        self.assertNotIn("scope", ran.call_args.kwargs)
+        self.assertEqual(len(ran.call_args.args[0]), 2, "not every row reached the one run")
 
-        Asserted on the argument rather than the printed line, because the line
-        is `run`'s and is stubbed out here; that `run` honours `scope` is
-        `TestConfirmingNeedsAGreenSuiteToo`'s subject.
-        """
-        table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
-        _, ran = self.swept(table, Report([Result(table[0], Verdict("caught"))]))
-        self.assertEqual(ran.call_args.kwargs["scope"], "nothing above about a.py")
-
-    def test_a_whole_table_keeps_the_unscoped_wording(self) -> None:
-        """`main`'s single-table path really does own everything above it, so
-        the default must not drift to the per-file phrasing."""
-        rows = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
-        with (
-            contextlib.redirect_stdout(io.StringIO()),
-            mock.patch.object(mutate, "run", return_value=Report([])) as ran,
-        ):
-            mutate._run_generated(rows, self.batch_args(Path("unused.json")))
-        self.assertEqual(ran.call_args.kwargs["scope"], "nothing above")
-
-    def test_rows_from_a_red_batch_are_counted_at_the_end(self) -> None:
-        """The number nothing printed. A reader was told "nothing above means
-        anything" once per red file and never told how much of the run that
-        came to -- so a `caught` row could be lifted out of a void batch and
-        believed. That happened."""
+    def test_a_red_baseline_voids_the_whole_run_and_says_so(self) -> None:
+        """One pool has one baseline, so the count #271 asked for collapses to
+        a sentence about everything -- which must still be printed, or a
+        `caught` row above it could be believed. That happened, per file, under
+        the batched design."""
         table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
         answer = Report([Result(table[0], Verdict("caught"))], baseline_red=True)
         said, _ = self.swept(table, answer)
-        # The line, then `startswith`, rather than `assertIn` on the whole of
-        # stdout. "-1 of 1 row(s)..." *contains* "1 of 1 row(s)...", so the
-        # obvious assertion passes on a counter that subtracts -- which is
-        # exactly the mutant that survived the first version of this test.
-        counted = next(line for line in said.splitlines() if "came from a batch" in line)
-        self.assertTrue(counted.startswith("1 of 1 row(s)"), counted)
-        self.assertIn("so they have no verdict", counted)
+        counted = next(line for line in said.splitlines() if "baseline was red" in line)
+        self.assertIn("none of the 1 new row(s) means anything", counted)
+
+    def test_a_red_baseline_leaves_no_new_rows_for_a_resume_to_trust(self) -> None:
+        """The rows of a red-baseline run are void, and `_recorded` drops the
+        red flag while `sweep` skips a recorded file by name -- so a void row
+        that reaches `--json` comes back on the next run as a final answer.
+        The old rows stay: they were recorded under their own green baselines.
+        """
+        where = self.persisted(self.rows("a.py:1 -- old"))
+        table = [
+            Mutation("a.py:1 -- old", "a.py", "a", "b", "test_mod"),
+            Mutation("b.py:1 -- fresh", "b.py", "c", "d", "test_mod"),
+        ]
+        answer = Report([Result(table[1], Verdict("caught"))], baseline_red=True)
+        args = self.batch_args(where)
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "run", return_value=answer),
+        ):
+            report = mutate.sweep(table, args)
+        self.assertTrue(report.baseline_red, "the flag was dropped on the way out")
+        on_disk = json.loads(where.read_text(encoding="utf-8"))
+        labels = [row["label"] for row in on_disk["results"]]
+        self.assertNotIn("b.py:1 -- fresh", labels, "a void row was recorded as final")
+        self.assertEqual(["a.py:1 -- old"], labels, "the resume state lost the good rows")
 
     def test_a_green_sweep_says_nothing_about_it(self) -> None:
-        """Without this the count could be printed unconditionally, saying
-        `0 of N` on every clean run."""
+        """Without this the sentence could be printed unconditionally."""
         table = [Mutation("a.py:1 -- one", "a.py", "a", "b", "test_mod")]
         said, _ = self.swept(table, Report([Result(table[0], Verdict("caught"))]))
-        self.assertNotIn("came from a batch whose baseline was red", said)
+        self.assertNotIn("baseline was red", said)
 
     def test_a_missing_file_is_not_an_error(self) -> None:
         """The first run of a sweep has nothing to resume from."""
@@ -1291,6 +1305,40 @@ class TestResumingASweep(unittest.TestCase):
             self.assertEqual(mutate._recorded(where), [])
 
 
+def pin_the_machine(case: unittest.TestCase) -> None:
+    """Make the budget arithmetic below depend only on what each test patches.
+
+    Two ambient facts otherwise decide it, and both are legitimate settings
+    rather than accidents:
+
+    - **who owns the machine.** On a CI runner `dedicated()` answers "this
+      run", and every `// 2` below is then asserting a rule that did not apply.
+    - **`WOSWOAR_MUTATE_TOTAL`.** `_budget` reads it *before* `_visible_memory`,
+      so an operator who exported it -- or a sweep launched with it, which is
+      exactly what the variable is for -- makes these tests read the ambient
+      number instead of the one they patched in.
+
+    The second was measured the expensive way: a 394-mutant sweep launched with
+    `WOSWOAR_MUTATE_TOTAL` set went red on its baseline at
+    `test_a_small_machine_still_gets_a_lane` (`AssertionError: 14 != 1`), which
+    voided all 329 rows it had answered. The variable reaches every probe
+    through the environment `_run` hands down, so the tests guarding the budget
+    code were exactly the tests a legitimate use of that code broke.
+
+    `TestWhoOwnsTheMachine` owns both of these questions and clears the whole
+    environment itself, so it does not use this.
+    """
+    pinned = mock.patch.object(mutate, "dedicated", lambda: "")
+    pinned.start()
+    case.addCleanup(pinned.stop)
+    # `clear=False` with the one name removed: the probe needs the rest of the
+    # environment (PATH, HOME, PYTHONPATH) to run at all.
+    without = mock.patch.dict(os.environ, {}, clear=False)
+    without.start()
+    case.addCleanup(without.stop)
+    os.environ.pop(mutate._TOTAL, None)
+
+
 class TestHowManyLanesFitInMemory(unittest.TestCase):
     """The bound that stops the per-row cap from being multiplied by the lanes.
 
@@ -1299,6 +1347,9 @@ class TestHowManyLanesFitInMemory(unittest.TestCase):
     by what a lane uses, and the host's memory was read without asking whether a
     container had said otherwise.
     """
+
+    def setUp(self) -> None:
+        pin_the_machine(self)
 
     def test_a_small_machine_still_gets_a_lane(self) -> None:
         """`max(1, ...)` is load-bearing: `ThreadPoolExecutor(max_workers=0)`
@@ -1358,6 +1409,9 @@ class TestTheShareOneLaneGets(unittest.TestCase):
     why the class above it, asserting the lane count on its own, was green
     throughout.
     """
+
+    def setUp(self) -> None:
+        pin_the_machine(self)
 
     def share(self, visible: int, wanted: int = 16, memory: int = MEMORY) -> mutate.Share:
         with mock.patch.object(mutate, "_visible_memory", return_value=visible):
@@ -1486,6 +1540,44 @@ class TestALaneCarriesItsShareIntoTheProbe(MutateTestCase):
         verdict = mutate._run(["test_budget"], self.root, memory=share)
         self.assertEqual(verdict.outcome, "survived", verdict.detail)
 
+    def test_the_probe_does_not_inherit_the_operators_machine_total(self) -> None:
+        """`WOSWOAR_MUTATE_TOTAL` is a knob for the machine, and a lane's answer
+        is its share of it.
+
+        `_budget` short-circuits `_visible_memory` when the variable is set, so
+        a probe that inherited it would size itself for the **outer** total and
+        ignore the per-lane `WOSWOAR_MUTATE_BUDGET` beside it -- which
+        `_budget`'s own docstring already called wrong, without the code
+        preventing it.
+
+        Found by a sweep rather than by reading. Launched with the variable
+        exported, every probe answered `_budget()` with the whole machine, the
+        two suites that patch `_visible_memory` to assert the arithmetic went
+        red, and the baseline they broke voided all 394 rows -- twice, because
+        the first fix was to the tests rather than to this line.
+
+        Driven through a real probe, and it asserts *both* names: a fix that
+        dropped the whole environment would pass a test that only looked for
+        the absence of one.
+        """
+        share = 1 << 30
+        self.write(
+            "test_budget.py",
+            f"""
+            import os
+            import unittest
+
+
+            class T(unittest.TestCase):
+                def test_the_lane_got_its_share_and_not_the_machine(self) -> None:
+                    self.assertIsNone(os.environ.get("WOSWOAR_MUTATE_TOTAL"))
+                    self.assertEqual(os.environ.get("WOSWOAR_MUTATE_BUDGET"), "{share}")
+            """,
+        )
+        with mock.patch.dict(os.environ, {mutate._TOTAL: str(64 << 30)}):
+            verdict = mutate._run(["test_budget"], self.root, memory=share)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
 
 class TestCountingWhatALaneHolds(unittest.TestCase):
     """Both readers, on every platform, because one of them is macOS's only guard."""
@@ -1587,6 +1679,15 @@ class TestItSaysWhatItGaveTheLanes(MutateTestCase):
     """A share lowered in silence reads as a slow tool rather than a bounded one,
     and it is what makes a later `ran out of memory` row inexplicable. Same
     argument as `--limit` printing what it dropped."""
+
+    def setUp(self) -> None:
+        # Same reason as `TestHowManyLanesFitInMemory`'s: this patches
+        # `_visible_memory` and asserts what the machine could afford, which an
+        # ambient `WOSWOAR_MUTATE_TOTAL` decides instead. `_run` no longer hands
+        # that variable to a probe, so a sweep cannot break this any more; a
+        # developer with it exported still can, which is what this is for.
+        super().setUp()
+        pin_the_machine(self)
 
     def running(self, visible: int, workers: int | None = None) -> str:
         self.package(guarded=True)
@@ -1961,41 +2062,9 @@ class TestATimeoutEndsTheWholeSession(MutateTestCase):
         )
 
 
-def enforced() -> bool:
-    """Whether this kernel applies the limits `verdict.cap` asks for.
-
-    Asked by trying it, in a subprocess, rather than by reading `sys.platform`.
-    macOS ignores `RLIMIT_AS` -- which CI discovered, not the documentation --
-    and a `skipIf(darwin)` would encode today's answer to a question that is
-    really "does this kernel enforce it", going green on a platform that
-    silently protects nothing and staying skipped if macOS ever starts.
-
-    It sets the limits *directly* rather than calling `verdict.cap`, and that is
-    not a stylistic choice -- mutation testing rejected the first version, which
-    did call it. A skip condition computed from the code under test cannot
-    detect that code being reverted: neutering `cap` made the probe report "not
-    enforced", the test skipped, and the row came back `SURVIVED` from a suite
-    that had simply declined to run it. A guard that switches itself off when
-    the thing it guards breaks is worse than no guard, because it is green.
-    """
-    probe = (
-        "import resource\n"
-        "for which in (resource.RLIMIT_AS, resource.RLIMIT_DATA):\n"
-        "    soft, hard = resource.getrlimit(which)\n"
-        "    try:\n"
-        "        resource.setrlimit(which, (256 * 1024 * 1024, hard))\n"
-        "    except (OSError, ValueError):\n"
-        "        pass\n"
-        "try:\n"
-        "    bytearray(768 * 1024 * 1024)\n"
-        "except MemoryError:\n"
-        "    print('enforced')\n"
-    )
-    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
-    return "enforced" in done.stdout
-
-
-@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+@unittest.skipUnless(
+    support.memory_caps_apply(), "this kernel does not enforce the address-space limit"
+)
 class TestAMutantThatEatsMemory(MutateTestCase):
     """The failure `timeout` cannot catch, because the machine goes first.
 
@@ -2045,7 +2114,9 @@ class TestAMutantThatEatsMemory(MutateTestCase):
         self.assertIn("ran out of memory", report.results[0].verdict.detail)
 
 
-@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+@unittest.skipUnless(
+    support.memory_caps_apply(), "this kernel does not enforce the address-space limit"
+)
 class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     """The intersection of the two cases above, which neither of them covers.
 
@@ -2060,7 +2131,7 @@ class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     lie #220 removed one level down. This repository uses `subTest` in more than
     twenty places, so the intersection is reachable rather than theoretical.
 
-    Gated on `enforced()` for the same reason as its sibling, which CI taught
+    Gated on `support.memory_caps_apply` for the same reason as its sibling, which CI taught
     twice: macOS does not apply `RLIMIT_AS`, so the 800 MiB simply succeeds
     there, `clamp` returns a large number, the subtest notices it and the row
     reads `caught`. The first version of this test copied the fixture and not
@@ -2629,3 +2700,995 @@ class TestTheScriptEntryPoint(MutateTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: A test id that certainly resolves, used where the point is "a real one is
+#: kept". This module's own name, so it cannot go stale without this file being
+#: edited -- and if it is renamed, the test that depends on it is right here
+#: rather than somewhere that would fail mysteriously.
+REAL = "tests.test_mutate.TestRememberingWhatCaughtEachMutation.test_a_remembered_test_runs_first"
+
+#: A deliberate bug the suite notices, cheaply: `tests.test_entry` is twenty
+#: tests in well under a second, and its clamp test fails the moment `truncate`
+#: stops clamping. Measured before it was trusted -- `caught`, with
+#: `tests.test_entry.TestParsedCommandsAreBounded.test_an_over_long_line_is_clamped_on_the_way_in`
+#: recorded as the killer.
+CLAMP_GUARD = Mutation(
+    "an over-long command is no longer clamped",
+    "woswoar/entry.py",
+    "if len(cmd) <= MAX_CMD_CHARS:",
+    "if True:",
+    "tests.test_entry",
+)
+
+#: An edit the same selection cannot see: the cap moves by one character, and
+#: `tests.test_entry` asserts around the symbol rather than the number. Also
+#: measured -- `survived`. Used where a fixture needs a row that does not turn
+#: into a whole-suite confirmation run.
+CAP_NUDGE = Mutation(
+    "the cap moves by one character",
+    "woswoar/entry.py",
+    "MAX_CMD_CHARS = 8000",
+    "MAX_CMD_CHARS = 8001",
+    "tests.test_entry",
+)
+
+
+def cached_row(
+    path: str = "woswoar/sync.py",
+    old: str = "a",
+    new: str = "b",
+    label: str = "x:1 in f()",
+) -> Mutation:
+    """One generated-shaped mutation, with only the fields the killer cache reads."""
+    return Mutation(label, path, old, new, "tests.test_sync", operator="branch")
+
+
+class TestRememberingWhatCaughtEachMutation(unittest.TestCase):
+    """`Killers`: run the test that worked last time, first.
+
+    The claim is about the *selection* the harness builds, which is what
+    `failfast` then walks in order -- so that is what these assert on. Driving a
+    whole sweep to observe it would take minutes and tell us the same thing.
+    """
+
+    def cache(self, known: dict[str, str]) -> mutate.Killers:
+        with tempfile.TemporaryDirectory() as box:
+            where = Path(box) / "killers.json"
+            where.write_text(json.dumps(known), encoding="utf-8")
+            return mutate.Killers(where)
+
+    def test_a_remembered_test_runs_first(self) -> None:
+        """In front, and the original selection untouched behind it."""
+        one = cached_row()
+        cached = self.cache({mutate._key(one): REAL})
+        (ahead,) = cached.ahead_of([one])
+        self.assertEqual(REAL, ahead.first)
+        self.assertEqual("tests.test_sync", ahead.tests)
+
+    def test_the_whole_selection_is_kept_behind_it(self) -> None:
+        """The safety argument, asserted rather than assumed. Substituting the
+        remembered test for the selection would make every stale entry a
+        `caught` that nothing verified -- flattering the tests, which is the
+        direction every bug in this class errs."""
+        one = cached_row()._replace(tests="tests.test_sync tests.test_store")
+        cached = self.cache({mutate._key(one): REAL})
+        (ahead,) = cached.ahead_of([one])
+        self.assertEqual("tests.test_sync tests.test_store", ahead.tests)
+        self.assertEqual(REAL, ahead.first)
+
+    def test_the_selection_stays_identical_across_rows(self) -> None:
+        """`run` shards the baseline check by distinct `tests` string, so a
+        killer folded into `tests` gives every row its own shard -- in tupferl,
+        one baseline run of a 42-row file's selection became 42 of them, and
+        that was the whole of a 372s -> 730s regression. It is invisible in
+        every functional assertion above: the verdicts were identical. Only the
+        clock saw it."""
+        rows = [cached_row(old=f"a{n}") for n in range(5)]
+        cached = self.cache({mutate._key(r): REAL for r in rows})
+        ahead = cached.ahead_of(rows)
+        self.assertEqual(1, len({r.tests for r in ahead}), "the baseline would shard per row")
+
+    def test_a_test_that_no_longer_exists_is_dropped(self) -> None:
+        """A renamed test leaves its module in place, so `unittest`'s loader
+        records an error rather than raising -- and an error there is classified
+        `broke`, which would turn every mutant that remembered it into a
+        non-answer. One rename would produce a wall of them."""
+        one = cached_row()
+        cached = self.cache({mutate._key(one): "tests.test_mutate.NoSuchClass.no_such_test"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            (ahead,) = cached.ahead_of([one])
+        self.assertEqual("", ahead.first)
+
+    def test_a_module_that_no_longer_exists_is_dropped_too(self) -> None:
+        one = cached_row()
+        cached = self.cache({mutate._key(one): "tests.test_gone.Class.test_x"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            (ahead,) = cached.ahead_of([one])
+        self.assertEqual("", ahead.first)
+
+    def test_a_row_nothing_is_remembered_about_is_left_alone(self) -> None:
+        (ahead,) = mutate.Killers(None).ahead_of([cached_row()])
+        self.assertEqual("", ahead.first)
+        self.assertEqual("tests.test_sync", ahead.tests)
+
+
+class TestTheKeyIsContentNotPosition(unittest.TestCase):
+    """A line number is invalidated by any edit above it -- which is every edit,
+    so a position-keyed cache would be empty exactly when it was most wanted."""
+
+    def test_the_same_edit_at_a_different_line_is_the_same_key(self) -> None:
+        moved = cached_row(label="woswoar/sync.py:900 in f()")._replace(span=(9000, 9001))
+        self.assertEqual(mutate._key(cached_row()), mutate._key(moved))
+
+    def test_a_different_edit_at_the_same_line_is_a_different_key(self) -> None:
+        """Otherwise two operators' rows on one line would share an entry, and
+        the second would run a test chosen for the first."""
+        self.assertNotEqual(mutate._key(cached_row()), mutate._key(cached_row(new="c")))
+        self.assertNotEqual(
+            mutate._key(cached_row()), mutate._key(cached_row(path="woswoar/store.py"))
+        )
+        self.assertNotEqual(
+            mutate._key(cached_row()), mutate._key(cached_row()._replace(operator="return-value"))
+        )
+
+
+class TestWhatTheCacheLearns(unittest.TestCase):
+    def learned(self, outcome: mutate.Outcome, killer: str) -> dict[str, str]:
+        one = cached_row()
+        with tempfile.TemporaryDirectory() as box:
+            cache = mutate.Killers(Path(box) / "killers.json")
+            cache.known = {mutate._key(one): "tests.test_old.C.t"}
+            cache.learn(mutate.Report([mutate.Result(one, mutate.Verdict(outcome, "", killer))]))
+            return cache.known
+
+    def test_a_catch_is_remembered(self) -> None:
+        self.assertEqual({mutate._key(cached_row()): REAL}, self.learned("caught", REAL))
+
+    def test_a_survivor_forgets_whatever_used_to_catch_it(self) -> None:
+        """Keeping it would put a test that cannot help at the front of every
+        future run of this row, for ever."""
+        self.assertEqual({}, self.learned("survived", ""))
+
+    def test_a_run_that_asked_nothing_changes_nothing(self) -> None:
+        """`broke` and `timeout` are not answers, so they are not evidence that
+        the remembered test stopped working."""
+        outcomes: tuple[mutate.Outcome, ...] = ("broke", "timeout")
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    {mutate._key(cached_row()): "tests.test_old.C.t"}, self.learned(outcome, "")
+                )
+
+
+class TestTheKillerIsRecordedAtAll(unittest.TestCase):
+    """The cache is worth nothing if `Verdict.killer` is empty, and it comes
+    from `tools/verdict.py` through a JSON report -- so this drives the real
+    thing rather than asserting on a field."""
+
+    def test_a_caught_mutation_names_the_test_in_a_form_unittest_takes_back(self) -> None:
+        found = run([CLAMP_GUARD], baseline=False, workers=1, summarise=False)
+        (result,) = found.results
+        self.assertEqual("caught", result.verdict.outcome)
+        self.assertTrue(result.verdict.killer, "nothing recorded the killing test")
+        # The claim: it loads. `str(test)` -- "method (dotted.id)" -- does not.
+        self.assertEqual({result.verdict.killer}, mutate._loadable([result.verdict.killer]))
+
+
+class TestTheAlarmArming(unittest.TestCase):
+    """`verdict.each_test`'s two answers, in process.
+
+    The behaviour of an *armed* alarm is `tests/test_verdict.py`'s subject,
+    driven through the real probe. What is asserted here is only the arming
+    contract `mutate._run` builds its argv from: zero arms nothing, anything
+    else comes back as given.
+    """
+
+    def test_zero_arms_nothing(self) -> None:
+        before = signal.getsignal(signal.SIGALRM)
+        self.addCleanup(signal.signal, signal.SIGALRM, before)
+        self.assertEqual(0.0, verdict_module.each_test(0))
+        self.assertEqual(2.0, verdict_module.each_test(2))
+
+
+class TestTheCheapPrefix(unittest.TestCase):
+    """`Killers.prefix`: cheap tests that between them catch a lot, first.
+
+    The remembered killer (above) helps a row that has been seen. This helps
+    every row, including one seen for the first time -- which is exactly the
+    case a per-row cache cannot serve.
+
+    Greedy on rows-newly-caught-per-second, which is the 4-approximation for
+    Min-Sum Set Cover and the best any polynomial algorithm gets unless P=NP.
+    """
+
+    def cache(self, known: dict[str, str], cost: dict[str, float]) -> mutate.Killers:
+        made = mutate.Killers(None)
+        made.known, made.cost = known, cost
+        return made
+
+    def test_a_cheap_test_that_catches_a_lot_comes_first(self) -> None:
+        """The ordering is by *rate*, not by either half alone: `slow` catches
+        the most and `rare` is the cheapest, and neither is the answer."""
+        cache = self.cache(
+            {f"k{n}": "tests.m.C.slow" for n in range(50)}
+            | {f"c{n}": "tests.m.C.quick" for n in range(20)}
+            | {"r0": "tests.m.C.rare"},
+            {"tests.m.C.slow": 0.40, "tests.m.C.quick": 0.02, "tests.m.C.rare": 0.001},
+        )
+        self.assertEqual(["tests.m.C.quick", "tests.m.C.rare", "tests.m.C.slow"], cache.prefix())
+
+    def test_it_stops_at_the_budget(self) -> None:
+        """Every row pays this up front, so it is bounded in seconds rather
+        than in tests -- tests do not all cost the same."""
+        cache = self.cache(
+            {f"k{n}": f"tests.m.C.t{n}" for n in range(20)},
+            {f"tests.m.C.t{n}": 0.2 for n in range(20)},
+        )
+        chosen = cache.prefix()
+        self.assertLessEqual(sum(0.2 for _ in chosen), mutate.PREFIX)
+        self.assertLess(len(chosen), 20)
+
+    def test_a_test_with_no_measured_cost_is_not_guessed_at(self) -> None:
+        """A killer recorded before costs existed has no denominator, and
+        inventing one would put it anywhere at all in the order."""
+        cache = self.cache({"k": "tests.m.C.unmeasured"}, {})
+        self.assertEqual([], cache.prefix())
+
+    def test_nothing_is_covered_twice(self) -> None:
+        """Greedy credits a test only with rows nothing before it caught, or
+        the second-best test rides on the first one's coverage and the prefix
+        fills with duplicates."""
+        cache = self.cache(
+            {"a": "tests.m.C.one", "b": "tests.m.C.one", "c": "tests.m.C.two"},
+            {"tests.m.C.one": 0.01, "tests.m.C.two": 0.02},
+        )
+        self.assertEqual(["tests.m.C.one", "tests.m.C.two"], cache.prefix())
+
+
+class TestTheCacheLearnsFromARealRun(unittest.TestCase):
+    """The plumbing, not the algorithm.
+
+    `TestTheCheapPrefix` sets `cost` by hand, so every one of its assertions
+    would pass while the harness recorded **zero** costs -- in tupferl, `sweep`
+    re-wrapped the report without `times` and the prefix quietly ordered
+    nothing. A test that builds its own inputs cannot see a data path that
+    never delivers them.
+    """
+
+    #: One real run for the class, not one per test: each is a tree copy plus
+    #: two subprocess suite runs, and the second test's claim is proven just as
+    #: well against the first run's report.
+    found: mutate.Report
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.found = run([CAP_NUDGE], baseline=True, workers=1, summarise=False)
+
+    def test_a_run_measures_the_tests_it_ran(self) -> None:
+        times = self.found.times or {}
+        self.assertTrue(times, "the run recorded no test timings at all")
+        # `tests.test_entry` is CAP_NUDGE's whole selection, so its tests are
+        # exactly what should have been measured.
+        self.assertTrue(
+            any(name.startswith("tests.test_entry.") for name in times), sorted(times)[:5]
+        )
+        self.assertTrue(all(seconds >= 0 for seconds in times.values()))
+
+    def test_they_reach_the_cache(self) -> None:
+        cache = mutate.Killers(None)
+        cache.learn(self.found)
+        self.assertEqual(self.found.times or {}, cache.cost)
+
+
+class TestWhichRowsGetThePrefix(unittest.TestCase):
+    """Which rows the cheap prefix reaches, and the two it used to be cut out of.
+
+    Exact beats general: a row with a remembered killer runs that instead. For
+    the rest, tupferl's first version compared module names -- which dropped the
+    prefix in the two places it was worth most, and neither is visible in a
+    `woswoar/` sweep: every file here has an importer, so every row names
+    modules and matches. It is the `tools/` sweeps, and any new file nothing
+    imports yet, that hit them.
+    """
+
+    def cache(self) -> mutate.Killers:
+        made = mutate.Killers(None)
+        made.cost = {REAL: 0.001}
+        made.known = {"a-row-that-is-not-this-one": REAL}
+        return made
+
+    def ahead(self, tests: str) -> Mutation:
+        with contextlib.redirect_stdout(io.StringIO()):
+            (ahead,) = self.cache().ahead_of([cached_row()._replace(tests=tests)])
+        return ahead
+
+    def test_a_row_with_a_remembered_killer_does_not_pay_for_it(self) -> None:
+        """That test is known to catch *this* row, so the prefix would only be
+        work in front of the answer."""
+        cache = self.cache()
+        one = cached_row()._replace(tests="tests.test_mutate")
+        cache.known = {mutate._key(one): REAL}
+        (ahead,) = cache.ahead_of([one])
+        self.assertEqual(REAL, ahead.first)
+
+    def test_a_row_with_nothing_remembered_gets_the_prefix(self) -> None:
+        self.assertEqual(REAL, self.ahead("tests.test_mutate").first)
+
+    def test_the_prefix_is_cut_to_what_the_row_can_reach(self) -> None:
+        """A test in a module that does not import the mutated file cannot see
+        the mutation, so running it would be pure cost."""
+        self.assertEqual("", self.ahead("tests.test_deps").first)
+
+    def test_a_row_that_runs_everything_gets_the_whole_prefix(self) -> None:
+        """`WHOLE_SUITE` is the empty string -- what a file nothing imports
+        gets, so its rows run the entire suite. Cutting the prefix to "modules
+        named in an empty selection" left them with nothing, which is the most
+        expensive row in the table paying the most for the omission.
+
+        Safe only because `first` reaches the probe as its own argument. Merged
+        into the selection it would make an empty list non-empty, and "run
+        everything" would become "run the prefix" -- see `verdict.collect`.
+        """
+        self.assertEqual(REAL, self.ahead(mutate.WHOLE_SUITE).first)
+
+    def test_a_prefix_test_in_one_of_several_named_modules_is_kept(self) -> None:
+        """`any`, not `all`: a row's selection may name several modules, and a
+        prefix test only has to be reachable from *one* of them.
+
+        Every other fixture here names a single module, where `any` and `all`
+        agree -- the two-symmetric-inputs weakness, and the sweep found it:
+        turning `any` into `all` survived the whole class. With two modules and
+        the prefix reachable from one, the two answers differ.
+        """
+        self.assertEqual(REAL, self.ahead("tests.test_deps tests.test_mutate").first)
+
+    def test_a_selection_naming_a_class_still_matches_its_tests(self) -> None:
+        """`tests.test_mutate.TestX` selects `tests.test_mutate.TestX.test_y`.
+        Comparing module names made this never match, so any row selected at
+        class granularity silently lost the prefix."""
+        klass = REAL.rsplit(".", 1)[0]
+        self.assertEqual(REAL, self.ahead(klass).first)
+
+
+class TestConfirmationReallyRunsTheWholeSuite(unittest.TestCase):
+    """`CONTRIBUTING.md` promises every survivor is re-run against the whole
+    suite before it is reported, and `Report.widened` is the flag that claims
+    it.
+
+    `WHOLE_SUITE` is the *empty* selection -- `verdict.collect` falls through to
+    `discover` only when the list is empty -- so a remembered test still
+    attached to a widened row is the one thing that could quietly turn
+    "everything" into "only this". That the probe's protocol keeps a `first` in
+    front of a discovery rather than in place of it is
+    `tests.test_verdict.TestWhichTestsGetRun`'s subject; what is asserted here
+    is the rows `confirm` actually builds.
+    """
+
+    def test_a_widened_row_carries_no_remembered_test(self) -> None:
+        survivor = mutate.Result(cached_row()._replace(first=REAL), mutate.Verdict("survived"))
+        seen: list[Mutation] = []
+
+        def watch(rerun: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+            seen.extend(rerun)
+            return mutate.Report([mutate.Result(row, mutate.Verdict("survived")) for row in seen])
+
+        with (
+            mock.patch.object(mutate, "run", watch),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            confirm(mutate.Report([survivor]), None, 30.0, MEMORY, baseline=False)
+        (row,) = seen
+        self.assertEqual("", row.first, "the remembered test rode into the whole-suite pass")
+        self.assertEqual(mutate.WHOLE_SUITE, row.tests)
+
+
+class TestARowActuallyRunsWithItsPrefix(unittest.TestCase):
+    """The gap that let tupferl's `WHOLE_SUITE` defect through.
+
+    Every other test here asserts on what `ahead_of` *returns*. None drove
+    `_attempt`, so nothing noticed that the argv it built turned "discover
+    everything" into "run these three" -- the review found it by reading. These
+    drive a real mutation with a real `first`.
+    """
+
+    def test_a_prefix_that_catches_it_still_reports_caught(self) -> None:
+        one = CLAMP_GUARD._replace(
+            first=(
+                "tests.test_entry.TestParsedCommandsAreBounded"
+                ".test_an_over_long_line_is_clamped_on_the_way_in"
+            )
+        )
+        found = run([one], baseline=False, workers=1, summarise=False)
+        self.assertEqual(["caught"], [r.verdict.outcome for r in found.results])
+
+    def test_a_prefix_that_misses_falls_through_to_the_selection(self) -> None:
+        """The safety argument, driven rather than asserted on a data
+        structure: a prefix that cannot see the mutation must cost one test,
+        not the answer."""
+        one = CLAMP_GUARD._replace(first="tests.test_deps.TestInstaller")
+        found = run([one], baseline=False, workers=1, summarise=False)
+        self.assertEqual(["caught"], [r.verdict.outcome for r in found.results])
+
+
+#: The spec-file spelling of `CLAMP_GUARD`, generated from its fields so the
+#: two cannot disagree when `woswoar/entry.py` changes -- only the one
+#: real-run `--json` test would catch a drifted literal; the mocked-`run`
+#: tests would not.
+SPEC_TABLE = (
+    "from tools.mutants import Mutation\n"
+    "MUTATIONS = [\n"
+    "    Mutation(\n"
+    f"        label={CLAMP_GUARD.label!r},\n"
+    f"        path={CLAMP_GUARD.path!r},\n"
+    f"        old={CLAMP_GUARD.old!r},\n"
+    f"        new={CLAMP_GUARD.new!r},\n"
+    f"        tests={CLAMP_GUARD.tests!r},\n"
+    "    )\n"
+    "]\n"
+)
+
+
+def spec_file(box: Path) -> Path:
+    where = box / "spec.py"
+    where.write_text(SPEC_TABLE, encoding="utf-8")
+    return where
+
+
+class TestASpecFileGetsTheFlagsItWasGiven(unittest.TestCase):
+    """A `MUTATIONS` table honours the command line it was run with.
+
+    It did not. The dispatch was `run(mutations)` -- no arguments -- so
+    `argparse` accepted `--workers`, `--memory`, `--timeout`, `--each-test`,
+    `--no-baseline`, `--no-confirm` and `--json`, and every one of them was
+    dropped on the floor. Asking for one lane got two. Asking for a report got
+    no file, which reads as the run having failed to write one rather than as
+    the flag never having been consulted -- an hour of tupferl's time went to
+    diagnosing exactly that misreading.
+
+    Each test below fails against `run(mutations)`, because that call cannot
+    carry the value being asserted.
+    """
+
+    #: `SPEC_TABLE` is a real row against a real file, because the `--json`
+    #: test below drives the actual run rather than a stub: `check` refuses a
+    #: path that is not there, and a report of nothing would not tell us the
+    #: flag was honoured. One that is *caught*, deliberately. With a surviving
+    #: row, a mutant that forces confirmation on sends the `--json` test into a
+    #: whole-suite re-run. Nothing here asserts on the survivor count, so the
+    #: cheaper row costs the tests nothing and gives the sweep two answers back.
+
+    def asked(self, *flags: str) -> dict[str, Any]:
+        """Run a spec file with `flags` and return the kwargs `run` received.
+
+        `run` is replaced rather than driven, because what is under test is the
+        wiring between the parser and the call -- not what a mutation does,
+        which every other class here covers and which would cost a suite run
+        per flag.
+        """
+        seen: dict[str, Any] = {}
+
+        def watch(table: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+            seen.update(kwargs)
+            seen["positional"] = args
+            return mutate.Report([])
+
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            with mock.patch.object(mutate, "run", watch):
+                mutate.main([str(spec_file(box)), "--no-confirm", "--no-killers", *flags])
+        return seen
+
+    def test_workers_reaches_the_run(self) -> None:
+        self.assertEqual(1, self.asked("--workers", "1")["workers"])
+
+    def test_memory_reaches_the_run(self) -> None:
+        self.assertEqual(0, self.asked("--memory", "0")["memory"])
+
+    def test_the_timeout_reaches_the_run(self) -> None:
+        self.assertEqual(7.0, self.asked("--timeout", "7")["timeout"])
+
+    def test_the_per_test_alarm_reaches_the_run(self) -> None:
+        self.assertEqual(3.0, self.asked("--each-test", "3")["each"])
+
+    def test_no_baseline_reaches_the_run(self) -> None:
+        self.assertFalse(self.asked("--no-baseline")["baseline"])
+
+    def test_the_baseline_is_on_by_default(self) -> None:
+        """The other half: a wiring that hard-coded `False` would pass the test
+        above and quietly stop checking the untouched tree."""
+        self.assertTrue(self.asked()["baseline"])
+
+    def test_json_is_written_and_marked_done(self) -> None:
+        """Not through the `run` stub -- this one drives the real thing,
+        because the report and its `.done` marker are what a watcher reads and
+        a stub cannot produce them."""
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            report = box / "out.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                mutate.main(
+                    [
+                        str(spec_file(box)),
+                        "--no-baseline",
+                        "--no-confirm",
+                        "--no-killers",
+                        "--json",
+                        str(report),
+                    ]
+                )
+            self.assertTrue(report.is_file(), "--json wrote nothing")
+            self.assertIn("results", json.loads(report.read_text(encoding="utf-8")))
+            self.assertTrue(
+                report.with_suffix(".json.done").is_file(), "the run left no done marker"
+            )
+
+
+class TestASpecFilesSurvivorsAreConfirmed(unittest.TestCase):
+    """The spec path keeps `CONTRIBUTING.md`'s promise about survivors now.
+
+    It never did before: survivors from a hand-written table were reported
+    without the whole-suite re-run, so `--no-confirm` was doubly inert -- it
+    turned off something that was not happening. The exit-status halves of the
+    spec path are `TestTheScriptEntryPoint`'s; these cover only the
+    confirmation wiring that used not to exist.
+    """
+
+    def status(self, *flags: str) -> tuple[int, dict[str, Any], list[bool]]:
+        seen: dict[str, Any] = {}
+        called: list[bool] = []
+
+        def watch(report: Any, *args: Any, **kwargs: Any) -> Any:
+            called.append(True)
+            seen.update(kwargs)
+            return report
+
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        with tempfile.TemporaryDirectory(prefix="woswoar-exit-") as name, quiet:
+            box = Path(name)
+            with mock.patch.object(mutate, "confirm", watch):
+                code = mutate.main([str(spec_file(box)), "--no-baseline", "--no-killers", *flags])
+        return code, seen, called
+
+    def test_survivors_are_confirmed_against_the_whole_suite_by_default(self) -> None:
+        _, _, called = self.status()
+        self.assertEqual([True], called, "survivors were reported without being confirmed")
+
+    def test_confirmation_is_told_what_the_run_was_told(self) -> None:
+        """Its `baseline` comes from `--no-baseline` like the run's does. A
+        wiring that passed the flag through un-negated -- checking a baseline
+        the caller asked to skip -- would pass every test above."""
+        _, seen, _ = self.status()
+        self.assertFalse(seen["baseline"], "confirmation re-checked a skipped baseline")
+
+    def test_no_confirm_really_turns_it_off(self) -> None:
+        """The precondition for the two above: if `confirm` ran either way,
+        their assertions would hold against a wiring that ignored the flag."""
+        _, _, called = self.status("--no-confirm")
+        self.assertEqual([], called, "--no-confirm confirmed anyway")
+
+
+class TestASpecFileGetsTheRestOfTheMachinery(unittest.TestCase):
+    """The killer cache, `--baseline-only`, and the `--json` lifecycle reach the
+    spec path too.
+
+    `_run_spec` exists because flags were silently dropped there once already;
+    its first fix stopped at the flags it knew about, and `--killers`,
+    `--baseline-only` and half the `--json` lifecycle were silently inert in
+    exactly the way it complains about.
+    """
+
+    def test_a_remembered_killer_runs_first_on_a_spec_row_too(self) -> None:
+        seen: list[Mutation] = []
+
+        def watch(table: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+            seen.extend(table)
+            return mutate.Report([])
+
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            remembered = box / "killers.json"
+            remembered.write_text(json.dumps({mutate._key(CLAMP_GUARD): REAL}), encoding="utf-8")
+            with mock.patch.object(mutate, "run", watch):
+                mutate.main(
+                    [
+                        str(spec_file(box)),
+                        "--no-confirm",
+                        "--killers",
+                        str(remembered),
+                    ]
+                )
+        (row,) = seen
+        self.assertEqual(REAL, row.first, "the cache never reached the spec path")
+
+    def test_baseline_only_runs_no_mutation(self) -> None:
+        """The question and nothing else -- `run` being reached would mean the
+        flag fell through to a full table run."""
+
+        def refuse(*args: Any, **kwargs: Any) -> mutate.Report:
+            raise AssertionError("--baseline-only ran the table")
+
+        with (
+            tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name,
+            mock.patch.object(mutate, "run", refuse),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = mutate.main(
+                [str(spec_file(Path(name))), "--baseline-only", "--no-killers", "--workers", "1"]
+            )
+        self.assertEqual(0, code, "a green baseline did not exit zero")
+
+    def test_a_stale_done_marker_is_cleared_before_the_run(self) -> None:
+        """A `.done` left by a previous run of the same spec would tell a
+        watcher this run finished before it began -- the false finish the
+        generated path already guards against. The pid is written first, so a
+        watcher started alongside has something to read."""
+        seen: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            report = box / "out.json"
+            marker = mutate._marker(report)
+            marker.touch()
+
+            def watch(table: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+                seen["marker"] = marker.exists()
+                seen["pid"] = mutate._pidfile(report).read_text(encoding="utf-8").strip()
+                return mutate.Report([])
+
+            with mock.patch.object(mutate, "run", watch):
+                mutate.main(
+                    [
+                        str(spec_file(box)),
+                        "--no-confirm",
+                        "--no-killers",
+                        "--json",
+                        str(report),
+                    ]
+                )
+            self.assertFalse(seen["marker"], "the stale marker outlived the start of the run")
+            self.assertEqual(str(os.getpid()), seen["pid"])
+            self.assertTrue(marker.exists(), "the finished run earned no marker")
+            self.assertFalse(mutate._pidfile(report).exists(), "the dead pid was left behind")
+
+
+class TestTheBaselineShards(unittest.TestCase):
+    """`_shards`: what the baseline runs, and what it no longer re-runs.
+
+    The remembered-`first` shard exists for the killer `confirm` records from a
+    whole-suite run -- a test *outside* every row's selection, which red on the
+    untouched tree would hand a row `caught` over a green-looking baseline. The
+    prefix's names, by contrast, are cut to each row's own selection, so a
+    shard repeating them is pure cost -- the whole bill on `--baseline-only`.
+    """
+
+    def test_a_remembered_test_outside_every_selection_gets_its_shard(self) -> None:
+        row = cached_row()._replace(tests="tests.test_sync", first="tests.test_deps.T.test_x")
+        self.assertIn("tests.test_deps.T.test_x", mutate._shards([row]))
+
+    def test_one_already_covered_by_a_selection_does_not(self) -> None:
+        row = cached_row()._replace(tests="tests.test_sync", first="tests.test_sync.T.test_x")
+        self.assertEqual(["tests.test_sync"], mutate._shards([row]))
+
+    def test_a_whole_suite_row_covers_everything(self) -> None:
+        rows = [
+            cached_row()._replace(tests=mutate.WHOLE_SUITE, first="tests.test_deps.T.test_x"),
+            cached_row(old="a2")._replace(tests="tests.test_sync"),
+        ]
+        self.assertEqual([mutate.WHOLE_SUITE, "tests.test_sync"], mutate._shards(rows))
+
+
+class TestWhatLandsWhileTheRunIsStillGoing(unittest.TestCase):
+    """`landed` is how `sweep` writes answers out as they arrive, and the one
+    thing it must never hand over is a row from a red-baseline run.
+
+    Driven with a real `run` rather than a stub, which is the gap the sweep
+    found: every other test of this fires `sweep` with `mutate.run` replaced,
+    so the callback itself -- the whole mechanism -- never executed. A resume
+    trusts what reached `--json`, so "nothing void was handed over" is the
+    claim, and a stub cannot make it.
+    """
+
+    def landings(self, table: list[Mutation], red: bool) -> list[str]:
+        """Labels handed to `landed`, from a real run of `table`.
+
+        The baseline is made red by failing the *shard*, not by breaking the
+        tree: `_borrow` is what runs a baseline shard, and a `Verdict` from it
+        that is not `survived` is exactly what a red untouched suite looks
+        like one layer up. That keeps the fixture to one seam and leaves the
+        code under test -- `run`'s collection order and its `not red` guard --
+        real.
+        """
+        seen: list[str] = []
+        real = mutate._borrow
+
+        def borrow(*args: Any, **kwargs: Any) -> mutate.Verdict:
+            if not red:
+                return real(*args, **kwargs)
+            return mutate.Verdict("caught", "tests.test_entry.T.test_x", why="a traceback")
+
+        with (
+            mock.patch.object(mutate, "_borrow", borrow),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            mutate.run(
+                table,
+                baseline=True,
+                workers=2,
+                summarise=False,
+                landed=lambda result: seen.append(result.mutation.label),
+            )
+        return seen
+
+    def test_every_row_is_handed_over_as_it_lands(self) -> None:
+        table = [CLAMP_GUARD, CAP_NUDGE]
+        self.assertEqual([row.label for row in table], self.landings(table, red=False))
+
+    def test_a_red_baseline_hands_over_nothing(self) -> None:
+        """The headline of this branch. `_recorded` drops the red flag on read
+        and `sweep` skips a recorded file by name, so a void row that reaches
+        `--json` comes back on the next run as a final answer."""
+        self.assertEqual([], self.landings([CLAMP_GUARD, CAP_NUDGE], red=True))
+
+
+class TestASweepWritesEachFileOutAsItFinishes(unittest.TestCase):
+    """`sweep`'s bookkeeping around a real run: count a file down, say so, and
+    persist what is complete.
+
+    Real again rather than stubbed, for the reason its neighbour gives. Both
+    rows here name the same file, so one "complete" line is the whole of it.
+    """
+
+    def swept(self, args_extra: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        report = Path(box) / "out.json"
+        args = argparse.Namespace(
+            json=report,
+            no_baseline=True,
+            workers=2,
+            timeout=mutate.TIMEOUT,
+            each_test=mutate.EACH_TEST,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+            **(args_extra or {}),
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            mutate.sweep([CLAMP_GUARD, CAP_NUDGE], args)
+        return said.getvalue(), json.loads(report.read_text(encoding="utf-8"))
+
+    def test_the_file_is_counted_down_and_its_rows_recorded(self) -> None:
+        said, written = self.swept()
+        self.assertIn(f"-- {CLAMP_GUARD.path} complete", said)
+        self.assertEqual(
+            sorted(row["label"] for row in written["results"]),
+            sorted([CLAMP_GUARD.label, CAP_NUDGE.label]),
+        )
+
+    def test_a_finished_file_is_on_disk_before_the_run_ends(self) -> None:
+        """The whole point of writing per file: a crash costs one file, not the
+        afternoon. Both assertions above are satisfied by `sweep`'s *final*
+        write, so neither can see the incremental one -- measured, by a spec
+        table: deleting `finished`'s `_persist` survived them both.
+
+        So this looks while the run is still going. The second file's row is
+        held until the first file's rows have been observed on disk; if the
+        report is only written at the end, the wait times out and the run
+        deadlocks rather than passing quietly -- which is why the bound is
+        short and its expiry is the failure.
+        """
+        import threading
+
+        held, seen = threading.Event(), threading.Event()
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        report = Path(box) / "out.json"
+        # Two files, so one can finish while the other is still in flight.
+        # `_attempt` is replaced rather than the tree mutated: what is under
+        # test is when `sweep` *writes*, not what a mutation does.
+        slow = Mutation(
+            "a second file",
+            "woswoar/codec.py",
+            "MAX_EXPORT_BYTES = 8 * 1024 * 1024",
+            "MAX_EXPORT_BYTES = 9 * 1024 * 1024",
+            "tests.test_codec",
+        )
+
+        # The two bounds must not be equal, and that is the whole of the
+        # fixture. The watcher gives up after LOOKING, then releases the held
+        # row; the row's own wait is far longer, so the release only ever comes
+        # from the watcher. Written with both at 30s the two raced -- `sweep`'s
+        # *final* write landed while the watcher was still polling, so deleting
+        # the incremental one passed anyway. Measured: that spelling reported
+        # SURVIVED against the narrow selection and `caught` only under the
+        # whole suite, which is the shape of a fixture that decides by timing.
+        LOOKING, RELEASED = 10.0, 60.0
+
+        def attempt(mutation: Mutation, *args: Any, **kwargs: Any) -> mutate.Verdict:
+            if mutation.path == slow.path:
+                held.wait(timeout=RELEASED)
+            return mutate.Verdict("caught", "tests.test_entry.T.test_x")
+
+        def watch() -> None:
+            deadline = time.monotonic() + LOOKING
+            while time.monotonic() < deadline:
+                if report.is_file() and json.loads(report.read_text(encoding="utf-8"))["results"]:
+                    seen.set()
+                    break
+                time.sleep(0.05)
+            held.set()
+
+        args = argparse.Namespace(
+            json=report,
+            no_baseline=True,
+            workers=2,
+            timeout=mutate.TIMEOUT,
+            each_test=mutate.EACH_TEST,
+            memory=mutate.MEMORY,
+            all=True,
+            batch=True,
+        )
+        looking = threading.Thread(target=watch)
+        looking.start()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "_attempt", attempt),
+        ):
+            mutate.sweep([CAP_NUDGE._replace(path=CLAMP_GUARD.path), slow], args)
+        looking.join()
+        self.assertTrue(seen.is_set(), "nothing was written until the whole run had finished")
+
+    def test_the_answers_are_the_real_ones(self) -> None:
+        """The pair was measured before it was trusted: the clamp guard is
+        caught by `tests.test_entry`, the one-character cap nudge is not. A
+        sweep that recorded rows without running them would pass the test above
+        and fail this one."""
+        _, written = self.swept()
+        by_label = {row["label"]: row["outcome"] for row in written["results"]}
+        self.assertEqual("caught", by_label[CLAMP_GUARD.label])
+        self.assertEqual("survived", by_label[CAP_NUDGE.label])
+
+
+class TestWhoOwnsTheMachine(unittest.TestCase):
+    """`_budget` halves a shared machine and does not halve a dedicated one.
+
+    The halving was unconditional, and on a machine with nobody else on it that
+    is waste rather than thrift: measured in tupferl on a 16 GiB four-core
+    container, it gave a budget of 8037 MiB, which `_share` turned into
+    **three** lanes where the cores wanted eight -- 283.7s against 154.7s on
+    one interleaved pair of the same 17-mutant table.
+    """
+
+    #: Bigger than `_SPARE` and than `_FLOOR`, so "leave a gibibyte" and "never
+    #: go under the floor" are both visible rather than clipping each other.
+    VISIBLE = 16 << 30
+
+    def budget(self, **environment: str) -> int:
+        seen = mock.patch.object(mutate, "_visible_memory", lambda: self.VISIBLE)
+        with seen, mock.patch.dict(os.environ, environment, clear=True):
+            return mutate._budget()
+
+    def test_a_shared_machine_keeps_half_for_the_person_using_it(self) -> None:
+        with mock.patch.object(mutate, "_confined", lambda: 0):
+            self.assertEqual(self.VISIBLE // 2, self.budget())
+
+    def test_a_ci_runner_is_not_shared(self) -> None:
+        """Nobody is waiting for their editor on a CI runner, and every CI
+        system sets this.
+
+        The gibibyte is written out rather than taken from `mutate._SPARE`:
+        against the constant this assertion changes with the code it checks and
+        holds for any value of it -- the copy-of-the-code fixture by name. In
+        tupferl's sweep both mutations of `_SPARE` survived the symbolic
+        spelling.
+        """
+        self.assertEqual(self.VISIBLE - (1 << 30), self.budget(CI="true"))
+
+    def test_a_cgroup_limit_means_the_share_is_already_carved_out(self) -> None:
+        """Halving a cgroup limit double-counts the same reservation: the
+        container has no other half to leave, because nobody else is in it."""
+        with mock.patch.object(mutate, "_confined", lambda: 1 << 30):
+            self.assertEqual(self.VISIBLE - (1 << 30), self.budget())
+
+    def test_being_told_beats_both(self) -> None:
+        asked = 12 << 30
+        self.assertEqual(asked, self.budget(**{mutate._TOTAL: str(asked)}))
+        self.assertEqual(asked, self.budget(CI="true", **{mutate._TOTAL: str(asked)}))
+
+    def test_nonsense_in_the_variable_is_ignored_rather_than_obeyed(self) -> None:
+        with mock.patch.object(mutate, "_confined", lambda: 0):
+            for said in ("", "0", "-1", "lots"):
+                with self.subTest(said=said):
+                    self.assertEqual(self.VISIBLE // 2, self.budget(**{mutate._TOTAL: said}))
+
+    def test_a_tiny_dedicated_machine_never_drops_under_the_floor(self) -> None:
+        """Otherwise subtracting `_SPARE` hands it less than one lane's ceiling
+        and it gets *fewer* lanes than the shared rule would have given -- the
+        opposite of the point."""
+        tiny = mock.patch.object(mutate, "_visible_memory", lambda: (1 << 30) + (1 << 20))
+        with tiny, mock.patch.dict(os.environ, {"CI": "true"}, clear=True):
+            self.assertEqual(mutate._FLOOR, mutate._budget())
+
+    def test_the_run_says_which_rule_it_used(self) -> None:
+        """A lane count nobody can account for is what sent tupferl's author
+        reading `_share` in the first place."""
+        alone = mock.patch.object(mutate, "_confined", lambda: 0)
+        with mock.patch.dict(os.environ, {}, clear=True), alone:
+            self.assertIn("shared", mutate._why())
+        with mock.patch.dict(os.environ, {"CI": "true"}, clear=True):
+            self.assertIn("dedicated", mutate._why())
+        with mock.patch.dict(os.environ, {mutate._TOTAL: "123"}, clear=True):
+            # `mutate._TOTAL`, not the literal. In tupferl this asserted
+            # "--budget" and passed for a release, naming a flag the parser has
+            # never had -- so someone reading the printed line and typing it
+            # got "unrecognized arguments". A test that pins prose has to pin
+            # it against the thing it describes.
+            self.assertEqual(mutate._TOTAL, mutate._why())
+
+
+class TestReadingACgroupLimit(unittest.TestCase):
+    """`_confined` tells a real limit from the two ways of saying "no limit"."""
+
+    HOST = 16 << 30
+
+    def confined(self, written: str) -> int:
+        def reads(where: str, **kwargs: object) -> str:
+            del where, kwargs
+            return written
+
+        # Both patched by name rather than through `mutate.<attr>`: the module
+        # imports `os` and `Path`, it does not re-export them, and mypy is
+        # right to say so.
+        host = mock.patch(
+            "os.sysconf", lambda name: {"SC_PAGE_SIZE": 1, "SC_PHYS_PAGES": self.HOST}[name]
+        )
+        with mock.patch("pathlib.Path.read_text", reads), host:
+            return mutate._confined()
+
+    def test_a_real_limit_below_the_host_total_counts(self) -> None:
+        self.assertEqual(2 << 30, self.confined(str(2 << 30)))
+
+    def test_cgroup_v2_writes_max_for_no_limit(self) -> None:
+        self.assertEqual(0, self.confined("max"))
+
+    def test_cgroup_v1_writes_a_sentinel_near_two_to_the_sixty_three(self) -> None:
+        """9223372036854771712 is what a v1 `memory.limit_in_bytes` holds for
+        "no limit". Read as a limit it would look like the largest dedicated
+        machine ever built."""
+        self.assertEqual(0, self.confined("9223372036854771712"))
+
+
+class TestWhenTheMachineCannotSayHowBigItIs(unittest.TestCase):
+    """`_confined`'s answers when the question cannot be asked.
+
+    In tupferl every one of these lines survived the first sweep of the budget
+    change: the tests above mock `_confined` wholesale, which proves what
+    `_budget` does with its answer and nothing about how the answer is reached.
+    """
+
+    def test_no_host_total_means_no_limit_can_be_judged(self) -> None:
+        """`sysconf` is not POSIX everywhere. Without a host total there is
+        nothing to compare a cgroup file against, and calling any number a
+        limit would be guessing -- a v1 sentinel would read as a machine with
+        eight exabytes."""
+        with mock.patch("os.sysconf", side_effect=OSError):
+            self.assertEqual(0, mutate._confined())
+
+    def test_no_cgroup_file_means_the_host_bounds_us(self) -> None:
+        with mock.patch("pathlib.Path.read_text", side_effect=OSError):
+            self.assertEqual(0, mutate._confined())
+
+    def test_a_shared_machine_is_reported_as_the_empty_string(self) -> None:
+        """`dedicated` returns a *reason*, and "no reason" has to be falsy for
+        `_budget` to read it. `None` would work there and break the line that
+        prints it."""
+        alone = mock.patch.object(mutate, "_confined", lambda: 0)
+        with mock.patch.dict(os.environ, {}, clear=True), alone:
+            self.assertEqual("", mutate.dedicated())
+
+    def test_a_budget_of_one_byte_is_still_a_budget(self) -> None:
+        """The boundary on `int(said) > 0`. A fixture using a comfortable
+        number cannot tell that from `> 1`."""
+        with mock.patch.dict(os.environ, {mutate._TOTAL: "1"}, clear=True):
+            self.assertEqual(1, mutate._budget())

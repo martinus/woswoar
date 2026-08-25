@@ -247,14 +247,15 @@ def a_pid(text: str) -> int:
     return pid
 
 
-#: How long `--pidfile` waits for the job to write one before giving up. Ten
-#: seconds because the file is written before the first row of work, so the only
-#: thing being waited on is an interpreter starting -- and a watcher that hung
-#: here for ever would be the silence this tool exists to break.
+#: How long `--pidfile` waits for the job to write one before giving up, unless
+#: `--pidfile-wait` says otherwise. Ten seconds because the file is written
+#: before the first row of work, so the only thing being waited on is an
+#: interpreter starting -- and a watcher that hung here for ever would be the
+#: silence this tool exists to break.
 PIDFILE_WAIT = 10.0
 
 
-def _await_pid(where: Path, interval: float) -> int:
+def _await_pid(where: Path, interval: float, patience: float | None = None) -> int:
     """The pid in ``where``, once the job has written it.
 
     Waited for rather than required up front, because the watcher is usually
@@ -269,15 +270,18 @@ def _await_pid(where: Path, interval: float) -> int:
     refuse.
     """
     step = min(interval, 0.1)
-    deadline = time.monotonic() + PIDFILE_WAIT
+    # Resolved here rather than as `patience: float = PIDFILE_WAIT` in the
+    # signature. A default argument is evaluated once, when the module is
+    # imported, so a test that shortened the constant would still get ten
+    # seconds.
+    waiting = PIDFILE_WAIT if patience is None else patience
+    deadline = time.monotonic() + waiting
     while True:
         try:
             return a_pid(where.read_text(encoding="utf-8").strip())
         except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
             if time.monotonic() >= deadline:
-                raise SystemExit(
-                    f"no usable pid in {where} after {PIDFILE_WAIT:g}s: {exc}"
-                ) from None
+                raise SystemExit(f"no usable pid in {where} after {waiting:g}s: {exc}") from None
         time.sleep(step)
 
 
@@ -319,6 +323,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--match", default=".", help="count lines of --log matching this regex (default: all)"
     )
+    parser.add_argument(
+        "--pidfile-wait",
+        type=float,
+        default=PIDFILE_WAIT,
+        # A real setting, not a test hook: a job whose interpreter has a large
+        # import to do before it writes its pid is a reason to wait longer, and
+        # a caller who knows the file is already there is a reason to wait less.
+        #
+        # That the two tests for the *deadline* can then take a fraction of a
+        # second instead of ten is the reason it was added now rather than the
+        # reason it exists -- they were the two slowest tests in the suite, 20s
+        # of a 250s serial run, spent watching a clock.
+        help="seconds to wait for --pidfile to appear (default: %(default)s)",
+    )
     parser.add_argument("--interval", type=float, default=INTERVAL, help="seconds between polls")
     parser.add_argument(
         "--stale",
@@ -328,7 +346,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    pid = args.pid if args.pid is not None else _await_pid(args.pidfile, args.interval)
+    pid = (
+        args.pid
+        if args.pid is not None
+        else _await_pid(args.pidfile, args.interval, args.pidfile_wait)
+    )
     watch = Watch(pid, args.log, args.done, re.compile(args.match), args.stale)
     while True:
         event = watch.step()

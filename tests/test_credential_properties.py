@@ -26,14 +26,12 @@ import re
 import unittest
 from unittest import mock
 
-from hypothesis import given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
+from tests import profiles  # noqa: F401  -- registers and loads the profile
 from tests.credential_shapes import INNOCENT_SHAPES, SECRET_SHAPES
 from woswoar import credentials
-
-settings.register_profile("woswoar-credentials", max_examples=400, deadline=None)
-settings.load_profile("woswoar-credentials")
 
 SECRET = st.sampled_from(SECRET_SHAPES)
 INNOCENT = st.sampled_from(INNOCENT_SHAPES)
