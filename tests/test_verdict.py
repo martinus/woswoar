@@ -65,6 +65,18 @@ SLEPT = 0.2
 BOUND = 20
 
 
+def skip_without_memory_caps() -> None:
+    """Skip this *test* where `RLIMIT_AS` is not enforced.
+
+    A function called from `setUp` rather than a `@skipUnless` decorator, so
+    the probe runs on first use rather than at import; and per test rather than
+    from `setUpClass`, so each skipped id is reported under its own name. See
+    `TestAnOutOfMemoryTestIsNotAnAnswer` for what the class-level spelling cost.
+    """
+    if not support.memory_caps_apply():
+        raise unittest.SkipTest("RLIMIT_AS is not usable here")
+
+
 class Probe(unittest.TestCase):
     """A sandbox of throwaway test modules, and one run of the tool over them."""
 
@@ -507,16 +519,23 @@ class TestAnOutOfMemoryTestIsNotAnAnswer(Probe):
     this and not the three tests beside it in `TestACarrierThatDidNotAssert`,
     which need no such thing. The same gate `tests.test_mutate` uses for the
     cap -- `support.memory_caps_apply`, asked by trying rather than by platform
-    name, and asked in `setUpClass` rather than at import so that a process
-    which loads this module without running the gated classes never pays for
-    the probe's fork.
+    name, and asked in `setUp` rather than at import, so a process that loads
+    this module without reaching the gated tests never pays for the probe's
+    fork. `functools.cache` means the fork happens once per process however
+    many tests ask.
+
+    **In `setUp`, not `setUpClass`, and that is the accounting rather than
+    taste.** A `setUpClass` that raises `SkipTest` reports one skip *for the
+    class*, so the individual ids `tools/run_tests.py` discovered never report
+    back and it correctly refuses to call the run green -- `6 discovered tests
+    never ran` on the macOS leg, where this gate is the one that actually
+    fires. Green on Linux, red on the only platform that reaches the branch;
+    `tests/test_run_tests.py` now refuses the shape for the whole suite.
     """
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        if not support.memory_caps_apply():
-            raise unittest.SkipTest("RLIMIT_AS is not usable here")
-        super().setUpClass()
+    def setUp(self) -> None:
+        skip_without_memory_caps()
+        super().setUp()
 
     def test_a_test_that_exhausts_the_cap_is_broken_not_caught(self) -> None:
         """`cap` bounds address space, and a `MemoryError` raised inside a test
@@ -788,13 +807,14 @@ class TestTheMemoryCapsArithmetic(Probe):
     green macOS leg is therefore not evidence that any of this holds -- see
     `support.memory_caps_apply`. A test that can only fail on one platform is
     worth having, and worth labelling as such; this paragraph is the label.
+
+    Gated per test rather than per class, for the accounting reason
+    `TestAnOutOfMemoryTestIsNotAnAnswer` records.
     """
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        if not support.memory_caps_apply():
-            raise unittest.SkipTest("RLIMIT_AS is not usable here")
-        super().setUpClass()
+    def setUp(self) -> None:
+        skip_without_memory_caps()
+        super().setUp()
 
     #: Comfortably larger than anything the child allocates, and small enough
     #: to be distinguishable from the unlimited value.

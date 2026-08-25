@@ -15,6 +15,7 @@ to do with the runner.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -316,6 +317,84 @@ class TestSkipsCanBeFatal(unittest.TestCase):
         with fixture(SKIPS):
             code, _ = run_main("--jobs", "2")
         self.assertEqual(code, 0)
+
+
+def skips_from_setupclass(tree: ast.Module) -> list[str]:
+    """Names of classes in `tree` that raise `SkipTest` from `setUpClass`.
+
+    Separate from the tests below so that the one proving the check can fail
+    drives *this* function rather than a second copy of its logic -- a test
+    containing its own copy of the code it checks cannot fail.
+    """
+    found = []
+    for klass in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+        for method in klass.body:
+            if not isinstance(method, ast.FunctionDef) or method.name != "setUpClass":
+                continue
+            for node in ast.walk(method):
+                # The `isinstance` inline rather than hoisted into a local:
+                # mypy narrows `node.exc` from the expression, not from a
+                # variable holding its result.
+                if (
+                    isinstance(node, ast.Raise)
+                    and node.exc is not None
+                    and "SkipTest" in ast.dump(node.exc)
+                ):
+                    found.append(klass.name)
+    return found
+
+
+class TestNoSuiteHereSkipsFromSetUpClass(unittest.TestCase):
+    """A class-level skip is invisible to the accounting above, so this suite
+    may not contain one.
+
+    `unittest` reports a `setUpClass` that raises `SkipTest` **once, for the
+    class** -- as `setUpClass (module.Class)` -- so the individual ids
+    `discovered` collected never report back, and the runner says "N discovered
+    tests never ran". That is the runner working correctly; the mistake is in
+    the suite.
+
+    It cost a red macOS leg: `tests/test_verdict.py`'s two `RLIMIT_AS` classes
+    gated themselves that way, which is invisible on Linux because there the
+    limit *is* enforced and the classes run. Six ids never reported, on the one
+    platform that reaches the branch. Gate in `setUp` instead -- same skip, one
+    report per id.
+
+    Read with `ast` over the sources rather than by running anything, so a class
+    that only skips on another platform is still caught here. The same shape as
+    `tests/test_errors.py` reading every `raise` out of the package.
+    """
+
+    def test_no_test_class_raises_skiptest_from_setupclass(self) -> None:
+        offenders = []
+        for source in sorted((ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            offenders += [f"{source.name}:{name}" for name in skips_from_setupclass(tree)]
+        self.assertEqual([], offenders, "gate these in setUp; setUpClass hides the ids")
+
+    def test_the_check_can_actually_fail(self) -> None:
+        """The check passes against a suite with no `setUpClass` at all, so this
+        pins that it recognises the shape it is looking for."""
+        offending = ast.parse(
+            "import unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise unittest.SkipTest('no')\n"
+        )
+        self.assertEqual(["T"], skips_from_setupclass(offending))
+
+    def test_a_setupclass_that_does_not_skip_is_fine(self) -> None:
+        """The other half: `setUpClass` is a normal thing to have, and only the
+        skip inside one is the problem."""
+        ordinary = ast.parse(
+            "import unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        cls.thing = 1\n"
+        )
+        self.assertEqual([], skips_from_setupclass(ordinary))
 
 
 class TestAModuleThatWillNotImport(unittest.TestCase):
