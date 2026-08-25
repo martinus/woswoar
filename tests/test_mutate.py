@@ -1008,6 +1008,72 @@ class TestAnUnanswerableRowNeedNotEndTheRun(MutateTestCase):
             )
 
 
+class TestWhatASandboxDoesNotCopy(unittest.TestCase):
+    """tupferl#32: the sandbox copy must not race a directory something else is
+    writing.
+
+    `_sandboxes` copies the working tree per lane. `.hypothesis` is created and
+    removed *by Hypothesis while the suite runs*, `tools/run_tests.py` shards
+    across twice the usable cores, and this module starts the harness inside one
+    of those shards -- so `copytree` scanned `.hypothesis/tmp` and it was gone
+    before the copy. It reached CI on tupferl's PR #31, on a diff that touched
+    no file in `tools/`, and the traceback named a test that was fine.
+
+    Driven against a real `_sandboxes` rather than by reading `_SKIP`: the
+    constant is the mechanism, and a test that asserted its *contents* would
+    pass against a `copytree` that had stopped passing it.
+    """
+
+    #: Every name `_SKIP` exists to keep out, and one that must survive.
+    #: `.hypothesis` and `sweeps` are the two this adds; the rest were already
+    #: there and are here so that dropping one is a failure rather than a
+    #: silence.
+    KEPT_OUT = (".git", "__pycache__", ".mypy_cache", ".ruff_cache", ".hypothesis", "sweeps")
+    KEPT = "woswoar"
+
+    def sandbox(self, tree: Path) -> Path:
+        """One lane's copy of `tree`, through the real `_sandboxes`."""
+        with (
+            mock.patch.object(Path, "cwd", return_value=tree),
+            mutate._sandboxes(1) as available,
+        ):
+            borrowed = available.get()
+            # Copied out while it is still borrowed: the context manager removes
+            # the whole thing on the way out.
+            return Path(shutil.copytree(Path(str(borrowed)), tree.parent / "seen"))
+
+    def test_none_of_them_reaches_a_lane(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="woswoar-skip-") as box:
+            tree = Path(box) / "tree"
+            (tree / self.KEPT).mkdir(parents=True)
+            (tree / self.KEPT / "__init__.py").write_text("", encoding="utf-8")
+            for name in self.KEPT_OUT:
+                (tree / name).mkdir()
+                (tree / name / "inside").write_text("x", encoding="utf-8")
+
+            copy = self.sandbox(tree)
+            for name in self.KEPT_OUT:
+                with self.subTest(name=name):
+                    self.assertFalse((copy / name).exists(), f"{name} was copied")
+            # One file that must survive, or "nothing was copied at all" would
+            # satisfy every assertion above.
+            self.assertTrue((copy / self.KEPT / "__init__.py").is_file(), "the tree was not copied")
+
+    def test_a_nested_one_is_kept_out_too(self) -> None:
+        """`shutil.ignore_patterns` matches the base name at any depth. A pattern
+        that only applied at the root would leave this copied, and nothing would
+        notice until the next red leg."""
+        with tempfile.TemporaryDirectory(prefix="woswoar-skip-") as box:
+            tree = Path(box) / "tree"
+            deep = tree / self.KEPT / "somewhere" / ".hypothesis"
+            deep.mkdir(parents=True)
+            (deep / "tmp").write_text("x", encoding="utf-8")
+
+            copy = self.sandbox(tree)
+            self.assertTrue((copy / self.KEPT / "somewhere").is_dir(), "the tree was not copied")
+            self.assertFalse((copy / self.KEPT / "somewhere" / ".hypothesis").exists())
+
+
 class TestTheJsonReport(unittest.TestCase):
     """The contract `tools/reached.py` reads, tested from this side of it.
 
