@@ -1245,7 +1245,31 @@ class TestResumingASweep(unittest.TestCase):
         answer = Report([Result(table[0], Verdict("caught"))], baseline_red=True)
         said, _ = self.swept(table, answer)
         counted = next(line for line in said.splitlines() if "baseline was red" in line)
-        self.assertIn("none of the 1 row(s) means anything", counted)
+        self.assertIn("none of the 1 new row(s) means anything", counted)
+
+    def test_a_red_baseline_leaves_no_new_rows_for_a_resume_to_trust(self) -> None:
+        """The rows of a red-baseline run are void, and `_recorded` drops the
+        red flag while `sweep` skips a recorded file by name -- so a void row
+        that reaches `--json` comes back on the next run as a final answer.
+        The old rows stay: they were recorded under their own green baselines.
+        """
+        where = self.persisted(self.rows("a.py:1 -- old"))
+        table = [
+            Mutation("a.py:1 -- old", "a.py", "a", "b", "test_mod"),
+            Mutation("b.py:1 -- fresh", "b.py", "c", "d", "test_mod"),
+        ]
+        answer = Report([Result(table[1], Verdict("caught"))], baseline_red=True)
+        args = self.batch_args(where)
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "run", return_value=answer),
+        ):
+            report = mutate.sweep(table, args)
+        self.assertTrue(report.baseline_red, "the flag was dropped on the way out")
+        on_disk = json.loads(where.read_text(encoding="utf-8"))
+        labels = [row["label"] for row in on_disk["results"]]
+        self.assertNotIn("b.py:1 -- fresh", labels, "a void row was recorded as final")
+        self.assertEqual(["a.py:1 -- old"], labels, "the resume state lost the good rows")
 
     def test_a_green_sweep_says_nothing_about_it(self) -> None:
         """Without this the sentence could be printed unconditionally."""
@@ -1968,41 +1992,9 @@ class TestATimeoutEndsTheWholeSession(MutateTestCase):
         )
 
 
-def enforced() -> bool:
-    """Whether this kernel applies the limits `verdict.cap` asks for.
-
-    Asked by trying it, in a subprocess, rather than by reading `sys.platform`.
-    macOS ignores `RLIMIT_AS` -- which CI discovered, not the documentation --
-    and a `skipIf(darwin)` would encode today's answer to a question that is
-    really "does this kernel enforce it", going green on a platform that
-    silently protects nothing and staying skipped if macOS ever starts.
-
-    It sets the limits *directly* rather than calling `verdict.cap`, and that is
-    not a stylistic choice -- mutation testing rejected the first version, which
-    did call it. A skip condition computed from the code under test cannot
-    detect that code being reverted: neutering `cap` made the probe report "not
-    enforced", the test skipped, and the row came back `SURVIVED` from a suite
-    that had simply declined to run it. A guard that switches itself off when
-    the thing it guards breaks is worse than no guard, because it is green.
-    """
-    probe = (
-        "import resource\n"
-        "for which in (resource.RLIMIT_AS, resource.RLIMIT_DATA):\n"
-        "    soft, hard = resource.getrlimit(which)\n"
-        "    try:\n"
-        "        resource.setrlimit(which, (256 * 1024 * 1024, hard))\n"
-        "    except (OSError, ValueError):\n"
-        "        pass\n"
-        "try:\n"
-        "    bytearray(768 * 1024 * 1024)\n"
-        "except MemoryError:\n"
-        "    print('enforced')\n"
-    )
-    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
-    return "enforced" in done.stdout
-
-
-@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+@unittest.skipUnless(
+    support.memory_caps_apply(), "this kernel does not enforce the address-space limit"
+)
 class TestAMutantThatEatsMemory(MutateTestCase):
     """The failure `timeout` cannot catch, because the machine goes first.
 
@@ -2052,7 +2044,9 @@ class TestAMutantThatEatsMemory(MutateTestCase):
         self.assertIn("ran out of memory", report.results[0].verdict.detail)
 
 
-@unittest.skipUnless(enforced(), "this kernel does not enforce the address-space limit")
+@unittest.skipUnless(
+    support.memory_caps_apply(), "this kernel does not enforce the address-space limit"
+)
 class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     """The intersection of the two cases above, which neither of them covers.
 
@@ -2067,7 +2061,7 @@ class TestASubTestThatRunsOutOfMemory(MutateTestCase):
     lie #220 removed one level down. This repository uses `subTest` in more than
     twenty places, so the intersection is reachable rather than theoretical.
 
-    Gated on `enforced()` for the same reason as its sibling, which CI taught
+    Gated on `support.memory_caps_apply` for the same reason as its sibling, which CI taught
     twice: macOS does not apply `RLIMIT_AS`, so the 800 MiB simply succeeds
     there, `clamp` returns a large number, the subtest notices it and the row
     reads `caught`. The first version of this test copied the fixture and not
@@ -2638,14 +2632,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-#: Seconds a driven probe may take before a test calls it hung. Above the ~2s an
-#: honest `collect(2)` spends and far below `tools/mutate.py`'s `EACH_TEST` of
-#: 150 -- the order tupferl learned matters the hard way: its `test_watch.py`
-#: bounded subprocesses at exactly the harness's alarm, the two raced, and seven
-#: mutants of the lines the bound existed to guard came back `BROKE`. See
-#: `TestAHungTestIsBoundedAndNotCredited.collect`.
-BOUND = 20
-
 #: A test id that certainly resolves, used where the point is "a real one is
 #: kept". This module's own name, so it cannot go stale without this file being
 #: edited -- and if it is renamed, the test that depends on it is right here
@@ -2819,123 +2805,18 @@ class TestTheKillerIsRecordedAtAll(unittest.TestCase):
         self.assertEqual({result.verdict.killer}, mutate._loadable([result.verdict.killer]))
 
 
-#: A test module that hangs on a blocking read, and one that does not. Written
-#: to a throwaway directory rather than kept in `tests/`, because `run_tests`
-#: discovers everything here and a permanently-hanging test in the tree is the
-#: exact failure this guards against.
-HANGS = """
-import os, unittest
-from pathlib import Path
+class TestTheAlarmArming(unittest.TestCase):
+    """`verdict.each_test`'s two answers, in process.
 
-
-class TestOne(unittest.TestCase):
-    def test_hangs_on_a_fifo(self):
-        where = Path(os.environ["HANGDIR"]) / "pipe"
-        if not where.exists():
-            os.mkfifo(where)
-        where.read_bytes()
-        self.fail("unreachable")
-
-    def test_is_fine(self):
-        self.assertTrue(True)
-"""
-
-
-class TestAHungTestIsBoundedAndNotCredited(unittest.TestCase):
-    """A per-test alarm, and the classification that makes it safe.
-
-    `tools/mutate.py`'s `TIMEOUT` bounds a whole *run* at 300s and cannot say
-    which test hung. This bounds a *test*, in seconds, and names it.
-
-    The dangerous part is not the timer, it is where the result is filed. The
-    alarm raises inside a real `TestCase`, so it reaches `addError` carrying a
-    genuine test -- indistinguishable by protocol from that test having noticed
-    the mutation. Filed as an answer it would report `caught`, crediting a test
-    that asserted nothing. 300s of wasted lane is visible; a false `caught` is
-    not.
+    The behaviour of an *armed* alarm is `tests/test_verdict.py`'s subject,
+    driven through the real probe. What is asserted here is only the arming
+    contract `mutate._run` builds its argv from: zero arms nothing, anything
+    else comes back as given.
     """
 
-    def collect(
-        self,
-        each: float,
-        wait: float = BOUND,
-        first: str = "",
-        names: tuple[str, ...] | None = None,
-    ) -> dict[str, Any]:
-        """Drive the real probe, in a real subprocess, on a real fifo.
-
-        The argv is positional and shared with `mutate._run`: report, failfast,
-        memory, per-test seconds, the prefix, then the selection. Spelling it
-        out here is what made a protocol change visible in tupferl -- when
-        `first` gained its own slot, that helper's selection slid into it and
-        the module ran twice.
-
-        `wait` sits between the two bounds on purpose: above the ~2s an honest
-        `collect(2)` takes, and far under `EACH_TEST`'s 150 -- so a mutant that
-        disarms the 2s alarm this asks for leaves the fifo read blocking, this
-        subprocess timeout kills it, and the row is *caught* by this test's own
-        `TimeoutExpired` rather than filed `BROKE` by the harness's alarm.
-        tupferl measured the other ordering: a bound equal to the harness's
-        alarm raced it and lost seven mutants to `BROKE`.
-        """
-        with tempfile.TemporaryDirectory() as name:
-            box = Path(name)
-            (box / "tests").mkdir()
-            (box / "tests" / "__init__.py").write_text("", encoding="utf-8")
-            (box / "tests" / "test_hang.py").write_text(HANGS, encoding="utf-8")
-            report = box / "verdict.json"
-            done = subprocess.run(
-                [
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    mutate._probe(),
-                    str(report),
-                    "0",
-                    "0",
-                    str(each),
-                    first,
-                    *(("tests.test_hang",) if names is None else names),
-                ],
-                cwd=box,
-                env={**os.environ, "HANGDIR": str(box), "PYTHONPATH": str(box)},
-                capture_output=True,
-                text=True,
-                timeout=wait,
-            )
-            self.assertTrue(report.is_file(), done.stderr[-800:])
-            return dict(json.loads(report.read_text(encoding="utf-8")))
-
-    def test_a_hung_test_is_interrupted_rather_than_waited_out(self) -> None:
-        """A blocking `read()` on a fifo. PEP 475 retries a syscall interrupted
-        by a signal, so this only works because the handler *raises* rather
-        than setting a flag."""
-        found = self.collect(2)
-        self.assertEqual(2, found["ran"], "the run did not get past the hung test")
-
-    def test_it_is_never_counted_as_the_test_noticing(self) -> None:
-        """The whole safety argument. `noticed` is what `caught` is made of."""
-        found = self.collect(2)
-        self.assertEqual([], found["noticed"])
-        broke = [str(line) for line in found["broke"]]
-        self.assertEqual(1, len(broke), broke)
-        self.assertIn("test_hangs_on_a_fifo", broke[0])
-        self.assertIn("did not finish", broke[0])
-
-    def test_zero_disables_it(self) -> None:
-        """So a platform without `SIGALRM`, or someone debugging a genuinely
-        slow test, can turn it off -- and then the whole-run `TIMEOUT` is what
-        bounds the hang, which is the behaviour before this existed.
-
-        Three seconds, not the default: a test that hangs on purpose has to be
-        the cheapest possible version of itself.
-        """
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.collect(0, wait=3)
-
     def test_zero_arms_nothing(self) -> None:
-        """The same claim without a subprocess at all, because the one above
-        can only ever say "it did not finish in three seconds"."""
+        before = signal.getsignal(signal.SIGALRM)
+        self.addCleanup(signal.signal, signal.SIGALRM, before)
         self.assertEqual(0.0, verdict_module.each_test(0))
         self.assertEqual(2.0, verdict_module.each_test(2))
 
@@ -2995,38 +2876,6 @@ class TestTheCheapPrefix(unittest.TestCase):
         self.assertEqual(["tests.m.C.one", "tests.m.C.two"], cache.prefix())
 
 
-class TestWhichRowsGetThePrefix(unittest.TestCase):
-    def cache(self) -> mutate.Killers:
-        made = mutate.Killers(None)
-        made.cost = {REAL: 0.001}
-        return made
-
-    def test_a_row_with_a_remembered_killer_does_not_pay_for_it(self) -> None:
-        """Exact beats general: that test is known to catch *this* row, so the
-        prefix would only be work in front of the answer."""
-        cache = self.cache()
-        one = cached_row()._replace(tests="tests.test_mutate")
-        cache.known = {mutate._key(one): REAL}
-        (ahead,) = cache.ahead_of([one])
-        self.assertEqual(REAL, ahead.first)
-
-    def test_a_row_with_nothing_remembered_gets_the_prefix(self) -> None:
-        cache = self.cache()
-        cache.known = {"someone-else": REAL}
-        with contextlib.redirect_stdout(io.StringIO()):
-            (ahead,) = cache.ahead_of([cached_row()._replace(tests="tests.test_mutate")])
-        self.assertEqual(REAL, ahead.first)
-
-    def test_the_prefix_is_cut_to_what_the_row_can_reach(self) -> None:
-        """A test in a module that does not import the mutated file cannot see
-        the mutation, so running it would be pure cost."""
-        cache = self.cache()
-        cache.known = {"someone-else": REAL}
-        with contextlib.redirect_stdout(io.StringIO()):
-            (ahead,) = cache.ahead_of([cached_row()._replace(tests="tests.test_deps")])
-        self.assertEqual("", ahead.first)
-
-
 class TestTheCacheLearnsFromARealRun(unittest.TestCase):
     """The plumbing, not the algorithm.
 
@@ -3037,9 +2886,17 @@ class TestTheCacheLearnsFromARealRun(unittest.TestCase):
     never delivers them.
     """
 
+    #: One real run for the class, not one per test: each is a tree copy plus
+    #: two subprocess suite runs, and the second test's claim is proven just as
+    #: well against the first run's report.
+    found: mutate.Report
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.found = run([CAP_NUDGE], baseline=True, workers=1, summarise=False)
+
     def test_a_run_measures_the_tests_it_ran(self) -> None:
-        found = run([CAP_NUDGE], baseline=True, workers=1, summarise=False)
-        times = found.times or {}
+        times = self.found.times or {}
         self.assertTrue(times, "the run recorded no test timings at all")
         # `tests.test_entry` is CAP_NUDGE's whole selection, so its tests are
         # exactly what should have been measured.
@@ -3049,20 +2906,20 @@ class TestTheCacheLearnsFromARealRun(unittest.TestCase):
         self.assertTrue(all(seconds >= 0 for seconds in times.values()))
 
     def test_they_reach_the_cache(self) -> None:
-        found = run([CAP_NUDGE], baseline=True, workers=1, summarise=False)
         cache = mutate.Killers(None)
-        cache.learn(found)
-        self.assertEqual(found.times or {}, cache.cost)
+        cache.learn(self.found)
+        self.assertEqual(self.found.times or {}, cache.cost)
 
 
-class TestThePrefixReachesTheExpensiveRows(unittest.TestCase):
-    """Which rows the prefix is cut to, and the two it used to be cut *out* of.
+class TestWhichRowsGetThePrefix(unittest.TestCase):
+    """Which rows the cheap prefix reaches, and the two it used to be cut out of.
 
-    tupferl's first version compared module names -- which dropped the prefix in
-    the two places it was worth most, and neither is visible in a `woswoar/`
-    sweep: every file here has an importer, so every row names modules and
-    matches. It is the `tools/` sweeps, and any new file nothing imports yet,
-    that hit them.
+    Exact beats general: a row with a remembered killer runs that instead. For
+    the rest, tupferl's first version compared module names -- which dropped the
+    prefix in the two places it was worth most, and neither is visible in a
+    `woswoar/` sweep: every file here has an importer, so every row names
+    modules and matches. It is the `tools/` sweeps, and any new file nothing
+    imports yet, that hit them.
     """
 
     def cache(self) -> mutate.Killers:
@@ -3075,6 +2932,23 @@ class TestThePrefixReachesTheExpensiveRows(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             (ahead,) = self.cache().ahead_of([cached_row()._replace(tests=tests)])
         return ahead
+
+    def test_a_row_with_a_remembered_killer_does_not_pay_for_it(self) -> None:
+        """That test is known to catch *this* row, so the prefix would only be
+        work in front of the answer."""
+        cache = self.cache()
+        one = cached_row()._replace(tests="tests.test_mutate")
+        cache.known = {mutate._key(one): REAL}
+        (ahead,) = cache.ahead_of([one])
+        self.assertEqual(REAL, ahead.first)
+
+    def test_a_row_with_nothing_remembered_gets_the_prefix(self) -> None:
+        self.assertEqual(REAL, self.ahead("tests.test_mutate").first)
+
+    def test_the_prefix_is_cut_to_what_the_row_can_reach(self) -> None:
+        """A test in a module that does not import the mutated file cannot see
+        the mutation, so running it would be pure cost."""
+        self.assertEqual("", self.ahead("tests.test_deps").first)
 
     def test_a_row_that_runs_everything_gets_the_whole_prefix(self) -> None:
         """`WHOLE_SUITE` is the empty string -- what a file nothing imports
@@ -3095,55 +2969,37 @@ class TestThePrefixReachesTheExpensiveRows(unittest.TestCase):
         klass = REAL.rsplit(".", 1)[0]
         self.assertEqual(REAL, self.ahead(klass).first)
 
-    def test_a_row_that_cannot_reach_it_still_does_not_pay(self) -> None:
-        """The guard the two above must not break: a test in a module that does
-        not import the mutated file cannot see the mutation."""
-        self.assertEqual("", self.ahead("tests.test_deps").first)
-
 
 class TestConfirmationReallyRunsTheWholeSuite(unittest.TestCase):
     """`CONTRIBUTING.md` promises every survivor is re-run against the whole
     suite before it is reported, and `Report.widened` is the flag that claims
     it.
 
-    Two things could quietly make that false, and both are one character wide.
     `WHOLE_SUITE` is the *empty* selection -- `verdict.collect` falls through to
-    `discover` only when the list is empty -- so anything in front of it turns
-    "everything" into "only this". The rows `confirm` builds are exactly the
-    shape that triggers it: a survivor's selection widened while its remembered
-    test is still attached.
+    `discover` only when the list is empty -- so a remembered test still
+    attached to a widened row is the one thing that could quietly turn
+    "everything" into "only this". That the probe's protocol keeps a `first` in
+    front of a discovery rather than in place of it is
+    `tests.test_verdict.TestWhichTestsGetRun`'s subject; what is asserted here
+    is the rows `confirm` actually builds.
     """
 
     def test_a_widened_row_carries_no_remembered_test(self) -> None:
-        survivor = mutate.Result(
-            cached_row()._replace(first="tests.test_sync.TestTheReport.test_it"),
-            mutate.Verdict("survived"),
-        )
-        widened = survivor.mutation._replace(tests=mutate.WHOLE_SUITE, first="")
-        self.assertEqual("", widened.first)
-        self.assertEqual("", widened.tests)
+        survivor = mutate.Result(cached_row()._replace(first=REAL), mutate.Verdict("survived"))
+        seen: list[Mutation] = []
 
-    def test_an_empty_selection_behind_a_prefix_still_discovers(self) -> None:
-        """The protocol half: an empty selection plus a prefix must run the
-        prefix *and* everything, not the prefix instead of everything.
+        def watch(rerun: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+            seen.extend(rerun)
+            return mutate.Report([mutate.Result(row, mutate.Verdict("survived")) for row in seen])
 
-        Driven in the probe's own two-test tree rather than against this
-        repository, which would run the whole suite inside a test of it.
-        """
-        found = TestAHungTestIsBoundedAndNotCredited.collect(
-            self,  # type: ignore[arg-type]
-            # Armed, because discovery reaches that tree's deliberately hanging
-            # test. With the alarm off this would hang for its whole subprocess
-            # timeout -- proving the discovery worked, expensively.
-            each=2,
-            wait=30,
-            first="tests.test_hang.TestOne.test_is_fine",
-            names=(),
-        )
-        # Two tests in that module, and the prefix names one of them -- so it
-        # runs twice, once in front and once as discovery reaches it. Anything
-        # less than three means the empty selection stopped discovering.
-        self.assertEqual(3, found["ran"])
+        with (
+            mock.patch.object(mutate, "run", watch),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            confirm(mutate.Report([survivor]), None, 30.0, MEMORY, baseline=False)
+        (row,) = seen
+        self.assertEqual("", row.first, "the remembered test rode into the whole-suite pass")
+        self.assertEqual(mutate.WHOLE_SUITE, row.tests)
 
 
 class TestARowActuallyRunsWithItsPrefix(unittest.TestCase):
@@ -3174,6 +3030,30 @@ class TestARowActuallyRunsWithItsPrefix(unittest.TestCase):
         self.assertEqual(["caught"], [r.verdict.outcome for r in found.results])
 
 
+#: The spec-file spelling of `CLAMP_GUARD`, generated from its fields so the
+#: two cannot disagree when `woswoar/entry.py` changes -- only the one
+#: real-run `--json` test would catch a drifted literal; the mocked-`run`
+#: tests would not.
+SPEC_TABLE = (
+    "from tools.mutants import Mutation\n"
+    "MUTATIONS = [\n"
+    "    Mutation(\n"
+    f"        label={CLAMP_GUARD.label!r},\n"
+    f"        path={CLAMP_GUARD.path!r},\n"
+    f"        old={CLAMP_GUARD.old!r},\n"
+    f"        new={CLAMP_GUARD.new!r},\n"
+    f"        tests={CLAMP_GUARD.tests!r},\n"
+    "    )\n"
+    "]\n"
+)
+
+
+def spec_file(box: Path) -> Path:
+    where = box / "spec.py"
+    where.write_text(SPEC_TABLE, encoding="utf-8")
+    return where
+
+
 class TestASpecFileGetsTheFlagsItWasGiven(unittest.TestCase):
     """A `MUTATIONS` table honours the command line it was run with.
 
@@ -3189,31 +3069,13 @@ class TestASpecFileGetsTheFlagsItWasGiven(unittest.TestCase):
     carry the value being asserted.
     """
 
-    #: A real row against a real file, because the `--json` test below drives
-    #: the actual run rather than a stub: `check` refuses a path that is not
-    #: there, and a report of nothing would not tell us the flag was honoured.
-    #:
-    #: One that is *caught*, deliberately. With a surviving row, a mutant that
-    #: forces confirmation on sends the `--json` test into a whole-suite re-run.
-    #: Nothing here asserts on the survivor count, so the cheaper row costs the
-    #: tests nothing and gives the sweep two answers back.
-    TABLE = (
-        "from tools.mutants import Mutation\n"
-        "MUTATIONS = [\n"
-        "    Mutation(\n"
-        '        label="probe",\n'
-        '        path="woswoar/entry.py",\n'
-        '        old="if len(cmd) <= MAX_CMD_CHARS:",\n'
-        '        new="if True:",\n'
-        '        tests="tests.test_entry",\n'
-        "    )\n"
-        "]\n"
-    )
-
-    def spec(self, box: Path) -> Path:
-        where = box / "spec.py"
-        where.write_text(self.TABLE, encoding="utf-8")
-        return where
+    #: `SPEC_TABLE` is a real row against a real file, because the `--json`
+    #: test below drives the actual run rather than a stub: `check` refuses a
+    #: path that is not there, and a report of nothing would not tell us the
+    #: flag was honoured. One that is *caught*, deliberately. With a surviving
+    #: row, a mutant that forces confirmation on sends the `--json` test into a
+    #: whole-suite re-run. Nothing here asserts on the survivor count, so the
+    #: cheaper row costs the tests nothing and gives the sweep two answers back.
 
     def asked(self, *flags: str) -> dict[str, Any]:
         """Run a spec file with `flags` and return the kwargs `run` received.
@@ -3233,7 +3095,7 @@ class TestASpecFileGetsTheFlagsItWasGiven(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
             box = Path(name)
             with mock.patch.object(mutate, "run", watch):
-                mutate.main([str(self.spec(box)), "--no-confirm", *flags])
+                mutate.main([str(spec_file(box)), "--no-confirm", "--no-killers", *flags])
         return seen
 
     def test_workers_reaches_the_run(self) -> None:
@@ -3265,7 +3127,14 @@ class TestASpecFileGetsTheFlagsItWasGiven(unittest.TestCase):
             report = box / "out.json"
             with contextlib.redirect_stdout(io.StringIO()):
                 mutate.main(
-                    [str(self.spec(box)), "--no-baseline", "--no-confirm", "--json", str(report)]
+                    [
+                        str(spec_file(box)),
+                        "--no-baseline",
+                        "--no-confirm",
+                        "--no-killers",
+                        "--json",
+                        str(report),
+                    ]
                 )
             self.assertTrue(report.is_file(), "--json wrote nothing")
             self.assertIn("results", json.loads(report.read_text(encoding="utf-8")))
@@ -3284,11 +3153,6 @@ class TestASpecFilesSurvivorsAreConfirmed(unittest.TestCase):
     confirmation wiring that used not to exist.
     """
 
-    def spec(self, box: Path) -> Path:
-        where = box / "spec.py"
-        where.write_text(TestASpecFileGetsTheFlagsItWasGiven.TABLE, encoding="utf-8")
-        return where
-
     def status(self, *flags: str) -> tuple[int, dict[str, Any], list[bool]]:
         seen: dict[str, Any] = {}
         called: list[bool] = []
@@ -3302,7 +3166,7 @@ class TestASpecFilesSurvivorsAreConfirmed(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="woswoar-exit-") as name, quiet:
             box = Path(name)
             with mock.patch.object(mutate, "confirm", watch):
-                code = mutate.main([str(self.spec(box)), "--no-baseline", *flags])
+                code = mutate.main([str(spec_file(box)), "--no-baseline", "--no-killers", *flags])
         return code, seen, called
 
     def test_survivors_are_confirmed_against_the_whole_suite_by_default(self) -> None:
@@ -3321,6 +3185,116 @@ class TestASpecFilesSurvivorsAreConfirmed(unittest.TestCase):
         their assertions would hold against a wiring that ignored the flag."""
         _, _, called = self.status("--no-confirm")
         self.assertEqual([], called, "--no-confirm confirmed anyway")
+
+
+class TestASpecFileGetsTheRestOfTheMachinery(unittest.TestCase):
+    """The killer cache, `--baseline-only`, and the `--json` lifecycle reach the
+    spec path too.
+
+    `_run_spec` exists because flags were silently dropped there once already;
+    its first fix stopped at the flags it knew about, and `--killers`,
+    `--baseline-only` and half the `--json` lifecycle were silently inert in
+    exactly the way it complains about.
+    """
+
+    def test_a_remembered_killer_runs_first_on_a_spec_row_too(self) -> None:
+        seen: list[Mutation] = []
+
+        def watch(table: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+            seen.extend(table)
+            return mutate.Report([])
+
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            remembered = box / "killers.json"
+            remembered.write_text(json.dumps({mutate._key(CLAMP_GUARD): REAL}), encoding="utf-8")
+            with mock.patch.object(mutate, "run", watch):
+                mutate.main(
+                    [
+                        str(spec_file(box)),
+                        "--no-confirm",
+                        "--killers",
+                        str(remembered),
+                    ]
+                )
+        (row,) = seen
+        self.assertEqual(REAL, row.first, "the cache never reached the spec path")
+
+    def test_baseline_only_runs_no_mutation(self) -> None:
+        """The question and nothing else -- `run` being reached would mean the
+        flag fell through to a full table run."""
+
+        def refuse(*args: Any, **kwargs: Any) -> mutate.Report:
+            raise AssertionError("--baseline-only ran the table")
+
+        with (
+            tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name,
+            mock.patch.object(mutate, "run", refuse),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = mutate.main(
+                [str(spec_file(Path(name))), "--baseline-only", "--no-killers", "--workers", "1"]
+            )
+        self.assertEqual(0, code, "a green baseline did not exit zero")
+
+    def test_a_stale_done_marker_is_cleared_before_the_run(self) -> None:
+        """A `.done` left by a previous run of the same spec would tell a
+        watcher this run finished before it began -- the false finish the
+        generated path already guards against. The pid is written first, so a
+        watcher started alongside has something to read."""
+        seen: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory(prefix="woswoar-spec-") as name:
+            box = Path(name)
+            report = box / "out.json"
+            marker = mutate._marker(report)
+            marker.touch()
+
+            def watch(table: Any, *args: Any, **kwargs: Any) -> mutate.Report:
+                seen["marker"] = marker.exists()
+                seen["pid"] = mutate._pidfile(report).read_text(encoding="utf-8").strip()
+                return mutate.Report([])
+
+            with mock.patch.object(mutate, "run", watch):
+                mutate.main(
+                    [
+                        str(spec_file(box)),
+                        "--no-confirm",
+                        "--no-killers",
+                        "--json",
+                        str(report),
+                    ]
+                )
+            self.assertFalse(seen["marker"], "the stale marker outlived the start of the run")
+            self.assertEqual(str(os.getpid()), seen["pid"])
+            self.assertTrue(marker.exists(), "the finished run earned no marker")
+            self.assertFalse(mutate._pidfile(report).exists(), "the dead pid was left behind")
+
+
+class TestTheBaselineShards(unittest.TestCase):
+    """`_shards`: what the baseline runs, and what it no longer re-runs.
+
+    The remembered-`first` shard exists for the killer `confirm` records from a
+    whole-suite run -- a test *outside* every row's selection, which red on the
+    untouched tree would hand a row `caught` over a green-looking baseline. The
+    prefix's names, by contrast, are cut to each row's own selection, so a
+    shard repeating them is pure cost -- the whole bill on `--baseline-only`.
+    """
+
+    def test_a_remembered_test_outside_every_selection_gets_its_shard(self) -> None:
+        row = cached_row()._replace(tests="tests.test_sync", first="tests.test_deps.T.test_x")
+        self.assertIn("tests.test_deps.T.test_x", mutate._shards([row]))
+
+    def test_one_already_covered_by_a_selection_does_not(self) -> None:
+        row = cached_row()._replace(tests="tests.test_sync", first="tests.test_sync.T.test_x")
+        self.assertEqual(["tests.test_sync"], mutate._shards([row]))
+
+    def test_a_whole_suite_row_covers_everything(self) -> None:
+        rows = [
+            cached_row()._replace(tests=mutate.WHOLE_SUITE, first="tests.test_deps.T.test_x"),
+            cached_row(old="a2")._replace(tests="tests.test_sync"),
+        ]
+        self.assertEqual([mutate.WHOLE_SUITE, "tests.test_sync"], mutate._shards(rows))
 
 
 class TestWhoOwnsTheMachine(unittest.TestCase):

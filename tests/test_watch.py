@@ -748,18 +748,18 @@ class TestTheCommandLine(Fixture):
     def test_the_deadline_defaults_to_the_constant(self) -> None:
         """`--pidfile-wait` is a setting with a default, not a required flag.
 
-        Asserted through the *message*, which names the deadline that applied,
-        so this reads the real default rather than the parser's. Without it,
-        `PIDFILE_WAIT` could be anything and every other test here would pass
-        -- they all pass `IMPATIENT`.
-
-        `--interval` is left alone, so one poll is 0.1s: the run gives up
-        after the deadline and this asserts what it *says*, not how long it
-        took.
+        Asserted through `--help`, which prints the parser's real default, so
+        this reads the wiring rather than re-running a ten-second wait to
+        observe it -- every other test here passes `IMPATIENT`, so nothing else
+        would notice the default drifting from the constant.
         """
-        ran = self.ran("--pidfile", str(self.root / "never"), "--pidfile-wait", "0.05")
-        self.assertEqual(ran.returncode, 1)
-        self.assertIn("after 0.05s", ran.stderr)
+        ran = self.ran("--help")
+        self.assertEqual(ran.returncode, 0)
+        # Whitespace-normalised: argparse wraps the help column wherever the
+        # terminal width falls, and a line break inside "(default: 10.0)" is
+        # not a change in the default.
+        flat = " ".join(ran.stdout.split())
+        self.assertIn("--pidfile to appear (default: 10.0)", flat)
         self.assertEqual(10.0, watch.PIDFILE_WAIT)
 
     def test_the_constant_is_resolved_when_it_is_read(self) -> None:

@@ -286,11 +286,14 @@ class Verdicts(unittest.TextTestResult):
         # branch is exactly the case this check exists for. `target is` is a
         # fact about a list mypy cannot argue with.
         target = self.noticed if isinstance(test, unittest.TestCase) else self.broke
-        target.append(str(test))
         if target is self.noticed:
-            self.killers.append(test.id())
-            if not self.reasons:
-                self.reasons.append("".join(traceback.format_exception(*err)))
+            # `_answered`, not a re-spelling of its body: the killer id and the
+            # first-only traceback were written out here a second time once,
+            # and `_carrier`'s docstring names "a refinement to one copy leaves
+            # the other" as exactly this file's hazard.
+            self._answered(test, err)
+        else:
+            target.append(str(test))
 
     def addSubTest(
         self, test: unittest.TestCase, subtest: unittest.TestCase, err: ExcInfo | None

@@ -32,15 +32,15 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from tests import support
+
 #: The repository root, so a child can import `tools` after chdir-free launch.
 ROOT = Path(__file__).resolve().parent.parent
 
 #: The tool's own source, read the way `mutate._probe` reads it -- from this
 #: tree, never from the sandbox. A copy under test could otherwise decide its
 #: own verdict, which is the property `verdict.py`'s docstring opens with.
-SOURCE = (Path(__file__).resolve().parent.parent / "tools" / "verdict.py").read_text(
-    encoding="utf-8"
-)
+SOURCE = (ROOT / "tools" / "verdict.py").read_text(encoding="utf-8")
 
 #: How long a sandbox test sleeps when it is standing in for one that hangs.
 #:
@@ -63,53 +63,6 @@ SLEPT = 0.2
 #: under `tools/mutate.py`'s 150s per-test alarm, so a hang-mutant is caught by
 #: this bound rather than filed `BROKE` by the harness's.
 BOUND = 20
-
-
-def address_space_caps() -> bool:
-    """Whether `RLIMIT_AS` can be set here *and* is applied. Asked by trying.
-
-    Three ways it can be unusable, and this run must tell them apart from a
-    working one rather than from each other:
-
-    - `setrlimit` is refused outright (macOS refuses `RLIMIT_AS`);
-    - it is accepted and not reflected by `getrlimit`;
-    - it is accepted, reflected, and simply not enforced when memory is asked
-      for -- which `tools/verdict.py`'s own docstring records CI discovering
-      rather than the documentation.
-
-    The first draft of this asked only "did the probe exit non-zero", which is
-    true of a refused `setrlimit` as well as of a refused *allocation* -- so on
-    macOS it answered "enforced" and let five tests through to fail. A probe
-    that cannot tell its own failure from the failure it is probing for is a
-    pass nobody can explain, in miniature -- so this one prints a marker and the
-    caller looks for exactly that.
-
-    Asked by trying rather than by reading `sys.platform`: the guarantee is then
-    tested wherever it really holds and skipped where it does not.
-    """
-    probe = (
-        "import resource\n"
-        "want = 64 << 20\n"
-        "hard = resource.getrlimit(resource.RLIMIT_AS)[1]\n"
-        "resource.setrlimit(resource.RLIMIT_AS, (want, hard))\n"
-        "assert resource.getrlimit(resource.RLIMIT_AS)[0] == want\n"
-        "try:\n"
-        "    bytearray(256 << 20)\n"
-        "except MemoryError:\n"
-        "    print('applied')\n"
-    )
-    try:
-        done = subprocess.run(
-            [sys.executable, "-B", "-c", probe], capture_output=True, text=True, timeout=30
-        )
-    except subprocess.SubprocessError:  # pragma: no cover - a machine in trouble
-        return False
-    return done.stdout.strip() == "applied"
-
-
-#: Computed once. The probe forks, and gating two classes on it would otherwise
-#: pay for that at import *and* at every decorated method.
-CAPS = address_space_caps()
 
 
 class Probe(unittest.TestCase):
@@ -146,6 +99,7 @@ class Probe(unittest.TestCase):
         memory: int = 0,
         each: float = 0.0,
         first: str = "",
+        wait: float = BOUND,
     ) -> dict[str, Any]:
         """Run the tool and return the report it wrote.
 
@@ -171,7 +125,7 @@ class Probe(unittest.TestCase):
             cwd=self.sandbox,
             capture_output=True,
             text=True,
-            timeout=BOUND,
+            timeout=wait,
         )
         self.assertTrue(
             self.report.is_file(),
@@ -488,15 +442,81 @@ class TestACarrierThatDidNotAssert(Probe):
         self.assertEqual(1, len(found["broke"]))
 
 
-@unittest.skipUnless(CAPS, "RLIMIT_AS is not usable here")
+#: A module that hangs on a blocking fifo read -- the case PEP 475 makes hard:
+#: a syscall interrupted by a signal is *retried*, so only a handler that
+#: raises can get past it. The `time.sleep` fixtures above do not prove that
+#: half; a fifo read does. The fifo lives at a relative path, so it lands in
+#: the sandbox the probe runs in.
+HANGS = """
+import os, unittest
+from pathlib import Path
+
+
+class TestOne(unittest.TestCase):
+    def test_hangs_on_a_fifo(self):
+        where = Path("pipe")
+        if not where.exists():
+            os.mkfifo(where)
+        where.read_bytes()
+        self.fail("unreachable")
+
+    def test_is_fine(self):
+        self.assertTrue(True)
+"""
+
+
+class TestAHungReadIsBoundedAndNotCredited(Probe):
+    """The alarm against the blocking read it exists for.
+
+    One test for both halves of the one claim about one run: the read is
+    interrupted rather than waited out, and the interruption is never filed as
+    the test noticing -- `noticed` is what `caught` is made of, and a false
+    `caught` is invisible where a wasted lane is not.
+    """
+
+    def hanging(self) -> None:
+        self.module("test_hang", HANGS)
+
+    def test_a_hung_read_is_interrupted_and_not_credited(self) -> None:
+        self.hanging()
+        found = self.verdict("test_hang", each=2)
+        self.assertEqual(2, found["ran"], "the run did not get past the hung test")
+        self.assertEqual([], found["noticed"])
+        broke = [str(line) for line in found["broke"]]
+        self.assertEqual(1, len(broke), broke)
+        self.assertIn("test_hangs_on_a_fifo", broke[0])
+        self.assertIn("did not finish", broke[0])
+
+    def test_zero_disables_it(self) -> None:
+        """So a platform without `SIGALRM`, or someone debugging a genuinely
+        slow test, can turn it off -- and then a whole-run bound is what stops
+        the hang, which is the behaviour before the alarm existed.
+
+        Three seconds, not `BOUND`: a test that hangs on purpose has to be the
+        cheapest possible version of itself.
+        """
+        self.hanging()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.verdict("test_hang", each=0, wait=3)
+
+
 class TestAnOutOfMemoryTestIsNotAnAnswer(Probe):
     """The `_carrier` arm that needs the cap *enforced* rather than merely set.
 
     Its own class so that a runner where `RLIMIT_AS` does not work loses only
     this and not the three tests beside it in `TestACarrierThatDidNotAssert`,
-    which need no such thing. The same gate `tests.test_mutate` already uses
-    for the cap, asked by trying rather than by platform name.
+    which need no such thing. The same gate `tests.test_mutate` uses for the
+    cap -- `support.memory_caps_apply`, asked by trying rather than by platform
+    name, and asked in `setUpClass` rather than at import so that a process
+    which loads this module without running the gated classes never pays for
+    the probe's fork.
     """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not support.memory_caps_apply():
+            raise unittest.SkipTest("RLIMIT_AS is not usable here")
+        super().setUpClass()
 
     def test_a_test_that_exhausts_the_cap_is_broken_not_caught(self) -> None:
         """`cap` bounds address space, and a `MemoryError` raised inside a test
@@ -745,7 +765,6 @@ class TestWhenTheToolItselfCannotRun(Probe):
         self.assertTrue(self.verdict("test_a")["loaded"])
 
 
-@unittest.skipUnless(CAPS, "RLIMIT_AS is not usable here")
 class TestTheMemoryCapsArithmetic(Probe):
     """`cap`'s four cases, asserted on the rlimit it sets rather than on a
     runaway allocation dying.
@@ -767,9 +786,15 @@ class TestTheMemoryCapsArithmetic(Probe):
     Linux.** macOS refuses to set it at all and reports an unlimited ceiling as
     `sys.maxsize` rather than `RLIM_INFINITY`; CI is what said so, twice. A
     green macOS leg is therefore not evidence that any of this holds -- see
-    `address_space_caps`. A test that can only fail on one platform is worth
-    having, and worth labelling as such; this paragraph is the label.
+    `support.memory_caps_apply`. A test that can only fail on one platform is
+    worth having, and worth labelling as such; this paragraph is the label.
     """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not support.memory_caps_apply():
+            raise unittest.SkipTest("RLIMIT_AS is not usable here")
+        super().setUpClass()
 
     #: Comfortably larger than anything the child allocates, and small enough
     #: to be distinguishable from the unlimited value.

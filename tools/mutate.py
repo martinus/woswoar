@@ -915,16 +915,13 @@ def _visible_memory() -> int:
     threshold this repository uses.
     """
     limits = []
-    for where in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-        try:
-            said = Path(where).read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        # cgroup v2 writes `max` for "no limit"; v1 writes a number so large it
-        # means the same thing, and comparing against the host total is the only
-        # way to tell that from a real limit.
-        if said.isdigit():
-            limits.append(int(said))
+    # The cgroup, through `_confined` -- the one reader of those files, so a fix
+    # to how the limit is located lands in one place and this number and
+    # `dedicated()`'s answer cannot come from different facts about the same
+    # machine. cgroup v2 writes `max` for "no limit" and v1 a sentinel near
+    # 2**63; `_confined` returns 0 for both, so neither reaches the `min`.
+    if confined := _confined():
+        limits.append(confined)
     # A lane's share, when this harness is itself running inside one. Same
     # question as the cgroup file above -- "how much may *this* process use" --
     # and the same answer shape, which is why it is a limit here rather than a
@@ -984,17 +981,31 @@ def dedicated() -> str:
     return ""
 
 
+def _told() -> int:
+    """What `WOSWOAR_MUTATE_TOTAL` says, or 0 -- unset, non-numeric and zero all
+    mean "nobody said".
+
+    One reader, because `_why` and `_budget` parsing the variable with different
+    predicates is how the printed reason lied: `_TOTAL=0` named the variable
+    while the budget actually came from the shared-machine rule, which is the
+    precise failure `_why` exists to prevent.
+    """
+    said = os.environ.get(_TOTAL, "")
+    return int(said) if said.isdigit() and int(said) > 0 else 0
+
+
 def _why() -> str:
     """Which rule set the budget, for the line the run prints.
 
     Said out loud for the same reason `--limit` says what it dropped: three
     lanes on a four-core machine reads as a slow tool rather than a bounded one,
-    and this author read `_share` twice before finding that the number came from
-    memory rather than cores.
+    and tupferl's author read `_share` twice before finding that the number came
+    from memory rather than cores.
     """
-    if os.environ.get(_TOTAL, "").isdigit():
+    if _told():
         return _TOTAL
-    return f"dedicated: {dedicated()}" if dedicated() else "shared machine, so half of it"
+    reason = dedicated()
+    return f"dedicated: {reason}" if reason else "shared machine, so half of it"
 
 
 def _budget() -> int:
@@ -1030,9 +1041,8 @@ def _budget() -> int:
     the operator of the machine rather than for one invocation, and it is read
     in one place.
     """
-    said = os.environ.get(_TOTAL, "")
-    if said.isdigit() and int(said) > 0:
-        return int(said)
+    if told := _told():
+        return told
     visible = _visible_memory()
     if dedicated():
         # Never below the floor: a very small dedicated box would otherwise be
@@ -1123,6 +1133,90 @@ def _share(wanted: int, memory: int, pinned: bool = False) -> Share:
     return Share(lanes, min(memory, max(floor, budget // lanes)))
 
 
+def _blame_baseline(verdict: Verdict, voided: str) -> None:
+    """Say the untouched tree is red, and prove it.
+
+    One printer for `run`'s two collection paths, because the copies had already
+    drifted where it hurts: only one printed the traceback. `survived` is the
+    untouched suite passing -- the one place the mutation vocabulary reads
+    backwards -- so a shard that broke or timed out is red too, and its reason
+    is the only clue to why.
+
+    The traceback, not just the failing test's name. A red baseline is the one
+    verdict that cannot be diagnosed by re-running the row, and the shard it
+    came from is rarely reproducible by hand -- `first` is a shard of its own,
+    the sandbox is a copy, and the lanes are concurrent. In tupferl, five
+    hand-built reproductions of a red baseline all came back green because the
+    thing that differed was never guessed. Printing what actually failed costs
+    nothing on a green run, which is every run.
+    """
+    print(
+        f"  BASELINE NOT GREEN ({verdict.outcome}) -- the suite does not "
+        f"pass untouched, so {voided} means anything: {verdict.detail}"
+    )
+    if verdict.why:
+        print(indent(verdict.why.rstrip(), "  | "))
+
+
+def _shards(table: Sequence[Mutation]) -> list[str]:
+    """The baseline shards this table needs, remembered tests included.
+
+    One shard per distinct selection rather than one serial run over the union.
+    Measured on four pinned cores with eight `tests.test_sync` classes: the
+    mutation phase took 2.35 s across eight lanes while a single-run baseline
+    took 6.75 s, so the check meant to cost nothing was two thirds of the wall
+    clock and got worse as the table grew -- mutations fan out, a union sums.
+
+    The `first` tests too, or the baseline never sees them. A remembered killer
+    can name a test *outside* the row's selection -- `confirm` records them from
+    whole-suite runs, so systematically so -- and if that test is red on the
+    untouched tree it fails there as well, `noticed[0]` names it, and the row
+    reports `caught` with a green baseline behind it. That is `confirm`'s own
+    recorded failure ("credited to a shell-hook test that had never heard of
+    the file under mutation") coming back through the cache.
+
+    One shard holding all of them, not one each: a shard per remembered test is
+    the sharding explosion that cost tupferl 372s -> 730s, in a new disguise.
+    And only the names no selection shard already runs: the cheap prefix is cut
+    to each row's own selection, so most remembered names are re-runs of tests
+    a shard above already covers -- pure cost, and the whole bill on
+    `--baseline-only`, whose point is speed. When any row's selection is
+    `WHOLE_SUITE`, its empty-string shard runs everything and covers them all.
+
+    One function for `run` and `_baseline_is_green`, so "the same shards `run`
+    would build" is true by construction rather than by two copies agreeing.
+    """
+    shards = sorted({mutation.tests for mutation in table})
+    remembered = sorted({name for row in table for name in row.first.split()})
+    if WHOLE_SUITE in shards:
+        fresh: list[str] = []
+    else:
+        fresh = [
+            name
+            for name in remembered
+            if not any(run_tests.selects(name, only) for shard in shards for only in shard.split())
+        ]
+    if fresh:
+        shards.append(" ".join(fresh))
+    return shards
+
+
+def _wanted(rows: int, shards: Sequence[str], workers: int | None) -> int:
+    """How many lanes to ask for, before `_share` says what the memory allows.
+
+    Twice the usable cores, which is what `tools/run_tests.py` measured for this
+    same subprocess-wait-bound work (jobs=8 beat jobs=4 by ~9%, jobs=16
+    regressed). An earlier `cpu // 2` here gave two lanes on a four-core runner
+    and was 1.76x slower than this for eight runs. A sandbox is ~1 ms, so a lane
+    is nearly free.
+
+    Shared with `_baseline_is_green`, which asks with the whole table's row
+    count even though it runs only the shards: the point of asking early is to
+    ask under the lane count and memory share the sweep itself would use.
+    """
+    return workers or min(rows + len(shards), usable_cpus() * 2, _LANES)
+
+
 def run(
     mutations: Iterable[Mutation],
     baseline: bool = True,
@@ -1150,8 +1244,9 @@ def run(
     target was measured at two thirds of the wall clock.
 
     ``scope`` names what a red baseline voids, because this function does not
-    always own the whole of "above". A nested pass -- `confirm`, or one batch of
-    a `sweep` -- prints its rows inside a larger run whose earlier verdicts are
+    always own the whole of "above". A nested pass -- `confirm`, the one caller
+    left now that `sweep` no longer batches -- prints its rows inside a larger
+    run whose earlier verdicts are
     still good, and "nothing above means anything" reads there as voiding those
     too. The alternative was a second `print` in the caller correcting this one,
     which is two sites that must stay adjacent, in order, and in agreement about
@@ -1170,31 +1265,8 @@ def run(
     for mutation in table:
         check(mutation)
 
-    # One shard per target rather than one serial run over the union. Measured on
-    # four pinned cores with eight `tests.test_sync` classes: the mutation phase
-    # took 2.35 s across eight lanes while a single-run baseline took 6.75 s, so
-    # the check meant to cost nothing was two thirds of the wall clock and got
-    # worse as the table grew -- mutations fan out, a union sums.
-    shards = sorted({mutation.tests for mutation in table})
-    # `first` too, or the baseline never sees it. A remembered killer can name a
-    # test *outside* the row's selection -- `confirm` records them from
-    # whole-suite runs, so systematically so -- and if that test is red on the
-    # untouched tree it fails here as well, `noticed[0]` names it, and the row
-    # reports `caught` with a green baseline behind it. That is `confirm`'s own
-    # recorded failure ("credited to a shell-hook test that had never heard of
-    # the file under mutation") coming back through the cache.
-    #
-    # One shard holding all of them, not one each: a shard per remembered test
-    # is the sharding explosion that cost 372s -> 730s, in a new disguise.
-    ahead = " ".join(sorted({name for row in table for name in row.first.split()}))
-    if ahead:
-        shards.append(ahead)
-    # Twice the usable cores, which is what `tools/run_tests.py` measured for this
-    # same subprocess-wait-bound work (jobs=8 beat jobs=4 by ~9%, jobs=16
-    # regressed). An earlier `cpu // 2` here gave two lanes on a four-core runner
-    # and was 1.76x slower than this for eight runs. A sandbox is ~1 ms, so a lane
-    # is nearly free.
-    wanted = workers or min(len(table) + len(shards), usable_cpus() * 2, _LANES)
+    shards = _shards(table)
+    wanted = _wanted(len(table), shards, workers)
     lanes, memory = _share(wanted, memory, pinned=workers is not None)
     if lanes != wanted or memory != asked:
         # Said out loud, for the reason `--limit` says what it dropped: a run
@@ -1225,40 +1297,42 @@ def run(
         ]
         if landed is not None:
             # Collected *before* the rows when a caller persists incrementally,
-            # which reverses the order below and is worth the reversal. A report
-            # written mid-run says `baseline_red: false`, `_recorded` drops the
-            # flag entirely, and `sweep` skips a recorded file by name -- so a
-            # red-baseline run that is interrupted leaves rows a resume treats as
-            # final. The per-file code this replaced could not do that: it wrote
-            # after its batch returned, by which time the baseline was known.
+            # which reverses the order below and is worth the reversal: `landed`
+            # never fires under a red baseline, so nothing a resume would trust
+            # reaches disk. A report written mid-run says `baseline_red: false`,
+            # `_recorded` drops the flag entirely, and `sweep` skips a recorded
+            # file by name -- so a red-baseline run that persisted its rows and
+            # was interrupted would leave rows a resume treats as final. The
+            # per-file code this replaced could not do that: it wrote after its
+            # batch returned, by which time the baseline was known.
             for future in checking:
                 first_look = future.result()
                 timings.update(first_look.times or {})
                 if first_look.outcome != "survived":
-                    print(
-                        f"  BASELINE NOT GREEN ({first_look.outcome}) -- the suite does not "
-                        f"pass untouched, so {scope} means anything: {first_look.detail}"
-                    )
-                    # The traceback, not just the name. A red baseline is the one
-                    # verdict that cannot be diagnosed by re-running the row, and
-                    # the shard it came from is rarely reproducible by hand --
-                    # `first` is a shard of its own, the sandbox is a copy, and
-                    # the lanes are concurrent. Printing what actually failed
-                    # costs nothing on a green run, which is every run.
-                    if first_look.why:
-                        print(indent(first_look.why.rstrip(), "  | "))
+                    # The rows print below this, so "nothing above" would point
+                    # the wrong way here.
+                    _blame_baseline(first_look, "none of this run's rows")
                     red = True
                     break
             checking = []
 
         for mutation, future in zip(table, futures, strict=True):
             verdict = future.result()
-            timings.update(verdict.times or {})
+            for name, cost in (verdict.times or {}).items():
+                # `setdefault`, so the baseline's numbers win however the two
+                # collection orders interleave: a `failfast` row stops at its
+                # first failure, and that truncated measurement recorded as the
+                # test's cost would enter the prefix budget every row pays --
+                # `confirm` makes the same argument about its own merge. The
+                # baseline alone runs whole selections to the end.
+                timings.setdefault(name, cost)
             results.append(Result(mutation, verdict))
-            if landed is not None:
+            if landed is not None and not red:
                 # In table order, because that is the order results are
                 # collected in -- so a caller can tell when a *file* is finished
-                # by counting, without knowing anything about the pool.
+                # by counting, without knowing anything about the pool. Not once
+                # the baseline came back red: what `landed` receives gets
+                # persisted as final, and a red baseline's rows are void.
                 landed(results[-1])
             print(f"  {_HEADLINE[verdict.outcome]:9} {mutation.label}")
             if verdict.answered:
@@ -1289,15 +1363,7 @@ def run(
             # ran before it went red.
             timings.update(baseline_verdict.times or {})
             if baseline_verdict.outcome != "survived":
-                # `survived` is the untouched suite passing, which is the one
-                # place the mutation vocabulary reads backwards. A shard that
-                # broke or timed out is red too, and its reason is the only clue
-                # to why -- the old wording asserted a failure that may not have
-                # happened.
-                print(
-                    f"  BASELINE NOT GREEN ({baseline_verdict.outcome}) -- the suite does not "
-                    f"pass untouched, so {scope} means anything: {baseline_verdict.detail}"
-                )
+                _blame_baseline(baseline_verdict, scope)
                 red = True
                 break
 
@@ -1545,9 +1611,6 @@ class Killers:
     def __init__(self, where: Path | None, budget: float = PREFIX) -> None:
         self.where = where
         self.budget = budget
-        #: What the last `ahead_of` decided, for a caller that wants to say so.
-        self.head: list[str] = []
-        self.dropped = 0
         self.known: dict[str, str] = {}
         self.cost: dict[str, float] = {}
         if where is not None and where.is_file():
@@ -1882,9 +1945,28 @@ def _run_spec(mutations: Sequence[Mutation], args: argparse.Namespace) -> int:
     is the promise `CONTRIBUTING.md` makes about a survivor before it is reported. The
     spec path never kept it, so `--no-confirm` was doubly inert here: it turned
     off something that was not happening.
+
+    The killer cache, `--baseline-only`, and the `--json` marker-and-pidfile
+    lifecycle are the same machinery the generated path uses, for the same
+    reason this function exists at all: the first fix stopped at the flags it
+    knew about, and `--baseline-only`, `--killers`, `--no-killers` and
+    `--prefix` were silently inert here in exactly the way the docstring above
+    complains about -- and a `.done` marker left by a previous run of the same
+    spec announced this run finished before it began.
     """
+    killers = Killers(None if args.no_killers else args.killers, budget=args.prefix)
+    table = killers.ahead_of(list(mutations))
+    if args.baseline_only:
+        return 0 if _baseline_is_green(table, args) else 1
+    if args.json:
+        # The same three moves, in the same order, as the generated path: pid
+        # first so a watcher started alongside has something to read, stale
+        # marker cleared before the first row, marker touched only after the
+        # last pass that can change a verdict.
+        _pidfile(args.json).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        _marker(args.json).unlink(missing_ok=True)
     report = run(
-        mutations,
+        table,
         baseline=not args.no_baseline,
         workers=args.workers,
         timeout=args.timeout,
@@ -1900,9 +1982,18 @@ def _run_spec(mutations: Sequence[Mutation], args: argparse.Namespace) -> int:
             each=args.each_test,
             baseline=not args.no_baseline,
         )
+    if report.baseline_red:
+        # The same two-ended closure as the generated path: a killer recorded
+        # from a red tree is a test that fails untouched, which must never be
+        # put in front of a later run.
+        print("the baseline was red, so nothing was remembered from this run.")
+    else:
+        killers.learn(report)
+        killers.save()
     if args.json:
         _persist(report, args.json)
         _marker(args.json).touch()
+        _pidfile(args.json).unlink(missing_ok=True)
     return 0 if report.clean else 1
 
 
@@ -2047,31 +2138,41 @@ def sweep(table: Sequence[Mutation], args: argparse.Namespace) -> Report:
             _persist(Report([*collected, *fresh]), args.json)
 
     report = _run_generated(rows, args, landed=finished)
+    if report.baseline_red:
+        # The new rows are void, and they never reach disk: `_recorded` skips a
+        # recorded file by name and drops the red flag on the way, so a
+        # persisted void row is one a resume would treat as final. `landed`
+        # stopped firing the moment the baseline came back red, so the mid-run
+        # writes already hold only `collected`; this write makes the final
+        # state say the same thing on a path that crashed between the two.
+        if args.json:
+            _persist(Report(collected), args.json)
+        print(
+            f"\nthe baseline was red, so none of the {len(report.results)} new row(s) "
+            f"means anything; none was recorded."
+        )
+        return Report([*collected, *report.results], True, times=report.times)
     collected.extend(report.results)
     if args.json:
-        _persist(Report(collected, report.baseline_red), args.json)
-    if report.baseline_red:
-        print(f"\nthe baseline was red, so none of the {len(collected)} row(s) means anything.")
+        _persist(Report(collected), args.json)
     # `times` carried through, not dropped. Re-wrapping the report without them
     # is what made the cheap prefix silently learn nothing: the run measured
     # every test and the number reached `Killers` as an empty dict.
-    return Report(collected, report.baseline_red, times=report.times)
+    return Report(collected, times=report.times)
 
 
 def _baseline_is_green(table: list[Mutation], args: argparse.Namespace) -> bool:
     """Run just this table's baseline shards, and say whether they all passed.
 
-    The same shards `run` would build, including the one holding every
-    remembered `first` test -- which is a shard of its own and was the one this
-    author forgot when reproducing a red baseline by hand.
+    The same shards `run` would build -- `_shards` is one function so that stays
+    true by construction; the remembered-`first` shard is the one tupferl's
+    author forgot when reproducing a red baseline by hand -- and the same
+    sizing, `_wanted` with the whole table's row count, so the question is asked
+    under the conditions the sweep will ask it under. That is the whole point of
+    asking early.
     """
-    shards = sorted({mutation.tests for mutation in table})
-    ahead = " ".join(sorted({name for row in table for name in row.first.split()}))
-    if ahead:
-        shards.append(ahead)
-    # The same sizing `run` does, so the question is asked under the conditions
-    # the sweep will ask it under -- which is the whole point of asking early.
-    wanted = args.workers if args.workers is not None else _affordable()
+    shards = _shards(table)
+    wanted = _wanted(len(table), shards, args.workers)
     lanes, memory = _share(wanted, args.memory, pinned=args.workers is not None)
     green = True
     with _sandboxes(lanes) as available, ThreadPoolExecutor(max_workers=lanes) as pool:
@@ -2121,7 +2222,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--batch",
         action="store_true",
-        help="run a file at a time, writing --json as each lands (implied by --all)",
+        help="record --json as each file completes (implied by --all)",
     )
     parser.add_argument(
         "--skip-operator",
@@ -2211,21 +2312,13 @@ def main(argv: list[str] | None = None) -> int:
         # be run, and before the first row.
         table = killers.ahead_of(table)
         if args.baseline_only:
-            # Before the prefix is announced and before any sandbox is built: a
-            # red baseline voids every row, so being able to ask *only* that
-            # question, in the time one shard takes rather than one sweep, is the
-            # difference between a minute and a re-run. Two full sweeps were paid
-            # for here to learn what this prints -- and the second was launched
-            # on a theory the first could not have confirmed.
+            # Before any sandbox is built: a red baseline voids every row, so
+            # being able to ask *only* that question, in the time one shard
+            # takes rather than one sweep, is the difference between a minute
+            # and a re-run. In tupferl two full sweeps were paid for here to
+            # learn what this prints -- and the second was launched on a theory
+            # the first could not have confirmed.
             return 0 if _baseline_is_green(table, args) else 1
-        if killers.dropped:
-            print(f"{killers.dropped} remembered test(s) no longer load; those rows run as usual.")
-        if killers.head:
-            spent = sum(killers.cost.get(test, 0.0) for test in killers.head)
-            print(
-                f"{len(killers.head)} cheap test(s), {spent:.2f}s, run first "
-                f"where nothing is remembered."
-            )
         if args.json:
             # Before the first row, so a watcher started alongside this one has
             # something to read straight away. Its own pid, not a caller's guess.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import io
 import os
 import pty
@@ -11,6 +12,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -519,3 +521,55 @@ class WoswoarTestCase(unittest.TestCase):
         return path
 
     entry = staticmethod(make_entry)
+
+
+@functools.cache
+def memory_caps_apply() -> bool:
+    """Whether this kernel applies the address-space limits `verdict.cap` asks
+    for. Asked by trying, in a subprocess, and cached -- the probe forks, and
+    before it was shared, `tests/test_mutate.py` and `tests/test_verdict.py`
+    each carried their own copy with quietly different rules, so on a kernel
+    where the two disagreed one file's memory tests would run while the
+    other's skipped, and nothing would say so.
+
+    Not by reading `sys.platform`: macOS ignores `RLIMIT_AS` -- which CI
+    discovered, not the documentation -- and a `skipIf(darwin)` would encode
+    today's answer to a question that is really "does this kernel enforce it",
+    going green on a platform that silently protects nothing and staying
+    skipped if macOS ever starts.
+
+    It sets the limits *directly* rather than calling `verdict.cap`, and that
+    is not a stylistic choice -- mutation testing rejected the version that
+    called it. A skip condition computed from the code under test cannot detect
+    that code being reverted: neutering `cap` made the probe report "not
+    enforced", the tests skipped, and the row came back `SURVIVED` from a suite
+    that had simply declined to run it. A guard that switches itself off when
+    the thing it guards breaks is worse than no guard, because it is green.
+
+    And the probe prints a marker rather than merely exiting non-zero. A first
+    draft asked only "did the child fail", which is true of a refused
+    `setrlimit` as well as of a refused *allocation* -- so on macOS it answered
+    "enforced" and let five tests through to fail. A probe that cannot tell its
+    own failure from the failure it is probing for is a pass nobody can
+    explain, in miniature.
+    """
+    probe = (
+        "import resource\n"
+        "for which in (resource.RLIMIT_AS, resource.RLIMIT_DATA):\n"
+        "    soft, hard = resource.getrlimit(which)\n"
+        "    try:\n"
+        "        resource.setrlimit(which, (256 * 1024 * 1024, hard))\n"
+        "    except (OSError, ValueError):\n"
+        "        pass\n"
+        "try:\n"
+        "    bytearray(768 * 1024 * 1024)\n"
+        "except MemoryError:\n"
+        "    print('enforced')\n"
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-B", "-c", probe], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.SubprocessError:  # pragma: no cover - a machine in trouble
+        return False
+    return "enforced" in done.stdout
