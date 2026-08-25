@@ -229,8 +229,45 @@ _MUTATION_PROFILE = "mutation"
 #: Names never copied into a mutation's sandbox. ``.git`` because it is large and
 #: nothing under test reads it; the caches because a stale one is the trap this
 #: module documents, and the cheapest way to not have it is to not copy it.
+#:
+#: ``.hypothesis`` and ``sweeps`` came from tupferl#32, and the first of the two
+#: is a *bug fix* rather than thrift:
+#:
+#: - **``.hypothesis`` is written while this copy is being taken.** Hypothesis
+#:   creates and removes ``.hypothesis/tmp`` as it runs, `tools/run_tests.py`
+#:   shards across twice the usable cores, and `tests/test_mutate.py` starts this
+#:   module *inside* the suite -- so one shard copies the tree while another is
+#:   using that directory. `shutil.copytree` scans an entry and it is gone before
+#:   it copies, which reaches CI as ``shutil.Error: [(... '.hypothesis/tmp',
+#:   "[Errno 2] No such file or directory")]`` on a diff that touches nothing
+#:   here. Seen on tupferl's PR #31; the same copy was confirmed here by building
+#:   a sandbox and looking, before this entry existed.
+#:
+#:   It also carries Hypothesis's *example database* into every sandbox, so a
+#:   mutant could be replayed against examples recorded by a different tree --
+#:   and the sandboxes are pooled and reused, so one mutant's failing example
+#:   would be replayed for the next borrower. That is not measured to have
+#:   changed a verdict here and is not claimed to have; it is a second reason not
+#:   to copy a cache, not the reason.
+#:
+#: - **``sweeps``** is this repository's own mutation reports -- 216 KB for one
+#:   395-mutant run, per lane, that no mutant reads. `Killers.save` does
+#:   ``mkdir(parents=True, exist_ok=True)``, so a nested harness that wants to
+#:   write one in a sandbox still can; it simply starts with a cold cache, which
+#:   is a miss rather than a failure.
+#:
+#: `shutil.ignore_patterns` matches on the **base name at any depth**, checked
+#: rather than assumed -- a pattern that only applied at the root would leave a
+#: nested one copied and nothing here would notice until the next red leg.
 _SKIP = shutil.ignore_patterns(
-    ".git", "__pycache__", ".mypy_cache", ".ruff_cache", ".venv", "*.egg-info"
+    ".git",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "*.egg-info",
+    ".hypothesis",
+    "sweeps",
 )
 
 
