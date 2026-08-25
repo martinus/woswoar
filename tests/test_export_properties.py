@@ -23,10 +23,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
+from tests import profiles
 from woswoar import store
-
-settings.register_profile("woswoar-export", max_examples=300, deadline=None)
-settings.load_profile("woswoar-export")
 
 #: A record as it sits in a log. Bytes, not text: these two functions are the
 #: layer below the record format and never decode anything, and a text strategy
@@ -318,7 +316,9 @@ class ExportPublishesWholeRecords(RuleBasedStateMachine):
 
 
 ExportPublishesWholeRecords.TestCase.settings = settings(
-    max_examples=200, stateful_step_count=20, deadline=None
+    max_examples=profiles.EXPORT_MACHINE[0],
+    stateful_step_count=profiles.EXPORT_MACHINE[1],
+    deadline=None,
 )
 TestExportPublishesWholeRecords = ExportPublishesWholeRecords.TestCase
 # `run_tests` loads a class by ``f"{__module__}.{__qualname__}"``, and Hypothesis

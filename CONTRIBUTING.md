@@ -59,15 +59,36 @@ python -m tools.mutate --all --json out.json  # every line of every mutable file
 ```
 
 `--all` is the whole package rather than a diff — several thousand mutants and
-hours — so it batches by file and writes `--json` as each one lands: a crash
-costs one file, and re-running with the same `--json` skips what is already
-recorded. There is no `--resume` flag; the report *is* the resume state.
-`--batch` asks for the same behaviour on a large `--base` diff. `--all` also
+hours — so it records per file and writes `--json` as each file completes: a
+crash costs one file, and re-running with the same `--json` skips what is
+already recorded. There is no `--resume` flag; the report *is* the resume
+state. Scheduling is one pool over every remaining row rather than a pool per
+file — per file, a batch could not return until its slowest row did, so hung
+mutants in different files were serialised (measured in tupferl, which ported
+these tools and sent this design back: ~600s of a 913s run spent that way).
+`--batch` asks for the same recording on a large `--base` diff. `--all` also
 drops the default `--limit`, which is sized for a diff and would otherwise run
 a twentieth of the table.
 
-Confirmation is pooled to the end rather than run per batch, because per batch
-a file with one survivor pays a whole suite run with fifteen lanes idle.
+Confirmation is pooled to the end, because run any earlier a file with one
+survivor pays a whole suite run with the other lanes idle.
+
+A sweep also remembers, in `sweeps/killers.json`, which test caught each
+mutation, and runs that test first the next time — in *front* of the row's
+usual selection, never in place of it, so a stale entry costs one extra test
+rather than a `caught` nothing verified. Rows with nothing remembered run a
+short prefix of cheap high-yield tests instead (`--prefix` budgets it,
+`--no-killers` turns the whole cache off). With the per-test alarm below, this
+is most of a measured 2.07× on a 274-mutant sweep in tupferl. The cache is
+machine-specific and disposable; deleting it costs one run at the old speed.
+
+`--baseline-only` runs just the untouched-suite check for the table and stops —
+the question a red baseline makes worth asking on its own, in the time one
+shard takes rather than one sweep. Probes pin the Hypothesis profile to
+`mutation` (small, derandomised — see `tests/profiles.py`), because a sweep
+runs one suite per mutant and the full example budget multiplies by the size
+of the table, and because a randomised baseline and a randomised mutant draw
+different examples, which makes "it failed" stop meaning "a test noticed".
 
 It reads `git diff --merge-base main` — working tree included, so uncommitted
 work counts — and generates mutants for the changed lines of `woswoar/**.py` and
@@ -128,7 +149,12 @@ the second half and was removed: dropping it is a real defect under a non-UTF-8
 locale, and unkillable in a suite that never runs under one.
 
 A generated mutant can also fail to *stop*, and there are three ways rather than
-one. `--timeout` (300 s) answers a mutation that never finishes. `--memory`
+one. `--timeout` (300 s) answers a mutation that never finishes, and
+`--each-test` (150 s) asks the tighter version of the same question — a *test*
+that never finishes — and names it, where the whole-run bound can only say "no
+answer within 300 s". 150 because the tests here bound the subprocesses they
+drive at up to 120 s, and a hang those guards would catch (`TimeoutExpired` is
+a test noticing) must reach the guard before the alarm files it as `BROKE`. `--memory`
 (4 GiB of address space, per process) answers one that never finishes *while
 allocating* — not a refinement of the first, because a timeout cannot fire on a
 machine that is already out of memory: an `at -= …` generated for this

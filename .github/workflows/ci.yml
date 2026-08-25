@@ -12,6 +12,9 @@ concurrency:
 
 env:
   PYTHONWARNINGS: error::DeprecationWarning
+  # `tests/profiles.py` reads this; without it CI would run the randomised
+  # `dev` profile, and a failure it finds would not reproduce.
+  WOSWOAR_HYPOTHESIS_PROFILE: ci
 
 jobs:
   lint:

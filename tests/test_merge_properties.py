@@ -35,13 +35,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hypothesis import given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
+from tests import profiles  # noqa: F401  -- registers and loads the profile
 from woswoar import manifest, store, sync
-
-settings.register_profile("woswoar-merge", max_examples=300, deadline=None)
-settings.load_profile("woswoar-merge")
 
 HOST = "aaaabbbbccccdddd"
 DAY = "2026/08/21"

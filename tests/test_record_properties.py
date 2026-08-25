@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import unittest
 
-from hypothesis import given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
+from tests import profiles  # noqa: F401  -- registers and loads the profile
 from woswoar import codec, entry
 
 #: Deliberately the whole of text. Commands arrive from a shell, so they hold
@@ -29,11 +30,9 @@ from woswoar import codec, entry
 #: that already work.
 TEXT = st.text()
 
-#: 400 rather than the default 100: at the default this file passed, and the
-#: unescaped `session` field only fell out on a longer search. Cheap enough to
-#: keep -- the whole module runs in about two seconds.
-settings.register_profile("woswoar", max_examples=400, deadline=None)
-settings.load_profile("woswoar")
+# The example budget lives in `tests/profiles.py` now, with the reason this file
+# used to carry: 400 rather than Hypothesis's 100, because the unescaped
+# `session` field only fell out on the longer search.
 
 ENTRIES = st.builds(
     entry.Entry,

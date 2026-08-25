@@ -93,6 +93,7 @@ a surviving mutation means a weak test.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -104,15 +105,17 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Iterable, Iterator, Sequence
+import unittest
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from textwrap import indent
 from typing import Literal, NamedTuple
 
-from tools import mutants
+from tools import mutants, run_tests
+from tools.cpus import usable_cpus
 from tools.mutants import Mutation, check
-from tools.sandbox import usable_cpus
 
 #: Re-exported, because every spec file and every pasted pull-request output in
 #: this repository's history says `from tools.mutate import Mutation`. The
@@ -124,6 +127,26 @@ __all__ = ["Mutation", "Report", "Result", "Verdict", "run", "verify"]
 #: still; the point is only that a mutant which never terminates cannot hold a
 #: lane for the rest of the table.
 TIMEOUT = 300.0
+
+#: Seconds one *test* may take before the run gives up on it, which is a much
+#: tighter question than `TIMEOUT`'s -- and it names the test, which `TIMEOUT`
+#: cannot: a whole-run bound reports "no answer within 300s" and leaves the
+#: reader to find out which of fifteen hundred tests it was.
+#:
+#: The honest tests do not set this number; the tests' own guards do. The
+#: slowest honest test measured 10.09s (serial run, 1500 tests, 249.7s total),
+#: but tests here bound the subprocesses they drive at 60s and 120s, and a
+#: hang-mutant one of those guards would catch -- `TimeoutExpired` is a test
+#: erroring, which is `caught` -- must reach the guard before the alarm.
+#: tupferl, which runs this alarm at 30s, measured the race the other way
+#: round: a test file that bounded its subprocesses at exactly the alarm's 30s
+#: lost seven mutants to `BROKE`, each one a kill its guard was about to make.
+#: So this sits 25% above the tallest guard and at half of `TIMEOUT`: a hung
+#: mutant costs 150s instead of 300s and is named.
+#:
+#: `TIMEOUT` stays, as the backstop for a hang that happens outside any test --
+#: a `setUpModule`, or an import. This does not replace it, it makes it rare.
+EACH_TEST = 150.0
 
 #: The most lanes worth running, whatever the machine reports.
 _LANES = 16
@@ -168,7 +191,7 @@ MEMORY = 4 << 30
 _FLOOR = 2 << 30
 
 #: How a lane tells a harness it starts itself what it may spend.
-#: `tests/test_mutate.py` starts this module 22 times and `tests/test_run_tests.py`
+#: `tests/test_mutate.py` starts this module and `tests/test_run_tests.py`
 #: starts the sharded runner, so a lane mutating `tools/` hosts a second harness --
 #: which, reading the host's memory as its own, sizes itself for a machine it does
 #: not have. Sixteen lanes each hosting sixteen is how 4,340 processes came to be
@@ -176,6 +199,32 @@ _FLOOR = 2 << 30
 #: ``python -c``, and read back by `_visible_memory` as one limit among the
 #: cgroup's.
 _BUDGET = "WOSWOAR_MUTATE_BUDGET"
+
+#: What the whole run may spend, in bytes, when the caller says so outright.
+#: Set by `--budget`, and an environment variable rather than a module global so
+#: that a nested harness inherits the answer instead of re-deriving it from a
+#: machine it can no longer see.
+_TOTAL = "WOSWOAR_MUTATE_TOTAL"
+
+#: What a run leaves for the operating system and for itself when the machine is
+#: its own. A gibibyte, which is `_LANE` -- the same number, because the thing
+#: being reserved is exactly "room for one more lane's worth of everything else".
+_SPARE = 1 << 30
+
+#: Which Hypothesis profile the suites this runs should use. Set for every probe
+#: and *not* conditional on the caller's own value: a sweep runs one suite per
+#: mutation, so the full example budget multiplies by the size of the table.
+#: `tests/profiles.py` makes the profile derandomised as well as small, which is
+#: the half that matters for correctness -- a randomised baseline and a
+#: randomised mutant draw different examples, and "it failed" then means nothing.
+_PROFILE = "WOSWOAR_HYPOTHESIS_PROFILE"
+
+#: The value it is set to. A constant rather than a literal in the `env` dict
+#: below, so a test can assert that the profile this asks for is one
+#: `tests/profiles.py` has registered -- `load_profile` on a name nobody
+#: registered raises inside the probe, where it surfaces as `BROKE` on every row
+#: rather than as the typo it is.
+_MUTATION_PROFILE = "mutation"
 
 #: Names never copied into a mutation's sandbox. ``.git`` because it is large and
 #: nothing under test reads it; the caches because a stale one is the trap this
@@ -199,6 +248,22 @@ class Verdict(NamedTuple):
     #: The first test that noticed, or the reason nothing could. Printed for
     #: everything except a plain `caught`, where the label already says it.
     detail: str = ""
+    #: The same test as `module.Class.method`, which is what `unittest` takes
+    #: back. Empty unless the outcome is `caught`. `detail` is for a reader and
+    #: this is for `killers`, which runs it again next time -- see `Killers`.
+    killer: str = ""
+    #: What each test that ran cost, by id. Not persisted to the `--json`
+    #: report, which is about verdicts; `Killers` keeps them, because ordering
+    #: by yield-per-second needs a denominator and measuring it separately would
+    #: be a second source of truth about the same suite.
+    times: dict[str, float] | None = None
+    #: The failing traceback, for a `caught` verdict. Carried but never printed
+    #: by a mutation row -- `caught` is the whole answer there, and two hundred
+    #: tracebacks is noise. `run`'s baseline branch is the one reader: a red
+    #: baseline voids every verdict above it, and a test's *name* is not enough
+    #: to diagnose one. Five hand-built reproductions of a red baseline all came
+    #: back green because the thing that differed was never guessed.
+    why: str = ""
 
     @property
     def answered(self) -> bool:
@@ -235,6 +300,11 @@ class Report(NamedTuple):
     #: survivor, and until #269 the only record that the promise had not been
     #: kept was a line of prose in a terminal nobody scrolls back to.
     widened: bool = False
+    #: What each test that ran cost, by id, across every row *and every baseline
+    #: shard* of this run. Not persisted with the verdicts -- it is not an answer
+    #: about the code, it is what `Killers` needs to put the cheap high-yield
+    #: tests first.
+    times: dict[str, float] | None = None
 
     @property
     def clean(self) -> bool:
@@ -578,6 +648,8 @@ def _run(
     failfast: bool = False,
     timeout: float = TIMEOUT,
     memory: int = MEMORY,
+    each: float = EACH_TEST,
+    first: str = "",
 ) -> Verdict:
     """What the suite concluded about one mutation, and by which route.
 
@@ -594,11 +666,15 @@ def _run(
     turn a loop bound into one that never fires, and with no limit here that
     holds a lane for the rest of the run.
 
-    Three limits, and each answers a failure the other two cannot see. `timeout`
-    is "this mutation never finishes"; `memory`, through `verdict.cap`, is "this
-    process never stops allocating"; and `_Lanes`, through the session started
-    here, is "this mutation spawns processes" -- which is neither of the others
-    and is the one that reached the OOM killer.
+    Four limits, and each answers a failure the others cannot see. `each` is
+    "this *test* never finishes", and is the one that fires in practice -- it
+    names the test, and it costs seconds where the others cost minutes.
+    `timeout` is "this *run* never finishes", the backstop for a hang outside
+    any test, in a `setUpModule` or an import, where no per-test alarm is armed.
+    `memory`, through `verdict.cap`, is "this process never stops allocating";
+    and `_Lanes`, through the session started here, is "this mutation spawns
+    processes" -- which is none of the others and is the one that reached the
+    OOM killer.
     """
     _clear_bytecode(root)
     # Both files land outside the sandbox on purpose: the copy is what the
@@ -617,6 +693,8 @@ def _run(
                     str(report),
                     "1" if failfast else "0",
                     str(memory),
+                    str(each),
+                    first,
                     *tests,
                 ],
                 cwd=root,
@@ -630,6 +708,7 @@ def _run(
                     **os.environ,
                     "PYTHONDONTWRITEBYTECODE": "1",
                     _BUDGET: str(memory),
+                    _PROFILE: _MUTATION_PROFILE,
                 },
                 # A file rather than a pipe, and this is not a style choice. The
                 # suite's `python -m woswoar` grandchildren inherit the write
@@ -691,10 +770,24 @@ def _run(
     if written["broke"]:
         return Verdict("broke", str(written["broke"][0]))
     if written["noticed"]:
-        return Verdict("caught", str(written["noticed"][0]))
+        # Required, like every sibling key on these lines. `_probe` reads
+        # `verdict.py` out of *this* tree, so the two are always the same
+        # revision -- there is no older probe to guard against, and a `.get`
+        # here would turn a real protocol break into a silently empty ordering.
+        remembered = written["killers"]
+        reasons = written["reasons"]
+        return Verdict(
+            "caught",
+            str(written["noticed"][0]),
+            str(remembered[0]) if remembered else "",
+            written["times"] or None,
+            str(reasons[0]) if reasons else "",
+        )
     if not written["ran"]:
         return Verdict("broke", "the targets held no tests")
-    return Verdict("survived")
+    # A survivor ran its whole selection, so its timings are the complete ones --
+    # as are a baseline shard's, which is where most of them come from.
+    return Verdict("survived", times=written["times"] or None)
 
 
 def _tail(noise: Path) -> str:
@@ -736,7 +829,7 @@ def _sandboxes(count: int) -> Iterator[queue.Queue[Path]]:
 
 
 def _borrow(
-    available: queue.Queue[Path], tests: Sequence[str], timeout: float, memory: int
+    available: queue.Queue[Path], tests: Sequence[str], timeout: float, memory: int, each: float
 ) -> Verdict:
     """Run ``tests`` unmutated in a borrowed sandbox. One shard of the baseline.
 
@@ -745,7 +838,7 @@ def _borrow(
     """
     root = available.get()
     try:
-        return _run(tests, root, timeout=timeout, memory=memory)
+        return _run(tests, root, timeout=timeout, memory=memory, each=each)
     finally:
         available.put(root)
 
@@ -772,6 +865,7 @@ def _attempt(
     failfast: bool,
     timeout: float,
     memory: int,
+    each: float,
 ) -> Verdict:
     """Apply one mutation in a borrowed sandbox and report what the suite said."""
     root = available.get()
@@ -780,8 +874,18 @@ def _attempt(
         original = source.read_text(encoding="utf-8")
         source.write_text(_applied(original, mutation), encoding="utf-8")
         try:
+            # `first` handed over as its own argument, never merged into the
+            # selection: an empty selection is `WHOLE_SUITE` and means "run
+            # everything", so anything pushed onto that list turns it into
+            # "run only this". See `verdict.collect`.
             return _run(
-                mutation.tests.split(), root, failfast=failfast, timeout=timeout, memory=memory
+                mutation.tests.split(),
+                root,
+                failfast=failfast,
+                timeout=timeout,
+                memory=memory,
+                each=each,
+                first=mutation.first,
             )
         finally:
             # Into the sandbox, not the working tree. Only so the next mutation
@@ -802,12 +906,12 @@ def _visible_memory() -> int:
 
     Not `SC_PHYS_PAGES` alone, which reports the host's and ignores a cgroup --
     so in a 2 GiB container on a 62 GiB host it answers 62 and the container is
-    OOM-killed with every per-lane cap respected. `tools/sandbox.py`'s
+    OOM-killed with every per-lane cap respected. `tools/cpus.py`'s
     `usable_cpus` makes exactly this argument for CPUs; this is the same mistake
     with the same shape, one resource over.
 
     Left here rather than beside `usable_cpus` because it has one caller.
-    `usable_cpus` moved into `sandbox` when it got a second, and that is the
+    `usable_cpus` got its own module when it got a third, and that is the
     threshold this repository uses.
     """
     limits = []
@@ -833,14 +937,109 @@ def _visible_memory() -> int:
     return min(limits) if limits else _LANES * _LANE
 
 
+def _confined() -> int:
+    """The cgroup's memory limit, or 0 when the host's RAM is what bounds us.
+
+    A limit counts only when it is *below* what the host reports: cgroup v2
+    writes `max` for "no limit" and v1 writes a sentinel near 2**63, and on this
+    machine that sentinel is what `memory.limit_in_bytes` holds. Comparing
+    against the host total is the only way to tell a real limit from either.
+    """
+    host = 0
+    with suppress(AttributeError, OSError, ValueError):  # not POSIX
+        host = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    if not host:
+        return 0
+    for where in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            said = Path(where).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if said.isdigit() and 0 < int(said) < host:
+            return int(said)
+    return 0
+
+
+def dedicated() -> str:
+    """Why this machine is this run's alone, or "" when it is shared.
+
+    Two signals, and both are facts rather than guesses about intent:
+
+    - **A cgroup limit is in force.** The kernel has already carved out this
+      process's share, so halving it again double-counts the same reservation --
+      the container has no "other half" to leave for anybody, because nobody
+      else is in it.
+    - **`CI` is set.** A CI runner is by construction not shared with a person
+      waiting for their editor to respond. Every CI system sets it, and
+      `tests/profiles.py` already keys off it for the same reason.
+
+    Returned as a *reason* rather than a bool so the line the run prints can say
+    which one applied. A lane count nobody can account for is what sent this
+    author reading `_share` in the first place.
+    """
+    if os.environ.get("CI"):
+        return "CI is set"
+    if _confined():
+        return "a cgroup limit is in force"
+    return ""
+
+
+def _why() -> str:
+    """Which rule set the budget, for the line the run prints.
+
+    Said out loud for the same reason `--limit` says what it dropped: three
+    lanes on a four-core machine reads as a slow tool rather than a bounded one,
+    and this author read `_share` twice before finding that the number came from
+    memory rather than cores.
+    """
+    if os.environ.get(_TOTAL, "").isdigit():
+        return _TOTAL
+    return f"dedicated: {dedicated()}" if dedicated() else "shared machine, so half of it"
+
+
 def _budget() -> int:
     """What this run may spend in total.
 
-    Half of visible memory, because the other half belongs to whoever is using
-    the machine. Mutation testing is a background chore and has no claim on the
-    whole box.
+    **Half of visible memory when the machine is shared with a person**, because
+    the other half is theirs: mutation testing is a background chore and has no
+    claim on a box somebody is working in.
+
+    That halving was unconditional, and on a dedicated machine it is not thrift
+    but waste. Measured in tupferl on the container this was found in -- 16 GiB,
+    four cores, nothing else running -- it gave a budget of 8037 MiB, and
+    `_share` then allowed **three** lanes where the cores wanted eight. The
+    ceiling is what
+    stops a runaway, within seconds; the budget only decides how many honest
+    lanes fit, and on a machine with no one else on it the honest answer is
+    nearly all of them.
+
+    So a dedicated machine keeps everything but `_SPARE`, and `WOSWOAR_MUTATE_TOTAL`
+    beats both -- because the one thing better than a good guess about who owns
+    the machine is being told.
+
+    **It is an environment variable and not a flag**, which this docstring and
+    the line `_why` prints both called `--budget` until someone typed that and
+    got "unrecognized arguments".
+
+    A first attempt at explaining *why* it is a variable said `_run` passes it
+    down so a nested harness inherits the same ceiling. That is wrong twice
+    over: `_run` passes `_BUDGET`, not this, and `_TOTAL` short-circuits
+    `_visible_memory` outright -- so a nested harness that inherited it would
+    size itself for the **outer** total and ignore exactly the per-lane share
+    `_BUDGET` exists to impose. The honest reason is smaller: it is a knob for
+    the operator of the machine rather than for one invocation, and it is read
+    in one place.
     """
-    return _visible_memory() // 2
+    said = os.environ.get(_TOTAL, "")
+    if said.isdigit() and int(said) > 0:
+        return int(said)
+    visible = _visible_memory()
+    if dedicated():
+        # Never below the floor: a very small dedicated box would otherwise be
+        # handed a budget under one lane's ceiling and get fewer lanes than the
+        # shared rule would have given it, which is the opposite of the point.
+        return max(_FLOOR, visible - _SPARE)
+    return visible // 2
 
 
 def _affordable() -> int:
@@ -933,8 +1132,10 @@ def run(
     failfast: bool = False,
     timeout: float = TIMEOUT,
     memory: int = MEMORY,
+    each: float = EACH_TEST,
     summarise: bool = True,
     scope: str = "nothing above",
+    landed: Callable[[Result], None] | None = None,
 ) -> Report:
     """Apply each mutation in its own copy of the tree; report what each answered.
 
@@ -975,6 +1176,19 @@ def run(
     # the check meant to cost nothing was two thirds of the wall clock and got
     # worse as the table grew -- mutations fan out, a union sums.
     shards = sorted({mutation.tests for mutation in table})
+    # `first` too, or the baseline never sees it. A remembered killer can name a
+    # test *outside* the row's selection -- `confirm` records them from
+    # whole-suite runs, so systematically so -- and if that test is red on the
+    # untouched tree it fails here as well, `noticed[0]` names it, and the row
+    # reports `caught` with a green baseline behind it. That is `confirm`'s own
+    # recorded failure ("credited to a shell-hook test that had never heard of
+    # the file under mutation") coming back through the cache.
+    #
+    # One shard holding all of them, not one each: a shard per remembered test
+    # is the sharding explosion that cost 372s -> 730s, in a new disguise.
+    ahead = " ".join(sorted({name for row in table for name in row.first.split()}))
+    if ahead:
+        shards.append(ahead)
     # Twice the usable cores, which is what `tools/run_tests.py` measured for this
     # same subprocess-wait-bound work (jobs=8 beat jobs=4 by ~9%, jobs=16
     # regressed). An earlier `cpu // 2` here gave two lanes on a four-core runner
@@ -990,24 +1204,62 @@ def run(
         # inexplicable.
         print(
             f"{lanes} lane(s) at {memory >> 20} MiB each, from {_budget() >> 20} MiB "
-            f"of usable memory -- see tools.mutate._share."
+            f"of usable memory ({_why()}) -- see tools.mutate._share."
         )
 
     results: list[Result] = []
+    timings: dict[str, float] = {}
     red = False
     with _sandboxes(lanes) as available, ThreadPoolExecutor(max_workers=lanes) as pool:
         checking = (
-            [pool.submit(_borrow, available, shard.split(), timeout, memory) for shard in shards]
+            [
+                pool.submit(_borrow, available, shard.split(), timeout, memory, each)
+                for shard in shards
+            ]
             if baseline
             else []
         )
         futures = [
-            pool.submit(_attempt, mutation, available, failfast, timeout, memory)
+            pool.submit(_attempt, mutation, available, failfast, timeout, memory, each)
             for mutation in table
         ]
+        if landed is not None:
+            # Collected *before* the rows when a caller persists incrementally,
+            # which reverses the order below and is worth the reversal. A report
+            # written mid-run says `baseline_red: false`, `_recorded` drops the
+            # flag entirely, and `sweep` skips a recorded file by name -- so a
+            # red-baseline run that is interrupted leaves rows a resume treats as
+            # final. The per-file code this replaced could not do that: it wrote
+            # after its batch returned, by which time the baseline was known.
+            for future in checking:
+                first_look = future.result()
+                timings.update(first_look.times or {})
+                if first_look.outcome != "survived":
+                    print(
+                        f"  BASELINE NOT GREEN ({first_look.outcome}) -- the suite does not "
+                        f"pass untouched, so {scope} means anything: {first_look.detail}"
+                    )
+                    # The traceback, not just the name. A red baseline is the one
+                    # verdict that cannot be diagnosed by re-running the row, and
+                    # the shard it came from is rarely reproducible by hand --
+                    # `first` is a shard of its own, the sandbox is a copy, and
+                    # the lanes are concurrent. Printing what actually failed
+                    # costs nothing on a green run, which is every run.
+                    if first_look.why:
+                        print(indent(first_look.why.rstrip(), "  | "))
+                    red = True
+                    break
+            checking = []
+
         for mutation, future in zip(table, futures, strict=True):
             verdict = future.result()
+            timings.update(verdict.times or {})
             results.append(Result(mutation, verdict))
+            if landed is not None:
+                # In table order, because that is the order results are
+                # collected in -- so a caller can tell when a *file* is finished
+                # by counting, without knowing anything about the pool.
+                landed(results[-1])
             print(f"  {_HEADLINE[verdict.outcome]:9} {mutation.label}")
             if verdict.answered:
                 continue
@@ -1031,6 +1283,11 @@ def run(
         # results they were waiting for -- they are simply told to disbelieve them.
         for future in checking:
             baseline_verdict = future.result()
+            # Before the `break`: a shard that ran a whole selection with nothing
+            # failing has measured every test in it, which is where most of what
+            # `Killers` orders by comes from. A red one still measured whatever
+            # ran before it went red.
+            timings.update(baseline_verdict.times or {})
             if baseline_verdict.outcome != "survived":
                 # `survived` is the untouched suite passing, which is the one
                 # place the mutation vocabulary reads backwards. A shard that
@@ -1046,7 +1303,7 @@ def run(
 
     if not red and summarise:
         _summarise(results)
-    report = Report(results, red)
+    report = Report(results, red, times=timings or None)
     _RUNS.append(report)
     return report
 
@@ -1097,6 +1354,7 @@ def confirm(
     timeout: float,
     memory: int,
     *,
+    each: float = EACH_TEST,
     baseline: bool = True,
 ) -> Report:
     """Re-run every survivor against the whole suite, and correct the ones caught.
@@ -1161,7 +1419,10 @@ def confirm(
     print(f"\nconfirming {len(survivors)} survivor(s) against the whole suite...")
     # `rerun` rather than `widened`: `Report.widened` is a different thing three
     # lines down, and one word for two meanings in one function is a re-read.
-    rerun = [result.mutation._replace(tests=WHOLE_SUITE) for _, result in survivors]
+    # `first=""` as well as the widened selection: this pass exists to run the
+    # *whole* suite against each survivor, and a remembered test in front of it
+    # would be the one thing that could make that untrue.
+    rerun = [result.mutation._replace(tests=WHOLE_SUITE, first="") for _, result in survivors]
     again = run(
         rerun,
         baseline=baseline,
@@ -1173,6 +1434,7 @@ def confirm(
         failfast=True,
         timeout=timeout,
         memory=memory,
+        each=each,
         summarise=False,
         # These rows are not the run's answer -- the narrow pass's are, and they
         # are still good. See `run`'s ``scope``.
@@ -1201,8 +1463,13 @@ def confirm(
     unsure = sum(1 for found in again.results if not found.verdict.answered)
     if unsure:
         print(f"{unsure} confirmation(s) could not be answered; those rows stand as reported.")
+    # `again` first so `report` wins: `again` is a `failfast` pass over mutated
+    # trees, where a test that normally costs five seconds stops at its first
+    # assertion and measures a hundredth of one. Recorded as its cost, it enters
+    # the prefix budget every row pays and the real prefix stops being bounded.
+    merged = {**(again.times or {}), **(report.times or {})}
     if not corrected:
-        return report._replace(widened=True)
+        return report._replace(widened=True, times=merged or None)
     print(f"{len(corrected)} of them were caught by a test the selection had not run.")
     return Report(
         [
@@ -1211,7 +1478,235 @@ def confirm(
         ],
         report.baseline_red,
         True,
+        merged or None,
     )
+
+
+#: Where the remembered killers live by default, under the directory the
+#: `.gitignore` already keeps out of the tree. Machine-specific and stale the
+#: moment a test is renamed, which is why nothing here trusts it: see `Killers`.
+KILLERS = Path("sweeps/killers.json")
+
+#: How long the cheap-first prefix may take before a row falls through to its
+#: own selection. Half a second, which is where the curve turns: measured in
+#: tupferl, where this mechanism was written, 40 tests cost 0.33s and cover 57%
+#: of caught rows, and the next ten cost 4.1s for 28 points more -- eight times
+#: the price per point.
+#: A budget rather than a count, because what matters is the seconds every row
+#: pays up front, and tests do not all cost the same.
+PREFIX = 0.5
+
+
+def _key(mutation: Mutation) -> str:
+    """What identifies a mutation across runs.
+
+    Content, never position. `label` and `span` both carry a line number, and a
+    line number is invalidated by any edit *above* it -- which is every edit, so
+    a position-keyed cache would be empty exactly when it was most wanted. What
+    stays the same is the file, the operator, and the text going in and out.
+
+    Hashed rather than concatenated because `old` and `new` are whole
+    statements: the keys would otherwise be kilobytes and the file unreadable.
+    """
+    parts = "\0".join((mutation.path, mutation.operator, mutation.old, mutation.new))
+    return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:16]
+
+
+class Killers:
+    """Which test caught each mutation last time, so it can run first this time.
+
+    A mutation is caught by a *set* of tests, and `failfast` stops at whichever
+    the selection reaches first. That order is alphabetical and has nothing to
+    do with cost, so a mutant in a pure function was found only after the
+    CLI-driven classes above it had run: 20.48s to learn something a 0.30s test
+    knew (tupferl#5).
+
+    Choosing one global order over all mutants is Min-Sum Set Cover -- NP-hard,
+    greedy within a factor of 4, and it needs the *full* kill-set per mutant,
+    which costs more to collect than it saves. Per mutant there is no problem to
+    solve: run the test that worked last time.
+
+    **The remembered test is put in front of the usual selection, never in place
+    of it.** That asymmetry is the whole safety argument. A cache that is right
+    saves the rest of the suite; a cache that is wrong costs one extra test and
+    the run continues exactly as it would have. Substituting instead would turn
+    every stale entry into a `caught` that nothing verified -- flattering the
+    tests, which is the direction every bug in this class has erred.
+
+    **It goes on `Mutation.first`, not into `Mutation.tests`.** Folding it into
+    `tests` was the first shape and it *doubled* the wall clock: `run` shards the
+    baseline check by distinct `tests` string, so giving every row its own killer
+    gave every row its own shard, and one baseline run of a 42-row file's
+    selection became 42 of them -- 42 whole-selection runs, which is the whole
+    regression and nothing to do with the ordering it was meant to fix. Measured
+    in tupferl at 372s against 730s before the field existed.
+    """
+
+    def __init__(self, where: Path | None, budget: float = PREFIX) -> None:
+        self.where = where
+        self.budget = budget
+        #: What the last `ahead_of` decided, for a caller that wants to say so.
+        self.head: list[str] = []
+        self.dropped = 0
+        self.known: dict[str, str] = {}
+        self.cost: dict[str, float] = {}
+        if where is not None and where.is_file():
+            try:
+                saved = json.loads(where.read_text(encoding="utf-8"))
+                # A flat mapping is the older shape, from before costs were
+                # recorded. Read rather than discarded: the killers in it are
+                # still good, and the costs refill on the next run.
+                rows = saved.get("killers", saved) if isinstance(saved, dict) else {}
+                self.known = {str(k): str(v) for k, v in rows.items() if isinstance(v, str) and v}
+                found = saved.get("costs", {}) if isinstance(saved, dict) else {}
+                self.cost = {str(k): float(v) for k, v in found.items()}
+            except (OSError, ValueError, AttributeError, TypeError):
+                # A half-written or hand-edited file is not worth a failure: the
+                # worst an empty cache does is run at yesterday's speed.
+                self.known, self.cost = {}, {}
+
+    def prefix(self) -> list[str]:
+        """Cheap tests that between them catch a lot, cheapest yield first.
+
+        Greedy on *rows newly caught per second*, which is the 4-approximation
+        for Min-Sum Set Cover (Feige, Lovász, Tetali) -- and the best any
+        polynomial algorithm gets unless P=NP. It is computed here from what the
+        cache already holds rather than from a checked-in list, so it cannot rot
+        against a suite that has moved.
+
+        This is what a row with no remembered killer runs first. The measured
+        shape, in tupferl where this was written: the first seven tests cost
+        under a millisecond each and cover 15% of everything, all of them
+        pure-logic tests, where a slow row's full selection was 22s by
+        comparison.
+
+        Under-counts on purpose. `failfast` stops at the first test to notice, so
+        only one killer per row is ever observed and a test gets no credit for
+        rows something else reached first. Real coverage is at least this.
+        """
+        rows: dict[str, set[str]] = {}
+        for key, test in self.known.items():
+            if test in self.cost:
+                rows.setdefault(test, set()).add(key)
+        covered: set[str] = set()
+        chosen: list[str] = []
+        spent = 0.0
+        while spent < self.budget:
+            best, yield_ = "", 0.0
+            for test, caught in rows.items():
+                fresh = len(caught - covered)
+                # A floor on the divisor: a test too fast to measure would
+                # otherwise divide by zero, and those are exactly the ones worth
+                # having first.
+                rate = fresh / max(self.cost[test], 0.001)
+                if fresh and rate > yield_:
+                    best, yield_ = test, rate
+            if not best or spent + self.cost[best] > self.budget:
+                break
+            chosen.append(best)
+            covered |= rows[best]
+            spent += self.cost[best]
+        return chosen
+
+    def ahead_of(self, table: Sequence[Mutation]) -> list[Mutation]:
+        """The same table, with each remembered killer moved to the front.
+
+        Only ids that still load are used, and they are resolved once for the
+        whole table rather than per mutant. That is not thrift: an id that no
+        longer exists makes `unittest`'s loader record an error, which
+        `tools/verdict.py` correctly classifies as `broke` -- so one renamed
+        test would turn every mutant that remembered it into a non-answer, and
+        the sweep would report a wall of `BROKE` rows for a rename.
+        """
+        head = self.prefix()
+        wanted = {self.known[_key(row)] for row in table if _key(row) in self.known} | set(head)
+        usable = _loadable(wanted)
+        if dropped := len(wanted) - len(usable):
+            print(f"{dropped} remembered test(s) no longer load, so their rows run as usual.")
+        head = [test for test in head if test in usable]
+        if head:
+            spent = sum(self.cost.get(test, 0.0) for test in head)
+            print(
+                f"{len(head)} cheap test(s), {spent:.2f}s, run first where nothing is remembered."
+            )
+
+        ahead = []
+        for row in table:
+            killer = self.known.get(_key(row), "")
+            if killer and killer in usable:
+                # Exact beats general: this test is known to catch *this* row, so
+                # the prefix would only be work before the answer.
+                ahead.append(row._replace(first=killer))
+                continue
+            # Nothing remembered -- a new row, or one whose killer stopped
+            # working. Cut to what this row can reach: a test in a module that
+            # does not import the mutated file cannot see the mutation, so
+            # running it is pure cost.
+            #
+            # `run_tests.selects` rather than comparing module names, which was
+            # the first version and dropped the prefix in the two places it was
+            # most wanted. An empty selection is `WHOLE_SUITE` -- what a file
+            # nothing imports gets -- so its rows run *everything*, ~51s each,
+            # and the prefix was cut to nothing for exactly them. And a selection
+            # naming a class rather than a module never matched at all.
+            reachable = row.tests.split()
+            mine = [
+                test
+                for test in head
+                if not reachable or any(run_tests.selects(test, only) for only in reachable)
+            ]
+            ahead.append(row._replace(first=" ".join(mine)) if mine else row)
+        return ahead
+
+    def learn(self, report: Report) -> None:
+        """Remember what caught each mutation, and forget what stopped catching it.
+
+        Costs come from `Report.times`, which `run` fills from every row it
+        collected *and* every baseline shard. The shards are the richest source
+        by far: they alone run a whole selection with nothing failing, so they
+        measure every test in it rather than the handful before the first
+        failure.
+        """
+        self.cost.update(report.times or {})
+        for result in report.results:
+            if result.verdict.outcome == "caught" and result.verdict.killer:
+                self.known[_key(result.mutation)] = result.verdict.killer
+            elif result.verdict.answered:
+                # It survived. Whatever used to catch it does not any more, so
+                # keeping the entry would put a test that cannot help at the
+                # front of every future run of this row.
+                self.known.pop(_key(result.mutation), None)
+
+    def save(self) -> None:
+        if self.where is None:
+            return
+        self.where.parent.mkdir(parents=True, exist_ok=True)
+        self.where.write_text(
+            json.dumps({"killers": self.known, "costs": self.cost}, indent=1, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
+def _loadable(ids: Iterable[str]) -> set[str]:
+    """Those of `ids` that `unittest` can still turn into a test.
+
+    Asked of the loader rather than by checking that the file exists: a renamed
+    *method* leaves its module in place, and that is the common way a remembered
+    id goes stale.
+    """
+    found = set()
+    for name in ids:
+        loader = unittest.TestLoader()
+        try:
+            loader.loadTestsFromName(name)
+        except Exception:
+            # Deliberately every exception: a module that no longer imports can
+            # raise anything at all on the way, and each one means the same
+            # thing here -- this id cannot be put in front of a run.
+            continue
+        if not loader.errors:
+            found.add(name)
+    return found
 
 
 def generated(args: argparse.Namespace) -> list[Mutation]:
@@ -1345,6 +1840,7 @@ def _persist(report: Report, where: Path) -> None:
                 "operator": result.mutation.operator,
                 "outcome": result.verdict.outcome,
                 "detail": result.verdict.detail,
+                "killer": result.verdict.killer,
                 # Enough to rebuild the row, not just to read about it. Without
                 # `old`/`new` a resumed sweep could skip a file but never
                 # re-confirm its survivors, and `CONTRIBUTING.md` promises every
@@ -1365,8 +1861,55 @@ def _persist(report: Report, where: Path) -> None:
     print(f"\nwrote {len(rows)} row(s) to {where}")
 
 
+def _run_spec(mutations: Sequence[Mutation], args: argparse.Namespace) -> int:
+    """A `MUTATIONS` table from a spec file, run the way the caller asked for.
+
+    This used to be `run(mutations)` -- no arguments at all -- so every flag on
+    the command line was accepted by `argparse` and then silently dropped:
+    `--workers`, `--memory`, `--timeout`, `--each-test`, `--no-baseline`,
+    `--no-confirm` and `--json`. Asking for one lane got two; asking for a report
+    got no file, which reads as the run having failed to write one rather than as
+    the flag never having been consulted -- and in tupferl, where this was found,
+    that misreading cost an hour diagnosing the wrong problem. A flag that
+    silently does nothing is the failure `verdict.py` exists to refuse one level
+    down, and the tool that checks the tests is a bad place to keep an exception.
+
+    `strict` stays on, which `_run_generated` turns off: a spec file is written
+    by hand, so a row that cannot be answered is a mistake in the table, and
+    stopping is what gets it fixed.
+
+    Survivors are confirmed against the whole suite unless `--no-confirm`, which
+    is the promise `CONTRIBUTING.md` makes about a survivor before it is reported. The
+    spec path never kept it, so `--no-confirm` was doubly inert here: it turned
+    off something that was not happening.
+    """
+    report = run(
+        mutations,
+        baseline=not args.no_baseline,
+        workers=args.workers,
+        timeout=args.timeout,
+        memory=args.memory,
+        each=args.each_test,
+    )
+    if not args.no_confirm:
+        report = confirm(
+            report,
+            args.workers,
+            args.timeout,
+            args.memory,
+            each=args.each_test,
+            baseline=not args.no_baseline,
+        )
+    if args.json:
+        _persist(report, args.json)
+        _marker(args.json).touch()
+    return 0 if report.clean else 1
+
+
 def _run_generated(
-    rows: Sequence[Mutation], args: argparse.Namespace, scope: str = "nothing above"
+    rows: Sequence[Mutation],
+    args: argparse.Namespace,
+    landed: Callable[[Result], None] | None = None,
 ) -> Report:
     """One batch of generated rows. Both the whole table and `sweep` use this.
 
@@ -1380,12 +1923,11 @@ def _run_generated(
     An average, not a bound -- `unittest` runs classes alphabetically, so a
     mutant caught only by the last of them still pays for nearly all.
 
-    ``scope`` is passed through to `run`, and defaults to the whole-table
-    wording because that is what `main`'s single-table path is. `sweep` calls
-    this once per *file* and must say so: eleven batches' worth of verdicts can
-    be scrolled above the twelfth, and telling the reader that all of it means
-    nothing is both false and the reason a real sweep's numbers were misread --
-    see #271.
+    No ``scope``: it existed because `sweep` called this once per *file*, and a
+    batch had to say that a red baseline voided only its own rows -- #271 is the
+    misreading that wording answered. The one-pool sweep ported from tupferl#7
+    replaced the batches, so there is one baseline and one scope again, and
+    `run`'s default is right.
     """
     return run(
         rows,
@@ -1396,7 +1938,8 @@ def _run_generated(
         failfast=True,
         timeout=args.timeout,
         memory=args.memory,
-        scope=scope,
+        each=args.each_test,
+        landed=landed,
     )
 
 
@@ -1431,7 +1974,7 @@ def _recorded(where: Path | None) -> list[Result]:
                     span=(row["span"][0], row["span"][1]) if row.get("span") else None,
                     operator=row.get("operator", ""),
                 ),
-                Verdict(row["outcome"], row.get("detail", "")),
+                Verdict(row["outcome"], row.get("detail", ""), row.get("killer", "")),
             )
             for row in saved.get("results", [])
         ]
@@ -1440,58 +1983,114 @@ def _recorded(where: Path | None) -> list[Result]:
 
 
 def sweep(table: Sequence[Mutation], args: argparse.Namespace) -> Report:
-    """Run a large table a file at a time, writing answers out as they land.
+    """Run a large table in one pool, writing answers out as each file finishes.
 
     One table of three thousand rows reports nothing until it ends, and the run
     it was written for took 151 minutes and was killed twice by an out-of-memory
     machine before the guard in #223 existed. A crash then cost the afternoon.
-    Batched by file, a crash costs one file, and re-running with the same
+    Recorded per file, a crash costs one file, and re-running with the same
     `--json` skips what is already recorded -- there is no separate flag.
 
-    Confirmation is pooled to the end rather than run per batch, and that is not
-    an optimisation detail: per batch, a file with a single survivor pays a whole
-    suite run with fifteen lanes idle. Measured on the first sweep here,
-    `credentials.py` spent 68 s on 13 mutants, almost all of it confirming one
-    row.
+    **Scheduled per row, recorded per file**, and separating those two is the
+    whole of tupferl#7, where this design was measured. This ran a *pool per
+    file* until then, so a batch could not return until its slowest row did: one
+    hung mutant held a lane for the full `--timeout` while the other lanes
+    idled, and two hangs in one tupferl table sat in different files, so they
+    were serialised -- ~600s of a 913s run, most of it with the machine two
+    thirds empty. Batching was never about parallelism; it is about when the
+    report is safe to write.
+
+    It also cost the baseline. Each batch checked its own shard, and with one
+    selection per file that shard had no second shard to run beside it: nine
+    files meant nine serialised suite runs. Pooled with everything else they
+    overlap.
+
+    A `--json` written mid-run says `baseline_red: false` until the run ends,
+    because the baseline shards are collected after the rows -- see `run`. That
+    is the exposure the per-batch version had too, one batch later, and it is
+    bounded the same way: a resumed run re-checks the baseline for whatever files
+    it still has to do.
     """
     collected = _recorded(args.json)
-    # Keyed by file, not by row: `_persist` writes after a whole batch, so a
-    # file is recorded entirely or not at all, and a label is not unique anyway
-    # -- 7 are duplicated in the `--all` table, for the reason `confirm`'s
-    # docstring gives.
+    # Keyed by file, not by row: a file is recorded entirely or not at all, and
+    # a label is not unique anyway -- 7 are duplicated in the `--all` table, for
+    # the reason `confirm`'s docstring gives.
     done = {result.mutation.path for result in collected}
+
     by_file: dict[str, list[Mutation]] = {}
     for row in table:
-        by_file.setdefault(row.path, []).append(row)
+        if row.path not in done:
+            by_file.setdefault(row.path, []).append(row)
+    for path in sorted(done & {row.path for row in table}):
+        print(f"{path}: already recorded, skipping")
+    if not by_file:
+        return Report(collected)
 
-    red = False
-    #: Rows from a batch whose baseline was red. They are kept -- dropping them
-    #: would make a resumed sweep re-run work it has already paid for -- but
-    #: they have no verdict, and until #271 nothing said how many there were.
-    #: The per-batch line said "nothing above means anything" about one file of
-    #: twelve, and the summary said nothing at all, so a reader could take a
-    #: `caught` row out of a void batch and believe it. One did.
-    unanswered = 0
+    # Smallest file first, and its rows contiguous. The pool ignores this -- it
+    # takes whatever is next -- but results are *collected* in table order, so
+    # contiguous rows are what let `finished` count a file down to zero.
     order = sorted(by_file, key=lambda path: len(by_file[path]))
-    for at, path in enumerate(order, start=1):
-        if path in done:
-            print(f"[{at}/{len(order)}] {path}: already recorded, skipping")
-            continue
-        rows = by_file[path]
-        print(f"\n[{at}/{len(order)}] {path}: {len(rows)} mutant(s)")
-        batch = _run_generated(rows, args, scope=f"nothing above about {path}")
-        red |= batch.baseline_red
-        if batch.baseline_red:
-            unanswered += len(batch.results)
-        collected.extend(batch.results)
+    rows = [row for path in order for row in by_file[path]]
+    left = {path: len(by_file[path]) for path in order}
+    print(f"\n{len(rows)} mutant(s) across {len(order)} file(s), in one pool")
+
+    fresh: list[Result] = []
+
+    def finished(result: Result) -> None:
+        fresh.append(result)
+        path = result.mutation.path
+        left[path] -= 1
+        if left[path]:
+            return
+        print(f"  -- {path} complete, {len(collected) + len(fresh)} row(s) recorded")
         if args.json:
-            _persist(Report(collected, red), args.json)
-    if unanswered:
-        print(
-            f"\n{unanswered} of {len(collected)} row(s) came from a batch whose baseline "
-            f"was red, so they have no verdict -- the rest stand."
-        )
-    return Report(collected, red)
+            _persist(Report([*collected, *fresh]), args.json)
+
+    report = _run_generated(rows, args, landed=finished)
+    collected.extend(report.results)
+    if args.json:
+        _persist(Report(collected, report.baseline_red), args.json)
+    if report.baseline_red:
+        print(f"\nthe baseline was red, so none of the {len(collected)} row(s) means anything.")
+    # `times` carried through, not dropped. Re-wrapping the report without them
+    # is what made the cheap prefix silently learn nothing: the run measured
+    # every test and the number reached `Killers` as an empty dict.
+    return Report(collected, report.baseline_red, times=report.times)
+
+
+def _baseline_is_green(table: list[Mutation], args: argparse.Namespace) -> bool:
+    """Run just this table's baseline shards, and say whether they all passed.
+
+    The same shards `run` would build, including the one holding every
+    remembered `first` test -- which is a shard of its own and was the one this
+    author forgot when reproducing a red baseline by hand.
+    """
+    shards = sorted({mutation.tests for mutation in table})
+    ahead = " ".join(sorted({name for row in table for name in row.first.split()}))
+    if ahead:
+        shards.append(ahead)
+    # The same sizing `run` does, so the question is asked under the conditions
+    # the sweep will ask it under -- which is the whole point of asking early.
+    wanted = args.workers if args.workers is not None else _affordable()
+    lanes, memory = _share(wanted, args.memory, pinned=args.workers is not None)
+    green = True
+    with _sandboxes(lanes) as available, ThreadPoolExecutor(max_workers=lanes) as pool:
+        checks = [
+            pool.submit(_borrow, available, shard.split(), args.timeout, memory, args.each_test)
+            for shard in shards
+        ]
+        for shard, future in zip(shards, checks, strict=True):
+            verdict = future.result()
+            name = shard if len(shard) < 70 else f"{shard[:67]}..."
+            if verdict.outcome == "survived":
+                print(f"  green   {name}")
+                continue
+            green = False
+            print(f"  RED ({verdict.outcome})  {name}: {verdict.detail}")
+            if verdict.why:
+                print(indent(verdict.why.rstrip(), "  | "))
+    print(f"\n{len(shards)} baseline shard(s), {'all green' if green else 'NOT green'}.")
+    return green
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1534,6 +2133,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=LIMIT, help="cap the table (0 for no cap)")
     parser.add_argument("--timeout", type=float, default=TIMEOUT, help="seconds per mutation")
     parser.add_argument(
+        "--each-test",
+        type=float,
+        default=EACH_TEST,
+        metavar="SECONDS",
+        help=f"seconds one test may take, 0 to disable (default {EACH_TEST:g})",
+    )
+    parser.add_argument(
         "--memory",
         type=_bytes,
         default=MEMORY,
@@ -1541,6 +2147,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--workers", type=int, help="lanes to run in parallel")
     parser.add_argument("--no-baseline", action="store_true", help="skip the untouched-suite check")
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="run just the untouched-suite check for this table, and stop",
+    )
     parser.add_argument(
         "--no-confirm",
         action="store_true",
@@ -1551,6 +2162,25 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="PATH",
         help="write the outcomes here, for `python -m tools.reached`",
+    )
+    parser.add_argument(
+        "--killers",
+        type=Path,
+        default=KILLERS,
+        metavar="PATH",
+        help=f"remember which test caught each mutation (default {KILLERS})",
+    )
+    parser.add_argument(
+        "--no-killers",
+        action="store_true",
+        help="ignore and do not update the remembered killers",
+    )
+    parser.add_argument(
+        "--prefix",
+        type=float,
+        default=PREFIX,
+        metavar="SECONDS",
+        help=f"budget for the cheap-tests-first prefix, 0 to disable (default {PREFIX:g})",
     )
     args = parser.parse_args(argv)
 
@@ -1572,10 +2202,30 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.base:
         table = generated(args)
+        killers = Killers(None if args.no_killers else args.killers, budget=args.prefix)
         if args.list:
             for row in table:
                 print(f"  {row.operator:16} {row.label}")
             return 0
+        # After `--list`, which is about the table rather than about how it will
+        # be run, and before the first row.
+        table = killers.ahead_of(table)
+        if args.baseline_only:
+            # Before the prefix is announced and before any sandbox is built: a
+            # red baseline voids every row, so being able to ask *only* that
+            # question, in the time one shard takes rather than one sweep, is the
+            # difference between a minute and a re-run. Two full sweeps were paid
+            # for here to learn what this prints -- and the second was launched
+            # on a theory the first could not have confirmed.
+            return 0 if _baseline_is_green(table, args) else 1
+        if killers.dropped:
+            print(f"{killers.dropped} remembered test(s) no longer load; those rows run as usual.")
+        if killers.head:
+            spent = sum(killers.cost.get(test, 0.0) for test in killers.head)
+            print(
+                f"{len(killers.head)} cheap test(s), {spent:.2f}s, run first "
+                f"where nothing is remembered."
+            )
         if args.json:
             # Before the first row, so a watcher started alongside this one has
             # something to read straight away. Its own pid, not a caller's guess.
@@ -1594,6 +2244,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.workers,
                 args.timeout,
                 args.memory,
+                each=args.each_test,
                 baseline=not args.no_baseline,
             )
         else:
@@ -1602,6 +2253,19 @@ def main(argv: list[str] | None = None) -> int:
             print("\n--no-confirm: survivors below were not re-run against the whole suite,")
             print("so one may simply have been run against tests that cannot see it.")
         _summarise(report.results)
+        # After `confirm`, whose verdicts are the ones that stand: a row it
+        # promotes from survivor to caught has a killer worth keeping, and one
+        # it leaves surviving must forget the test that stopped catching it.
+        if report.baseline_red:
+            # Its verdicts are meaningless by definition, so its killers are
+            # too -- and a killer recorded from a red tree is a test that fails
+            # untouched, which is exactly what must never be put in front of a
+            # later run. This is the supply line for the false `caught` the
+            # baseline shard above guards against; both ends are closed.
+            print("the baseline was red, so nothing was remembered from this run.")
+        else:
+            killers.learn(report)
+            killers.save()
         if args.json:
             _persist(report, args.json)
             # Last, and after `confirm`: the marker means the whole run is over,
@@ -1635,7 +2299,7 @@ def main(argv: list[str] | None = None) -> int:
     if ran_itself:
         return 0 if all(report.clean for report in mine) else 1
     if mutations:
-        return 0 if run(mutations).clean else 1
+        return _run_spec(mutations, args)
     raise SystemExit(
         f"{args.script} defines no MUTATIONS and never called verify(), so there was "
         f"nothing to run. The shape this takes is `MUTATIONS = [Mutation(...), ...]` "

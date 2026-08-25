@@ -227,3 +227,7 @@ __marimo__/
 # that removed spec_201.py). Ignored rather than merely uncommitted, because
 # `*.spec` above is PyInstaller's and matches none of these.
 spec_*.py
+
+# Mutation sweeps. The reports are throwaway like the specs above; the killers
+# cache (tools/mutate.py's KILLERS) is machine-specific by design.
+sweeps/

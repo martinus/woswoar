@@ -131,19 +131,6 @@ def worktree(revision: str, beside: Path | None = None) -> Iterator[tuple[Path, 
         shutil.rmtree(path, ignore_errors=True)
 
 
-def usable_cpus() -> int:
-    """How many CPUs this process may actually use.
-
-    Not ``os.cpu_count()``, which reports the host's and ignores an affinity mask
-    or a container's quota -- so on a two-core-limited runner on a sixteen-core
-    host it answers sixteen. `tools/run_tests.py` has said so since it was
-    written; this is the second caller, which is why it is here rather than
-    spelled again.
-    """
-    counter = getattr(os, "process_cpu_count", os.cpu_count)  # process_cpu_count is 3.13+
-    return counter() or 4
-
-
 def same_filesystem(one: Path, other: Path) -> bool:
     """Whether two paths sit on the same device.
 

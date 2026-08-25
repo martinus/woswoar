@@ -22,13 +22,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hypothesis import given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
+from tests import profiles  # noqa: F401  -- registers and loads the profile
 from tests.test_record_properties import ENTRIES
 from woswoar import entry, forget, store
-
-settings.load_profile("woswoar")  # registered beside `ENTRIES`, which this imports.
 
 #: Lines as they sit in a log. Bytes rather than text, because that is what
 #: `surviving` is handed -- a decrypted chunk straight off a peer -- and because

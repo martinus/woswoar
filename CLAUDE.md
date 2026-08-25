@@ -334,6 +334,11 @@ opens its PR and waits for a person regardless of what CI says.
 
 - Before blaming your branch for a CI failure, measure the same job on `main`,
   enough times to see a one-in-forty flake. Two runs of green proves nothing.
+- Hypothesis profiles live in `tests/profiles.py`, selected by
+  `WOSWOAR_HYPOTHESIS_PROFILE`: CI sets `ci`, `tools/mutate.py` pins `mutation`
+  for every probe, and the default is a randomised `dev`. To reproduce a
+  CI-only Hypothesis failure, run the preflight the way CI does:
+  `CI=true WOSWOAR_HYPOTHESIS_PROFILE=ci python -m tools.run_tests`.
 - Moving a name between modules leaves `.mypy_cache` wrong, and it fails as
   `AssertionError: Cannot find component 'X' for 'woswoar.old_module.X'` from
   inside mypy rather than as a type error. `rm -rf .mypy_cache` and re-run; it is

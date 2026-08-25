@@ -27,6 +27,19 @@ from tools import watch
 
 ANY = re.compile(".")
 
+#: What the two pidfile-deadline tests pass to `--pidfile-wait`.
+#:
+#: They were the **two slowest tests in the suite**: 10.09s and 10.08s of a
+#: 249.7s serial run, spent watching `watch.PIDFILE_WAIT` elapse in real time.
+#: Nothing about the claim under test needs ten seconds -- "the deadline fires,
+#: exits 1, and names the file" is the same claim at half of one.
+#:
+#: Half a second rather than something smaller: `_await_pid` polls at
+#: `min(interval, 0.1)`, so this is five polls, and a deadline shorter than a
+#: couple of polls would be testing the interpreter's start-up rather than the
+#: loop.
+IMPATIENT = 0.5
+
 
 class Fixture(unittest.TestCase):
     """A scratch log and report path, and a way to make a pid that is really gone."""
@@ -515,6 +528,14 @@ class TestTheCommandLine(Fixture):
         mutation run of this file spent ten minutes on its last ten rows for
         exactly that reason, with the tool's own per-mutant timeout the only
         thing left to catch them.
+
+        **The number has to beat the harness's per-test alarm, not merely
+        exist.** In tupferl this was 30 against an alarm of 30, the two raced,
+        and seven mutants of `main` and `alive` came back `BROKE` -- which is
+        never `caught`, so the lines the bound existed to guard were unguarded
+        by it. Here the alarm is `mutate.EACH_TEST`'s 150s, so 30 clears it
+        comfortably; a hang-mutant is caught by this timeout's own
+        `TimeoutExpired` long before the alarm can file it as no answer.
         """
         return subprocess.run(
             self.command(*extra), cwd=self.repo, capture_output=True, text=True, timeout=30
@@ -669,16 +690,28 @@ class TestTheCommandLine(Fixture):
         self.assertLess(time.monotonic() - began, 5.0, "it waited a whole poll interval")
 
     def test_waiting_for_a_pidfile_is_not_a_spin(self) -> None:
-        """Ten seconds of busy loop is ten seconds of a core, on a machine about
-        to be busy with the job being waited for. Measured rather than read,
-        the same way the main loop's sleep is."""
+        """A busy loop while waiting is a core taken from the job being waited
+        for. Measured rather than read, the same way the main loop's sleep is.
+
+        `--pidfile-wait` shortens the deadline rather than the *behaviour*: the
+        loop still polls at `--interval` and still gives up when the deadline
+        passes, which is the whole of what `_await_pid` does. See `IMPATIENT`
+        for why this test and the one below stopped waiting ten real seconds.
+        """
         before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
         ran = subprocess.run(
-            self.command("--pidfile", str(self.root / "never"), "--interval", "0.05"),
+            self.command(
+                "--pidfile",
+                str(self.root / "never"),
+                "--interval",
+                "0.05",
+                "--pidfile-wait",
+                str(IMPATIENT),
+            ),
             cwd=self.repo,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=30,
             env={**os.environ, "PYTHONPATH": str(self.repo)},
         )
         self.assertEqual(ran.returncode, 1)
@@ -687,17 +720,72 @@ class TestTheCommandLine(Fixture):
 
     def test_a_pidfile_that_never_arrives_is_an_error_not_a_wait(self) -> None:
         """A watcher that settled into watching nothing would be reporting the
-        silence it was built to break. Bounded, and it says which file."""
+        silence it was built to break. Bounded, and it says which file.
+
+        The bound it reports is `IMPATIENT`, not `PIDFILE_WAIT`, which is the
+        point of asserting on the phrase rather than the number: the message
+        has to name the deadline that actually applied.
+        """
         ran = subprocess.run(
-            self.command("--pidfile", str(self.root / "never"), "--interval", "0.05"),
+            self.command(
+                "--pidfile",
+                str(self.root / "never"),
+                "--interval",
+                "0.05",
+                "--pidfile-wait",
+                str(IMPATIENT),
+            ),
             cwd=self.repo,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=30,
             env={**os.environ, "PYTHONPATH": str(self.repo)},
         )
         self.assertEqual(ran.returncode, 1)
         self.assertIn("no usable pid", ran.stderr)
+        self.assertIn(f"after {IMPATIENT:g}s", ran.stderr)
+
+    def test_the_deadline_defaults_to_the_constant(self) -> None:
+        """`--pidfile-wait` is a setting with a default, not a required flag.
+
+        Asserted through the *message*, which names the deadline that applied,
+        so this reads the real default rather than the parser's. Without it,
+        `PIDFILE_WAIT` could be anything and every other test here would pass
+        -- they all pass `IMPATIENT`.
+
+        `--interval` is left alone, so one poll is 0.1s: the run gives up
+        after the deadline and this asserts what it *says*, not how long it
+        took.
+        """
+        ran = self.ran("--pidfile", str(self.root / "never"), "--pidfile-wait", "0.05")
+        self.assertEqual(ran.returncode, 1)
+        self.assertIn("after 0.05s", ran.stderr)
+        self.assertEqual(10.0, watch.PIDFILE_WAIT)
+
+    def test_the_constant_is_resolved_when_it_is_read(self) -> None:
+        """Not baked into the signature as a default argument, which is
+        evaluated once at import -- so a caller who patched the constant would
+        still get ten seconds.
+
+        In process, because that is the only place a patched constant can be
+        observed: the tests above run `watch` as a subprocess, which reads its
+        own module and would pass either way.
+        """
+        with (
+            mock.patch.object(watch, "PIDFILE_WAIT", 0.05),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            watch._await_pid(self.root / "never", 0.05)
+        self.assertIn("after 0.05s", str(caught.exception))
+
+    def test_the_deadline_it_reports_is_the_one_it_was_given(self) -> None:
+        """Two different values, because a message that always printed the
+        constant would pass against one that printed `PIDFILE_WAIT` regardless
+        -- and that is exactly the mutation `patience` invites."""
+        for said in ("0.05", "0.25"):
+            with self.subTest(wait=said):
+                ran = self.ran("--pidfile", str(self.root / "never"), "--pidfile-wait", said)
+                self.assertIn(f"after {float(said):g}s", ran.stderr)
 
     def test_a_pid_and_a_pidfile_together_are_refused(self) -> None:
         """Two answers to one question, and no way to tell which the caller
