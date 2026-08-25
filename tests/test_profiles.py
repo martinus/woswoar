@@ -58,10 +58,7 @@ class TestTheProfilesExist(unittest.TestCase):
         """The machine budgets live beside the profiles and are keyed by the
         same variable, so a sweep that shrank `max_examples` but left a
         250-example state machine running would still take hours."""
-        code = (
-            "from tests import profiles;"
-            "print(profiles.EXPORT_MACHINE, profiles.IMPORT_MACHINE)"
-        )
+        code = "from tests import profiles;print(profiles.EXPORT_MACHINE, profiles.IMPORT_MACHINE)"
         said = subprocess.run(
             [sys.executable, "-c", code],
             cwd=ROOT,
