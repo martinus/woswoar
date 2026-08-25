@@ -705,7 +705,20 @@ def _run(
                 # row mutating `tools/` runs tests that start this module again,
                 # and without it the inner one sizes itself for the whole host.
                 env={
-                    **os.environ,
+                    # `_TOTAL` dropped rather than inherited, and `_budget`'s
+                    # docstring is where this was already written down: it
+                    # short-circuits `_visible_memory` outright, so a nested
+                    # harness that inherited it would size itself for the
+                    # **outer** machine total and ignore exactly the per-lane
+                    # share `_BUDGET` exists to impose. The operator sets that
+                    # variable for the machine; a lane's answer is its share.
+                    #
+                    # Found by a sweep rather than by reading: with `_TOTAL`
+                    # exported, every probe answered `_budget()` with 15 GiB,
+                    # and the two suites that patch `_visible_memory` to assert
+                    # the arithmetic went red -- a red baseline that voided all
+                    # 394 rows, twice.
+                    **{k: v for k, v in os.environ.items() if k != _TOTAL},
                     "PYTHONDONTWRITEBYTECODE": "1",
                     _BUDGET: str(memory),
                     _PROFILE: _MUTATION_PROFILE,

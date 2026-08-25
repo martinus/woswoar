@@ -1540,6 +1540,44 @@ class TestALaneCarriesItsShareIntoTheProbe(MutateTestCase):
         verdict = mutate._run(["test_budget"], self.root, memory=share)
         self.assertEqual(verdict.outcome, "survived", verdict.detail)
 
+    def test_the_probe_does_not_inherit_the_operators_machine_total(self) -> None:
+        """`WOSWOAR_MUTATE_TOTAL` is a knob for the machine, and a lane's answer
+        is its share of it.
+
+        `_budget` short-circuits `_visible_memory` when the variable is set, so
+        a probe that inherited it would size itself for the **outer** total and
+        ignore the per-lane `WOSWOAR_MUTATE_BUDGET` beside it -- which
+        `_budget`'s own docstring already called wrong, without the code
+        preventing it.
+
+        Found by a sweep rather than by reading. Launched with the variable
+        exported, every probe answered `_budget()` with the whole machine, the
+        two suites that patch `_visible_memory` to assert the arithmetic went
+        red, and the baseline they broke voided all 394 rows -- twice, because
+        the first fix was to the tests rather than to this line.
+
+        Driven through a real probe, and it asserts *both* names: a fix that
+        dropped the whole environment would pass a test that only looked for
+        the absence of one.
+        """
+        share = 1 << 30
+        self.write(
+            "test_budget.py",
+            f"""
+            import os
+            import unittest
+
+
+            class T(unittest.TestCase):
+                def test_the_lane_got_its_share_and_not_the_machine(self) -> None:
+                    self.assertIsNone(os.environ.get("WOSWOAR_MUTATE_TOTAL"))
+                    self.assertEqual(os.environ.get("WOSWOAR_MUTATE_BUDGET"), "{share}")
+            """,
+        )
+        with mock.patch.dict(os.environ, {mutate._TOTAL: str(64 << 30)}):
+            verdict = mutate._run(["test_budget"], self.root, memory=share)
+        self.assertEqual(verdict.outcome, "survived", verdict.detail)
+
 
 class TestCountingWhatALaneHolds(unittest.TestCase):
     """Both readers, on every platform, because one of them is macOS's only guard."""
@@ -1641,6 +1679,15 @@ class TestItSaysWhatItGaveTheLanes(MutateTestCase):
     """A share lowered in silence reads as a slow tool rather than a bounded one,
     and it is what makes a later `ran out of memory` row inexplicable. Same
     argument as `--limit` printing what it dropped."""
+
+    def setUp(self) -> None:
+        # Same reason as `TestHowManyLanesFitInMemory`'s: this patches
+        # `_visible_memory` and asserts what the machine could afford, which an
+        # ambient `WOSWOAR_MUTATE_TOTAL` decides instead. `_run` no longer hands
+        # that variable to a probe, so a sweep cannot break this any more; a
+        # developer with it exported still can, which is what this is for.
+        super().setUp()
+        pin_the_machine(self)
 
     def running(self, visible: int, workers: int | None = None) -> str:
         self.package(guarded=True)
