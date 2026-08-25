@@ -3032,6 +3032,17 @@ class TestWhichRowsGetThePrefix(unittest.TestCase):
         """
         self.assertEqual(REAL, self.ahead(mutate.WHOLE_SUITE).first)
 
+    def test_a_prefix_test_in_one_of_several_named_modules_is_kept(self) -> None:
+        """`any`, not `all`: a row's selection may name several modules, and a
+        prefix test only has to be reachable from *one* of them.
+
+        Every other fixture here names a single module, where `any` and `all`
+        agree -- the two-symmetric-inputs weakness, and the sweep found it:
+        turning `any` into `all` survived the whole class. With two modules and
+        the prefix reachable from one, the two answers differ.
+        """
+        self.assertEqual(REAL, self.ahead("tests.test_deps tests.test_mutate").first)
+
     def test_a_selection_naming_a_class_still_matches_its_tests(self) -> None:
         """`tests.test_mutate.TestX` selects `tests.test_mutate.TestX.test_y`.
         Comparing module names made this never match, so any row selected at
