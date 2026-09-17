@@ -83,10 +83,35 @@ jobs:
           sudo tar -xzf /tmp/fzf.tar.gz -C /usr/local/bin fzf
           fzf --version
 
+      - name: install the suite's own dependency
+        # The third time the drift above bit, and the first that was not an apt
+        # package. `ci.yml`'s `test` job runs `pip install -e .[test]`; this file
+        # ran discovery with nothing installed, so the eight property-test
+        # modules failed to *import* -- eight errors and a ninth failure from
+        # `test_every_test_is_assigned_to_exactly_one_batch`, which notices the
+        # `_FailedTest` placeholders unittest substitutes for them. v0.12.0 died
+        # here with every check on its pull request green.
+        #
+        # `[test]` rather than `[dev]`, for `ci.yml`'s reason: this job runs the
+        # suite and nothing else, and ruff, mypy and shellcheck have already had
+        # their say on the pull request.
+        #
+        # `tests/test_release_workflow.py` now asserts this file and that job
+        # agree, so a fourth instance is a red test rather than a failed release.
+        run: pip install -e .[test]
+
       - name: tests
         # A tag can be pushed to any commit by anyone. Re-running the suite here
         # costs half a minute and means a release is never cut from something
         # that was not tested at this exact commit.
+        #
+        # `WOSWOAR_HYPOTHESIS_PROFILE` for the reason `ci.yml` sets it globally:
+        # without it `tests/profiles.py` loads the randomised `dev` profile, and
+        # a randomised property search is the wrong thing to put on the one job
+        # that decides whether a release is cut -- it can fail on an example no
+        # pull request ever drew, and pass on the re-run.
+        env:
+          WOSWOAR_HYPOTHESIS_PROFILE: ci
         run: python -m unittest discover -s . -t . -p 'test_*.py'
 
       - name: build
