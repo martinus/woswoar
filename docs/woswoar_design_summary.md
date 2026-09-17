@@ -460,6 +460,15 @@ multi-line command would appear as several unrelated candidates.
   `sudo sync; …` sat above a three-minute-old `woswoar sync`. It also let the
   right-aligned age column rank things, since fzf scores `begin` net of leading
   whitespace and `1y` is padded one space wider than `10h`.
+- `--scheme=history` — fzf's own scoring for command history, and what makes the
+  tiebreak above reachable. Under the default scheme a match starting after
+  whitespace scores two points more than one starting after a `/`, doubled on
+  the match's first character, so `./native/scripts/bam-oida test …` run an hour
+  ago ranked below every months-old `bam-oida test …`. The gap is in the score,
+  which the tiebreak never sees. `history` flattens both boundary bonuses, the
+  scores tie, and recency decides. Gated on fzf 0.32+, which is where `--scheme`
+  arrives: an unknown *option* makes fzf exit before it draws, so an older fzf
+  keeps `--tiebreak=index` alone rather than losing the picker.
 - `--bind=ctrl-g/ctrl-h/ctrl-s:reload(woswoar list --scope …)` — switch scope
   without leaving the picker. This is why `list` exists as its own subcommand.
 
