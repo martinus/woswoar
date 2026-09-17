@@ -1185,11 +1185,20 @@ class TestTheConfirmationBoundIsDerived(unittest.TestCase):
         self.assertEqual(confirm_timeout(300.0, {}), 300.0)
 
     def test_a_measured_suite_raises_the_bound_above_the_floor(self) -> None:
-        """The reported case: 249.7 s of serial suite under a 300 s bound. The
-        derived bound has to clear it with room for lane contention."""
-        costs = {f"test_{i}": 2.497 for i in range(100)}  # 249.7s
+        """The reported case: a ~250 s serial suite under a 300 s bound. The
+        derived bound has to clear it with room for lane contention.
+
+        Every cost here is exactly representable, and that is not fussiness.
+        The first version used 2.497 and compared against `3.0 * 249.7`, which
+        passed on 3.12 and 3.14 and failed on 3.10 with
+        `749.100000000002 != 749.0999999999999`: CPython 3.12 gave `sum()`
+        compensated summation for floats, so the naive accumulation on 3.10
+        lands a few ulps away. Halves sum exactly under either algorithm, so the
+        test is about the arithmetic it claims to be about.
+        """
+        costs = {f"test_{i}": 2.5 for i in range(100)}  # 250.0s, exactly
         self.assertGreater(confirm_timeout(300.0, costs), 300.0)
-        self.assertEqual(confirm_timeout(300.0, costs), 3.0 * 249.7)
+        self.assertEqual(confirm_timeout(300.0, costs), 750.0)
 
     def test_the_floor_wins_when_it_is_the_larger(self) -> None:
         """`--timeout` is a floor, not an opinion to be overruled. Someone who
