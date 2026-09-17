@@ -35,6 +35,47 @@ def line(ts: int, cmd: str) -> str:
     return format_line(make_entry(ts, cmd))
 
 
+def _timestamp_offset(blob: bytes, ts: int) -> int:
+    """Where `ts` sits as an entry's own timestamp field, in bytes.
+
+    Walked structurally rather than found with `blob.index(str(ts))`, which is
+    what this did and which corrupted the wrong field about one run in 64 (#326).
+    A cache is `_MAGIC` then one `_FILE` chunk per log, and each chunk is a
+    header -- `relpath`, `host`, `size`, `mtime_ns`, `offset`, `head` -- before
+    the entries. The header comes first, so *any* `"100"` in it was found first,
+    and `mtime_ns` is a 19-digit wall clock: 1.55% of them contain "100", as do
+    some `head` hex digests. The helper then damaged the header, `loads` raised
+    on `int(mtime_ns)` before the code under test was reached, and CI went red on
+    a change that had nothing to do with it.
+
+    The quieter half is why this is a locator rather than a narrower search:
+    `test_the_entries_come_back_rather_than_a_traceback` passes either way when
+    the damage lands in the header, because `load_entries` rebuilds from `logs/`
+    for a corrupt header just as it does for a corrupt timestamp. On those runs
+    it guarded nothing and said so to nobody.
+
+    So this matches a *field*, never a substring: the timestamp is field 0 of
+    each six-field record, so a record's own start is the offset wanted. A `ts`
+    that is not there raises rather than returning something plausible -- the one
+    outcome worse than the bug is a helper that quietly damages nothing.
+    """
+    field, record, file = (
+        sep.encode("utf-8") for sep in (cache._FIELD, cache._RECORD, cache._FILE)
+    )
+    want = str(ts).encode("utf-8")
+    base = 0
+    for chunk in blob.split(file):
+        header, sep, body = chunk.partition(record)
+        if sep:
+            at = base + len(header) + len(sep)
+            for row in body.split(record):
+                if row.split(field)[0] == want:
+                    return at
+                at += len(row) + len(record)
+        base += len(chunk) + len(file)
+    raise AssertionError(f"no entry in the cache has timestamp {ts}")
+
+
 def bump_mtime(path: object) -> None:
     """Push mtime forward so a same-size rewrite is still detectable.
 
@@ -193,7 +234,7 @@ class TestADamagedNumberRebuilds(WoswoarTestCase):
         """
         path = store.cache_file()
         blob = path.read_bytes()
-        at = blob.index(str(ts).encode("utf-8"))
+        at = _timestamp_offset(blob, ts)
         # The *second* digit, so the damage stays inside the number whatever
         # its length. Writing past the last digit lands on the field separator
         # instead, which breaks the record structure -- a different failure,
@@ -220,6 +261,62 @@ class TestADamagedNumberRebuilds(WoswoarTestCase):
 
         restored = cache.loads(store.cache_file().read_bytes())
         self.assertEqual([e.ts for e in restored.entries()], [100])
+
+    def test_the_damage_lands_on_the_timestamp_and_nothing_else(self) -> None:
+        """#326, with a fixture that can tell the wrong answers apart.
+
+        Three things can divert a search for `str(ts)`, and the fixture carries
+                one of each. The header precedes the entries in a chunk, and `mtime_ns`
+                is a 19-digit wall clock -- 1.55% of them contain "100", and the forced
+                value below is one CI actually drew. The decoy record supplies the other
+                two: its command is the digits *as a substring* and *as a whole field*,
+                so a locator that matches anywhere in a record, and one that matches any
+                field rather than field 0, both damage the wrong entry and are told
+                apart here. A command of exactly `100` is a typo, not a contrivance.
+
+                Asserted through `stamps_and_commands`, which converts nothing, so the
+                damaged timestamp can be read back as the string it now is and named.
+                Phrasing it as "the entries come back" is what hid this for a release:
+                `load_entries` rebuilds from `logs/` for a damaged header exactly as it
+                does for a damaged timestamp, so that assertion holds whichever field was
+                hit, and held on every run where the helper missed.
+        """
+        self.write_log(
+            MACHINE_ID,
+            "2026-07-29",
+            # The decoy first, so a wrong search reaches it before the target.
+            [line(200, "100"), line(100, "git status")],
+        )
+        log = store.log_file(MACHINE_ID, "2026-07-29")
+        forced = 1789649508591110002  # contains "100"
+        os.utime(log, ns=(forced, forced))
+        cache.load_entries()
+        self.damage_a_timestamp(100)
+
+        damaged = cache.loads(store.cache_file().read_bytes())
+        stamps, commands = damaged.stamps_and_commands()
+        self.assertEqual(
+            stamps,
+            ["200", "1?0"],
+            "the damaged byte is not the timestamp this was asked for",
+        )
+        self.assertEqual(commands, ["100", "git status"], "a command was damaged instead")
+        self.assertEqual(
+            [meta.mtime_ns for meta in damaged.meta.values()],
+            [forced],
+            "the damage landed in the file header instead",
+        )
+
+    def test_a_timestamp_that_is_not_in_the_cache_is_an_error(self) -> None:
+        """The guard matters because what it prevents is invisible. A locator
+        that finds nothing and returns an offset anyway damages some unrelated
+        byte, or none, and leaves a test that passes while guarding nothing --
+        which is the whole of #326, and is not a thing the damaged run announces.
+        """
+        self.write_log(MACHINE_ID, "2026-07-29", [line(100, "git status")])
+        cache.load_entries()
+        with self.assertRaises(AssertionError):
+            self.damage_a_timestamp(999)
 
     def test_a_cache_that_is_merely_stale_is_still_updated_in_place(self) -> None:
         """Guard the guard, and it has to be observable rather than merely
