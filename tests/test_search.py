@@ -312,6 +312,21 @@ SYNC_HISTORY = [
 ]
 
 
+#: The second report, and a gap the tiebreak cannot close. Every line here
+#: matches "bam-oida test" on the same characters, so the only thing separating
+#: them under fzf's default scheme is what sits in front of the match: a space
+#: for the old ones, a `/` for the recent ones, worth two points of score. That
+#: is decided before the tiebreak is consulted, so the hour-old command sank
+#: below all four months-old ones and stayed there however often it was run.
+BAM_HISTORY = [
+    (2 * HOUR, "./native/scripts/bam-oida test wscommon_test"),
+    (25 * HOUR, "./native/scripts/bam-oida test -h"),
+    (30 * DAY, 'gra work "OA-71847 Add LLM-optimized mutation testing to bam-oida"'),
+    (5 * 30 * DAY, "bam-oida test agentcommunication_test"),
+    (6 * 30 * DAY, "bam-oida test"),
+]
+
+
 @requires_fzf
 class TestRealFzfRanking(unittest.TestCase):
     """The order fzf actually produces, out of the real binary.
@@ -322,10 +337,16 @@ class TestRealFzfRanking(unittest.TestCase):
     stand-in -- the behaviour under test is fzf's, not woswoar's.
     """
 
-    def filtered(self, query: str) -> subprocess.CompletedProcess[str]:
+    def filtered(
+        self, query: str, history: list[tuple[int, str]] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """The fixture through the real fzf, with the real argv."""
         lines = search.render_rows(
-            [(NOW - age, cmd, "0", MACHINE_ID) for age, cmd in SYNC_HISTORY], now=NOW
+            [
+                (NOW - age, cmd, "0", MACHINE_ID)
+                for age, cmd in (SYNC_HISTORY if history is None else history)
+            ],
+            now=NOW,
         )
         # No `check`: 1 means "nothing matched", which one test below wants.
         return subprocess.run(
@@ -335,8 +356,8 @@ class TestRealFzfRanking(unittest.TestCase):
             text=True,
         )
 
-    def ordered(self, query: str) -> list[str]:
-        completed = self.filtered(query)
+    def ordered(self, query: str, history: list[tuple[int, str]] | None = None) -> list[str]:
+        completed = self.filtered(query, history)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return [search.command_from_line(line) for line in completed.stdout.splitlines()]
 
@@ -371,6 +392,37 @@ class TestRealFzfRanking(unittest.TestCase):
             order.index("atuin sync"),
             order.index("atuin sync -h"),
             "the padding of the age column decided the order",
+        )
+
+    def test_a_path_prefix_does_not_sink_a_recent_command(self) -> None:
+        """The report: `./native/scripts/bam-oida test ...` run an hour ago,
+        ranked below four `bam-oida test ...` lines five and six months old.
+
+        Asserted as the whole order rather than one pair, because the claim is
+        that nothing but recency separates these: every line matches the same
+        characters, and the only difference the default scheme sees is a `/`
+        where the others have a space. With `--scheme=history` the scores tie and
+        `--tiebreak=index` hands back the order `rank_rows` gave it.
+        """
+        self.assertEqual(
+            self.ordered("bam-oida test", BAM_HISTORY),
+            [cmd for _, cmd in BAM_HISTORY],
+            "fzf's boundary bonus outranked recency",
+        )
+
+    def test_one_character_in_front_of_the_match_does_not_rank(self) -> None:
+        """The same pair reduced to what actually differs.
+
+        `BAM_HISTORY` is the report; this is the mechanism, and it is the
+        fixture that cannot be too weak to tell the two answers apart. The two
+        commands are identical but for the character before the match, and with
+        `--scheme` unset fzf puts the older one first on the strength of it.
+        """
+        pair = [(10 * HOUR, "x/aaa bbb"), (11 * HOUR, "x aaa bbb")]
+        self.assertEqual(
+            self.ordered("aaa", pair),
+            ["x/aaa bbb", "x aaa bbb"],
+            "a `/` in front of the match outranked an hour of recency",
         )
 
     def test_the_time_column_is_still_not_matched_against(self) -> None:
@@ -553,8 +605,10 @@ class TestThePickerAppearsBeforeTheHistoryIsBuilt(WoswoarTestCase):
             mock.patch.object(search, "lines_for", slow_lines),
             # The version probe would otherwise be caught by the fake `Popen`
             # above -- `subprocess.run` uses it. This test is about the order of
-            # two things, not about which fzf is installed.
+            # two things, not about which fzf is installed. Both gates, because
+            # `_fzf_argv` falls through to the second one when the first says no.
             mock.patch.object(search, "fzf_supports_transform", return_value=False),
+            mock.patch.object(search, "fzf_supports_scheme", return_value=False),
         ):
             search.interactive("global")
 
@@ -904,6 +958,35 @@ class TestCtrlRCyclesTheScope(unittest.TestCase):
         self.assertTrue([a for a in argv if a.startswith("--bind=ctrl-r:transform:")])
         header = next(a for a in argv if a.startswith("--header="))
         self.assertIn("ctrl-r", header, "the key is bound but never mentioned")
+
+    def test_an_fzf_without_scheme_is_not_offered_it(self) -> None:
+        """An unknown *option* makes fzf exit before it draws anything, so this
+        is worse to guess wrong than an unknown action: the cost is the picker,
+        and the gain would be a ranking nobody sees."""
+        with (
+            mock.patch.object(search, "fzf_supports_transform", return_value=False),
+            mock.patch.object(search, "fzf_supports_scheme", return_value=False),
+        ):
+            argv = search._fzf_argv("global", "", True, 0)
+        self.assertNotIn("--scheme=history", argv)
+        self.assertIn("--tiebreak=index", argv, "nothing is left ordering an old fzf")
+
+    def test_an_fzf_with_scheme_but_not_transform_still_gets_it(self) -> None:
+        """0.32 up to 0.45 has `--scheme` and not `transform`. The ranking is not
+        a key, so there is no reason for it to ride the keys' gate."""
+        with (
+            mock.patch.object(search, "fzf_supports_transform", return_value=False),
+            mock.patch.object(search, "fzf_supports_scheme", return_value=True),
+        ):
+            argv = search._fzf_argv("global", "", True, 0)
+        self.assertIn("--scheme=history", argv)
+
+    def test_the_scheme_gate_reads_a_version(self) -> None:
+        for version, wanted in (("0.31.0", False), ("0.32.0", True), ("0.74.3 (Fedora)", True)):
+            with self.subTest(version=version):
+                done = subprocess.CompletedProcess([], 0, stdout=version, stderr="")
+                with mock.patch("subprocess.run", return_value=done):
+                    self.assertEqual(search.fzf_supports_scheme(), wanted)
 
     def test_the_version_is_reported_as_well_as_judged(self) -> None:
         """`doctor` shows a person the string fzf printed while the gate below

@@ -1026,6 +1026,9 @@ def _self_command() -> str:
 #: Ctrl-T timeline are both built on.
 TRANSFORM_SINCE = (0, 45)
 
+#: The fzf that gained `--scheme`, whose `history` scoring `_fzf_argv` asks for.
+SCHEME_SINCE = (0, 32)
+
 
 def fzf_version() -> tuple[str, tuple[int, int] | None]:
     """What `fzf --version` says, and the (major, minor) parsed out of it.
@@ -1077,6 +1080,18 @@ def fzf_supports_transform() -> bool:
     """
     _, parsed = fzf_version()
     return parsed is not None and parsed >= TRANSFORM_SINCE
+
+
+def fzf_supports_scheme() -> bool:
+    """Whether this fzf has `--scheme`, added in 0.32.
+
+    Gated for the reason `fzf_supports_transform` is, one step worse: an unknown
+    *option* makes fzf exit before it draws anything at all, so an ungated
+    `--scheme=history` would cost the whole picker on an older fzf rather than
+    one key.
+    """
+    _, parsed = fzf_version()
+    return parsed is not None and parsed >= SCHEME_SINCE
 
 
 def _scope_case(var: str, answer: dict[Scope, Scope], fallback: str = SCOPES[0]) -> str:
@@ -1459,6 +1474,30 @@ def _fzf_argv(scope: Scope, query: str, dedup: bool, host_width: int) -> list[st
     ]
     # Asked once and reused, because it forks `fzf --version`.
     transform = fzf_supports_transform()
+    # fzf's own scoring for command history, and the one thing `--tiebreak` above
+    # cannot do: the tiebreak only runs when the scores are equal, and with
+    # `--scheme` unset they are not. A match that starts after whitespace
+    # collects `bonusBoundaryWhite` where one that starts after a `/` collects
+    # `bonusBoundaryDelimiter` -- one point, doubled on the first character of
+    # the match, and applied before recency is ever consulted. Measured, not
+    # read off the source: `x aaa bbb` and `x/aaa bbb` differ in that one
+    # character and fzf reverses them.
+    #
+    # Reported against `bam-oida`: `./native/scripts/bam-oida test ...` run an
+    # hour ago sat below four `bam-oida test ...` lines five and six months old,
+    # and no amount of running the recent one moved it, because the gap is in the
+    # score and not in the tiebreak. `history` flattens both bonuses to
+    # `bonusBoundary`, the scores tie, and `--tiebreak=index` decides -- which is
+    # what the tiebreak was put there to do.
+    #
+    # `--tiebreak=index` stays although this scheme implies it: it is the only
+    # thing ordering an fzf below 0.32, where `--scheme` is not offered.
+    #
+    # Short-circuited rather than asked outright. 0.45 is above 0.32, so an fzf
+    # with `transform` has `--scheme` as well, and the second `fzf --version`
+    # forks only on the old fzf that genuinely has to be asked.
+    if transform or fzf_supports_scheme():
+        argv.append("--scheme=history")
     if transform:
         argv.append(_cycle_binding(self_cmd, dedup_flag, width))
         argv.append(_timeline_binding(self_cmd, dedup_flag, width))
