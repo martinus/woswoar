@@ -107,9 +107,18 @@ for, and what it costs.
 
 Either way the `--json` report says which happened: `widened` is true only when
 every survivor in the file really was re-run against the whole suite. It is
-false after `--no-confirm`, after a suppressed confirmation, and in a
-part-written file from an interrupted sweep — the cases where the paragraph
-above promises something the file cannot deliver.
+false after `--no-confirm`, after a suppressed confirmation, when any
+confirmation timed out or broke, and in a part-written file from an interrupted
+sweep — the cases where the paragraph above promises something the file cannot
+deliver.
+
+A confirmation probe is one serial pass over the whole suite, so it does not
+share `--timeout`, which bounds a mutation against a module or two. Its bound is
+derived from what a sweep remembers each test costing (`sweeps/killers.json`),
+so it follows the suite as that grows; `--timeout` is its floor. Deriving it
+rather than typing a second number in is the point: the margin the shared bound
+used to have was lost by the suite growing, not by anyone changing the number,
+and every confirmation then timed out at once.
 
 Seventeen operators, and `--skip-operator NAME` drops one — the escape hatch for
 an equivalent mutant a whole operator keeps producing, where `# pragma: no
