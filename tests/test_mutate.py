@@ -28,7 +28,17 @@ from unittest import mock
 
 from tools import mutate, reached
 from tools import verdict as verdict_module
-from tools.mutate import MEMORY, Mutation, Report, Result, Verdict, confirm, run, verify
+from tools.mutate import (
+    MEMORY,
+    Mutation,
+    Report,
+    Result,
+    Verdict,
+    confirm,
+    confirm_timeout,
+    run,
+    verify,
+)
 
 from . import support
 from .support import requires_git
@@ -898,9 +908,236 @@ class TestConfirmingNeedsAGreenSuiteToo(TwoRowsSharingALabel):
         """
         report = run(self.two_rows_with_one_label(), baseline=False, strict=False)
         genuine = Report(report.results[1:], report.baseline_red)
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()) as said:
             confirmed = confirm(genuine, workers=None, timeout=60.0, memory=MEMORY)
         self.assertEqual([result.verdict.outcome for result in confirmed.results], ["survived"])
+        self.assertTrue(confirmed.widened)
+        # What is *not* said, because both lines below are conditional and a
+        # mutation making either unconditional survived every other test here.
+        # They would read "0 confirmation(s) could not be answered ... the report
+        # is not marked widened" beside a report that is, and "0 of them were
+        # caught" after correcting none -- false sentences, in the pass whose
+        # whole job is to stop a reader trusting a wrong row.
+        self.assertNotIn("could not be answered", said.getvalue())
+        self.assertNotIn("were caught by a test the selection had not run", said.getvalue())
+        # The merged timings survive the pass. `Killers` budgets the cheap-first
+        # prefix from them, so dropping them here costs every later run its
+        # ordering -- silently, since nothing else reads the field.
+        self.assertTrue(confirmed.times, "confirmation discarded what the run measured")
+
+    def hangs_only_where_the_narrow_pass_cannot_look(self) -> Mutation:
+        """One row that survives the narrow pass fast and hangs the wide one.
+
+        The shape #322 reports, reduced to something that fits a test: the
+        confirmation probe runs the whole suite, exceeds its bound and comes back
+        `TIMEOUT` -- which is neither a survivor nor a catch. The hang is in a
+        function the narrow selection never calls, so the narrow row is answered
+        in milliseconds and only the widened re-run pays for it.
+
+        A real hang rather than a stubbed clock: what is under test is what the
+        bound does to a probe that will not finish, and a stand-in for the probe
+        would be a test of the stand-in.
+        """
+        self.write("mod.py", "def first():\n    return 1\n\n\ndef second():\n    return 2\n")
+        self.write(
+            "test_narrow.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Narrow(unittest.TestCase):
+                def test_first_only(self) -> None:
+                    self.assertEqual(mod.first(), 1)
+            """,
+        )
+        # Found by discovery alone, so only the confirmation pass reaches it.
+        self.write(
+            "test_wide.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Wide(unittest.TestCase):
+                def test_second(self) -> None:
+                    self.assertEqual(mod.second(), 2)
+            """,
+        )
+        return Mutation(
+            "second hangs",
+            "mod.py",
+            "    return 2",
+            '    __import__("time").sleep(600)',
+            "test_narrow",
+        )
+
+    def test_a_confirmation_that_timed_out_does_not_earn_widened(self) -> None:
+        """#322. `widened` is a promise about what ran, not about the pass being
+        attempted, and CONTRIBUTING.md states it: true "only when every survivor
+        in the file really was re-run against the whole suite".
+
+        A probe that timed out re-ran nothing, and this set the flag anyway --
+        so a sweep where every confirmation timed out wrote `"widened": true`
+        into its `--json`, which `tools/reached.py` then reads back as a survivor
+        that had been checked against everything. The quiet direction: the run
+        looks like it answered fewer rows, not like it stopped checking.
+        """
+        report = run([self.hangs_only_where_the_narrow_pass_cannot_look()], baseline=False)
+        self.assertEqual([result.verdict.outcome for result in report.results], ["survived"])
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(report, workers=None, timeout=8.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["survived"],
+            "precondition: the narrow verdict must stand, unanswered by the widened run",
+        )
+        self.assertFalse(confirmed.widened, "an unanswered confirmation claimed the promise")
+        # And says so, rather than leaving the reader to notice a TIMEOUT row.
+        self.assertIn("could not be answered", said.getvalue())
+        self.assertIn("not marked widened", said.getvalue())
+
+    def test_a_correction_beside_a_timeout_still_does_not_earn_widened(self) -> None:
+        """The mixed run, and the reason it needs its own test.
+
+        `confirm` returns from two places -- one when nothing was corrected, one
+        when something was -- and the second is reached only when a survivor is
+        promoted. A fixture where everything times out exercises the first and
+        leaves the second free to grant the promise, which is what a mutation of
+        it proved: `kept` restored to `True` there survived the test above.
+
+        Here one row is caught by the wide suite and the other hangs it, so
+        `corrected` is non-empty and `unsure` is one at the same time. The
+        promise covers *every* survivor, so one unanswered probe voids it
+        however many of its neighbours were answered.
+        """
+        self.write("mod.py", "def first():\n    return 1\n\n\ndef second():\n    return 2\n")
+        self.write(
+            "test_narrow.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Narrow(unittest.TestCase):
+                def test_neither_is_called(self) -> None:
+                    self.assertTrue(hasattr(mod, "first"))
+            """,
+        )
+        # Calls both, so it catches the first row and hangs on the second --
+        # each probe mutates only its own row, so neither interferes.
+        self.write(
+            "test_wide.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Wide(unittest.TestCase):
+                def test_both(self) -> None:
+                    self.assertEqual(mod.first(), 1)
+                    self.assertEqual(mod.second(), 2)
+            """,
+        )
+        rows = [
+            Mutation("first returns 99", "mod.py", "    return 1", "    return 99", "test_narrow"),
+            Mutation(
+                "second hangs",
+                "mod.py",
+                "    return 2",
+                '    __import__("time").sleep(600)',
+                "test_narrow",
+            ),
+        ]
+        report = run(rows, baseline=False, strict=False)
+        self.assertEqual(
+            [result.verdict.outcome for result in report.results],
+            ["survived", "survived"],
+            "precondition: both rows must survive the narrow pass",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(report, workers=None, timeout=8.0, memory=MEMORY)
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught", "survived"],
+            "precondition: one row corrected, one left unanswered",
+        )
+        self.assertIn("were caught by a test the selection had not run", said.getvalue())
+        self.assertFalse(
+            confirmed.widened,
+            "a correction earned the promise for a survivor that was never re-run",
+        )
+
+    def test_the_derived_bound_is_the_one_the_probe_actually_gets(self) -> None:
+        """The plumbing, and it is the line the rest of #322 rests on.
+
+        Arithmetic tests cover `confirm_timeout`; a mutation restoring
+        `timeout=timeout` in the `run` call survived every one of them, because
+        a derived number nothing arms is dead code that reads as a fix.
+
+        So this is timed rather than asserted on an argument: the mutant sleeps
+        four seconds, the floor is two, and the remembered costs derive twelve.
+        Under the floor the probe times out and the row stands as a survivor;
+        under the derived bound it finishes, the wide test sees `None` instead of
+        2, and the row is corrected. The two answers are opposite, which is the
+        only way to tell which bound was armed.
+        """
+        self.write("mod.py", "def first():\n    return 1\n\n\ndef second():\n    return 2\n")
+        self.write(
+            "test_narrow.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Narrow(unittest.TestCase):
+                def test_first_only(self) -> None:
+                    self.assertEqual(mod.first(), 1)
+            """,
+        )
+        self.write(
+            "test_wide.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class Wide(unittest.TestCase):
+                def test_second(self) -> None:
+                    self.assertEqual(mod.second(), 2)
+            """,
+        )
+        row = Mutation(
+            "second dawdles",
+            "mod.py",
+            "    return 2",
+            '    __import__("time").sleep(4)',
+            "test_narrow",
+        )
+        report = run([row], baseline=False)
+        self.assertEqual([result.verdict.outcome for result in report.results], ["survived"])
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            confirmed = confirm(
+                report,
+                workers=None,
+                timeout=2.0,
+                memory=MEMORY,
+                # Sums to 4.0, so `CONFIRM_SLACK` derives 12.0 -- above the
+                # sleep, where the floor of 2.0 is below it.
+                costs={"a": 2.0, "b": 2.0},
+            )
+        self.assertIn("12s each", said.getvalue(), "the printed bound is not the derived one")
+        self.assertEqual(
+            [result.verdict.outcome for result in confirmed.results],
+            ["caught"],
+            "the probe was bounded by --timeout, so the derivation reaches nothing",
+        )
         self.assertTrue(confirmed.widened)
 
     def test_no_baseline_still_means_no_baseline(self) -> None:
@@ -923,6 +1160,121 @@ class TestConfirmingNeedsAGreenSuiteToo(TwoRowsSharingALabel):
             ["caught", "caught"],
             "--no-baseline no longer reaches the confirmation pass",
         )
+
+
+class TestTheConfirmationBoundIsDerived(unittest.TestCase):
+    """#322: a whole-suite probe cannot share the per-mutation bound.
+
+    `--timeout` bounds one mutation against a module or two. A confirmation
+    probe is one serial pass over everything, and when the suite grew past the
+    bound every probe came back `TIMEOUT` -- 249.7 s of work against 300 s, with
+    lanes competing for the same cores. Nobody moved the number; the suite moved
+    under it.
+
+    So the bound is derived from what `Killers` remembers each test costing,
+    which is refilled on every run. These are the arithmetic, not the plumbing:
+    `confirm` passes `killers.cost` and the value reaches `run`'s `timeout`.
+    """
+
+    def test_no_measurement_leaves_the_floor_alone(self) -> None:
+        """A fresh machine, `--no-killers`, or a file that would not parse. The
+        floor is today's behaviour, and a guess dressed up as a derivation would
+        be worse -- it would read as measured in the output and be a number
+        nobody chose."""
+        self.assertEqual(confirm_timeout(300.0, None), 300.0)
+        self.assertEqual(confirm_timeout(300.0, {}), 300.0)
+
+    def test_a_measured_suite_raises_the_bound_above_the_floor(self) -> None:
+        """The reported case: a ~250 s serial suite under a 300 s bound. The
+        derived bound has to clear it with room for lane contention.
+
+        Every cost here is exactly representable, and that is not fussiness.
+        The first version used 2.497 and compared against `3.0 * 249.7`, which
+        passed on 3.12 and 3.14 and failed on 3.10 with
+        `749.100000000002 != 749.0999999999999`: CPython 3.12 gave `sum()`
+        compensated summation for floats, so the naive accumulation on 3.10
+        lands a few ulps away. Halves sum exactly under either algorithm, so the
+        test is about the arithmetic it claims to be about.
+        """
+        costs = {f"test_{i}": 2.5 for i in range(100)}  # 250.0s, exactly
+        self.assertGreater(confirm_timeout(300.0, costs), 300.0)
+        self.assertEqual(confirm_timeout(300.0, costs), 750.0)
+
+    def test_the_floor_wins_when_it_is_the_larger(self) -> None:
+        """`--timeout` is a floor, not an opinion to be overruled. Someone who
+        raises it means "give things longer", and a derived bound that came back
+        *shorter* would answer the opposite of what they asked."""
+        self.assertEqual(confirm_timeout(9000.0, {"test_one": 1.0}), 9000.0)
+
+    def test_the_bound_follows_the_suite_as_it_grows(self) -> None:
+        """The whole point of deriving it. A second constant beside `TIMEOUT`
+        would rot exactly as the first one did, and silently -- the failure is a
+        row that says `TIMEOUT`, which is neither a survivor nor a catch."""
+        small = confirm_timeout(1.0, {"a": 10.0})
+        grown = confirm_timeout(1.0, {"a": 10.0, "b": 10.0})
+        self.assertEqual(grown, 2 * small)
+
+
+def spying_on_confirm() -> tuple[Any, list[dict[str, Any]]]:
+    """A stand-in for `confirm` that records the keywords it was handed.
+
+    Module level because the two entry points live in two classes, each with the
+    fixture it needs -- a spec file here, a git repository further down -- and a
+    second copy of this is how one of them would come to check something subtly
+    other than the other.
+    """
+    seen: list[dict[str, Any]] = []
+
+    def recording(report: Report, *args: Any, **kw: Any) -> Report:
+        seen.append(kw)
+        return report
+
+    return recording, seen
+
+
+class TestTheRememberedCostsReachConfirm(MutateTestCase):
+    """The wiring between `Killers` and `confirm_timeout`, on the spec path.
+
+    `confirm` derives its bound from remembered per-test costs, and every caller
+    has to hand them over. Nothing else can see this: a mutation deleting
+    `costs=killers.cost` from a call site passed `confirm_timeout`'s arithmetic
+    tests and the end-to-end one alike, because the derivation then falls back to
+    the floor -- which is the behaviour #322 reported, restored without a word.
+
+    `TestTheGeneratedEntryPoint` carries the same check for the other caller.
+    """
+
+    def test_the_spec_path_hands_over_what_it_remembers(self) -> None:
+        self.write("mod.py", "def f():\n    return 1\n")
+        self.write(
+            "test_mod.py",
+            """
+            import unittest
+
+            import mod
+
+
+            class T(unittest.TestCase):
+                def test_f(self) -> None:
+                    self.assertEqual(mod.f(), 1)
+            """,
+        )
+        self.write(
+            "spec.py",
+            """
+            from tools.mutate import Mutation
+
+            MUTATIONS = [Mutation("f returns 2", "mod.py", "return 1", "return 2", "test_mod")]
+            """,
+        )
+        recording, seen = spying_on_confirm()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "confirm", recording),
+        ):
+            mutate.main(["spec.py", "--no-baseline", "--no-killers"])
+        self.assertEqual(len(seen), 1, "confirm was not reached")
+        self.assertIn("costs", seen[0], "the spec path derives its bound from nothing")
 
 
 class TestASubTestIsARealAnswer(MutateTestCase):
@@ -2486,6 +2838,20 @@ class TestTheGeneratedEntryPoint(MutateTestCase):
         report = self.root / "rows.json"
         cli(self.root, "--base", "HEAD", "--operator", "branch", "--json", str(report))
         self.assertFalse(mutate._pidfile(report).exists())
+
+    def test_the_generated_path_hands_over_what_it_remembers(self) -> None:
+        """The other half of `TestTheRememberedCostsReachConfirm`, here because
+        `repo` is here: `confirm` must be given the remembered costs it derives
+        its bound from, or #322 is back with the output unchanged."""
+        self.repo(guarded=True)
+        recording, seen = spying_on_confirm()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(mutate, "confirm", recording),
+        ):
+            mutate.main(["--base", "HEAD", "--operator", "branch", "--no-killers"])
+        self.assertEqual(len(seen), 1, "confirm was not reached")
+        self.assertIn("costs", seen[0], "the generated path derives its bound from nothing")
 
     def test_the_pid_is_there_while_the_run_is_going(self) -> None:
         """Observed from inside, because it is gone by the time `main` returns

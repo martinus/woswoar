@@ -128,6 +128,19 @@ __all__ = ["Mutation", "Report", "Result", "Verdict", "run", "verify"]
 #: lane for the rest of the table.
 TIMEOUT = 300.0
 
+#: What a confirmation probe may take, as a multiple of the *measured* serial
+#: suite. Three, because the arithmetic in #322 is the whole of it: a 249.7 s
+#: suite against a 300 s bound left every lane timing out on a four-core box at
+#: seven lanes, so contention roughly doubles the serial cost and the bound has
+#: to sit above that with room.
+#:
+#: A multiplier on something measured rather than a second constant to keep in
+#: step: `TIMEOUT` bounds one mutation against a module or two, and a
+#: confirmation probe is a whole serial suite, so one number cannot be right for
+#: both -- and a number typed in here rots as the suite grows, which is exactly
+#: how the margin that used to exist was lost.
+CONFIRM_SLACK = 3.0
+
 #: Seconds one *test* may take before the run gives up on it, which is a much
 #: tighter question than `TIMEOUT`'s -- and it names the test, which `TIMEOUT`
 #: cannot: a whole-run bound reports "no answer within 300s" and leaves the
@@ -1464,6 +1477,34 @@ def verify(mutations: Iterable[Mutation], baseline: bool = True, workers: int | 
 WHOLE_SUITE = ""
 
 
+def confirm_timeout(floor: float, costs: dict[str, float] | None) -> float:
+    """How long one whole-suite confirmation probe may take.
+
+    Derived from `Killers`' remembered per-test costs, which are refilled on
+    every run, so this tracks the suite instead of rotting as it grows -- the
+    failure #322 reported was a 300 s bound meeting a 249.7 s serial suite, and
+    that margin was not lost by anyone changing the number.
+
+    `floor` is `--timeout`, and it is a floor rather than the answer: a person
+    who raises it means "give things longer", and a derived bound that came back
+    *shorter* would be the opposite of what they asked for.
+
+    No remembered costs means no measurement to derive from -- a fresh machine,
+    `--no-killers`, a hand-edited file -- and then this is the floor, which is
+    today's behaviour. A guess dressed as a derivation would be worse: it would
+    look measured in the output and be a number nobody chose.
+
+    The sum is biased low. `Killers` records what a test cost under `failfast`,
+    where a test that normally takes five seconds can stop at its first
+    assertion -- see the merge order in `confirm`. `CONFIRM_SLACK` absorbs that
+    along with lane contention, which is why it is applied to the sum rather
+    than each term.
+    """
+    if not costs:
+        return floor
+    return max(floor, CONFIRM_SLACK * sum(costs.values()))
+
+
 def confirm(
     report: Report,
     workers: int | None,
@@ -1472,6 +1513,7 @@ def confirm(
     *,
     each: float = EACH_TEST,
     baseline: bool = True,
+    costs: dict[str, float] | None = None,
 ) -> Report:
     """Re-run every survivor against the whole suite, and correct the ones caught.
 
@@ -1532,7 +1574,15 @@ def confirm(
         # holds. Leaving it false here would mark every clean sweep as
         # unconfirmed, which is the one report this tool exists to produce.
         return report._replace(widened=True)
-    print(f"\nconfirming {len(survivors)} survivor(s) against the whole suite...")
+    # Its own bound, not `--timeout`. A confirmation probe is a whole serial
+    # suite where a narrow row is a module or two, so the per-mutation number
+    # cannot answer both -- and when it does not fit, the probe times out, which
+    # is neither a survivor nor a catch. Printed because a derived number the
+    # reader cannot see is one they cannot check (#322).
+    bound = confirm_timeout(timeout, costs)
+    print(
+        f"\nconfirming {len(survivors)} survivor(s) against the whole suite, {bound:.0f}s each..."
+    )
     # `rerun` rather than `widened`: `Report.widened` is a different thing three
     # lines down, and one word for two meanings in one function is a re-read.
     # `first=""` as well as the widened selection: this pass exists to run the
@@ -1548,7 +1598,7 @@ def confirm(
         # notices settles the row, and this pass runs the *whole* suite per
         # survivor -- the one place where not stopping costs the most.
         failfast=True,
-        timeout=timeout,
+        timeout=bound,
         memory=memory,
         each=each,
         summarise=False,
@@ -1578,14 +1628,24 @@ def confirm(
     }
     unsure = sum(1 for found in again.results if not found.verdict.answered)
     if unsure:
-        print(f"{unsure} confirmation(s) could not be answered; those rows stand as reported.")
+        print(
+            f"{unsure} confirmation(s) could not be answered; those rows stand as reported, "
+            "and the report is not marked widened."
+        )
+    # `widened` is the *promise*, not the pass having been attempted:
+    # CONTRIBUTING.md says it "is true only when every survivor in the file
+    # really was re-run against the whole suite". A probe that timed out or
+    # broke re-ran nothing, so the promise is not kept and the flag may not be
+    # set -- which is what #322 is about, and it was set anyway. `Report.widened`
+    # says "there is exactly one way to earn it"; this is the earning.
+    kept = not unsure
     # `again` first so `report` wins: `again` is a `failfast` pass over mutated
     # trees, where a test that normally costs five seconds stops at its first
     # assertion and measures a hundredth of one. Recorded as its cost, it enters
     # the prefix budget every row pays and the real prefix stops being bounded.
     merged = {**(again.times or {}), **(report.times or {})}
     if not corrected:
-        return report._replace(widened=True, times=merged or None)
+        return report._replace(widened=kept, times=merged or None)
     print(f"{len(corrected)} of them were caught by a test the selection had not run.")
     return Report(
         [
@@ -1593,7 +1653,7 @@ def confirm(
             for where, result in enumerate(report.results)
         ],
         report.baseline_red,
-        True,
+        kept,
         merged or None,
     )
 
@@ -2031,6 +2091,7 @@ def _run_spec(mutations: Sequence[Mutation], args: argparse.Namespace) -> int:
             args.memory,
             each=args.each_test,
             baseline=not args.no_baseline,
+            costs=killers.cost,
         )
     if report.baseline_red:
         # The same two-ended closure as the generated path: a killer recorded
@@ -2282,7 +2343,14 @@ def main(argv: list[str] | None = None) -> int:
         help="run every operator but this one",
     )
     parser.add_argument("--limit", type=int, default=LIMIT, help="cap the table (0 for no cap)")
-    parser.add_argument("--timeout", type=float, default=TIMEOUT, help="seconds per mutation")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=TIMEOUT,
+        # A floor for confirmation, because that pass derives its own larger
+        # bound from the remembered test costs -- see `confirm_timeout`.
+        help="seconds per mutation, and the floor for a confirmation probe",
+    )
     parser.add_argument(
         "--each-test",
         type=float,
@@ -2389,6 +2457,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.memory,
                 each=args.each_test,
                 baseline=not args.no_baseline,
+                costs=killers.cost,
             )
         else:
             # Nothing to clear: `widened` is false until `confirm` earns it, so
